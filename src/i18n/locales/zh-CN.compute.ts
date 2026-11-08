@@ -1679,6 +1679,13 @@ export const zhCompute = {
   'console.reconnect': '重新连接控制台',
   'console.exitFullscreen': '退出全屏',
   'console.enterFullscreen': '进入全屏',
+  'console.syncSize': '把终端尺寸同步到客户机',
+  'console.syncSizeTitle': '同步终端尺寸',
+  'console.syncSizeMessage':
+    '串口不会把窗口尺寸传给客户机，所以只能在终端里执行：{cmd}。请确认它停在 shell 提示符上 —— 这行字会敲进当前的输入行。',
+  'console.syncSizeConfirm': '发送命令',
+  'console.syncSizeDone': '已发送 stty 命令',
+  'console.syncSizeFailed': '终端还没连接，无法同步尺寸',
   'console.lxcNotRunning': '容器未运行',
   'console.vmNotRunning': '虚拟机未运行',
   'console.nameQuoted': '「{name}」',

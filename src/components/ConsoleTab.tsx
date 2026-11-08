@@ -33,6 +33,7 @@ import {
   IconUpload,
   IconMonitor,
   IconTerminal,
+  IconLayout,
 } from './Icons';
 import {
   ConsoleAssist,
@@ -61,6 +62,8 @@ export interface VncHandle {
   typeText: (text: string) => Promise<{ typed: number; skipped: number }>;
   /** 移动端按键条：直接发一个 X11 keysym（Ctrl 组合靠 down/up 两次调用） */
   sendKey?: (keysym: number, code?: string, down?: boolean) => void;
+  /** 容器尺寸变了（进 / 出全屏）后重算画面：终端重算行列，VNC 重新缩放 */
+  resize?: () => void;
 }
 
 /* 控制台高度档位（标准 / 紧凑）的本地记忆键 */
@@ -206,6 +209,9 @@ export function ConsoleTab({
   const [state, setState] = useState<ConnState>('idle');
   const [error, setError] = useState<string | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
+  /* 面板内全屏：浏览器不给普通元素全屏时（Safari、部分内嵌 WebView）的兜底。
+     它不依赖 Fullscreen API，纯 CSS 铺满视口，所以按钮永远不会「点了没反应」。 */
+  const [theater, setTheater] = useState(false);
   const [reconnectKey, setReconnectKey] = useState(0);
   const [compact, setCompact] = useState<boolean>(() => {
     try {
@@ -275,14 +281,42 @@ export function ConsoleTab({
     consoleHandle.current = null;
   }, [node, vmid]);
 
-  /* 全屏状态跟踪 */
+  /* 全屏状态跟踪：浏览器全屏与面板内全屏（theater）两条路都归到这里。
+     尺寸在过渡结束后才稳定 —— 进入全屏的那一刻量出来的还是旧尺寸，
+     终端会按旧列数把画面留在左上角，VNC 也会停在原来的缩放比例上。
+     所以排两帧再补一次，确保重新量过。 */
   useEffect(() => {
     const handler = () => {
-      setFullscreen(Boolean(document.fullscreenElement));
+      const on = Boolean(document.fullscreenElement);
+      setFullscreen(on);
+      if (!on) setTheater(false);
+      const kick = () => consoleHandle.current?.resize?.();
+      requestAnimationFrame(() => requestAnimationFrame(kick));
+      window.setTimeout(kick, 200);
     };
     document.addEventListener('fullscreenchange', handler);
     return () => document.removeEventListener('fullscreenchange', handler);
   }, []);
+
+  /* 面板内全屏：锁页面滚动、Esc 退出、并让终端 / VNC 重新量尺寸。
+     浏览器全屏由浏览器自己处理（Esc 也是它管），这里只处理兜底那条路。 */
+  useEffect(() => {
+    if (!theater) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setTheater(false);
+    };
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    document.addEventListener('keydown', onKey);
+    const kick = () => consoleHandle.current?.resize?.();
+    requestAnimationFrame(() => requestAnimationFrame(kick));
+    const timer = window.setTimeout(kick, 200);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      document.removeEventListener('keydown', onKey);
+      window.clearTimeout(timer);
+    };
+  }, [theater]);
 
   /* 记住高度档位，下次打开控制台沿用 */
   useEffect(() => {
@@ -322,17 +356,31 @@ export function ConsoleTab({
   const toggleFullscreen = useCallback(async () => {
     const el = shellEl;
     if (!el) return;
-    try {
-      if (document.fullscreenElement) {
+    if (document.fullscreenElement) {
+      try {
         await document.exitFullscreen();
-      } else {
+      } catch (err) {
+        console.warn('退出全屏失败', err);
+      }
+      return;
+    }
+    if (theater) {
+      setTheater(false);
+      return;
+    }
+    /* 浏览器全屏优先，它能把面板真正推出标签栏。Safari（尤其 iOS）不支持
+       普通元素全屏，部分内嵌 WebView 也会直接拒绝 —— 失败就退到面板内全屏，
+       至少点了有反应、画面铺满视口。 */
+    try {
+      if (typeof el.requestFullscreen === 'function') {
         await el.requestFullscreen();
+        return;
       }
     } catch (err) {
-      /* 某些浏览器/权限下会失败，静默处理 */
-      console.warn('全屏切换失败', err);
+      console.warn('浏览器全屏不可用，改用面板内全屏', err);
     }
-  }, [shellEl]);
+    setTheater(true);
+  }, [shellEl, theater]);
 
   const reconnect = () => setReconnectKey((k) => k + 1);
 
@@ -353,6 +401,38 @@ export function ConsoleTab({
     } finally {
       setSerialBusy(false);
     }
+  };
+
+  /**
+   * 把面板算出来的网格尺寸同步进客户机。
+   *
+   * 串口只有字节流，没有窗口尺寸协商：客户机的 `ttyS0` 一直是内核默认的
+   * 80×24，面板把 xterm 调到 200×50 它也不知道，于是 vim / top 这类全屏
+   * 程序就卡在左上角。面板知道自己的行列数，能做的只有把 `stty` 这行命令
+   * 敲进客户机 —— 走的是输入通道，所以必须先确认终端停在 shell 提示符上，
+   * 否则这串字会插进用户正在敲的命令里。
+   */
+  const syncTerminalSize = async () => {
+    const handle = consoleHandle.current;
+    if (!handle || !('getSize' in handle) || !handle.getSize) {
+      toast.warning(t('console.syncSizeFailed'));
+      return;
+    }
+    const size = handle.getSize();
+    if (!size) {
+      toast.warning(t('console.syncSizeFailed'));
+      return;
+    }
+    const cmd = `stty rows ${size.rows} cols ${size.cols}`;
+    const ok = await confirmCad({
+      title: t('console.syncSizeTitle'),
+      message: t('console.syncSizeMessage', { cmd }),
+      confirmText: t('console.syncSizeConfirm'),
+      container: shellEl,
+    });
+    if (!ok) return;
+    handle.pasteText(`${cmd}\n`);
+    toast.success(t('console.syncSizeDone'), cmd);
   };
 
   /* ---- 剪贴板 / 键入 ---- */
@@ -528,7 +608,12 @@ export function ConsoleTab({
     );
 
   return (
-    <div className={`console-shell${compact ? ' is-compact' : ''}`} ref={attachShell}>
+    <div
+      className={`console-shell${compact ? ' is-compact' : ''}${
+        fullscreen || theater ? ' is-fullscreen' : ''
+      }`}
+      ref={attachShell}
+    >
       {/* ---- 工具栏 ---- */}
       <div className="console-toolbar">
         <div className="console-toolbar-left">
@@ -623,6 +708,16 @@ export function ConsoleTab({
             <IconUpload size={16} />
           </IconButton>
 
+          {/* 串口不给客户机传尺寸，只能把 stty 敲进去；图形模式没有这个问题 */}
+          {state === 'connected' && mode === 'term' && termAvailable ? (
+            <IconButton
+              label={t('console.syncSize')}
+              onClick={() => void syncTerminalSize()}
+            >
+              <IconLayout size={16} />
+            </IconButton>
+          ) : null}
+
           <IconButton
             label={
               compact ? t('console.restoreHeight') : t('console.compactHeight')
@@ -636,11 +731,13 @@ export function ConsoleTab({
           </IconButton>
           <IconButton
             label={
-              fullscreen ? t('console.exitFullscreen') : t('console.enterFullscreen')
+              fullscreen || theater
+                ? t('console.exitFullscreen')
+                : t('console.enterFullscreen')
             }
             onClick={() => void toggleFullscreen()}
           >
-            {fullscreen ? <IconShrink size={16} /> : <IconExpand size={16} />}
+            {fullscreen || theater ? <IconShrink size={16} /> : <IconExpand size={16} />}
           </IconButton>
         </div>
       </div>
@@ -948,6 +1045,16 @@ function VncConsole({
           sendKey: (keysym, code, down) => {
             try {
               session.sendKey?.(keysym, code, down);
+            } catch {
+              /* 连接已断：下次重连会重建句柄 */
+            }
+          },
+          resize: () => {
+            try {
+              /* noVNC 只盯 window resize：全屏是元素级的尺寸变化，它未必收到
+                 通知，画面就会停在原来的缩放比例上。赋值会重新量容器并缩放 */
+              session.scaleViewport = true;
+              session.resizeSession = true;
             } catch {
               /* 连接已断：下次重连会重建句柄 */
             }

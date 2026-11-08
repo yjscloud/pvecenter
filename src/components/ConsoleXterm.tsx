@@ -55,6 +55,10 @@ export interface ConsoleTermHandle {
    * `\x1b[A`）。终端本身就是字符流，不需要像 VNC 那样折算成 keysym。
    */
   sendKey?: (seq: string) => void;
+  /** 容器被外部改尺寸（进出全屏）后按新尺寸重算行列，并通知远端 pty */
+  resize?: () => void;
+  /** 当前网格的列数与行数；串口不会自己同步给客户机，需要调用方拿去发 stty */
+  getSize?: () => { cols: number; rows: number } | null;
 }
 
 interface ConsoleXtermProps {
@@ -313,6 +317,14 @@ export function ConsoleXterm({
           sendData(seq);
           term?.focus();
         },
+        resize: () => {
+          try {
+            fit?.fit();
+          } catch {
+            /* 容器还量不出尺寸时忽略，ResizeObserver 会再补一次 */
+          }
+        },
+        getSize: () => (term ? { cols: term.cols, rows: term.rows } : null),
       });
     }
 

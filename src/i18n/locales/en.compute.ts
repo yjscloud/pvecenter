@@ -1892,6 +1892,13 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'console.reconnect': 'Reconnect the console',
   'console.exitFullscreen': 'Exit full screen',
   'console.enterFullscreen': 'Enter full screen',
+  'console.syncSize': 'Fit the terminal size to the guest',
+  'console.syncSizeTitle': 'Sync terminal size',
+  'console.syncSizeMessage':
+    'A serial line carries no window size, so this has to run inside the guest: {cmd}. Make sure it is sitting at a shell prompt — the text is typed onto the current input line.',
+  'console.syncSizeConfirm': 'Send command',
+  'console.syncSizeDone': 'stty command sent',
+  'console.syncSizeFailed': 'The terminal is not connected yet',
   'console.lxcNotRunning': 'The container is not running',
   'console.vmNotRunning': 'The virtual machine is not running',
   'console.nameQuoted': '“{name}”',

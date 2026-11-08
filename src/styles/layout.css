@@ -1207,11 +1207,24 @@
   height: clamp(260px, 42vh, 500px);
 }
 
-/* 全屏时由浏览器接管尺寸，必须放在最后才能盖掉上面的固定高度 */
-.console-shell:fullscreen {
-  height: 100%;
+/* 全屏。两条路共用一套尺寸：
+   * `:fullscreen` —— 浏览器全屏，元素被放进 top layer；
+   * `.is-fullscreen` —— 面板内全屏（Fullscreen API 不可用时由 JS 加类）。
+   只靠 `:fullscreen` 的话，不支持普通元素全屏的环境点了没反应；而某些内嵌
+   WebView 里全屏元素也不会被撑到视口，表现就是「只放大了一点、四周还是黑的」。
+   必须放在 .is-compact 之后：两者选择器权重相同，靠顺序盖掉固定高度。 */
+.console-shell:fullscreen,
+.console-shell.is-fullscreen {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  max-height: none;
   border: none;
   border-radius: 0;
+  z-index: var(--z-dropdown);
+  background: var(--bg-surface);
 }
 
 .console-toolbar {
