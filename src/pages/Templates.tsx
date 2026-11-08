@@ -1661,7 +1661,10 @@ function TemplateCreateWizard({
     try {
       const task = await runner.run(
         storagesApi
-          .downloadUrl({ node, storage: dlStorage, url, content: 'import' })
+          /* 带上目标节点所属的连接：下载任务由 PVE 发起，节点名在那台机器上
+             才有效。不带就会落到「面板当前连接」，PVE 把别人的节点名当主机名
+             去解析，回一句 hostname lookup 'node02' failed */
+          .downloadUrl({ node, storage: dlStorage, url, content: 'import' }, nodeConn)
           .then((res) => {
             holder.res = res;
             return res;

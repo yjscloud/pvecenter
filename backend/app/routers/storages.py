@@ -626,6 +626,13 @@ async def download_image_from_url(
             ),
         )
 
+    # 路由级 ``bind_node_connection`` 只看得见**查询参数**，而这条接口的 node
+    # 在 JSON body 里 —— 依赖里注入的永远是 None，等于没绑。请求于是落到
+    # 「面板当前连接」，在那台 PVE 上找别的集群的节点名（``node02``），PVE 就把它
+    # 当主机名解析，回 ``hostname lookup 'node02' failed``。这里按 body 里的节点
+    # 补一次绑定；前端已带 ``X-PVE-Connection`` 时函数内部直接返回，不干预。
+    await bind_node_connection(payload.node)
+
     client = get_client()
     try:
         storages = await client.storages(payload.node)

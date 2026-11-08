@@ -744,9 +744,18 @@ export const storagesApi = {
    * 让 PVE 自己把镜像从 URL 下载进存储（云镜像模板的第一步）。
    *
    * 返回的是任务 UPID —— 下载完成前文件不存在，调用方要等任务结束再刷新列表。
+   *
+   * ``connectionId`` 必须带上：节点名在每台 PVE 上都是**本地的**，不带连接时
+   * 请求会落到「面板当前连接」，那台机器上没有这个节点名就回
+   * ``hostname lookup 'node02' failed`` —— 看着像 PVE 的 DNS 坏了，其实是
+   * 下载任务被发去打另一台 PVE 了。
    */
-  downloadUrl: (body: StorageDownloadRequest) =>
-    post<StorageDownloadResult>('/storages/download-url', body),
+  downloadUrl: (body: StorageDownloadRequest, connectionId?: string) =>
+    post<StorageDownloadResult>(
+      '/storages/download-url',
+      body,
+      scoped(connectionId),
+    ),
   /** 上传（后端可能未实现，调用方需容错）*/
   upload: (
     params: { node: string; storage: string; content: string },
