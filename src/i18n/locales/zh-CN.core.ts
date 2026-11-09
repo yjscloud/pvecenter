@@ -44,36 +44,36 @@ export const zhCore = {
   'sidebar.collapse': '收起侧边栏',
   'sidebar.expand': '展开侧边栏',
 
-  'nav.section.overview': '总览',
-  'nav.section.compute': '计算',
-  'nav.section.storageNetwork': '存储与网络',
+  'nav.section.overview': '全局总览',
+  'nav.section.compute': '计算资源',
+  'nav.section.storageNetwork': '存储网络',
   'nav.section.dataProtection': '数据保护',
-  'nav.section.security': '安全',
-  'nav.section.observability': '观测与集成',
+  'nav.section.security': '安全防护',
+  'nav.section.observability': '观测集成',
   'nav.section.system': '系统管理',
 
   /* 未配置 Proxmox 时，依赖 PVE 的导航项右侧那颗小圆点的悬停说明 */
   'nav.pveNotConfigured': '面板还没接入 Proxmox 主机，点进去会提示你去添加',
 
-  'nav.dashboard': '仪表盘',
+  'nav.dashboard': '运行总览',
   'nav.vms': '虚拟机',
-  'nav.lxc': '容器',
-  'nav.templates': '模板',
-  'nav.nodes': '节点',
-  'nav.storages': '存储',
-  'nav.networks': '网络',
+  'nav.lxc': 'LXC 容器',
+  'nav.templates': '系统模板',
+  'nav.nodes': '集群节点',
+  'nav.storages': '存储资源',
+  'nav.networks': '网络配置',
   'nav.frp': '内网穿透',
-  'nav.snapshots': '快照',
-  'nav.backups': '备份',
+  'nav.snapshots': '快照记录',
+  'nav.backups': '备份恢复',
   'nav.incident': '应急响应',
-  'nav.firewall': '防火墙',
+  'nav.firewall': '访问控制',
   'nav.sshSecurity': 'SSH 安全',
   'nav.hostAudit': '登录审计',
-  'nav.ports': '端口与进程',
+  'nav.ports': '端口进程',
   'nav.securityBaseline': '安全基线',
   'nav.alerts': '监控告警',
   'nav.certificates': '证书管理',
-  'nav.feishuBot': '飞书机器人',
+  'nav.feishuBot': '飞书 Bot',
   'nav.tasks': '任务队列',
   'nav.users': '用户管理',
   'nav.audit': '审计日志',
@@ -591,7 +591,7 @@ export const zhCore = {
   'faq.a2': '控制台需要虚拟化平台本身认可的登录凭据，与面板使用的 API 凭据是两套机制。该功能可选，不填不影响其它功能。',
   'faq.q3': 'SSL 证书「自动续期」是怎么工作的？',
   'faq.a3': '面板会按你设定的提前天数（默认到期前 15 天）自动发起续期，签发成功后自动部署并执行你配置的重载命令，全过程写入审计日志。',
-  'faq.q4': '飞书机器人需要公网回调吗？会不会被人乱操作？',
+  'faq.q4': '飞书 Bot 需要公网回调吗？会不会被人乱操作？',
   'faq.a4': '需要：机器人通过飞书开放平台的事件回调访问面板，回调地址必须能被飞书访问到（内网部署可用反向代理）。安全上做了两层限制：一是必须配置群会话或用户白名单，名单外的消息一律拒绝；二是危险操作会先弹确认卡片，点确认才执行，全过程写入审计日志。',
 
   /* ---------------------------------------------------- 时间 / 时长格式 */
@@ -607,7 +607,7 @@ export const zhCore = {
   /* ------------------------------------------------------------ 404 页面 */
   'notFound.title': '页面不存在',
   'notFound.text': '你访问的地址没有对应的页面，可能是链接已失效或路径输入有误。',
-  'notFound.backDashboard': '返回仪表盘',
+  'notFound.backDashboard': '返回运行总览',
   'notFound.backPrev': '返回上一页',
   'notFound.goVms': '或者去看看虚拟机列表',
 
@@ -680,7 +680,7 @@ export const zhCore = {
   'update.form.other': '其它（见手工命令）',
 
   /* ------------------------------------------------------------ AI 排查助手 */
-  'nav.aiAssistant': 'AI 排查助手',
+  'nav.aiAssistant': 'AI 助手',
 
   /* ---------------------------------------------------------- API 错误文案 */
   /* -------------------------------------------------------------- 接口错误 */

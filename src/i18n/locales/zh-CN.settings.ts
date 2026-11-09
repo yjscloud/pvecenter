@@ -603,7 +603,7 @@ export const zhSettings = {
   'settings.urlPreviewFilled': '按上面填的地址拼接',
   'settings.urlPreviewFallback': '未填写，回落到请求 Host',
   'settings.urlPreviewReset': '重置密码（邮件正文里的按钮）',
-  'settings.urlPreviewFeishu': '飞书机器人事件回调地址',
+  'settings.urlPreviewFeishu': '飞书 Bot 事件回调地址',
   'settings.urlPreviewHost': '当前请求 Host（留空时就用它）',
   'settings.faqTitle': '常见问题',
   'settings.faqSubtitle': '官网「常见问题」区块的内容，对所有访问者生效',
@@ -802,8 +802,8 @@ export const zhSettings = {
   'users.quotaFailedHint':
     '拿不到「生效上限 / 已用」的数据，下面两列显示为「—」。这通常不是用户没配额度，而是请求失败（权限不足，或后端未重启到最新版本）。',
 
-  /* -------------------------------------------------------- 飞书机器人 */
-  'feishu.title': '飞书机器人',
+  /* ---------------------------------------------------------- 飞书 Bot */
+  'feishu.title': '飞书 Bot',
   'feishu.subtitle':
     '在飞书会话里直接查询与控制虚拟机（列表 / 状态 / 开机 / 关机 / 重启 / 创建）',
   'feishu.saveOk': '保存成功',

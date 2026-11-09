@@ -305,7 +305,7 @@ export const zhNode = {
      192.168.1.0/24、node2 可能是 10.0.0.0/24），池限定节点后才不会在错误的
      节点上被选出来。空 = 全部节点。 */
   'ippool.colScope': '适用范围',
-  'ippool.scopeAnyPve': '全部 PVE',
+  'ippool.scopeAnyPve': '全部 PVE 集群',
   'ippool.scopeAnyNode': '全部节点',
   'ippool.nodesEditTitle': '选择这个地址池的适用范围',
   'ippool.scopeTitle': '「{name}」的适用范围',
@@ -452,7 +452,7 @@ export const zhNode = {
   'nodesConnections.backToNodes': '返回节点列表',
 
   /* ------------------------------------------------------- 网络总览 */
-  'networks.title': '网络总览',
+  'networks.title': '网络配置',
   'networks.subtitleSummary': '{nodes} 个节点 · {total} 个接口 · {bridges} 个网桥',
   'networks.readOnlyTitle': '只读总览',
   'networks.readOnlyAdmin':
@@ -507,7 +507,7 @@ export const zhNode = {
   'networks.nodeEmpty': '该节点没有匹配的接口',
 
   /* ------------------------------------------------------------- 节点 */
-  'nodes.title': '节点',
+  'nodes.title': '集群节点',
   /* 页头走**全机队**口径：多 PVE 面板里不能再只报默认那台的版本与仲裁，
      否则其余集群失去仲裁时页头照样一片绿。 */
   'nodes.subtitleFleet':
@@ -532,10 +532,10 @@ export const zhNode = {
   'nodes.limitedConnsTailUser': '。请联系管理员处理。',
   'nodes.searchPlaceholder': '搜索节点名、来源主机…',
   'nodes.searchAria': '搜索节点',
-  'nodes.filterConnAria': '按来源 PVE 筛选',
+  'nodes.filterConnAria': '按来源 PVE 集群筛选',
   'nodes.sortAria': '排序方式',
-  'nodes.allHosts': '全部 PVE 主机',
-  'nodes.defaultConnection': '默认连接',
+  'nodes.allHosts': '全部 PVE 集群',
+  'nodes.defaultConnection': '默认集群',
   'nodes.showing': '显示 {shown} / {total} 个节点',
   'nodes.loadFailed': '无法加载节点列表',
   'nodes.emptyTitle': '暂无节点',
@@ -665,7 +665,7 @@ export const zhNode = {
   'tasks.unknownTask': '未知任务',
 
   /* -------------------------------------------------------------- 存储 */
-  'storages.title': '存储',
+  'storages.title': '存储资源',
   'storages.subtitle': '共 {n} 个存储池 · 总容量 {size}',
   'storages.selectFirst': '请先选择存储池',
   'storages.selectFirstDetail': '在下方表格中点击「浏览」选定目标存储',

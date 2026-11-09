@@ -9,7 +9,7 @@ import type { MessageKey } from './zh-CN';
 
 export const enMonitor: Partial<Record<MessageKey, string>> = {
   /* ------------------------------------------------------------ Dashboard */
-  'dashboard.title': 'Cluster dashboard',
+  'dashboard.title': 'Overview',
   'dashboard.subtitle.posture': 'Cluster posture: {state}',
   'dashboard.refresh': 'Refresh',
   'dashboard.updatedAt': 'Updated {time}',
@@ -23,9 +23,9 @@ export const enMonitor: Partial<Record<MessageKey, string>> = {
     'Drag cards to reorder them, click "Hide" to tuck away what you do not need. Changes are saved to your account immediately and follow you across browsers and devices.',
   'dashboard.hiddenTitle': 'Hidden cards',
   'dashboard.hiddenSubtitle': 'Click one to put it back where it was',
-  'dashboard.emptyNoAccess': 'No dashboard cards available for this account',
+  'dashboard.emptyNoAccess': 'No overview cards available for this account',
   'dashboard.emptyNoAccessDesc':
-    'The dashboard only shows cards you have permission for: your account cannot view nodes, guests or storage, so there is nothing to display here. Ask an administrator if you need access.',
+    'The overview only shows cards you have permission for: your account cannot view nodes, guests or storage, so there is nothing to display here. Ask an administrator if you need access.',
   'dashboard.emptyAllHidden': 'All cards are hidden',
   'dashboard.emptyAllHiddenDesc':
     'Click "Edit layout" in the top right, then pick a card under "Hidden cards" to bring it back.',

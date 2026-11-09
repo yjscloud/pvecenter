@@ -160,8 +160,9 @@ const KIND_META: Record<GuestKind, KindMeta> = {
   },
 };
 
-/** 随语言变的五个常用词：名词、量词、创建按钮、空状态引导、克隆占位 */
+/** 随语言变的六个常用词：页标题、名词、量词、创建按钮、空状态引导、克隆占位 */
 function useKindLabels(kind: GuestKind): {
+  title: string;
   noun: string;
   unit: string;
   create: string;
@@ -172,6 +173,9 @@ function useKindLabels(kind: GuestKind): {
   const prefix = KIND_KEY[kind];
   return useMemo(
     () => ({
+      /* 页标题与侧栏对齐（「虚拟机」/「LXC 容器」），句子里的名词仍用
+         「虚拟机」/「容器」—— 那些句子描述的是具体机型，不必跟着变 */
+      title: t(`${prefix}.title`),
       noun: t(`${prefix}.noun`),
       unit: t(`${prefix}.unit`),
       create: t(`${prefix}.create`),
@@ -514,7 +518,13 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
      额度里不算任何人 —— 面板外建的、或归属记录丢了的，就是一份白送的额度，
      而此前在界面上完全看不见。 */
   const [ownerFilter, setOwnerFilter] = useState<'all' | 'unowned'>('all');
-  const [sort, setSort] = useState<SortState | null>(null);
+  /* 默认按创建时间升序：先建的排在最上面。取不到创建时间的存量机器
+     （created 为 null，PVE 8 之前建的、或 meta 里没写 ctime 的）按 0 参与比较，
+     会排在最前面 —— 它们的时间确实最早（未知）。用户点表头仍可改排序。 */
+  const [sort, setSort] = useState<SortState | null>({
+    key: 'created',
+    direction: 'asc',
+  });
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [createOpen, setCreateOpen] = useState(false);
   /* 导入 / 导出都是虚拟机专有：容器没有 OVF、也没有「导出磁盘镜像」这回事 */
@@ -1568,7 +1578,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       title={
         <>
           {meta.titleIcon}
-          {L.noun}
+          {L.title}
         </>
       }
       subtitle={

@@ -636,7 +636,7 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'notFound.title': 'Page not found',
   'notFound.text':
     'There is no page at the address you visited. The link may have expired or the URL may be mistyped.',
-  'notFound.backDashboard': 'Back to dashboard',
+  'notFound.backDashboard': 'Back to overview',
   'notFound.backPrev': 'Go back',
   'notFound.goVms': 'Or browse the virtual machine list',
 

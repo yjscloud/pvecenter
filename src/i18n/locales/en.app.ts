@@ -11,7 +11,7 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'scope.label': 'Cluster scope',
   'scope.all': 'All clusters',
   'scope.title':
-    'Which PVE cluster the pages read from: nodes, VMs, storage and tasks, plus the dashboard leaderboards and capacity forecast. The topbar status, system info and the dashboard cluster posture always cover every connection',
+    'Which PVE cluster the pages read from: nodes, VMs, storage and tasks, plus the overview leaderboards and capacity forecast. The topbar status, system info and the overview cluster posture always cover every connection',
   'vmImport.warnOvaExtract': 'An OVA is unpacked first, so the target storage needs extra space',
   'vmImport.warnOvmfLsi': 'The controller found in the OVF cannot boot under UEFI — pick virtio-scsi below',
   'vmImport.warnFirmwareUnknown':
@@ -45,11 +45,13 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'dashboard.nodes.cores': '{n} cores',
 
   /* ------------------------------------------ Main list: virtual machines / containers */
+  'guestList.vm.title': 'Virtual machines',
   'guestList.vm.noun': 'virtual machine',
   'guestList.vm.unit': 'VMs',
   'guestList.vm.create': 'Create VM',
   'guestList.vm.empty': 'No virtual machines in this cluster yet — click “Create VM” to start.',
   'guestList.vm.cloneName': 'Name for the cloned VM',
+  'guestList.ct.title': 'Containers',
   'guestList.ct.noun': 'container',
   'guestList.ct.unit': 'containers',
   'guestList.ct.create': 'Create container',
@@ -652,7 +654,7 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'ai.gotoAlerts': 'Open monitoring & alerts',
   'ai.gotoSsh': 'Open SSH security',
   'ai.gotoBackups': 'Open backups',
-  'ai.gotoMetrics': 'Open dashboard',
+  'ai.gotoMetrics': 'Open overview',
   'ai.gotoPorts': 'Open ports & processes',
   'ai.gotoHostAudit': 'Open login audit',
   'ai.gotoStorages': 'Open storage',

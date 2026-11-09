@@ -358,7 +358,7 @@ export const zhSecurity = {
   'sshConfig.localRemoveConfirm': '再点一次确认移出',
   'localHost.noticeTitle': '面板本机尚未纳入安全管控',
   'localHost.noticeBody':
-    '「SSH 安全 / 安全基线 / 端口与进程 / 登录审计」默认只覆盖你添加的受管主机，不碰运行面板的这台服务器 —— 读取它的日志与 /proc、修改 sshd 与 fail2ban 都需要较高权限，所以要你明确导入一次。导入只是打开开关，不需要填任何凭据。',
+    '「SSH 安全 / 安全基线 / 端口进程 / 登录审计」默认只覆盖你添加的受管主机，不碰运行面板的这台服务器 —— 读取它的日志与 /proc、修改 sshd 与 fail2ban 都需要较高权限，所以要你明确导入一次。导入只是打开开关，不需要填任何凭据。',
   'localHost.importAction': '导入本机',
   'localHost.imported': '已导入面板本机',
   'localHost.importedHint': '这四个功能的「本机」作用域现在可以用了',
@@ -633,8 +633,8 @@ export const zhSecurity = {
   'trend.loadFailedMsg': '趋势数据暂时读不到，稍后重试。',
   'trend.rescanning': '正在逐台巡检 {done}/{total}',
 
-  /* ----------------------------------------------------- 端口与进程 */
-  'ports.title': '端口与进程',
+  /* -------------------------------------------------------- 端口进程 */
+  'ports.title': '端口进程',
   'ports.subtitle': '巡检各服务器的监听端口与可疑进程（反弹 shell 启发式），异常时推送告警',
   'ports.ignoreUntil': '{time} 前不再提示',
   'ports.status.notScanned': '未巡检',
@@ -775,7 +775,7 @@ export const zhSecurity = {
     '：挖矿与蠕虫常见进程名（xmrig、kdevtmpfsi、kinsing 等）、netcat 监听模式、连接到常见后门/远控端口。',
   'ports.heurPermLabel': '权限的影响',
   /* ---------------------------------------------------------------- 防火墙 */
-  'firewall.title': '防火墙',
+  'firewall.title': '访问控制',
   'firewall.subtitle': 'Proxmox 原生防火墙：集群 / 节点 / 虚拟机规则、安全组、IP 集合与批量下发',
   'firewall.viewAria': '防火墙视图切换',
   'firewall.tabRules': '安全策略',

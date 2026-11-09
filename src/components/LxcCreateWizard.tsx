@@ -704,19 +704,19 @@ export function LxcCreateWizard({
                 />
               </Field>
               <Input
-                label={t('lxcWizard.fieldVmid')}
-                hint={t('lxcWizard.fieldVmidHint')}
-                value={form.vmid}
-                onChange={(e) => update('vmid', e.target.value)}
-                error={errors.vmid}
-              />
-              <Input
                 label={t('lxcWizard.fieldName')}
                 required
                 placeholder={t('lxcWizard.namePlaceholder')}
                 value={form.name}
                 onChange={(e) => update('name', e.target.value)}
                 error={errors.name}
+              />
+              <Input
+                label={t('lxcWizard.fieldVmid')}
+                hint={t('lxcWizard.fieldVmidHint')}
+                value={form.vmid}
+                onChange={(e) => update('vmid', e.target.value)}
+                error={errors.vmid}
               />
               <Input
                 label={t('lxcWizard.fieldPassword')}

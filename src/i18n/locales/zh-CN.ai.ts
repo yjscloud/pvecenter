@@ -5,7 +5,7 @@
    ========================================================================== */
 
 export const zhAi = {
-  'ai.title': 'AI 排查助手',
+  'ai.title': 'AI 助手',
   'ai.subtitle':
     '描述现象或直接提问，AI 会登录这台主机跑诊断命令去查，边查边答。只读命令直接执行；要改动系统的命令，必须你逐条批准。',
   'ai.runningHint': '正在调模型并执行命令，通常十几秒到一分钟',
@@ -20,13 +20,13 @@ export const zhAi = {
     'AI 排查只能作用于「SSH 安全 → 受管主机」里登记过的服务器。先把要排查的机器加进来，这里才有得选。',
   'ai.notConfigured': '还没有配置大模型',
   'ai.notConfiguredHint':
-    'AI 排查助手需要一个大模型才能工作。支持外部 API（DeepSeek / 通义 / OpenAI）和内网自建（vLLM / Ollama），两者填法一样。',
+    'AI 助手需要一个大模型才能工作。支持外部 API（DeepSeek / 通义 / OpenAI）和内网自建（vLLM / Ollama），两者填法一样。',
   'ai.configureNow': '去配置',
 
   /* 配置面板 */
   'ai.settingsTitle': '模型设置',
   'ai.settingsDesc': '配置对全平台生效，密钥加密存储在后端，不会下发到浏览器',
-  'ai.enable': '启用 AI 排查助手',
+  'ai.enable': '启用 AI 助手',
   'ai.enableHint': '关闭后所有用户都无法发起排查',
   'ai.provider': '大模型',
   'ai.providerName': '名称',

@@ -5,8 +5,8 @@
    ========================================================================== */
 
 export const zhMonitor = {
-  /* ------------------------------------------------------------- 仪表盘 */
-  'dashboard.title': '集群仪表盘',
+  /* ----------------------------------------------------------- 运行总览 */
+  'dashboard.title': '运行总览',
   /* 副标题里的态势**是全机队**口径（取最坏的那一套），与下面的「集群态势」卡同源 */
   'dashboard.subtitle.posture': '集群态势：{state}',
   'dashboard.refresh': '刷新',
@@ -23,9 +23,9 @@ export const zhMonitor = {
   'dashboard.hiddenTitle': '已隐藏的卡片',
   'dashboard.hiddenSubtitle': '点一下放回它原来的位置',
   /* 卡片全被权限裁空 / 全被自己隐藏：两种「空」的出口不同，文案必须分开 */
-  'dashboard.emptyNoAccess': '当前账号没有可查看的仪表盘卡片',
+  'dashboard.emptyNoAccess': '当前账号没有可查看的总览卡片',
   'dashboard.emptyNoAccessDesc':
-    '仪表盘按权限显示卡片：你的账号没有查看节点 / 虚拟机 / 存储等资源的权限，所以这里没有可展示的内容。需要的话请联系管理员分配权限。',
+    '运行总览按权限显示卡片：你的账号没有查看节点 / 虚拟机 / 存储等资源的权限，所以这里没有可展示的内容。需要的话请联系管理员分配权限。',
   'dashboard.emptyAllHidden': '所有卡片都被隐藏了',
   'dashboard.emptyAllHiddenDesc':
     '点右上角「编辑布局」，从「已隐藏的卡片」里把它们放回来。',
@@ -387,17 +387,17 @@ export const zhMonitor = {
   'frp.targetOption': '{name}（{kind} {vmid}）· {ip}',
   'frp.targetOptionUnnamed': '{kind} {vmid} · {ip}',
   'frp.targetSelectPlaceholder': '请选择目标地址',
-  'frp.targetSelectEmpty': '暂无可指向的虚机 / 容器',
-  'frp.targetSelectHint': '只能选择你名下虚机 / 容器的 IP（共 {n} 个）',
+  'frp.targetSelectEmpty': '暂无可指向的虚拟机 / LXC 容器',
+  'frp.targetSelectHint': '只能选择你名下虚拟机 / LXC 容器的 IP（共 {n} 个）',
   'frp.targetSelectHintManual':
-    '只能选择你名下虚机 / 容器的 IP；其它地址仅限管理员放行的网段：{cidrs}',
+    '只能选择你名下虚拟机 / LXC 容器的 IP；其它地址仅限管理员放行的网段：{cidrs}',
   'frp.targetManualOption': '其它地址（管理员已放行的网段）',
   'frp.targetGrantedOption': '管理员授权 · {ip}',
   'frp.fieldLocalIpManual': '目标 IP（须在放行网段内）',
   'frp.localIpPlaceholder': '例如 10.0.0.25',
   'frp.localIpRequired': '请填写目标 IP',
   'frp.localIpInvalid': '请填写合法的 IPv4 / IPv6 地址',
-  'frp.localIpNotAllowed': '该 IP 不在允许范围内：只能是自己名下的虚机，或管理员放行的网段',
+  'frp.localIpNotAllowed': '该 IP 不在允许范围内：只能是自己名下的虚拟机，或管理员放行的网段',
   'frp.fieldLocalPort': '本地端口',
   'frp.fieldRemotePort': '公网端口',
   'frp.portRange': '端口范围 1-65535',
@@ -432,7 +432,7 @@ export const zhMonitor = {
   'frp.policyPortRange': '公网端口 {min}–{max}',
   'frp.policyForbiddenPort': '端口 {port} 是面板 / PVE / 常见服务的关键端口，不能占用',
   'frp.policyPortInUse': '端口 {port} 已被其它规则占用',
-  'frp.policyOwnIps': '可填写的目标（你名下的虚机 / 容器 IP）：',
+  'frp.policyOwnIps': '可填写的目标（你名下的虚拟机 / LXC 容器 IP）：',
   'frp.policyMoreIps': '另有 {n} 个',
   'frp.policyAllowCidrs': '管理员放行的网段：{cidrs}',
   'frp.policyGranted': '管理员授权给你的目标：',
@@ -441,8 +441,8 @@ export const zhMonitor = {
   'frp.policyNoTargetBody':
     '你名下暂时没有可指向的地址：未装 Guest Agent、未开机、也没配静态地址的机器都解析不出 IP。请先给机器补上 IP 采集（安装 Agent / 配好静态地址并开机），或让管理员在「用户授权」里放行可穿透的目标 IP。',
   'frp.policyNoTargetWithCidrs':
-    '你名下暂时没有可解析到 IP 的虚机；目前只能使用管理员放行的网段：{cidrs}',
-  'frp.policyTargetLookupFailed': '读取名下虚机失败：{error}',
+    '你名下暂时没有可解析到 IP 的虚拟机；目前只能使用管理员放行的网段：{cidrs}',
+  'frp.policyTargetLookupFailed': '读取名下虚拟机失败：{error}',
   /* 常显在规则列表上方：解释「为什么我的机器不在下拉里」 */
   'frp.targetIpHint':
     '为什么有些机器不在列表里？未装 Guest Agent、未开机、也没配静态地址的机器解析不到 IP。可先补上 IP 采集，或请管理员在「用户授权」里为你放行目标 IP。',
@@ -502,7 +502,7 @@ export const zhMonitor = {
   'frp.grantsEmptyHint':
     '选择用户、填入要放行的 IP / 网段后点「添加授权」；一次可以填多个。',
   'frp.grantsNote':
-    '授权只放宽「目标地址」的范围：不改变虚机归属，也不会修改已存在的规则；撤销后已建的规则仍保留，但不能再拿该地址新建。端口区间与面板自身地址的限制仍然生效。',
+    '授权只放宽「目标地址」的范围：不改变虚拟机归属，也不会修改已存在的规则；撤销后已建的规则仍保留，但不能再拿该地址新建。端口区间与面板自身地址的限制仍然生效。',
   'alerts.vmDiskAgentHint':
     '虚拟机的磁盘已用量来自客户机的 qemu-guest-agent；未安装该 agent 时取不到数据，规则不会触发。',
 } as const;

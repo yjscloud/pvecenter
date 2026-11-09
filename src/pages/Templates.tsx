@@ -8,6 +8,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   clusterApi,
   configApi,
+  connectionsApi,
   lxcApi,
   nodesApi,
   storagesApi,
@@ -15,6 +16,7 @@ import {
   vmsApi,
 } from '../api/endpoints';
 import { errorMessage } from '../api/client';
+import { getGlobalScope } from '../api/scope';
 import { PageShell } from '../components/Layout';
 import { Card } from '../components/ui/Card';
 import { Badge, TagList } from '../components/ui/Badge';
@@ -1453,6 +1455,9 @@ function TemplateCreateWizard({
   }, [open]);
 
   /* 模式 A 表单 */
+  /* 先选目标 PVE 集群，再选节点：节点名只在一台 PVE 上有意义，跨连接混在一起的下拉
+     会让用户在一台机器的节点名上建另一台机器的模板（hostname lookup 失败）。 */
+  const [targetConn, setTargetConn] = useState('');
   const [node, setNode] = useState('');
   const [vmid, setVmid] = useState('');
   const [name, setName] = useState('');
@@ -1479,41 +1484,80 @@ function TemplateCreateWizard({
   const [tags, setTags] = useState('template');
   const [submitting, setSubmitting] = useState(false);
 
-  const nodesQuery = useQuery({
-    queryKey: ['nodes'],
-    queryFn: nodesApi.list,
+  /* 可选的 PVE 集群（「目标 PVE 集群」下拉） */
+  const connectionsQuery = useQuery({
+    queryKey: ['connections'],
+    queryFn: connectionsApi.list,
     enabled: open,
+    staleTime: 60_000,
+    retry: false,
+  });
+
+  const connectionOptions = useMemo(
+    () =>
+      (connectionsQuery.data ?? []).map((c) => ({
+        /* 标签只给连接名（未命名时退回主机名）：普通用户不需要知道地址 */
+        label: `${c.name || c.host}${c.active ? t('vmCreate.connCurrentTag') : ''}`,
+        value: c.id,
+      })),
+    [connectionsQuery.data, t],
+  );
+
+  /* 节点列表只取**当前连接**下的节点。取号与创建也一律带上 targetConn：
+     不带就会落到「面板当前连接」（或后端兜底的那台），在别的集群的节点名上
+     建机会直接 hostname lookup 失败，VMID 也可能与那台上的机器撞号
+     （每台 PVE 的 VMID 空间各自独立）。 */
+  const nodesQuery = useQuery({
+    queryKey: ['nodes', targetConn],
+    queryFn: () => nodesApi.list(targetConn),
+    enabled: open && Boolean(targetConn),
     staleTime: 60_000,
   });
 
-  /* 目标节点所属的 PVE 连接。节点是从**全部连接**里挑的，取号与创建都必须带上
-     它的连接：不带就会落到「面板当前连接」（或后端兜底的那台），在别的集群的
-     节点名上建机会直接 hostname lookup 失败，而 VMID 也可能与那台上的机器撞号
-     （每台 PVE 的 VMID 空间各自独立）。 */
-  const nodeConn = useMemo(
-    () => (nodesQuery.data ?? []).find((n) => n.node === node)?.connection_id ?? '',
-    [nodesQuery.data, node],
-  );
-
   const nextIdQuery = useQuery({
-    queryKey: ['cluster', 'nextid', nodeConn],
-    queryFn: () => clusterApi.nextId(nodeConn),
-    enabled: open,
+    queryKey: ['cluster', 'nextid', targetConn],
+    queryFn: () => clusterApi.nextId(targetConn),
+    enabled: open && Boolean(targetConn),
     retry: false,
     staleTime: 0,
   });
 
+  /* 默认落在顶栏「集群作用域」选的那一套连接上；作用域是「全部集群」时回落到
+     兜底连接，与创建虚拟机向导保持一致。 */
+  useEffect(() => {
+    if (!open) return;
+    const list = connectionsQuery.data ?? [];
+    if (!list.length) return;
+    if (targetConn && list.some((c) => c.id === targetConn)) return;
+    const target =
+      list.find((c) => c.id === getGlobalScope()) ??
+      list.find((c) => c.active) ??
+      list[0];
+    setTargetConn(target?.id ?? '');
+  }, [open, targetConn, connectionsQuery.data]);
+
+  /* 换连接 = 换一台独立的 PVE：节点、VMID 空间、存储、镜像都不通用，全部清空，
+     由下面按新连接取回的数据重新填充。 */
+  useEffect(() => {
+    setNode('');
+    setVmid('');
+    setDiskStorage('');
+    setImageVolId('');
+    setDlStorage('');
+  }, [targetConn]);
+
   /* 磁盘存储池：只列**所选节点上**的池子，并带上该节点所属连接 —— 这台主机上
-     可能挂着别的 PVE 的节点，只按名字查会被页面级连接带到别处（见 useNodeStorages） */
-  const storagesQuery = useNodeStorages(node, undefined, open);
+     可能挂着别的 PVE 的节点，只按名字查会被页面级连接带到别处（见 useNodeStorages）。
+     目标 PVE 集群由上面的下拉显式给出，不再按节点名反查。 */
+  const storagesQuery = useNodeStorages(node, targetConn, open);
 
   /* 可作模板系统盘来源的镜像。
      这件事交给后端（/api/templates/images）：它要同时扫 import 与 iso 两种
      存储内容，还得知道每种内容里 PVE 认哪些扩展名 —— 前端自己扫容易漏，
      之前就漏掉了 import 目录，导致 .qcow2 永远选不到。 */
   const imagesQuery = useQuery({
-    queryKey: ['templates', 'images', nodeConn, node],
-    queryFn: () => templatesApi.images(node, nodeConn),
+    queryKey: ['templates', 'images', targetConn, node],
+    queryFn: () => templatesApi.images(node, targetConn),
     enabled: open && Boolean(node),
     retry: false,
   });
@@ -1528,8 +1572,8 @@ function TemplateCreateWizard({
   );
 
   const bridgesQuery = useQuery({
-    queryKey: ['nodes', nodeConn, node, 'network'],
-    queryFn: () => nodesApi.network(node, nodeConn),
+    queryKey: ['nodes', targetConn, node, 'network'],
+    queryFn: () => nodesApi.network(node, targetConn),
     enabled: open && Boolean(node),
     retry: false,
     staleTime: 60_000,
@@ -1661,10 +1705,10 @@ function TemplateCreateWizard({
     try {
       const task = await runner.run(
         storagesApi
-          /* 带上目标节点所属的连接：下载任务由 PVE 发起，节点名在那台机器上
-             才有效。不带就会落到「面板当前连接」，PVE 把别人的节点名当主机名
-             去解析，回一句 hostname lookup 'node02' failed */
-          .downloadUrl({ node, storage: dlStorage, url, content: 'import' }, nodeConn)
+          /* 带上「目标 PVE 集群」选中的那套：下载任务由 PVE 发起，节点名在那台机器上
+         才有效。不带就会落到「面板当前连接」，PVE 把别人的节点名当主机名
+         去解析，回一句 hostname lookup 'node02' failed */
+          .downloadUrl({ node, storage: dlStorage, url, content: 'import' }, targetConn)
           .then((res) => {
             holder.res = res;
             return res;
@@ -1678,8 +1722,8 @@ function TemplateCreateWizard({
           timeout: 1_800_000,
           invalidate: [
             /* 新文件要立刻出现在「镜像来源」下拉里 */
-            ['templates', 'images', nodeConn, node],
-            ['storages', nodeConn || '', node],
+            ['templates', 'images', targetConn, node],
+            ['storages', targetConn || '', node],
           ],
         },
       );
@@ -1711,8 +1755,8 @@ function TemplateCreateWizard({
     }
     setSubmitting(true);
     try {
-      /* 带上目标节点所属的连接：节点是从全部连接里挑的，不带会落到面板当前连接，
-         在别的集群的节点名上建机会报 hostname lookup 失败 */
+      /* 创建请求同样带着「目标 PVE 集群」选中的那套：节点名只在那台 PVE 上有效，
+         不带会落到面板当前连接，报 hostname lookup 失败 */
       const res = await vmsApi.create(
         {
           node,
@@ -1749,7 +1793,7 @@ function TemplateCreateWizard({
               }
             : undefined,
         },
-        nodeConn || undefined,
+        targetConn || undefined,
       );
 
       toast.success(
@@ -1836,6 +1880,40 @@ function TemplateCreateWizard({
           </Notice>
 
           <div className="form-grid">
+            {/* 先选目标 PVE 集群，再选节点：节点列表按它收窄，取号与创建也都落在这一套
+                连接上 —— 否则会在别的集群的同名节点上建模板。 */}
+            <Select
+              label={t('templates.fieldConnection')}
+              required
+              value={targetConn}
+              onChange={(e) => setTargetConn(e.target.value)}
+              options={
+                connectionOptions.length
+                  ? connectionOptions
+                  : [{ label: t('templates.fieldConnectionEmpty'), value: '' }]
+              }
+              hint={
+                nodesQuery.isError
+                  ? errorMessage(nodesQuery.error)
+                  : t('templates.fieldConnectionHint')
+              }
+            />
+            <Select
+              label={t('common.node')}
+              required
+              value={node}
+              onChange={(e) => setNode(e.target.value)}
+              options={[
+                { label: t('templates.nodePlaceholder'), value: '' },
+                ...(nodesQuery.data ?? []).map((n) => ({
+                  label: `${n.node}${
+                    n.status !== 'online' ? t('templates.nodeOffline') : ''
+                  }`,
+                  value: n.node,
+                })),
+              ]}
+              hint={!targetConn ? t('templates.fieldNodePickConn') : undefined}
+            />
             <Input
               label={t('common.name')}
               required
@@ -1854,21 +1932,6 @@ function TemplateCreateWizard({
                   ? t('templates.cloneSuggested', { vmid: nextIdQuery.data.vmid })
                   : undefined
               }
-            />
-            <Select
-              label={t('common.node')}
-              required
-              value={node}
-              onChange={(e) => setNode(e.target.value)}
-              options={[
-                { label: t('templates.nodePlaceholder'), value: '' },
-                ...(nodesQuery.data ?? []).map((n) => ({
-                  label: `${n.node}${
-                    n.status !== 'online' ? t('templates.nodeOffline') : ''
-                  }`,
-                  value: n.node,
-                })),
-              ]}
             />
             <Input
               label={t('templates.colTags')}

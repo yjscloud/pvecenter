@@ -308,7 +308,7 @@ export const enNode: Partial<Record<MessageKey, string>> = {
      networks (same vmbr0, 192.168.1.0/24 on node1 and 10.0.0.0/24 on node2).
      Blank = every node. */
   'ippool.colScope': 'Scope',
-  'ippool.scopeAnyPve': 'All PVE hosts',
+  'ippool.scopeAnyPve': 'All PVE clusters',
   'ippool.scopeAnyNode': 'All nodes',
   'ippool.nodesEditTitle': 'Choose where this pool applies',
   'ippool.scopeTitle': 'Scope of “{name}”',
@@ -539,10 +539,10 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'nodes.limitedConnsTailUser': '. Ask an administrator to handle it.',
   'nodes.searchPlaceholder': 'Search node name or source host…',
   'nodes.searchAria': 'Search nodes',
-  'nodes.filterConnAria': 'Filter by source PVE',
+  'nodes.filterConnAria': 'Filter by source PVE cluster',
   'nodes.sortAria': 'Sort order',
-  'nodes.allHosts': 'All PVE hosts',
-  'nodes.defaultConnection': 'Default connection',
+  'nodes.allHosts': 'All PVE clusters',
+  'nodes.defaultConnection': 'Default cluster',
   'nodes.showing': 'Showing {shown} of {total} nodes',
   'nodes.loadFailed': 'Could not load the node list',
   'nodes.emptyTitle': 'No nodes',

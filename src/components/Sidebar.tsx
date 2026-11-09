@@ -12,8 +12,8 @@ import {
   IconBackup,
   IconBell,
   IconBox,
-  IconChat,
-  IconCheck,
+  IconCertificate,
+  IconFeishu,
   IconClock,
   IconRestart,
   IconDashboard,
@@ -22,7 +22,7 @@ import {
   IconPlug,
   IconServer,
   IconSettings,
-  IconShield,
+  IconShieldCheck,
   IconSnapshot,
   IconSparkle,
   IconStorage,
@@ -336,7 +336,8 @@ export const NAV_SECTIONS: NavSection[] = [
       {
         to: '/security-baseline',
         labelKey: 'nav.securityBaseline',
-        icon: <IconCheck size={18} />,
+        /* 盾牌 + 对勾：和「体检 / 达标」的语义对上，而不是一个通用对勾 */
+        icon: <IconShieldCheck size={18} />,
         permission: 'baseline.view',
       },
       {
@@ -366,7 +367,8 @@ export const NAV_SECTIONS: NavSection[] = [
       {
         to: '/certificates',
         labelKey: 'nav.certificates',
-        icon: <IconShield size={18} />,
+        /* 证书 / 奖章字形：比通用盾牌更能说明管的是 HTTPS 证书 */
+        icon: <IconCertificate size={18} />,
         permission: 'cert.view',
       },
       /* 飞书机器人是**面板自身**的配置（后端 feishu.py 用 settings.manage），
@@ -374,7 +376,8 @@ export const NAV_SECTIONS: NavSection[] = [
       {
         to: '/bot',
         labelKey: 'nav.feishuBot',
-        icon: <IconChat size={18} />,
+        /* 飞书标志而不是通用气泡：一眼看出这条通道接的是飞书 */
+        icon: <IconFeishu size={18} />,
         permission: 'settings.manage',
       },
       /* AI 排查助手：紧跟在机器人下面 —— 两者都是「有事时把结论送到你面前」的
@@ -412,6 +415,16 @@ export const NAV_SECTIONS: NavSection[] = [
         icon: <IconTasks size={18} />,
         permission: 'task.view',
       },
+      /* 后台作业：巡检什么时候跑、跑成什么样、间隔能不能调。
+         紧挨「任务队列」—— 两者问的是同一件事（面板里的任务），一个即时、一个定时，
+         中间隔四个页面会让人以为它属于「设置」的子项。
+         用循环箭头而不是时钟 —— 时钟已给「登录审计」，这里要保持图标唯一。 */
+      {
+        to: '/scheduler',
+        labelKey: 'nav.scheduler',
+        icon: <IconRestart size={18} />,
+        permission: 'settings.manage',
+      },
       /* 用户与角色：给它的人进得来（后端 /users、/roles 读接口只要 users.view），
          但增删改还要 users.manage，页面内再判一次 */
       {
@@ -427,19 +440,11 @@ export const NAV_SECTIONS: NavSection[] = [
         icon: <IconAudit size={18} />,
         permission: 'audit.view',
       },
-      /* 设置与后台作业：面板自身的配置，与飞书机器人同一档（settings.manage） */
+      /* 面板自身的配置，与飞书机器人同一档（settings.manage） */
       {
         to: '/settings',
         labelKey: 'nav.settings',
         icon: <IconSettings size={18} />,
-        permission: 'settings.manage',
-      },
-      /* 后台作业：巡检什么时候跑、跑成什么样、间隔能不能调。
-         用循环箭头而不是时钟 —— 时钟已给「登录审计」，这里要保持图标唯一。 */
-      {
-        to: '/scheduler',
-        labelKey: 'nav.scheduler',
-        icon: <IconRestart size={18} />,
         permission: 'settings.manage',
       },
     ],

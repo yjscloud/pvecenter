@@ -1472,31 +1472,6 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
             ) : null}
 
             <div className="form-grid">
-              <Input
-                label={t('vmCreate.fieldName')}
-                required
-                value={form.name}
-                onChange={(e) => update('name', e.target.value)}
-                placeholder={t('vmCreate.fieldNamePlaceholder')}
-                error={errors.name}
-                autoFocus
-              />
-              <Input
-                label="VMID"
-                required
-                value={form.vmid}
-                onChange={(e) => update('vmid', e.target.value.replace(/\D/g, ''))}
-                placeholder={t('vmCreate.fieldVmidPlaceholder')}
-                error={errors.vmid}
-                hint={
-                  nextIdQuery.data
-                    ? t('vmCreate.vmidHintSuggested', {
-                        conn: targetConnLabel,
-                        vmid: nextIdQuery.data.vmid,
-                      })
-                    : t('vmCreate.vmidHint')
-                }
-              />
               {/* 限宽必须包在外层：给 Select 传 style 只会缩窄内层输入框，
                   箭头（相对外层容器定位）会飘到框外 */}
               {regionOptions.length > 1 ? (
@@ -1541,6 +1516,31 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                   loading={nodesQuery.isLoading}
                 />
               </Field>
+              <Input
+                label={t('vmCreate.fieldName')}
+                required
+                value={form.name}
+                onChange={(e) => update('name', e.target.value)}
+                placeholder={t('vmCreate.fieldNamePlaceholder')}
+                error={errors.name}
+                autoFocus
+              />
+              <Input
+                label="VMID"
+                required
+                value={form.vmid}
+                onChange={(e) => update('vmid', e.target.value.replace(/\D/g, ''))}
+                placeholder={t('vmCreate.fieldVmidPlaceholder')}
+                error={errors.vmid}
+                hint={
+                  nextIdQuery.data
+                    ? t('vmCreate.vmidHintSuggested', {
+                        conn: targetConnLabel,
+                        vmid: nextIdQuery.data.vmid,
+                      })
+                    : t('vmCreate.vmidHint')
+                }
+              />
               <Input
                 label={t('vmCreate.fieldTags')}
                 value={form.tags}

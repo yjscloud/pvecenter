@@ -85,7 +85,7 @@ function HighlightVisual({ kind }: { kind: VisualKind }) {
   }
 }
 
-/* ---- 1. AI 排查助手：一句提问 → 只读取数 → 只给结论 ---- */
+/* ---- 1. AI 助手：一句提问 → 只读取数 → 只给结论 ---- */
 
 /** 示意里点出的两类只读来源：本地命令一条、平台内置工具一条，都是真实存在的 */
 const AI_TOOL_KEYS: MessageKey[] = [

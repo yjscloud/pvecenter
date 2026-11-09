@@ -114,8 +114,8 @@ export interface Domain {
 export const DOMAINS: Domain[] = [
   {
     id: 'overview',
-    name: ['总览', 'Overview'],
-    en: ['Overview', '总览'],
+    name: ['全局总览', 'Overview'],
+    en: ['Overview', '全局总览'],
     icon: <IconDashboard size={17} />,
     summary: [
       '打开第一眼要回答两个问题：集群现在什么状态、还有什么没处理。',
@@ -123,7 +123,7 @@ export const DOMAINS: Domain[] = [
     ],
     items: [
       {
-        name: ['集群仪表盘', 'Cluster dashboard'],
+        name: ['运行总览', 'Overview'],
         desc: [
           'KPI、节点健康、资源分布、容量预测与占用排行一屏看完',
           'KPIs, node health, resource usage, capacity forecast and top consumers on one screen',
@@ -131,7 +131,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconDashboard size={15} />,
       },
       {
-        name: ['工作台待办', 'Workbench to-dos'],
+        name: ['待办事项', 'Workbench to-dos'],
         desc: [
           '连接异常、待审批注册、配额告急、告警与基线未通过自动汇总',
           'Broken connections, registrations awaiting approval, quota warnings, alerts and failed baselines gathered in one place',
@@ -139,7 +139,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconLayout size={15} />,
       },
       {
-        name: ['实时指标流', 'Live metric stream'],
+        name: ['实时指标', 'Live metric stream'],
         desc: [
           '节点 CPU / 内存经 WebSocket 每 5 秒推送，断线自动回落轮询',
           'Node CPU / memory pushed over WebSocket every 5 seconds, falling back to polling if the socket drops',
@@ -155,7 +155,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconSearch size={15} />,
       },
       {
-        name: ['多集群连接', 'Multi-cluster connections'],
+        name: ['集群连接', 'Multi-cluster connections'],
         desc: [
           '同时接入多套 Proxmox，节点与存储按连接隔离不串味',
           'Attach several Proxmox clusters at once; nodes and storage stay isolated per connection',
@@ -163,9 +163,9 @@ export const DOMAINS: Domain[] = [
         icon: <IconPlug size={15} />,
       },
       {
-        name: ['卡片布局自定义', 'Custom card layout'],
+        name: ['卡片布局', 'Custom card layout'],
         desc: [
-          '仪表盘卡片可拖动排序、可隐藏，布局按账号存在服务端',
+          '总览卡片可拖动排序、可隐藏，布局按账号存在服务端',
           'Drag, reorder and hide dashboard cards; the layout is stored per account on the server',
         ],
         icon: <IconGrip size={15} />,
@@ -174,11 +174,11 @@ export const DOMAINS: Domain[] = [
   },
   {
     id: 'compute',
-    name: ['计算', 'Compute'],
-    en: ['Compute', '计算'],
+    name: ['计算资源', 'Compute'],
+    en: ['Compute', '计算资源'],
     icon: <IconCpu size={17} />,
     summary: [
-      '从建机器到交出去的完整链路，虚拟机与容器两套端点各自成套。',
+      '从建机器到交出去的完整链路，虚拟机与 LXC 容器两套端点各自成套。',
       'The whole path from creating a machine to handing it over — VMs and containers each with their own endpoints.',
     ],
     items: [
@@ -191,7 +191,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconVm size={15} />,
       },
       {
-        name: ['容器（LXC）', 'Containers (LXC)'],
+        name: ['LXC 容器', 'Containers (LXC)'],
         desc: [
           '与虚拟机同面板管理，网卡、挂载点与快照独立成套',
           'Managed in the same panel as VMs, with their own NICs, mount points and snapshots',
@@ -199,7 +199,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconBox size={15} />,
       },
       {
-        name: ['模板流水线', 'Template pipeline'],
+        name: ['系统模板', 'Template pipeline'],
         desc: [
           'cloud 镜像一键建模板，克隆时注入主机名、IP 与 SSH 密钥',
           'Turn a cloud image into a template in one click; hostname, IP and SSH keys are injected on clone',
@@ -215,7 +215,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconTasks size={15} />,
       },
       {
-        name: ['节点', 'Nodes'],
+        name: ['集群节点', 'Nodes'],
         desc: [
           '在线状态、负载与 RRD 曲线，CPU / 内存 / 网络 / 磁盘逐项下钻',
           'Online state, load and RRD charts, drilling down into CPU / memory / network / disk',
@@ -223,7 +223,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconServer size={15} />,
       },
       {
-        name: ['浏览器控制台', 'In-browser console'],
+        name: ['远程控制', 'In-browser console'],
         desc: [
           'noVNC 图形控制台，PVE 无需暴露公网',
           'noVNC graphical console, without exposing Proxmox to the internet',
@@ -242,8 +242,8 @@ export const DOMAINS: Domain[] = [
   },
   {
     id: 'storage',
-    name: ['存储与网络', 'Storage & network'],
-    en: ['Storage & network', '存储与网络'],
+    name: ['存储网络', 'Storage & network'],
+    en: ['Storage & network', '存储网络'],
     icon: <IconStorage size={17} />,
     summary: [
       '存储池、集群网络与内网出口，全部在面板里在线配置。',
@@ -251,7 +251,7 @@ export const DOMAINS: Domain[] = [
     ],
     items: [
       {
-        name: ['存储', 'Storage'],
+        name: ['存储资源', 'Storage'],
         desc: [
           '容量与使用率、内容浏览、ISO 与镜像上传，上传即可用于装机',
           'Capacity and usage, content browsing, ISO and image upload ready for provisioning',
@@ -259,7 +259,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconStorage size={15} />,
       },
       {
-        name: ['网络', 'Network'],
+        name: ['网络配置', 'Network'],
         desc: [
           '网桥、Bond 与 VLAN 在线配置，改动先进「待应用」再统一下发',
           'Bridges, bonds and VLANs configured online; changes stage as pending, then apply together',
@@ -290,12 +290,12 @@ export const DOMAINS: Domain[] = [
     en: ['Data protection', '数据保护'],
     icon: <IconBackup size={17} />,
     summary: [
-      '先把数据兜住：快照、定时备份，以及真出事之后怎么处置。',
+      '先把数据兜住：快照记录、定时备份，以及真出事之后怎么处置。',
       'Cover the data first: snapshots, scheduled backups, and what to do when something really goes wrong.',
     ],
     items: [
       {
-        name: ['快照', 'Snapshots'],
+        name: ['快照记录', 'Snapshots'],
         desc: [
           '全局视图集中查看，一键回滚与删除，回滚前二次确认',
           'One global view, one-click rollback and delete, with confirmation before rolling back',
@@ -303,7 +303,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconSnapshot size={15} />,
       },
       {
-        name: ['备份与计划', 'Backups & schedules'],
+        name: ['备份恢复', 'Backups & schedules'],
         desc: [
           '三种备份模式与压缩策略，可视化配置 Proxmox 定时任务',
           'Three backup modes and compression choices, configuring Proxmox schedules visually',
@@ -330,8 +330,8 @@ export const DOMAINS: Domain[] = [
   },
   {
     id: 'security',
-    name: ['安全', 'Security'],
-    en: ['Security', '安全'],
+    name: ['安全防护', 'Security'],
+    en: ['Security', '安全防护'],
     icon: <IconShield size={17} />,
     summary: [
       '防、查、管、溯：从网络规则一直盖到主机加固与操作留痕。',
@@ -339,7 +339,7 @@ export const DOMAINS: Domain[] = [
     ],
     items: [
       {
-        name: ['防火墙', 'Firewall'],
+        name: ['访问控制', 'Firewall'],
         desc: [
           'PVE 原生防火墙图形化，集群 / 节点 / 虚拟机三级规则与安全组',
           'A UI over the native PVE firewall: cluster / node / VM level rules and security groups',
@@ -363,7 +363,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconClock size={15} />,
       },
       {
-        name: ['端口与进程', 'Ports & processes'],
+        name: ['端口进程', 'Ports & processes'],
         desc: [
           '巡检监听端口与可疑进程，反弹 shell 启发式命中即告警',
           'Scans listening ports and suspicious processes, alerting on heuristic reverse-shell hits',
@@ -378,20 +378,12 @@ export const DOMAINS: Domain[] = [
         ],
         icon: <IconCheck size={15} />,
       },
-      {
-        name: ['AI 排查助手', 'AI troubleshooting assistant'],
-        desc: [
-          '接入大模型后用自然语言排查主机问题，只读命令与体检数据自动取数给结论，回答长度与单次额度可调',
-          'Troubleshoot a host in plain language once an LLM is configured: read-only commands and audit data are gathered for you, with adjustable answer length and token budget',
-        ],
-        icon: <IconSparkle size={15} />,
-      },
     ],
   },
   {
     id: 'observe',
-    name: ['观测与集成', 'Observability & integrations'],
-    en: ['Observability', '观测与集成'],
+    name: ['观测集成', 'Observability & integrations'],
+    en: ['Observability', '观测集成'],
     icon: <IconBell size={17} />,
     summary: [
       '让系统替你盯着外面的事：指标、证书、硬件与通知通道。',
@@ -415,12 +407,20 @@ export const DOMAINS: Domain[] = [
         icon: <IconKey size={15} />,
       },
       {
-        name: ['飞书机器人', 'Feishu bot'],
+        name: ['飞书 Bot', 'Feishu bot'],
         desc: [
           '群里 @机器人 查状态、开关机、建快照，白名单 + 卡片二次确认',
           '@ the bot in a group to check status, power machines on or off or take snapshots, with an allow-list and card confirmation',
         ],
         icon: <IconChat size={15} />,
+      },
+      {
+        name: ['AI 助手', 'AI assistant'],
+        desc: [
+          '接入大模型后用自然语言排查主机问题，只读命令与体检数据自动取数给结论，回答长度与单次额度可调',
+          'Troubleshoot a host in plain language once an LLM is configured: read-only commands and audit data are gathered for you, with adjustable answer length and token budget',
+        ],
+        icon: <IconSparkle size={15} />,
       },
       {
         name: ['硬件健康', 'Hardware health'],
@@ -475,7 +475,7 @@ export const DOMAINS: Domain[] = [
         icon: <IconRestart size={15} />,
       },
       {
-        name: ['用户与角色', 'Users & roles'],
+        name: ['用户管理', 'Users & roles'],
         desc: [
           '内置三级角色，权限点可逐条自定义，注册需管理员审批',
           'Three built-in roles, per-permission customisation, and registration approved by an admin',
@@ -864,7 +864,7 @@ export const TOPO_ENTRIES: TopoNode[] = [
     desc: ['WebSocket 双向透传', 'WebSocket passthrough'],
   },
   {
-    name: ['飞书机器人', 'Feishu bot'],
+    name: ['飞书 Bot', 'Feishu bot'],
     desc: ['群内指令与确认卡片', 'In-chat commands and confirmation cards'],
   },
 ];
@@ -900,7 +900,7 @@ export const PILLARS: Pillar[] = [
     icon: <IconShield size={17} />,
     title: ['危险操作二次确认', 'Confirmation for dangerous operations'],
     desc: [
-      '删除虚机、改连接、下发防火墙等操作即使 token 有效也要重输密码（开了 2FA 再加动态码）',
+      '删除虚拟机、改连接、下发访问控制规则等操作即使 token 有效也要重输密码（开了 2FA 再加动态码）',
       'Deleting a VM, changing a connection or pushing firewall rules asks for the password again even with a valid token (plus a TOTP code when 2FA is on)',
     ],
   },
@@ -994,10 +994,10 @@ export const SCENARIOS: Scenario[] = [
       'One PVE host plus this panel is the smallest complete way to run a virtualisation platform.',
     ],
     points: [
-      ['虚拟机与容器同面板，创建、开关机、控制台一步到位', 'VMs and containers in one panel: create, power on or off and open the console without switching tools'],
+      ['虚拟机与 LXC 容器同面板，创建、开关机、控制台一步到位', 'VMs and containers in one panel: create, power on or off and open the console without switching tools'],
       ['模板 + Cloud-init 克隆即交付，不用每次从头装系统', 'Template + Cloud-init means clone and deliver, with no reinstall from scratch each time'],
       ['存储容量、ISO 上传与挂载都留在面板内完成', 'Storage capacity, ISO uploads and mounting all happen inside the panel'],
-      ['快照与定时备份先把「能回滚」这条路留好', 'Snapshots and scheduled backups keep a rollback path open from the start'],
+      ['快照记录与定时备份先把「能回滚」这条路留好', 'Snapshots and scheduled backups keep a rollback path open from the start'],
     ],
     tags: [['计算', 'Compute'], ['存储', 'Storage'], ['数据保护', 'Data protection']],
   },
@@ -1011,11 +1011,11 @@ export const SCENARIOS: Scenario[] = [
     ],
     points: [
       ['节点在线状态、负载与 RRD 趋势曲线逐项下钻', 'Online state, load and RRD trends for every node, with drill-down per metric'],
-      ['集群仲裁与 HA 态势直接进仪表盘关键指标', 'Quorum and HA status sit among the dashboard KPIs'],
+      ['集群仲裁与 HA 态势直接进运行总览的关键指标', 'Quorum and HA status sit among the dashboard KPIs'],
       ['存储按连接 / 共享 / 本地正确去重，容量不被重复累加', 'Storage is de-duplicated across connections, shared and local, so capacity is never double-counted'],
       ['资源占用排行支持内存与 CPU 双口径排序', 'Top consumers can be ranked by memory or by CPU'],
     ],
-    tags: [['节点', 'Nodes'], ['仪表盘', 'Dashboard'], ['监控告警', 'Monitoring']],
+    tags: [['集群节点', 'Nodes'], ['运行总览', 'Overview'], ['监控告警', 'Monitoring']],
   },
   {
     id: 'delivery',
@@ -1031,7 +1031,7 @@ export const SCENARIOS: Scenario[] = [
       ['IP 地址池维护可复用地址段，创建时挑一个即可', 'The IP pool keeps reusable ranges, so you just pick one when creating'],
       ['证书申请、签发、部署与到期续期全流程自动完成', 'Certificate request, issuance, deployment and renewal run end to end automatically'],
     ],
-    tags: [['模板', 'Templates'], ['IP 池', 'IP pools'], ['证书', 'Certificates']],
+    tags: [['系统模板', 'Templates'], ['IP 池', 'IP pools'], ['证书', 'Certificates']],
   },
   {
     id: 'security',
@@ -1042,13 +1042,13 @@ export const SCENARIOS: Scenario[] = [
       'From network policy to host hardening to a record of every action, so you can explain what happened when it matters.',
     ],
     points: [
-      ['防火墙集群 / 节点 / 虚拟机三级规则与安全组', 'Firewall rules and security groups at cluster / node / VM level'],
+      ['访问控制：集群 / 节点 / 虚拟机三级规则与安全组', 'Firewall rules and security groups at cluster / node / VM level'],
       ['SSH 登录日志统一采集，爆破命中即告警并联动 fail2ban', 'SSH login logs collected in one place, alerting and triggering fail2ban on brute force'],
       ['端口与可疑进程巡检，反弹 shell 特征命中进告警', 'Ports and suspicious processes inspected, raising alerts on reverse-shell signatures'],
       ['登录历史与 sudo 提权记录可追溯，敏感操作全部入审计', 'Login history and sudo escalations stay traceable, and every sensitive action reaches the audit log'],
     ],
     tags: [
-      ['防火墙', 'Firewall'],
+      ['访问控制', 'Firewall'],
       ['SSH 安全', 'SSH security'],
       ['安全基线', 'Baseline'],
       ['审计日志', 'Audit log'],
@@ -1085,7 +1085,7 @@ export const STEPS: { title: Bi; desc: Bi }[] = [
   {
     title: ['打开值守能力', 'Turn on the watchkeepers'],
     desc: [
-      '配置告警规则、基线巡检、证书续期与飞书机器人，之后交给面板盯着。',
+      '配置告警规则、基线巡检、证书续期与飞书 Bot，之后交给面板盯着。',
       'Configure alert rules, baseline inspection, certificate renewal and the Feishu bot, then let the panel keep watch.',
     ],
   },

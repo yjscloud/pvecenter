@@ -8,7 +8,7 @@
 import type { MessageKey } from './zh-CN';
 
 export const enAi: Partial<Record<MessageKey, string>> = {
-  'ai.title': 'AI inspection assistant',
+  'ai.title': 'AI assistant',
   'ai.subtitle':
     'Describe the symptom or just ask a question — the AI signs in to this host, runs diagnostic commands and answers as it goes. Read-only commands run directly; anything that changes the system needs your approval, command by command.',
   'ai.runningHint': 'Calling the model and running commands; usually 10-60 seconds',
