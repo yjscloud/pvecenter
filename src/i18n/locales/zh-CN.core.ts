@@ -512,6 +512,16 @@ export const zhCore = {
   'task.unreachable': '连续多次无法获取任务状态，操作可能仍在后台执行，请到「任务队列」查看',
   'task.doneWarn': '{title}完成（有警告）',
   'task.interrupted': '任务被中断',
+  'task.runningPct': '任务执行中… {pct}%',
+  /* 失败原因 → 下一步（只认高频且用户自己能解决的几类） */
+  'task.hintNoSpace': '存储空间不足：清理旧备份或换更大的存储后重试',
+  'task.hintGuestRunning': '目标客户机正在运行：恢复会重写它的磁盘，请先关机（关闭电源）再重试；PVE 可能已留下半成品，重试前先确认清理',
+  'task.hintPermission': '权限不足：确认面板所用的 PVE 令牌有对应权限',
+  'task.hintLocked': '虚拟机或存储被锁定：等正在进行的任务结束后重试',
+  'task.hintTimeout': '上游超时：稍后重试，持续失败请检查 PVE 负载',
+  'task.hintMissing': '目标已不存在：刷新列表确认后再试',
+  'task.hintCheckLog': '打开「任务队列」可看到完整日志',
+  'task.openQueue': '打开任务队列',
   /* ------------------------------------------------------------ 二次确认 */
   'stepUp.errPassword': '请输入登录密码',
   'stepUp.errCode': '请输入两步验证动态码或一张恢复码',

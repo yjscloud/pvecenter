@@ -526,6 +526,16 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'task.unreachable': 'The task status could not be fetched repeatedly; the operation may still be running in the background — check the Task queue',
   'task.doneWarn': '{title} finished (with warnings)',
   'task.interrupted': 'The task was interrupted',
+  'task.runningPct': 'Task running… {pct}%',
+  /* Failure cause → next step (only the common, self-serviceable ones) */
+  'task.hintNoSpace': 'Out of storage space: clean up old backups or use a larger store, then retry',
+  'task.hintGuestRunning': 'The target guest is running: a restore rewrites its disks, so shut it down first and retry; PVE may have left a half-restored guest behind — check before retrying',
+  'task.hintPermission': 'Permission denied: check that the panel’s PVE token has the required privileges',
+  'task.hintLocked': 'The VM or storage is locked: wait for the running task to finish, then retry',
+  'task.hintTimeout': 'Upstream timeout: retry later; if it keeps failing, check the PVE load',
+  'task.hintMissing': 'The target no longer exists: refresh the list and try again',
+  'task.hintCheckLog': 'Open the Task queue for the full log',
+  'task.openQueue': 'Open task queue',
   /* ---------------------------------------------------- Step-up confirmation */
   'stepUp.errPassword': 'Please enter your sign-in password',
   'stepUp.errCode': 'Enter a two-factor code or a recovery code',

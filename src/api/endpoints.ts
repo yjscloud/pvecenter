@@ -1408,6 +1408,13 @@ export const backupsApi = {
     get<BackupJob[]>('/backups/jobs', scoped(connectionId)),
   createJob: (body: BackupJobInput, connectionId?: string) =>
     post<{ job_id: string | number }>('/backups/jobs', body, scoped(connectionId)),
+  /** 改计划必须走 PUT：POST 会另建一条（表现为「改了没生效」） */
+  updateJob: (jobId: string | number, body: BackupJobInput, connectionId?: string) =>
+    put<{ job_id: string | number; updated: boolean }>(
+      `/backups/jobs/${jobId}`,
+      body,
+      scoped(connectionId),
+    ),
   deleteJob: (jobId: string | number, connectionId?: string) =>
     del<{ ok: boolean }>(`/backups/jobs/${jobId}`, scoped(connectionId)),
   /**

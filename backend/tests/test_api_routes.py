@@ -29,6 +29,7 @@ from app.pve import PveConnection, ProxmoxError  # noqa: E402
 from conftest import connect, delete_setting_sync  # noqa: E402
 from app.config import settings  # noqa: E402
 from test_pve_client import (  # noqa: E402
+    JOB_STORE,
     SNAPSHOT_STORE,
     TOKEN_ID,
     TOKEN_SECRET,
@@ -3918,6 +3919,26 @@ class TestSnapshotBackupIsolation:
         )
         assert resp.status_code == 403
 
+    def test_restore_returns_task_without_nameerror(self, api) -> None:
+        """恢复接口要在任务发起后正常返回。
+
+        这里曾经留着已经删掉的 ``_active_connection()``：PVE 侧任务已经起来了，
+        接口却因 NameError 变成 500，用户以为没恢复成功、又点一次。
+        """
+        admin = auth_headers(api)
+        resp = api.post(
+            "/api/backups/restore",
+            json={
+                "node": "pve1",
+                "storage": "local",
+                "volid": "local:vzdump-qemu-100-2026_09_20-02_00_00.vma.zst",
+                "vmid": 102,
+            },
+            headers=admin,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["task"]
+
     def test_backup_jobs_are_per_user(self, api) -> None:
         admin = auth_headers(api)
         bob = self._new_user(api, "bob")
@@ -3965,6 +3986,142 @@ class TestSnapshotBackupIsolation:
         mine = api.get("/api/backups/jobs", headers=bob).json()
         assert [j["owner"] for j in mine] == ["bob"]
         assert mine[0]["schedule"] == "06:00"
+
+    def test_backup_job_scope_switch_sends_delete(self, api) -> None:
+        """「指定 VMID → 整节点」时要把删除项传给 PVE。
+
+        PVE 的计划更新是**合并**语义：只发 all=1 不会清掉旧的 vmid，计划里两套
+        范围会同时存在。前端切到整节点时附带 ``delete=["vmid"]``，后端要把它
+        转成 PVE 的逗号串，而不是原样丢一个数组过去。
+        """
+        admin = auth_headers(api)
+        created = api.post(
+            "/api/backups/jobs",
+            json={"schedule": "03:00", "storage": "local", "node": "pve1", "vmid": "100"},
+            headers=admin,
+        )
+        assert created.status_code == 200, created.text
+        job_id = str(created.json()["job_id"])
+        assert JOB_STORE[job_id].get("vmid") == "100"
+
+        resp = api.put(
+            f"/api/backups/jobs/{job_id}",
+            json={
+                "schedule": "03:00",
+                "storage": "local",
+                "node": "pve1",
+                "all": True,
+                "delete": ["vmid"],
+            },
+            headers=admin,
+        )
+        assert resp.status_code == 200, resp.text
+        assert JOB_STORE[job_id]["all"] == 1
+        assert JOB_STORE[job_id]["delete"] == "vmid"
+
+    def test_backup_job_can_target_all_nodes(self, api) -> None:
+        """计划不写 ``node`` = 集群所有节点（PVE 在每个节点各跑一遍）。
+
+        前端「所有节点」就是**不发 node**；后端不能自己补一个默认节点，否则范围
+        会悄悄缩成一台。从「某个节点」切到「所有节点」时还要把 node 删掉，因为
+        PVE 的更新是合并语义。
+        """
+        admin = auth_headers(api)
+
+        created = api.post(
+            "/api/backups/jobs",
+            json={"schedule": "03:00", "storage": "local", "vmid": "100"},
+            headers=admin,
+        )
+        assert created.status_code == 200, created.text
+        job_id = str(created.json()["job_id"])
+        assert "node" not in JOB_STORE[job_id]
+
+        # 先落在一个节点上，再切回「所有节点」
+        JOB_STORE[job_id]["node"] = "pve1"
+        resp = api.put(
+            f"/api/backups/jobs/{job_id}",
+            json={
+                "schedule": "03:00",
+                "storage": "local",
+                "vmid": "100",
+                "delete": ["node"],
+            },
+            headers=admin,
+        )
+        assert resp.status_code == 200, resp.text
+        assert JOB_STORE[job_id]["delete"] == "node"
+
+    def test_backup_job_update_maps_prune_backups_key(self, api) -> None:
+        """编辑计划时保留策略要用 PVE 的**连字符**属性名。
+
+        创建路径是手工拼 ``data`` 的，一直有这条映射；编辑（PUT）走 model_dump，
+        早先把 ``prune_backups`` 原样发过去，PVE 回
+        ``property is not defined in schema and the schema does not allow
+        additional properties``。
+        """
+        admin = auth_headers(api)
+        created = api.post(
+            "/api/backups/jobs",
+            json={"schedule": "02:00", "storage": "local", "vmid": "100"},
+            headers=admin,
+        )
+        assert created.status_code == 200, created.text
+        job_id = str(created.json()["job_id"])
+
+        resp = api.put(
+            f"/api/backups/jobs/{job_id}",
+            json={
+                "schedule": "02:00",
+                "storage": "local",
+                "vmid": "100",
+                "prune_backups": "keep-daily=7,keep-weekly=4",
+            },
+            headers=admin,
+        )
+        assert resp.status_code == 200, resp.text
+        stored = JOB_STORE[job_id]
+        assert stored["prune-backups"] == "keep-daily=7,keep-weekly=4"
+        assert "prune_backups" not in stored
+
+        # 清空保留策略：只有带 delete，PVE 才会真的把属性删掉
+        resp = api.put(
+            f"/api/backups/jobs/{job_id}",
+            json={
+                "schedule": "02:00",
+                "storage": "local",
+                "vmid": "100",
+                "delete": ["prune-backups"],
+            },
+            headers=admin,
+        )
+        assert resp.status_code == 200, resp.text
+        assert JOB_STORE[job_id]["delete"] == "prune-backups"
+
+    def test_backup_job_prune_backups_normalized(self, api) -> None:
+        """PVE 有的版本把 ``prune-backups`` 返回成**解析后的对象**，接口统一给字符串。
+
+        前端按字符串渲染这一列，拿到 ``{"keep-daily": 7, ...}`` 会抛 React #31
+        （Objects are not valid as a React child）整页白屏 —— 出口处就得收敛。
+        """
+        admin = auth_headers(api)
+        JOB_STORE["prune-dict"] = {
+            "id": "prune-dict",
+            "type": "vzdump",
+            "schedule": "02:00",
+            "storage": "local",
+            "node": "pve1",
+            "prune-backups": {
+                "keep-daily": 7,
+                "keep-weekly": 4,
+                "keep-monthly": 3,
+            },
+        }
+        jobs = api.get("/api/backups/jobs", headers=admin).json()
+        row = next(j for j in jobs if j["id"] == "prune-dict")
+        assert row["prune_backups"] == "keep-daily=7,keep-weekly=4,keep-monthly=3"
+        # raw 原样透传，供排障用，不参与渲染
+        assert isinstance(row["raw"]["prune-backups"], dict)
 
 
 # --------------------------------------------------------------- alert rules

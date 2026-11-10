@@ -3601,6 +3601,16 @@ body.is-col-resizing * {
   justify-content: flex-end;
 }
 
+/* 破坏性动作（删除）与普通动作拉开距离：图标按钮一个挨一个时，
+   鼠标/手指很容易落错一格，而删除是不可撤销的 */
+.row-actions-split {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border-muted);
+}
+
 /* --- 宿主机网卡表格 ---
    单元格一格里放两行：主值（接口名 / 地址 / 状态徽标）+ 一行更小更淡的
    补充说明（取址方式、网关、开机自启）。分成两行而不是再开一列，是为了
@@ -3886,6 +3896,20 @@ body.is-col-resizing * {
   margin-top: 3px;
   overflow-wrap: anywhere;
   line-height: 1.5;
+}
+
+/* 失败/超时后的一步：给用户一条能点的路，而不是只告诉他「失败了」 */
+.toast-action {
+  display: inline-block;
+  margin-top: 6px;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.toast-action:hover {
+  text-decoration: underline;
 }
 
 .toast-close {

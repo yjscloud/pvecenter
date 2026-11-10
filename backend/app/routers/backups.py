@@ -39,6 +39,7 @@ from .. import (
     sshremote,
     store,
 )
+from ..backup_volid import archive_guest_type, vmid_from_volid
 from ..formatters import paginate_rows, pve_flag
 from ..pve import (
     ProxmoxError,
@@ -213,8 +214,8 @@ async def backup_stats(
 
 # 归属标记，形如 ``[owner:alice]``；写进 PVE 的 notes / comment 字段
 _OWNER_RE = re.compile(r"\[owner:([^\[\]\s]+)\]")
-# 从 vzdump 归档文件名解析 vmid：``vzdump-qemu-110-...`` / ``vzdump-lxc-110-...``
-_VOLID_VMID_RE = re.compile(r"vzdump-(?:qemu|lxc)-(\d+)")
+# 归档 volid → 客户机类型 / vmid 见 ``app/backup_volid.py``：目录型存储写
+# ``vzdump-<type>-<vmid>``，PBS 写 ``backup/<ct|vm>/<vmid>/...``，两种都要认。
 
 
 def _mark_owner(text: Optional[str], username: str) -> str:
@@ -256,8 +257,7 @@ def _effective_owner(
 
 
 def _vmid_from_volid(volid: str) -> Optional[int]:
-    match = _VOLID_VMID_RE.search(volid or "")
-    return int(match.group(1)) if match else None
+    return vmid_from_volid(volid)
 
 
 def _connection_scope() -> str:
@@ -463,6 +463,120 @@ def _archive_size(item: Dict[str, Any]) -> Optional[int]:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+async def _assert_restore_target_free(
+    client: Any,
+    node: str,
+    vmid: int,
+    guest_type: str,
+    *,
+    force: bool,
+) -> None:
+    """恢复目标 VMID 已被占用时提前拒绝，并把原因说清楚。
+
+    PVE 里虚拟机和容器**共用同一套 VMID 编号**，于是撞号有两种完全不同的
+    后果：同类型占用可以靠 ``force`` 覆盖；另一种类型占用则根本覆盖不了
+    （PVE 只回一句英文 ``CT 103 already exists on node 'pve9-2'``，force 也
+    照拒不误）。用户对着这句话既不知道该删机器还是该换编号，只能当成面板坏了。
+
+    另外，覆盖一台**开机中**的机器同样是必败操作：PVE 会先拷盘再拒绝，留下
+    半成品（``VM 102 state is NOT cleaned up`` + ``vm is running``）。这一档
+    也在这里拦掉，并把「先关机」说清楚。
+
+    预检只负责提前提示：读不到集群清单（权限 / 网络）时直接放行，最终判定
+    仍然由 PVE 做。
+    """
+    try:
+        resources = await client.cluster_resources("vm")
+    except ProxmoxError:
+        return
+    for item in resources or []:
+        try:
+            if int(item.get("vmid")) != int(vmid):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if str(item.get("node") or "") != node:
+            continue
+        existing_type = str(item.get("type") or "qemu")
+        label = "容器" if existing_type == "lxc" else "虚拟机"
+        if existing_type != guest_type:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"节点 {node} 上已存在{label} {vmid}：虚拟机和容器共用同一套 "
+                    f"VMID 编号，恢复不能覆盖另一种类型的机器（开启「强制覆盖」也不行）。"
+                    f"请先删除{label} {vmid}，或换一个 VMID 再恢复。"
+                ),
+            )
+        if str(item.get("status") or "") == "running":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"节点 {node} 上的{label} {vmid} 正在运行：恢复会重写它的磁盘，"
+                    f"Proxmox 不允许在开机状态下恢复（force 也不行）。请先关机"
+                    f"（关闭电源）后再恢复。"
+                ),
+            )
+        if not force:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"节点 {node} 上已存在{label} {vmid}：确认覆盖请开启「强制覆盖」，"
+                    "否则请先删除它，或换一个 VMID 再恢复。"
+                ),
+            )
+        return
+
+
+def _restore_conflict_detail(message: str, node: str, vmid: int) -> Optional[str]:
+    """把 PVE 的「VMID 被占」英文报错翻成可操作的中文（预检漏掉时兜底）。
+
+    PVE 的原话形如 ``CT 103 already exists on node 'pve9-2'``，用户从这句
+    话里读不出「该删机器」还是「该换编号」，只能当成面板坏了。
+    """
+    text = message or ""
+    if "already exists on node" not in text.lower():
+        return None
+    holder = "容器" if re.match(r"\s*ct\b", text, re.I) else "虚拟机"
+    return (
+        f"节点 {node} 上的 VMID {vmid} 已被{holder}占用：虚拟机和容器共用同一套 "
+        f"VMID 编号，同类型机器可开启「强制覆盖」覆盖，另一种类型则必须先删除。"
+        f"请换一个 VMID，或先删除占用的{holder}。（PVE：{text}）"
+    )
+
+
+def _restore_running_detail(message: str, node: str, vmid: int) -> Optional[str]:
+    """PVE 拒绝在开机状态下恢复时的中文说明（同步报错的兜底）。
+
+    异步任务的那份（``TASK ERROR: unable to restore VM 102 - vm is running``）
+    由前端 ``taskFailureHint`` 翻译，这里管同步返回的那一份。
+    """
+    text = message or ""
+    if not re.search(r"\b(?:vm|ct|container|lxc|guest)\b.*\bis running\b", text, re.I):
+        return None
+    return (
+        f"节点 {node} 上的客户机 {vmid} 正在运行：恢复会重写它的磁盘，"
+        f"Proxmox 不允许在开机状态下恢复。请先关机后再试。（PVE：{text}）"
+    )
+
+
+def _restore_format_detail(message: str, volid: str) -> Optional[str]:
+    """类型判定失败的兜底说明。
+
+    PVE 的原话是 ``got unexpected backup format 'pbs-ct'`` —— 它把容器归档当
+    虚拟机解析（hostname / net0 / rootfs 全报 unknown setting），并留下半成品
+    机器。这说明面板没判出归档类型（volid 形状不常见且没带 format），得把
+    「换一份数据重试」这句话说明白，否则用户只会一遍遍重试同一个失败。
+    """
+    if "unexpected backup format" not in (message or "").lower():
+        return None
+    return (
+        "面板没能从这份归档认出它是虚拟机备份还是容器备份，PVE 因此按错误端点"
+        f"解析失败（{message}）。请先刷新备份列表再重试（列表会带上归档的 "
+        f"format）；PVE 可能已留下半成品机器，重试前请先在节点上清理。volid：{volid}"
+    )
 
 
 #: 备份归档目录的缓存时长（秒）。与 ``/api/storages/content`` 取同一口径：
@@ -811,7 +925,7 @@ async def restore_backup(
     storage = payload.storage or payload.volid.split(":", 1)[0]
     await assert_backup_access(user, payload.node, storage, payload.volid)
     # 归档归属校验只说明「这个备份是你能读的」，不代表「你可以往这个 vmid 里恢复」：
-    # force 默认开着，指向别人的机器就是把人家系统盘覆盖掉。
+    # 指向别人的机器就是把人家的系统盘覆盖掉，所以 force 只由用户显式开启。
     for _kind in ownership.GUEST_KINDS:
         await guestguard.require_guest_object_if_owned(
             user, payload.node, payload.vmid, _kind
@@ -819,11 +933,16 @@ async def restore_backup(
     # 恢复备份同样是「多出一台机器」。归档里的核数 / 内存 / 磁盘在开工前读不出来
     # （PVE 的备份索引不给客户机配置），所以这一维只能把住**台数**；核数 / 内存 /
     # 磁盘会在机器出现后的下一次统计里如实反映（读数会显示超额），但拦不住这一次。
-    # 归档名里的 vzdump-lxc 决定它算容器还是虚拟机额度。
-    await quota.enforce_create(
-        user, request, "ct" if "vzdump-lxc" in payload.volid else "vm"
-    )
+    # 类型看 volid / storage content 的 format（目录型存储写 vzdump-<type>-<vmid>，
+    # PBS 写 backup/<ct|vm>/<vmid>/…），认不出时按虚拟机处理。
+    guest_type = archive_guest_type(payload.volid, payload.format) or "qemu"
+    await quota.enforce_create(user, request, "ct" if guest_type == "lxc" else "vm")
     client = get_client()
+    # 目标 VMID 撞号要在调用 PVE 之前判掉：撞上另一种类型的机器时 force 也救不了，
+    # 而 PVE 只会回一句英文的 "CT 103 already exists on node 'xxx'"。
+    await _assert_restore_target_free(
+        client, payload.node, payload.vmid, guest_type, force=payload.force
+    )
     try:
         result = await client.backup_restore(
             payload.node,
@@ -832,12 +951,21 @@ async def restore_backup(
             storage=payload.storage,
             force=payload.force,
             start=payload.start,
+            fmt=payload.format,
         )
     except ProxmoxError as exc:
         await security.audit(
             request, user, "backup.restore", target=payload.volid,
             result="failed", detail=exc.message,
         )
+        # 预检漏掉（集群清单读不到 / 刚好被占）时兜底：英文报错同样翻成人话。
+        detail = (
+            _restore_conflict_detail(exc.message, payload.node, payload.vmid)
+            or _restore_running_detail(exc.message, payload.node, payload.vmid)
+            or _restore_format_detail(exc.message, payload.volid)
+        )
+        if detail:
+            raise HTTPException(status_code=409, detail=detail) from exc
         _raise(exc)
 
     task = result if isinstance(result, str) else (result or {}).get("task", "")
@@ -846,12 +974,14 @@ async def restore_backup(
         detail={"vmid": payload.vmid},
     )
     # 创建时间：恢复出来的机器同样继承归档里来源机器的 meta.ctime（PVE 整体复制
-    # config），所以面板自己记一份 —— 归档名里的 vzdump-qemu / vzdump-lxc 决定类型。
+    # config），所以面板自己记一份 —— 类型按上面解析出来的 guest_type 记，别用
+    # 归档名里的 vzdump 前缀（PBS 归档没有前缀）。
+    # 恢复是节点级操作：连接按「请求头 → 当前连接」确定（见 _connection_scope）
     await guest_created.record(
-        _active_connection(),
+        _connection_scope(),
         payload.node,
         payload.vmid,
-        "lxc" if "vzdump-lxc" in payload.volid else "qemu",
+        guest_type,
         source="restore",
         username=str(user.get("username") or ""),
     )
@@ -1228,6 +1358,26 @@ async def verify_protected_backups(
 
 
 # ------------------------------------------------------------- backup jobs
+def _prune_string(value: Any) -> str:
+    """把保留策略统一成 ``keep-daily=7,keep-weekly=4`` 属性串。
+
+    PVE 各版本对 ``prune-backups`` 的返回形状并不一致：多数版本给字符串，
+    有的版本（以及带默认保留策略的新建计划）直接给解析后的对象
+    ``{"keep-daily": 7, ...}``。前端是按字符串渲染这一列的，拿到对象会抛
+    React #31（Objects are not valid as a React child）导致整页白屏 —— 在出口
+    处收敛一次，任何客户端都不用各自猜形状。
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return ",".join(
+            f"{k}={v}" for k, v in value.items() if v is not None and v != ""
+        )
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(v) for v in value if v is not None)
+    return "" if value is None else str(value)
+
+
 @router.get("/backups/jobs")
 async def list_backup_jobs(
     user: Dict[str, Any] = Depends(security.require_any_permission("vm.backup", "ct.backup")),
@@ -1269,7 +1419,7 @@ async def list_backup_jobs(
                 "enabled": pve_flag(job.get("enabled", 1), 1) == 1,
                 "comment": _strip_owner(comment),
                 "notes_template": job.get("notes-template", ""),
-                "prune_backups": job.get("prune-backups", ""),
+                "prune_backups": _prune_string(job.get("prune-backups")),
                 "next_run": job.get("next-run"),
                 "mailnotification": job.get("mailnotification", ""),
                 "owner": owner,
@@ -1396,9 +1546,22 @@ async def update_backup_job(
     )
     data = payload.model_dump(exclude_none=True)
 
+    # 「整节点 ↔ 指定 VMID」互斥：PVE 的更新是合并语义，切到 all=1 时必须让
+    # PVE 把旧的 vmid 删掉，否则计划里两套范围同时存在，实际仍按 vmid 跑。
+    if "delete" in data:
+        removals = [str(v).strip() for v in (data.pop("delete") or []) if str(v).strip()]
+        if removals:
+            data["delete"] = ",".join(removals)
+
     # PVE uses these parameter names verbatim.
     if "notes" in data:
         data["notes-template"] = data.pop("notes")
+    # 保留策略在 PVE 里叫 ``prune-backups``（连字符）。创建路径是手工拼 data 的，
+    # 一直有这条映射；编辑（PUT）走 model_dump 就会把 ``prune_backups`` 原样发过去，
+    # PVE 直接回 "property is not defined in schema and the schema does not allow
+    # additional properties"。
+    if "prune_backups" in data:
+        data["prune-backups"] = data.pop("prune_backups")
     if "enabled" in data:
         data["enabled"] = 1 if data["enabled"] else 0
     if "all" in data:

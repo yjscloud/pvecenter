@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -30,6 +31,8 @@ from ..schemas import (
     SshPolicyIn,
     SshTargetIn,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ssh", tags=["ssh"])
 

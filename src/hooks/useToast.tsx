@@ -12,7 +12,8 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import type { ToastItem, ToastType } from '../api/types';
+import { Link } from 'react-router';
+import type { ToastAction, ToastItem, ToastType } from '../api/types';
 import { useT } from '../i18n';
 
 /* ---------------------------------------------------------------------------
@@ -20,17 +21,22 @@ import { useT } from '../i18n';
    --------------------------------------------------------------------------- */
 
 export interface ToastApi {
-  /** 弹出 toast，返回 id */
-  push: (type: ToastType, title: string, message?: string) => string;
-  success: (title: string, message?: string) => string;
-  error: (title: string, message?: string) => string;
-  warning: (title: string, message?: string) => string;
-  info: (title: string, message?: string) => string;
+  /** 弹出 toast，返回 id。`action` 用来给用户一条下一步（如「打开任务队列」） */
+  push: (
+    type: ToastType,
+    title: string,
+    message?: string,
+    action?: ToastAction,
+  ) => string;
+  success: (title: string, message?: string, action?: ToastAction) => string;
+  error: (title: string, message?: string, action?: ToastAction) => string;
+  warning: (title: string, message?: string, action?: ToastAction) => string;
+  info: (title: string, message?: string, action?: ToastAction) => string;
   /**
    * 破坏性操作成功（删除 / 隔离）。与 success 的区别只在视觉权重：
    * 不可撤销的动作用更强的配色，别让用户划过去。
    */
-  destructive: (title: string, message?: string) => string;
+  destructive: (title: string, message?: string, action?: ToastAction) => string;
   /** 弹出持久 toast（不自动消失），返回 id */
   loading: (title: string, message?: string) => string;
   /** 更新已存在的 toast */
@@ -88,10 +94,15 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 
   const push = useCallback(
-    (type: ToastType, title: string, message?: string): string => {
+    (
+      type: ToastType,
+      title: string,
+      message?: string,
+      action?: ToastAction,
+    ): string => {
       const id = nextId();
       setToasts((prev) => {
-        const next = [...prev, { id, type, title, message }];
+        const next = [...prev, { id, type, title, message, action }];
         // 最多同时展示 5 条
         return next.length > 5 ? next.slice(next.length - 5) : next;
       });
@@ -146,11 +157,12 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const api = useMemo<ToastApi>(
     () => ({
       push,
-      success: (title, message) => push('success', title, message),
-      error: (title, message) => push('error', title, message),
-      warning: (title, message) => push('warning', title, message),
-      info: (title, message) => push('info', title, message),
-      destructive: (title, message) => push('destructive', title, message),
+      success: (title, message, action) => push('success', title, message, action),
+      error: (title, message, action) => push('error', title, message, action),
+      warning: (title, message, action) => push('warning', title, message, action),
+      info: (title, message, action) => push('info', title, message, action),
+      destructive: (title, message, action) =>
+        push('destructive', title, message, action),
       loading,
       update,
       dismiss,
@@ -336,6 +348,15 @@ function ToastViewport({
             <div className="toast-title">{item.title}</div>
             {item.message ? (
               <div className="toast-message">{item.message}</div>
+            ) : null}
+            {item.action ? (
+              <Link
+                to={item.action.href}
+                className="toast-action"
+                onClick={() => onDismiss(item.id)}
+              >
+                {item.action.label}
+              </Link>
             ) : null}
           </div>
           <button

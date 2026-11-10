@@ -26,6 +26,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from . import reqmetrics
+from .backup_volid import archive_guest_type
 from .config import settings
 
 # UPID format: UPID:<node>:<pid>:<pstart>:<starttime>:<type>:<id>:<user>:<comment>
@@ -1133,17 +1134,27 @@ class ProxmoxClient:
         archive: str,
         vmid: int,
         storage: Optional[str] = None,
-        force: bool = True,
+        force: bool = False,
         start: bool = False,
+        fmt: Optional[str] = None,
     ) -> Any:
         payload: Dict[str, Any] = {
-            "archive": archive,
             "vmid": vmid,
             "force": 1 if force else 0,
             "start": 1 if start else 0,
         }
         if storage:
             payload["storage"] = storage
+        if archive_guest_type(archive, fmt) == "lxc":
+            # 容器恢复走 LXC 端点，归档参数叫 ``ostemplate`` 且必须带 ``restore=1``
+            # （``pct restore`` 内部就是这条路径）。虚拟机端点只认 ``archive``：
+            # 拿容器归档（含 PBS 的 ``pbs-ct``）去恢复会被按 vma/qcow2 解析，
+            # PVE 回 "got unexpected backup format 'pbs-ct'"，hostname / net0 /
+            # rootfs 全部报 unknown setting。
+            payload["ostemplate"] = archive
+            payload["restore"] = 1
+            return await self.post(f"/nodes/{node}/lxc", data=payload)
+        payload["archive"] = archive
         return await self.post(f"/nodes/{node}/qemu", data=payload)
 
     async def backup_jobs(self) -> List[Dict[str, Any]]:

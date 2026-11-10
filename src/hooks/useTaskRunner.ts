@@ -9,7 +9,8 @@ import { ApiError, errorMessage } from '../api/client';
 import { invalidateQuota } from './quotaCache';
 import { useToast } from './useToast';
 import { useT } from '../i18n';
-import type { TaskInfo } from '../api/types';
+import { taskFailureHint } from '../utils/status';
+import type { TaskDetail, TaskInfo } from '../api/types';
 
 export interface RunTaskOptions {
   /** toast 标题，如 "启动虚拟机" */
@@ -53,6 +54,26 @@ export interface TaskRunner {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 从任务日志里读进度百分比。
+ *
+ * PVE 的 ``/tasks/{upid}/status`` 并不给 progress（vzdump 实测恒为 None），
+ * 真正的进度写在日志行里：``INFO:  42% (3.4 GiB of 8.0 GiB)``。备份动辄几十分钟，
+ * 只转圈不显示进度，用户分不清「在跑」和「卡死」—— 所以扫一遍日志尾部取最后一个
+ * 百分比（详情接口本来就带回来了，不额外发请求）。
+ */
+function logProgress(task: TaskInfo): number | null {
+  const lines = (task as TaskDetail).log;
+  if (!Array.isArray(lines)) return null;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const match = /(\d{1,3})\s*%/.exec(String(lines[i]?.t ?? ''));
+    if (!match) continue;
+    const pct = Number(match[1]);
+    if (Number.isFinite(pct) && pct > 0 && pct <= 100) return pct;
+  }
+  return null;
+}
 
 /**
  * 任务等待 hook。
@@ -140,8 +161,13 @@ export function useTaskRunner(): TaskRunner {
         persistent: true,
       });
 
+      /* 失败/超时后给一条“下一步”：光说失败，用户只能关掉通知去猜 */
+      const queueAction = { href: '/tasks', label: t('task.openQueue') };
+
       const started = Date.now();
       let lastTask: TaskInfo | null = null;
+      /** 上一次上报的进度，只有变化时才改 toast（否则每 1.5 秒重渲染一次） */
+      let lastPct: number | null = null;
       /* 连续轮询失败计数。主机选错、任务被清理、网络异常时，旧逻辑会一直
          continue 到 10 分钟超时才收尾，界面上就是「关机中 / 删除中」永不结束。 */
       let failures = 0;
@@ -158,11 +184,12 @@ export function useTaskRunner(): TaskRunner {
               message: t('task.timeout'),
               loading: false,
               persistent: false,
+              action: queueAction,
             });
             return lastTask;
           }
 
-          let task: TaskInfo;
+          let task: TaskDetail;
           try {
             task = await tasksApi.detail(upid, node);
           } catch (err) {
@@ -190,6 +217,7 @@ export function useTaskRunner(): TaskRunner {
                 message: missing ? t('task.missing') : t('task.unreachable'),
                 loading: false,
                 persistent: false,
+                action: queueAction,
               });
               flush(invalidate);
               return lastTask;
@@ -199,6 +227,15 @@ export function useTaskRunner(): TaskRunner {
           failures = 0;
 
           lastTask = task;
+
+          /* 进度条：日志里出现百分比就实时报出来，避免长任务只剩一个转圈 */
+          const pct = logProgress(task);
+          if (pct !== null && pct !== lastPct) {
+            lastPct = pct;
+            toast.update(toastId, {
+              message: t('task.runningPct', { pct }),
+            });
+          }
 
           if (task.status !== 'running') {
             const exit = task.exitstatus ?? '';
@@ -226,13 +263,19 @@ export function useTaskRunner(): TaskRunner {
               flush(invalidate);
               onSuccess?.(task);
             } else {
-              const message = exit || t('task.interrupted');
+              /* 失败只甩原始 exit 串，用户读不懂也不知道下一步 —— 常见的
+                 磁盘满 / 无权限 / 被锁 / 目标不存在翻译成可操作的建议 */
+              const hint = taskFailureHint(exit, t);
+              const message = [exit || t('task.interrupted'), hint]
+                .filter(Boolean)
+                .join(' · ');
               toast.update(toastId, {
                 type: 'error',
                 title: t('task.failed', { title }),
                 message,
                 loading: false,
                 persistent: false,
+                action: queueAction,
               });
               onError?.(task);
               // 失败也刷新，保证列表状态与后端一致

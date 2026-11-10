@@ -2677,6 +2677,13 @@ export interface BackupRestoreRequest {
   vmid: number;
   force?: boolean;
   start?: boolean;
+  /**
+   * 归档在 storage content 里的 `format`（`pbs-ct` / `pbs-vm` / `vma.zst`…）。
+   *
+   * PBS 的 volid 形如 `pbs:backup/ct/104/…`，没有 vzdump 前缀 —— 后端靠这个
+   * 字段（以及 volid 里的 `backup/ct|vm`）判断该恢复到容器还是虚拟机端点。
+   */
+  format?: string;
 }
 
 export interface BackupJob {
@@ -2687,6 +2694,8 @@ export interface BackupJob {
   compress: string;
   vmid?: string;
   node?: string;
+  /** 备份整个节点（PVE 的 all=1）：与 vmid 二选一 */
+  all?: boolean;
   enabled: boolean;
   notes?: string;
   comment?: string;
@@ -2708,9 +2717,18 @@ export interface BackupJobInput {
   compress: string;
   vmid?: string;
   node?: string;
+  /** 备份整个节点（PVE 的 all=1）：与 vmid 二选一 */
+  all?: boolean;
   enabled: boolean;
   notes?: string;
   prune_backups?: string;
+  /**
+   * 更新时要从计划里删掉的字段（PVE 的更新是**合并**语义）。
+   *
+   * 仅用于「整节点 ↔ 指定 VMID」互相切换：切到 all=1 时必须显式删掉 vmid，
+   * 否则旧的 vmid 会留下来继续生效。创建时忽略。
+   */
+  delete?: string[];
 }
 
 /* ---------------------------------------------------------------------------
@@ -2859,6 +2877,12 @@ export interface PanelSettings {
  */
 export type ToastType = 'success' | 'error' | 'warning' | 'info' | 'destructive';
 
+/** toast 里的操作链接（失败/超时后指一条下一步的路） */
+export interface ToastAction {
+  href: string;
+  label: string;
+}
+
 export interface ToastItem {
   id: string;
   type: ToastType;
@@ -2867,6 +2891,8 @@ export interface ToastItem {
   /** 持久 toast（loading 用） */
   persistent?: boolean;
   loading?: boolean;
+  /** 可选操作链接，如「打开任务队列」 */
+  action?: ToastAction;
 }
 
 export type BadgeVariant =

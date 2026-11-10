@@ -468,6 +468,40 @@ export function compressOptions(t: TFunc) {
   ];
 }
 
+/**
+ * 任务失败原因 → 可操作建议。
+ *
+ * PVE 的 exitstatus 是给管理员看的英文串（``vzdump ... failed: no space left``），
+ * 用户拿到它并不知道下一步做什么。这里只认几类「高频且用户自己能解决」的成因，
+ * 认不出来就返回 null（不编造），原串照旧展示。
+ */
+const FAILURE_HINTS: Array<{ re: RegExp; key: MessageKey }> = [
+  /* 恢复一台**开机中**的机器：PVE 先拷盘再拒绝，留下半成品。这条要排在
+     「锁」之前 —— 两者都会出现 "is running"，但用户要做的事完全不同。 */
+  {
+    re: /\b(?:vm|ct|container|lxc|guest)\b[^\n]*\bis running\b/i,
+    key: 'task.hintGuestRunning',
+  },
+  { re: /no space|disk full|enospc|out of space/i, key: 'task.hintNoSpace' },
+  { re: /permission denied|no permission|not allowed|403/i, key: 'task.hintPermission' },
+  { re: /can'?t lock|is locked|lock file|already running/i, key: 'task.hintLocked' },
+  { re: /timed? ?out|timeout/i, key: 'task.hintTimeout' },
+  { re: /not exist|not found|no such|does not exist|404/i, key: 'task.hintMissing' },
+];
+
+export function taskFailureHint(exit: string | undefined, t: TFunc): string | null {
+  const text = (exit ?? '').trim();
+  if (!text) return null;
+  for (const item of FAILURE_HINTS) {
+    if (item.re.test(text)) return t(item.key);
+  }
+  /* 备份/恢复类失败一定有日志，指个方向比让用户干瞪眼强 */
+  if (/vzdump|backup|restore|qemu-server|pct/i.test(text)) {
+    return t('task.hintCheckLog');
+  }
+  return null;
+}
+
 export function timeframeOptions(t: TFunc) {
   return [
     { label: t('opt.tfHour'), value: 'hour' },

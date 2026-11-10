@@ -1279,8 +1279,13 @@ class BackupRestore(BaseModel):
     volid: str
     vmid: int
     storage: Optional[str] = None
-    force: bool = True
+    # 默认**不**覆盖：fallback 成 True 会让前端那个「强制覆盖」开关形同虚设
+    # （关着也照样 force=1），把别人的机器无声覆盖掉。
+    force: bool = False
     start: bool = False
+    # storage content 里那条记录的 ``format``（``pbs-ct`` / ``pbs-vm`` / ``vma.zst``…）。
+    # 只是给 volid 解析做补充：PBS 的 volid 不带 vzdump 前缀，认类型得靠它兜底。
+    format: Optional[str] = None
 
 
 class BackupJobCreate(BaseModel):
@@ -1298,6 +1303,9 @@ class BackupJobCreate(BaseModel):
     prune_backups: Optional[str] = None
     dow: Optional[str] = None
     starttime: Optional[str] = None
+    # 更新时要移除的字段名（PVE 的更新是合并语义）。用于「整节点 ↔ 指定 VMID」
+    # 互相切换：切到 all=1 时必须删掉 vmid，否则旧 vmid 会留下来继续生效。
+    delete: Optional[List[str]] = None
 
 
 # -------------------------------------------------------------------- users

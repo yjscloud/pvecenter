@@ -33,6 +33,24 @@ def _raise(exc: ProxmoxError) -> None:
     )
 
 
+def _active_connection() -> Dict[str, str]:
+    """默认读取的那一套 PVE（id + 展示名）。
+
+    面板把多条 PVE 连接当**同级**，没有「主连接」这个概念；但少数接口
+    （``/health``、``/cluster/status``）一次只能读一台，需要一个确定目标。
+    那个目标由管理员在「设置 → 系统信息」里指定，这里把它一并返回 ——
+    否则多连接部署下「这个节点数是哪一台的」没人答得上来。
+    """
+    try:
+        cid = str(store.get_active_connection_id() or "")
+        for profile in store.get_connections():
+            if str(profile.get("id") or "") == cid:
+                return {"id": cid, "name": connection_label(profile)}
+    except Exception:  # noqa: BLE001 - 拿不到名字不影响主数据
+        pass
+    return {"id": "", "name": ""}
+
+
 @router.get("/cluster/status")
 async def cluster_status(
     user: Dict[str, Any] = Depends(security.require_permission("node.view")),
