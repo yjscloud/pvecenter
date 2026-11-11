@@ -311,14 +311,6 @@ export const NAV_SECTIONS: NavSection[] = [
     titleKey: 'nav.section.security',
     items: [
       {
-        /* 页面里虚拟机与容器是两个独立作用域、两套权限：哪一侧都能进
-           （只授予容器权限的自定义角色照样要能配容器防火墙） */
-        to: '/firewall',
-        labelKey: 'nav.firewall',
-        icon: <IconLock size={18} />,
-        permissions: ['firewall.view', 'ct.firewall.view'],
-      },
-      {
         /* 默认落在「主机与告警配置」而不是监测数据：SSH 凭据与告警策略是这台
            面板真正要人去配的东西，监测数据配好了就只是看。两个页面顶部都有一组
            subnav 可以互相跳，所以监测数据并没有变成不可达 —— 只是深了一层。 */
@@ -328,10 +320,21 @@ export const NAV_SECTIONS: NavSection[] = [
         permission: 'ssh.view',
       },
       {
-        to: '/host-audit',
-        labelKey: 'nav.hostAudit',
-        icon: <IconClock size={18} />,
-        permission: 'ssh.view',
+        /* 页面里虚拟机与容器是两个独立作用域、两套权限：哪一侧都能进
+           （只授予容器权限的自定义角色照样要能配容器防火墙） */
+        to: '/firewall',
+        labelKey: 'nav.firewall',
+        icon: <IconLock size={18} />,
+        permissions: ['firewall.view', 'ct.firewall.view'],
+      },
+      {
+        /* 端口与进程和安全基线问的都是「这台机器有没有问题」：端口管运行面
+           （谁在监听、进程可不可疑），基线管配置面（口令、补丁、内核参数）。
+           先列运行面、再列配置面，从看得见的连接走到底层配置。 */
+        to: '/ports',
+        labelKey: 'nav.ports',
+        icon: <IconActivity size={18} />,
+        permission: 'ports.view',
       },
       {
         to: '/security-baseline',
@@ -341,13 +344,10 @@ export const NAV_SECTIONS: NavSection[] = [
         permission: 'baseline.view',
       },
       {
-        /* 端口与进程排在安全基线**之后**：两者问的都是「这台机器有没有问题」，
-           基线管的是配置面（口令、补丁、内核参数），端口管的是运行面（谁在监听、
-           进程可不可疑）。先看配置、再看运行面，是从静态到动态的排查顺序。 */
-        to: '/ports',
-        labelKey: 'nav.ports',
-        icon: <IconActivity size={18} />,
-        permission: 'ports.view',
+        to: '/host-audit',
+        labelKey: 'nav.hostAudit',
+        icon: <IconClock size={18} />,
+        permission: 'ssh.view',
       },
     ],
   },
@@ -358,6 +358,25 @@ export const NAV_SECTIONS: NavSection[] = [
     id: 'observability',
     titleKey: 'nav.section.observability',
     items: [
+      /* AI 排查助手：真正消费的是巡检 / 基线结果、面向的是排障，归到观测更贴。
+         原先挂在「安全」组末尾，与安全基线同档看着顺，但那组会因此变成 6 项。
+         权限仍是 baseline.view：后端 ai 路由的 VIEW 守卫、路由守卫与
+         AskAiButton 用的是同一把钥匙（只有模型配置要 settings.manage）。 */
+      {
+        to: AI_ASSISTANT_NAV_PATH,
+        labelKey: 'nav.aiAssistant',
+        icon: <IconSparkle size={18} />,
+        permission: 'baseline.view',
+      },
+      /* 飞书机器人是**面板自身**的配置（后端 feishu.py 用 settings.manage），
+         和设置同一档；放在这一组是因为它跟告警一样属于「系统替你盯着外面的事」 */
+      {
+        to: '/bot',
+        labelKey: 'nav.feishuBot',
+        /* 飞书标志而不是通用气泡：一眼看出这条通道接的是飞书 */
+        icon: <IconFeishu size={18} />,
+        permission: 'settings.manage',
+      },
       {
         to: '/alerts',
         labelKey: 'nav.alerts',
@@ -370,27 +389,6 @@ export const NAV_SECTIONS: NavSection[] = [
         /* 证书 / 奖章字形：比通用盾牌更能说明管的是 HTTPS 证书 */
         icon: <IconCertificate size={18} />,
         permission: 'cert.view',
-      },
-      /* 飞书机器人是**面板自身**的配置（后端 feishu.py 用 settings.manage），
-         和设置同一档；放在这一组是因为它跟告警一样属于「系统替你盯着外面的事」 */
-      {
-        to: '/bot',
-        labelKey: 'nav.feishuBot',
-        /* 飞书标志而不是通用气泡：一眼看出这条通道接的是飞书 */
-        icon: <IconFeishu size={18} />,
-        permission: 'settings.manage',
-      },
-      /* AI 排查助手：紧跟在机器人下面 —— 两者都是「有事时把结论送到你面前」的
-         一端（机器人送告警，它送归因）。原先挂在「安全」组末尾，与安全基线同档
-         看着顺，但那组会因此变成 6 项；它真正消费的是巡检 / 基线结果、面向的是
-         排障，归到观测更贴。
-         权限仍是 baseline.view：后端 ai 路由的 VIEW 守卫、路由守卫与
-         AskAiButton 用的是同一把钥匙（只有模型配置要 settings.manage）。 */
-      {
-        to: AI_ASSISTANT_NAV_PATH,
-        labelKey: 'nav.aiAssistant',
-        icon: <IconSparkle size={18} />,
-        permission: 'baseline.view',
       },
     ],
   },
