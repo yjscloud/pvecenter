@@ -21,6 +21,7 @@ import { Card, CardHeader, KpiCard } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Button, IconButton } from '../components/ui/Button';
 import { Input, Select, Switch, Textarea, Field } from '../components/ui/Input';
+import { MultiSelect } from '../components/ui/MultiSelect';
 import { Table, type Column } from '../components/ui/Table';
 import { Modal } from '../components/ui/Modal';
 import { ErrorState, Notice, CollapsibleCard } from '../components/ui/EmptyState';
@@ -38,6 +39,7 @@ import {
   IconClock,
   IconCheck,
   IconShield,
+  IconOwnerDrift,
   IconCopy,
   IconActivity,
   IconUpload,
@@ -329,7 +331,7 @@ export function Backups() {
           {isAdmin ? (
             <Button
               variant="secondary"
-              icon={<IconShield size={15} />}
+              icon={<IconOwnerDrift size={15} />}
               onClick={() => setDriftOpen(true)}
             >
               {t('backups.driftAction')}
@@ -430,7 +432,7 @@ function BackupCreateTab({ canBackup }: { canBackup: boolean }) {
 
   const vmsQuery = useQuery({
     queryKey: ['vms', 'all', conn],
-    queryFn: () => vmsApi.list(undefined, { connectionId: conn }),
+    queryFn: () => vmsApi.list(undefined, { connectionId: conn, type: 'all' }),
     enabled: Boolean(conn),
     staleTime: 30_000,
   });
@@ -668,7 +670,7 @@ function BackupCreateTab({ canBackup }: { canBackup: boolean }) {
                 onChange={(e) => setVmid(e.target.value)}
                 placeholder={t('backups.vmPlaceholder')}
                 options={nodeVms.map((v) => ({
-                  label: `${v.vmid} — ${v.name || t('backups.vmUnnamed')}`,
+                  label: `${v.type === 'lxc' ? 'CT' : 'VM'} ${v.vmid} — ${v.name || t('backups.vmUnnamed')}`,
                   value: String(v.vmid),
                 }))}
               />
@@ -2408,6 +2410,49 @@ function JobEditor({
     [nodeNames, t],
   );
 
+  /* 可备份的机器：虚拟机 + 容器混排（type=all），并剔掉模板。
+     取数与「立即备份」Tab、恢复页保持一致，免得两处列出来的机器对不上。 */
+  const vmsQuery = useQuery({
+    queryKey: ['vms', 'plan-scope', conn],
+    queryFn: () => vmsApi.list(undefined, { connectionId: conn, type: 'all' }),
+    enabled: open && Boolean(conn),
+    staleTime: 30_000,
+  });
+
+  const vmidOptions = useMemo(() => {
+    const list = (vmsQuery.data ?? []).filter((v) => !v.template);
+    const opts = list
+      /* 指定了节点就只列这台节点上的；「所有节点」时列整个集群的 */
+      .filter((v) => !form.node || form.node === ALL_NODES || v.node === form.node)
+      .sort((a, b) => a.vmid - b.vmid)
+      .map((v) => ({
+        value: String(v.vmid),
+        /* 带 VM/CT 前缀：两类机器在 PVE 里共用一套 VMID，光看数字分不清 */
+        label: `${v.type === 'lxc' ? 'CT' : 'VM'} ${v.vmid} — ${
+          v.name || t('backups.vmUnnamed')
+        }`,
+        /* 选「所有节点」时补上节点名，否则不同节点上的同名机器分不出来 */
+        hint: form.node === ALL_NODES ? v.node : undefined,
+      }));
+    /* 计划里已有、但当前列表里查不到的 VMID（机器已删、或不属于所选节点）
+       也要补进选项：否则打开编辑时摘要说「已选 N 项」，列表里却一个都没勾，
+       既看不出是哪几台，也没法取消掉。 */
+    const known = new Set(opts.map((o) => o.value));
+    const orphan = (form.vmid ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .filter((id) => !known.has(id));
+    for (const id of orphan) {
+      opts.push({
+        value: id,
+        label: t('backups.vmidOrphan', { vmid: id }),
+        hint: undefined,
+      });
+    }
+    return opts;
+  }, [vmsQuery.data, form.node, form.vmid, t]);
+
   const connectionOptions = useMemo(
     () =>
       (connectionsQuery.data ?? []).map((c) => ({
@@ -2603,7 +2648,9 @@ function JobEditor({
               value={form.node ?? ''}
               onChange={(e) => {
                 const next = e.target.value;
-                setForm((prev) => ({ ...prev, node: next, storage: '' }));
+                /* 换节点 = 换一批机器：已选的 VMID 多半不属于新节点，
+                   留着会悄悄把别的节点上的机器也塞进这条计划 */
+                setForm((prev) => ({ ...prev, node: next, storage: '', vmid: '' }));
                 /* 立即执行需要一个具体节点：整集群计划没法「马上跑一次」 */
                 if (next === ALL_NODES) setStartNow(false);
               }}
@@ -2726,14 +2773,19 @@ function JobEditor({
         </Field>
 
         {form.all ? null : (
-          <Field label={t('backups.vmidsLabel')} required hint={t('backups.vmidsHint')}>
-            <Input
-              value={form.vmid ?? ''}
-              onChange={(e) => patch('vmid', e.target.value)}
-              placeholder="100,101,102"
-              className="mono"
-            />
-          </Field>
+          /* MultiSelect 自带 Field 外壳（label/hint），这里别再套一层，
+             否则标签会重复出现两遍 */
+          <MultiSelect
+            label={t('backups.vmidsLabel')}
+            required
+            hint={t('backups.vmidsHint')}
+            value={vmids}
+            onChange={(next) => patch('vmid', next.join(','))}
+            options={vmidOptions}
+            placeholder={t('backups.vmidSelectPlaceholder')}
+            selectAllLabel={t('common.selectAll')}
+            emptyText={t('backups.vmidEmpty')}
+          />
         )}
 
         <Field

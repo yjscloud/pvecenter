@@ -838,6 +838,14 @@ async def download_image_from_url(
         detail={"url": safe_url, "content": content},
     )
 
+    # 新文件要能立刻出现在「镜像来源」下拉里。下载任务在 PVE 后台异步执行，
+    # 前端要轮询到任务结束才刷新列表 —— 那时文件已在存储里，但不在这里失效
+    # 缓存的话，列表会返回下载前的旧结果（IMAGES_TTL = 30s），刚下完的文件
+    # 选不中，看起来像「下载了却没被自动选上」。做法与 /storages/upload 一致。
+    if content in ("iso", "import"):
+        pvecache.invalidate("templates:images")
+    pvecache.invalidate("storage-content:")
+
     return {
         "task": upid if isinstance(upid, str) else "",
         # 下载完成后就是这一卷：前端据此直接选中它，不必等列表刷新

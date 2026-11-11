@@ -1952,6 +1952,13 @@ function TemplateCreateWizard({
                 label: `${img.volid}（${formatBytes(img.size)}, ${img.storage}）`,
                 value: img.volid,
               })),
+              /* 刚下载完、镜像列表还没刷新回来时，先把选中的那一卷补进选项 ——
+                 受控 Select 的 value 不在 options 里会显示成空白，看起来像
+                 「下载了却没被自动选上」。列表刷新后这条自动消失。 */
+              ...(imageVolId &&
+              !(imagesQuery.data ?? []).some((img) => img.volid === imageVolId)
+                ? [{ label: imageVolId, value: imageVolId }]
+                : []),
             ]}
             hint={
               pickedImage?.import_risk

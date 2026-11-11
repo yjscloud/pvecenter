@@ -33,6 +33,11 @@ export const zhCore = {
   'common.status': '状态',
   'common.allNodes': '全部节点',
   'common.opFailed': '操作失败',
+  'common.selectAll': '全选',
+  'common.selectedCount': '已选 {count} 项',
+  'common.selectPlaceholder': '请选择',
+  'common.noOptions': '暂无可选项',
+  'common.listSeparator': '、',
 
   /* ---------------------------------------------------------- 文档语言 */
   'lang.zh': '中文',

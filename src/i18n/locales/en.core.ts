@@ -32,6 +32,11 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'common.status': 'Status',
   'common.allNodes': 'All nodes',
   'common.opFailed': 'Operation failed',
+  'common.selectAll': 'Select all',
+  'common.selectedCount': '{count} selected',
+  'common.selectPlaceholder': 'Select…',
+  'common.noOptions': 'No options',
+  'common.listSeparator': ', ',
 
   /* ----------------------------------------------------------- Language */
   'lang.zh': '中文',
