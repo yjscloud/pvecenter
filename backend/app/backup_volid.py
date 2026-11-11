@@ -21,8 +21,12 @@ from typing import Optional
 #: ``vzdump-qemu-110-...`` / ``vzdump-lxc-110-...``（目录型存储的命名）
 _VZDUMP_RE = re.compile(r"vzdump-(qemu|lxc)-(\d+)")
 #: ``pbs:backup/ct/104/2026_11_10T02_00_00Z`` / ``pbs:backup/vm/104/...``
-#: 注意 ``backup`` 前面是存储名后的冒号（``pbs:``），不是斜杠。
-_PBS_RE = re.compile(r"(?:^|[:/])backup/(ct|vm)/(\d+)(?:/|$)")
+#:
+#: 带 namespace 时路径会多一段（PVE 8.4+ / PBS 3.x 的 ``ns/<ns>/``，不同版本
+#: 放在 ``backup`` 前后都出现过），所以这里**不锚定 ``backup/``**，只认
+#: ``/ct|vm/<vmid>/`` 这段结构 —— 目录型存储的 ``vzdump-*`` 由上面的正则先命中，
+#: 不会落到这里；``vm-104-disk-0`` 这类卷名是连字符，也不会误匹配。
+_PBS_RE = re.compile(r"(?:^|[:/])(ct|vm)/(\d+)(?:/|$)")
 
 #: PVE 在 storage content 里给的 ``format``。PBS 直接写客户机类型；
 #: 目录型存储靠文件格式区分（容器只能是 tar 系，虚拟机是 vma / qcow2 / raw）。

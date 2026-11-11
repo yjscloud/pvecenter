@@ -180,6 +180,10 @@ import type {
   SnapshotCreateRequest,
   Storage,
   StorageContent,
+  PbsConfigItem,
+  PbsOverview,
+  PbsStorageSummary,
+  PbsTestResult,
   TaskDetail,
   TaskInfo,
   UserInfo,
@@ -736,6 +740,17 @@ export const storagesApi = {
     },
     connectionId?: string,
   ) => get<StorageContent[]>('/storages/content', { params, ...scoped(connectionId) }),
+  /**
+   * PBS 存储的备份概况（最近备份时间 / 归档数 / 控制台地址）。
+   *
+   * 只有存在 `type === 'pbs'` 的存储时才需要请求：它要为每个 PBS 存储额外扫
+   * 一遍归档目录，不该在普通的存储页打开时无条件发生。
+   */
+  pbsSummary: (node?: string, connectionId?: string) =>
+    get<PbsStorageSummary[]>('/storages/pbs-summary', {
+      params: node ? { node } : {},
+      ...scoped(connectionId),
+    }),
   deleteContent: (body: { node: string; storage: string; volid: string }) =>
     del<TaskResponse & { deleted?: string }>('/storages/content', {
       params: body,
@@ -773,6 +788,40 @@ export const storagesApi = {
       onProgress,
     );
   },
+};
+
+/* ---------------------------------------------------------------------------
+   PBS（直连概览与只读凭据）
+   --------------------------------------------------------------------------- */
+
+export const pbsApi = {
+  /**
+   * 概览：`pve_storages` 回答「PVE 侧有没有对接 PBS」，`connections` 回答
+   * 「有没有直连凭据」。两个字段合成三态，前端不要自己拼两个接口拼错。
+   */
+  overview: () => get<PbsOverview>('/pbs/overview'),
+  /** 连接列表（密钥只回 token_secret_set，不回明文） */
+  config: () => get<PbsConfigItem[]>('/pbs/config'),
+  /** 整份保存：留空的 token_secret 表示沿用已保存的密钥 */
+  saveConfig: (connections: PbsConfigItem[]) =>
+    put<PbsConfigItem[]>('/pbs/config', { connections }),
+  /**
+   * 连通性测试：`/version` 通过后再探一次仓库与任务能力。
+   *
+   * PBS 没有只读的 system 角色（Sys.Audit 只在 Admin 里），所以“能连上”不代表
+   * “任务/磁盘看得到”。capabilities 让前端能提前说清楚缺什么。
+   */
+  test: (connection: Partial<PbsConfigItem>) =>
+    post<PbsTestResult>('/pbs/config/test', connection),
+  /** 一条 PBS 任务的日志（点任务行时查看）。多连接时必须带 connectionId */
+  taskLog: (params: { upid: string; node?: string; connectionId?: string }) =>
+    get<{ lines: string[] }>('/pbs/task-log', {
+      params: {
+        upid: params.upid,
+        node: params.node,
+        connection_id: params.connectionId,
+      },
+    }),
 };
 
 /* ---------------------------------------------------------------------------

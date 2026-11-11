@@ -447,13 +447,14 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   /* ------------------------------------------------ Nodes: connections */
   'nodesConnections.title': 'Proxmox connections',
   'nodesConnections.subtitle':
-    'The panel reaches every Proxmox VE host through an API token; each connection is independent and equal',
+    'The panel reaches every Proxmox VE host through an API token — connections are independent and equal; PBS read-only access is optional and uses its own credentials',
   /* Shown when a non-admin opens this page directly: the whole page needs
      settings.manage */
   'nodesConnections.noPermissionTitle': 'Administrator access required',
   'nodesConnections.noPermissionBody':
     'Connection settings contain the PVE host address, API tokens and console credentials — only administrators can view or change them.',
   'nodesConnections.backToNodes': 'Back to the node list',
+  'nodesConnections.viewAria': 'Connection layout',
 
   /* -------------------------------------------------------- Network overview */
   'networks.title': 'Network overview',
@@ -708,6 +709,15 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'storages.colAvail': 'Available',
   'storages.colUsage': 'Usage',
   'storages.colShared': 'Shared',
+  'storages.colLastBackup': 'Last backup',
+  'storages.lastBackupHint':
+    'PBS storage only: the newest archive in this datastore, plus the total archive count',
+  'storages.pbsLoading': 'Loading…',
+  'storages.pbsNoBackup': 'No backups yet',
+  'storages.pbsArchiveCount': '{n} archives',
+  'storages.pbsVerifyFailed': 'verify failed',
+  'storages.pbsConsole': 'Open PBS console',
+  'storages.pbsConsoleAria': 'Open the PBS console for {storage} in a new window',
   'storages.browse': 'Browse',
   'storages.contentTitle': 'Browsing · {storage}',
   'storages.avail': '{size} available',

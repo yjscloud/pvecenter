@@ -241,11 +241,14 @@ def _clear_process_caches() -> None:
     * ``reportcache``：巡检报告的内存 TTL 缓存；
     * ``pvecache``：仪表盘 / 连接状态的只读缓存。
     """
-    from app import pvecache, reportcache, store
+    from app import pbs, pvecache, reportcache, store
 
     reportcache._cache.clear()
     reportcache._locks.clear()
     reportcache._refresh_marks.clear()
     pvecache.invalidate()
+    # PBS 概览缓存同样是模块级全局：不清的话，上一个用例桩出来的“已配置”会在
+    # 下一个用例里被直接命中，断言看到的不是自己造的数据。
+    pbs.invalidate_overview()
     # settings 读缓存在清库后必须一起丢：否则「新库」里读到的还是上一个用例的值
     store.clear_settings_cache()

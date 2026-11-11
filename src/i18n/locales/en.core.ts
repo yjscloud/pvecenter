@@ -396,6 +396,8 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'common.copied': 'Copied to clipboard',
   'common.copyFailed': 'Copy failed',
   'common.clipboardDenied': 'The browser blocked clipboard access',
+  'common.viewCards': 'Cards',
+  'common.viewList': 'List',
 
   /* --------------------------------------- Topbar: console status / notifications */
   'status.console.label': 'Console status',

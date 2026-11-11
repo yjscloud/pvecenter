@@ -465,6 +465,23 @@ def _archive_size(item: Dict[str, Any]) -> Optional[int]:
         return None
 
 
+def _verification(raw: Any) -> Optional[Dict[str, str]]:
+    """PBS 归档的校验状态，只留 ``state`` / ``upid`` 两项。
+
+    ``verification`` 是 PVE 对 **PBS 存储**才返回的字段（``dir`` / ``nfs`` 等
+    没有），形状为 ``{"state": "ok" | "failed" | "none", "upid": "..."}``。
+    这里做白名单重建而不是原样透传：PVE 的条目以后加字段时，不该顺带把未知
+    内容发给前端；同时把 ``state`` 统一小写，前端只需认三个值。
+    """
+    if not isinstance(raw, dict):
+        return None
+    state = str(raw.get("state") or "").strip().lower()
+    if not state:
+        return None
+    upid = str(raw.get("upid") or "").strip()
+    return {"state": state, "upid": upid} if upid else {"state": state}
+
+
 async def _assert_restore_target_free(
     client: Any,
     node: str,
@@ -719,6 +736,8 @@ async def list_backups(
                     "protected": pve_flag(item.get("protected", 0)) == 1,
                     "name": _backup_name(volid),
                     "owner": owner,
+                    # 只有 PBS 存储才有；目录型存储这里是 None，前端据此不显示徽标
+                    "verification": _verification(item.get("verification")),
                 }
             )
 

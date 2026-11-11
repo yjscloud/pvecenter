@@ -17,7 +17,7 @@
 
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { clusterApi, connectionsApi, nodesApi } from '../api/endpoints';
 import { errorMessage, isNotConfigured } from '../api/client';
 import { PageShell } from '../components/Layout';
@@ -30,6 +30,11 @@ import { CardSkeleton } from '../components/ui/Spinner';
 import { EmptyState, ErrorState, Notice } from '../components/ui/EmptyState';
 import { SetupRequired } from '../components/SetupRequired';
 import { NodeSubNav } from '../components/NodeSubNav';
+import {
+  PbsRegionSection,
+  PbsStatusStrip,
+  usePbsRegionMerge,
+} from '../components/PbsStatusStrip';
 import {
   IconServer,
   IconRefresh,
@@ -64,6 +69,11 @@ import type { NodeInfo } from '../api/types';
 /* 「集群失去仲裁」提示的关闭状态记忆键 */
 const QUORUM_NOTICE_KEY = 'pve_quorum_notice_dismissed';
 
+/* PBS 是挂在 PVE 分组树**下面**的最后一个分组。它和区域一样默认展开，
+   所以也放进 collapsedGroups：工具栏「全部展开 / 收起」要能一起带上它。 */
+const PBS_GROUP_ID = 'pbs';
+const PBS_GROUP_KEY = `region:${PBS_GROUP_ID}`;
+
 type SortKey = 'name' | 'cpu' | 'mem' | 'disk' | 'status';
 
 const SORT_OPTIONS: Array<{ label: MessageKey; value: SortKey }> = [
@@ -77,6 +87,7 @@ const SORT_OPTIONS: Array<{ label: MessageKey; value: SortKey }> = [
 export function Nodes() {
   const t = useT();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   /* 连接写操作需要 settings.manage，仅管理员可进入表单 */
   const { isAdmin } = useAuth();
   /* 顶栏的集群作用域（空串 = 全部集群）：页头那行读数与下方列表都跟着它，
@@ -276,11 +287,33 @@ export function Nodes() {
     );
   };
 
+  /* ---- PBS 归到哪个机房 ----
+     PBS 连接上也能填「区域 / 机房」（与 PVE 连接同一个字段）。填了、且 PVE 侧
+     存在同名区域，它就是那个机房的备份服务器，卡片直接并进该区域分组；没填或
+     填了 PVE 里没有的区域，仍然是页面最下面单独那一组 —— 不能凭空塞进别人的
+     机房，那会让人以为这台 PBS 归那个机房管。
+
+     判断要用的 PBS 概览与下面那组分组的缓存是同一份（queryKey 相同）。 */
+  const pveRegions = useMemo(
+    () => regionGroups.map((g) => g.id).filter(Boolean),
+    [regionGroups],
+  );
+  const {
+    mergedRegions,
+    hasStandalone: hasStandalonePbs,
+    pbsCountOfRegion,
+  } = usePbsRegionMerge(pveRegions);
+
   /* 工具栏那个「全部展开 / 全部收起」要覆盖两级，但两级语义相反，
-     所以分成两组 id：一组往 collapsedGroups 里放，一组往 openConns 里放。 */
+     所以分成两组 id：一组往 collapsedGroups 里放，一组往 openConns 里放。
+     底部那个 PBS 分组全部并入区域后就不存在了，不能再把它的 id 算进来 ——
+     否则「全部收起」永远差一组，「全部展开」也不会出现。 */
   const regionIds = useMemo(
-    () => (showRegion ? regionGroups.map((g) => g.id) : []),
-    [regionGroups, showRegion],
+    () => [
+      ...(showRegion ? regionGroups.map((g) => g.id) : []),
+      ...(hasStandalonePbs ? [PBS_GROUP_ID] : []),
+    ],
+    [regionGroups, showRegion, hasStandalonePbs],
   );
   const connIds = useMemo(
     () => (grouped ? groups.map((g) => g.id) : []),
@@ -289,6 +322,17 @@ export function Nodes() {
   const allCollapsed =
     openConns.length === 0 &&
     regionIds.every((id) => collapsedGroups.includes(`region:${id}`));
+
+  /* 没能归进任何机房的 PBS 排在 PVE 分组**下面**。定义成变量挂在主体条件之外：
+     PVE 加载中、报错、空态时备份链路的状态照样要看得见，它跟 PVE 查询是两条
+     独立链路。全部并进区域后这一组不渲染（由 hasStandalonePbs 决定）。 */
+  const pbsGroup = (
+    <PbsStatusStrip
+      open={!collapsedGroups.includes(PBS_GROUP_KEY)}
+      onToggle={() => toggleGroup(PBS_GROUP_KEY)}
+      excludeRegions={[...mergedRegions]}
+    />
+  );
 
   const connectionOptions = useMemo(() => {
     const seen = new Map<string, string>();
@@ -410,6 +454,9 @@ export function Nodes() {
               void nodesQuery.refetch();
               void fleetQuery.refetch();
               void connStatusQuery.refetch();
+              /* PBS 状态条独立轮询：页头「刷新」理应把它一起带上，
+                 否则用户点完看到别的都更新了、只有它停在旧值 */
+              void queryClient.invalidateQueries({ queryKey: ['pbs', 'overview'] });
             }}
             loading={nodesQuery.isFetching && !nodesQuery.isLoading}
           >
@@ -621,6 +668,8 @@ export function Nodes() {
               (n, group) => n + group.nodes.length,
               0,
             );
+            /* 并进这个区域的 PBS 台数：类型单独报，但加起来要和下面看到的行数一致 */
+            const regionPbsCount = pbsCountOfRegion(region.id);
             return (
               <section className="tree-group" key={`region:${region.id}`}>
                 {/* 一级：区域 / 机房。整条都是开关 */}
@@ -643,6 +692,14 @@ export function Nodes() {
                       <Badge variant="neutral" size="sm">
                         {t('nodes.nodeCount', { n: regionNodeCount })}
                       </Badge>
+                      {/* 这个区域里还并进了几台 PBS。不并进节点数里 ——
+                          节点是 PVE 的机器，PBS 是备份服务器，混在一起数会
+                          让「3 台节点」和下面只剩 2 张节点卡对不上 */}
+                      {regionPbsCount > 0 ? (
+                        <Badge variant="neutral" size="sm">
+                          {t('pbs.stripPbsCount', { n: regionPbsCount })}
+                        </Badge>
+                      ) : null}
                     </span>
                   </button>
                 ) : null}
@@ -717,6 +774,11 @@ export function Nodes() {
                         </section>
                       );
                     })}
+
+                    {/* 这个机房的 PBS：区域对上了就并在这里，不再单独成组 */}
+                    {mergedRegions.has(region.id) ? (
+                      <PbsRegionSection region={region.id} />
+                    ) : null}
                   </div>
                 )}
               </section>
@@ -724,6 +786,10 @@ export function Nodes() {
           })}
         </div>
       )}
+
+      {/* 备份链路的健康状态：排在 PVE 分组之后，折叠状态归本页统一管。
+          全部并进各自的机房后这一组不再出现（PBS 卡片已经在区域里了）。 */}
+      {hasStandalonePbs ? pbsGroup : null}
     </PageShell>
   );
 }

@@ -384,6 +384,11 @@ export const zhCore = {
   'common.copied': '已复制到剪贴板',
   'common.copyFailed': '复制失败',
   'common.clipboardDenied': '浏览器不允许访问剪贴板',
+  /* 卡片 / 列表视图切换：节点连接、安全基线、端口防护三处共用同一枚分段控件，
+     它们分属不同词条域（node / security）。放 core 才不会因为某个页面没加载
+     另一个域的词条，把这枚控件渲染成一片原样的键名。 */
+  'common.viewCards': '卡片',
+  'common.viewList': '列表',
 
   /* --------------------------------------------- 顶栏：控制台状态 / 消息中心 */
   'status.console.label': '控制台状态',

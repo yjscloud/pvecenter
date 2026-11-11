@@ -444,12 +444,13 @@ export const zhNode = {
   /* --------------------------------------------------- 节点：连接配置 */
   'nodesConnections.title': 'Proxmox 连接',
   'nodesConnections.subtitle':
-    '面板通过 API Token 访问各台 Proxmox VE；每台连接相互独立、地位相同',
+    '面板通过 API Token 访问各台 Proxmox VE，每台连接相互独立、地位相同；PBS 只读接入是可选项，凭据体系独立',
   /* 非管理员直接访问这一页时的提示：整页属于 settings.manage */
   'nodesConnections.noPermissionTitle': '需要管理员权限',
   'nodesConnections.noPermissionBody':
     '连接配置包含 PVE 主机地址、API 令牌与控制台凭据，只有管理员可以查看和修改。',
   'nodesConnections.backToNodes': '返回节点列表',
+  'nodesConnections.viewAria': '连接展示方式',
 
   /* ------------------------------------------------------- 网络总览 */
   'networks.title': '网络配置',
@@ -511,7 +512,7 @@ export const zhNode = {
   /* 页头走**全机队**口径：多 PVE 面板里不能再只报默认那台的版本与仲裁，
      否则其余集群失去仲裁时页头照样一片绿。 */
   'nodes.subtitleFleet':
-    '{connections} 个 PVE 连接 · {clusters} 个集群 · {online}/{total} 节点在线 · {quorum}',
+    '{connections} 台 PVE 连接 · {clusters} 个集群 · {online}/{total} 台节点在线 · {quorum}',
   'nodes.quorumOk': '仲裁正常',
   'nodes.quorumBadCount': '{n} 个集群仲裁异常',
   'nodes.addNode': '添加节点',
@@ -536,7 +537,7 @@ export const zhNode = {
   'nodes.sortAria': '排序方式',
   'nodes.allHosts': '全部 PVE 集群',
   'nodes.defaultConnection': '默认集群',
-  'nodes.showing': '显示 {shown} / {total} 个节点',
+  'nodes.showing': '显示 {shown} / {total} 台节点',
   'nodes.loadFailed': '无法加载节点列表',
   'nodes.emptyTitle': '暂无节点',
   'nodes.emptyAdmin':
@@ -547,9 +548,10 @@ export const zhNode = {
   'nodes.noMatchTitle': '没有匹配的节点',
   'nodes.noMatchDesc': '调整搜索关键词或来源主机筛选试试。',
   'nodes.onlineRatio': '{online}/{total} 在线',
-  'nodes.pveCount': '{n} 个 PVE',
-  'nodes.nodeCount': '{n} 个节点',
-  'nodes.offlineCount': '{n} 个离线',
+  /* 机器按「台」数：PVE、节点、离线台数统一台 */
+  'nodes.pveCount': '{n} 台 PVE',
+  'nodes.nodeCount': '{n} 台节点',
+  'nodes.offlineCount': '{n} 台离线',
   /* 分组默认展开，这两个动作作用于全部分组 */
   'nodes.expandAll': '全部展开',
   'nodes.collapseAll': '全部收起',
@@ -690,6 +692,15 @@ export const zhNode = {
   'storages.colAvail': '可用',
   'storages.colUsage': '使用率',
   'storages.colShared': '共享',
+  'storages.colLastBackup': '最近备份',
+  'storages.lastBackupHint':
+    '只有 PBS 存储会显示：时间取该存储里最新一份归档，数量为归档总数',
+  'storages.pbsLoading': '读取中…',
+  'storages.pbsNoBackup': '暂无备份',
+  'storages.pbsArchiveCount': '{n} 份归档',
+  'storages.pbsVerifyFailed': '校验失败',
+  'storages.pbsConsole': '打开 PBS 控制台',
+  'storages.pbsConsoleAria': '在新窗口打开 {storage} 的 PBS 控制台',
   'storages.browse': '浏览',
   'storages.contentTitle': '内容浏览 · {storage}',
   'storages.avail': '可用 {size}',

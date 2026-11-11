@@ -1699,6 +1699,42 @@ class QuarantineReleaseIn(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
+# ---------------------------------------------------------------- PBS
+class PbsConnectionIn(BaseModel):
+    """一条 PBS 只读连接。
+
+    ``token_secret`` 留空表示**沿用已保存的密钥**：列表接口从不回显密钥，
+    编辑已有连接时用户不重填也不该把凭据清空。
+    """
+
+    id: str = ""
+    # 名称 / 区域与 PVE 连接（ConnectionConfigIn）同义：name 用于区分多台 PBS，
+    # region 只是界面分组标签，不参与连接逻辑；老记录没有 region 键时按空串兜底
+    name: str = ""
+    region: str = ""
+    host: str
+    port: int = Field(default=8007, ge=1, le=65535)
+    # PBS 的 token id 形如 user@realm!tokenname
+    token_id: str
+    token_secret: str = ""
+    # 留空则跟随环境默认（生产默认校验证书）
+    verify_ssl: Optional[bool] = None
+    # 钉扎用的证书 / CA PEM；PBS 自签时填它比“关掉校验”安全
+    ca_cert: str = ""
+    # 多节点 PBS 时指定读哪一台；留空取 /nodes 的第一台
+    node: str = ""
+
+
+class PbsConfigIn(BaseModel):
+    """整体保存 PBS 连接列表（列表为空 = 关闭直连）。"""
+
+    connections: List[PbsConnectionIn] = Field(default_factory=list)
+
+
+class PbsConnectionTestIn(PbsConnectionIn):
+    """连通性测试：只需能拼出一次 /version 请求。"""
+
+
 # ---------------------------------------------------------------- 备份防护
 class BackupProtectIn(BaseModel):
     """把一个备份卷登记为「受保护」（面板层禁止删除 + 定期核对告警）。"""

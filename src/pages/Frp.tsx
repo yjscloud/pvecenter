@@ -21,6 +21,8 @@ import { Input, Select, Switch } from "../components/ui/Input";
 import { Modal } from "../components/ui/Modal";
 import {
   IconNetwork,
+  /* 页面标题用与侧边栏同一枚隧道字形：同一个功能在导航与页头是同一个标志 */
+  IconFrp,
   IconPlay,
   IconStop,
   IconPlus,
@@ -54,7 +56,7 @@ export function Frp() {
     <PageShell
       title={
         <>
-          <IconNetwork size={20} />
+          <IconFrp size={20} />
           {t('frp.title')}
         </>
       }

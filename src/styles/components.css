@@ -7803,3 +7803,1190 @@ body.is-col-resizing * {
 
   .cert-step-ms { display: none; }
 }
+
+/* ---------------------------------------------------------------- PBS 概览 */
+/* 备份页顶部的只读卡片：三态由组件决定，这里只管排版。自上而下一路收窄——
+   连接头（名称 / 版本 / 地址）→ 阈值告警条 → 主仓库大数字 + 4 个伴随指标
+   → 次要仓库一行一条 → 任务列表（默认 3 条，可展开）。 */
+.pbs-l1 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 4px 0;
+}
+
+.pbs-connection {
+  padding: 14px 0;
+  border-top: 1px solid var(--border-muted);
+}
+
+.pbs-connection:first-of-type {
+  border-top: 0;
+  padding-top: 4px;
+}
+
+.pbs-connection-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pbs-connection-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.pbs-connection-error {
+  margin: 8px 0 0;
+  word-break: break-word;
+}
+
+/* 阈值告警条：多块仓库同时超限时压成一行，正常时整条不渲染 */
+.pbs-alert {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+}
+
+.pbs-alert strong {
+  font-weight: 600;
+}
+
+.pbs-alert.is-warn {
+  background: var(--warning-dim);
+  color: var(--warning);
+}
+
+.pbs-alert.is-crit {
+  background: var(--danger-dim);
+  color: var(--danger);
+}
+
+/* 监控面板：左边主仓库，右边 2×2 主机指标格。主卡白底、副格灰底 ——
+   用底色差异分主次，比把字号加粗更安静。磁盘 / GC 不在这里占格：
+   它们整行铺在面板下面，既能把二级信息放全，也不会把主卡拉高留白。 */
+.pbs-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+  align-items: stretch;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.pbs-panel-main {
+  display: flex;
+  min-width: 0;
+}
+
+.pbs-panel-main > .pbs-hero {
+  flex: 1;
+}
+
+/* 右列：指标格在上、状态胶囊在下，两者一起跟主卡等高 */
+.pbs-side {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 合并进面板的备份 KPI：与上面的监控区属于同一张卡，
+   去掉各自的白卡边框、换成灰底格 —— 否则就是「卡里再套四张卡」。 */
+.pbs-kpis {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-muted);
+}
+
+.pbs-kpis .kpi-card {
+  background: var(--bg-elevated);
+  background-image: none;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* 卡片自带的顶部品牌高光线在这里是多余的一层：数字本身已经是渐变蓝 */
+.pbs-kpis .kpi-card::before {
+  display: none;
+}
+
+.pbs-tiles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.pbs-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  min-width: 0;
+}
+
+.pbs-tile-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
+
+.pbs-tile-value {
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 备注行（内存百分比 / 核数 / 1m5m15m）：有值才占位 */
+.pbs-tile-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pbs-tile-sub:empty {
+  display: none;
+}
+
+/* 内存备注行：细条 + 百分比。8% 这种数字单看不直观，一条 3px 的条更省事 */
+.pbs-tile-sub.is-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pbs-mini-bar {
+  flex: 1;
+  min-width: 24px;
+  height: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.pbs-mini-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--grad-accent);
+}
+
+/* 主仓库 = 面板里唯一的「大数字」：仓库名 → 使用率 + 剩余 → 进度条 → 明细。
+   白底 + 细边框 + 极轻阴影，跟右侧灰底指标格拉开一层；异常态只换描边颜色，
+   不叠底色 —— 顶部已经有告警条，别两处抢视线。 */
+.pbs-hero {
+  display: flex;
+  flex-direction: column;
+  /* 被右列拉高时把多余高度摊到各行之间（标题顶、明细底），
+     而不是整块居中在上下各留一大片白 */
+  justify-content: space-between;
+  gap: 9px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-sm);
+  min-width: 0;
+}
+
+.pbs-hero.is-warn {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border-muted));
+}
+
+.pbs-hero.is-crit {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border-muted));
+  background: var(--danger-dim);
+}
+
+/* 读不到容量（缺 Datastore.Audit / 端点 404）：给个等高占位，别把右栏顶歪 */
+.pbs-hero.is-empty {
+  justify-content: center;
+  gap: 6px;
+  min-height: 96px;
+}
+
+/* 标题行：仓库名（这是哪块盘）+ 右侧「使用率」定性标签 */
+.pbs-hero-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pbs-hero-name {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 维护模式标记：跟仓库名同一行，用告警色但只占一个胶囊 */
+.pbs-hero-tag {
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--warning-dim);
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* 左侧「使用率 → 大数字」两行，与右侧容量三联共用同一基线 */
+.pbs-hero-gauge {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pbs-hero-main {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+}
+
+/* 容量三联（已用 / 剩余 / 总容量）：靠右横排，把大数字右边那半行填满。
+   三格之间用发丝分隔线，读起来是一组数，而不是三块无关的东西。 */
+.pbs-hero-stats {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  align-items: flex-end;
+  gap: 0 14px;
+  margin-left: auto;
+  min-width: 0;
+}
+
+.pbs-hero-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  padding-left: 14px;
+  border-left: 1px solid var(--border-muted);
+  min-width: 0;
+}
+
+.pbs-hero-stat:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+
+.pbs-hero-stat b {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.pbs-hero-value {
+  font-size: 34px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.pbs-hero-value.is-warn {
+  color: var(--warning);
+}
+
+.pbs-hero-value.is-crit {
+  color: var(--danger);
+}
+
+.pbs-hero-unit {
+  font-size: 15px;
+  font-weight: 500;
+  margin-left: 2px;
+  color: var(--text-muted);
+}
+
+.pbs-hero-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* 8px 是这条进度条的下限：再细，缩放后的页面上就看不见了。
+   正常态用品牌蓝渐变（与下方 KPI 图标的蓝同一支），越线才换成橙 / 红。 */
+.pbs-hero-bar {
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.pbs-hero-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--grad-accent);
+  transition: width var(--transition);
+}
+
+.pbs-hero.is-warn .pbs-hero-bar > i {
+  background: var(--warning);
+}
+
+.pbs-hero.is-crit .pbs-hero-bar > i {
+  background: var(--danger);
+}
+
+/* 明细一行：GC 计划 / 新备份自动校验。容量三个数已经在三联里，这里不重复 */
+.pbs-hero-sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+/* 运行状态条：磁盘健康 + 垃圾回收，整行铺开、永远渲染。
+   左侧色点与数值同色：绿＝正常、红＝异常、蓝＝进行中、灰＝读不到。 */
+.pbs-status {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.pbs-status-item {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  min-width: 0;
+}
+
+.pbs-status-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.pbs-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex: none;
+}
+
+.pbs-status-value {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* 副行（盘容量 / 盘型 / 耗时）：右对齐吃掉剩余宽度，窄了省略 */
+.pbs-status-sub {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pbs-status-item.is-ok {
+  background: var(--success-dim);
+}
+
+.pbs-status-item.is-ok .pbs-status-dot {
+  background: var(--success);
+}
+
+.pbs-status-item.is-ok .pbs-status-value {
+  color: var(--success);
+}
+
+.pbs-status-item.is-bad {
+  background: var(--danger-dim);
+}
+
+.pbs-status-item.is-bad .pbs-status-dot {
+  background: var(--danger);
+}
+
+.pbs-status-item.is-bad .pbs-status-value,
+.pbs-status-item.is-bad .pbs-status-sub {
+  color: var(--danger);
+}
+
+.pbs-status-item.is-busy {
+  background: var(--info-dim);
+}
+
+.pbs-status-item.is-busy .pbs-status-dot {
+  background: var(--info);
+}
+
+.pbs-status-item.is-busy .pbs-status-value {
+  color: var(--info);
+}
+
+/* ---- 节点页的 PBS 分组 ----
+   与上面的 PVE 三级树同款：外层 .tree-group，标题栏复用 .tree-head.is-region，
+   子级放在 .tree-body 里，每台 PBS 一张与 NodeCard 完全同款的 Card。
+   分组默认展开（和区域一样），卡片默认收起（和节点一样）；开合状态由节点页
+   统一管，工具栏「全部展开 / 收起」能一起覆盖。 */
+.pbs-strip-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* tree-head 本身是 100% 宽；这里让标题栏吃掉剩余宽度，操作按钮排在它右边 */
+.pbs-strip-toggle {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+}
+
+.pbs-strip-toggle .tree-meta {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.pbs-strip-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+/* 子级就是 PVE 的 NodeCard：`.tree-body` 的竖线 + 16px 行距照搬，
+   卡头 / 折叠箭头 / 指标条全部走全局 `.card` 与 `.node-metric` 样式，
+   这里不再另写一套「PBS 专用行」，两种卡片才不会越改越不像。 */
+.pbs-strip-body {
+  gap: 16px;
+}
+
+/* 并进区域分组的 PBS：不再单独成组、也不再加一层缩进竖线 —— 它和该机房里的
+   PVE 连接是同级的「这台机器提供什么」，行距与 .tree-body 对齐即可。 */
+.pbs-region-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ---- 单台 PBS：二级连接条 + 三级节点卡 ----
+   连接条复用 `.tree-head`（与 PVE 连接那一级同款）；节点卡直接用全局 `.card`
+   与 `.node-card-body`，不再另写一套「PBS 专用行」，两种卡片才不会越改越不像。 */
+
+/* 1000px 以下标题栏就放不下「箭头 + 名称 + 两个按钮」了。
+   不折行的话按钮会把「PBS 备份服务器」挤成两行，和上面 PVE 分组头的
+   单行节奏对不上。 */
+@media (max-width: 1000px) {
+  /* 标题栏独占一行，刷新 / 管理落到第二行右侧 */
+  .pbs-strip-head {
+    flex-wrap: wrap;
+  }
+
+  /* 标题栏仍然占满整行：和上面 PVE 分组头一样是通栏的浅底条。
+     刷新 / 管理是它下面那一行（不能塞进 button 里），窄屏多一行可以接受，
+     但把通栏条砍成半截会立刻失去层级一致性。 */
+  .pbs-strip-toggle {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+  }
+
+  /* 名称不能被徽章挤成两行：PVE 分组名也从不换行。统计徽章整体落到第二行，
+     对齐到箭头之后的文字起点 */
+  .pbs-strip-toggle .tree-name {
+    white-space: nowrap;
+  }
+
+  .pbs-strip-toggle .tree-meta {
+    flex-basis: 100%;
+    margin-left: 0;
+    justify-content: flex-start;
+    padding-left: 23px;
+  }
+
+  .pbs-strip-actions {
+    margin-left: auto;
+  }
+}
+
+/* ---- 多节点：聚合带 + 节点对比表 ----
+   单节点时不渲染这两块（没有对比对象，它们只是把同样的信息再说一遍）。
+   聚合带回答「所有节点加起来怎么样」，节点表回答「哪一台不一样」。 */
+.pbs-fleet {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+.pbs-fleet-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 色点跟着文字颜色走：一处改颜色，点和字不会脱节 */
+.pbs-fleet-chip .pbs-status-dot {
+  background: currentColor;
+}
+
+.pbs-fleet-chip.is-ok {
+  color: var(--success);
+}
+
+.pbs-fleet-chip.is-warn {
+  color: var(--warning);
+  background: var(--warning-dim);
+}
+
+.pbs-fleet-chip.is-bad {
+  color: var(--danger);
+  background: var(--danger-dim);
+}
+
+.pbs-fleet-chip.is-busy {
+  color: var(--info);
+  background: var(--info-dim);
+}
+
+.pbs-fleet-chip.is-unknown {
+  color: var(--text-muted);
+}
+
+.pbs-nodes-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0 6px;
+}
+
+.pbs-node-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+/* 一行一台 PBS：名称 → 使用率 → 剩余 → 磁盘 → GC → 最近任务 → 折叠箭头。
+   列顺序固定，扫视时同一列在同一个位置，这才是「对比」而不是「罗列」。 */
+.pbs-node-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.15fr) minmax(100px, 1fr) 78px auto auto auto 18px;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.pbs-node-row:hover {
+  background: var(--bg-hover);
+}
+
+.pbs-node-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.pbs-node.is-open > .pbs-node-row {
+  background: var(--bg-hover);
+}
+
+.pbs-node-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pbs-node-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pbs-node-ver {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* 节点健康点：红 / 橙 / 灰 / 绿，与聚合带、状态条同一套语义 */
+.pbs-health-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--text-muted);
+}
+
+.pbs-health-dot.is-ok {
+  background: var(--success);
+}
+
+.pbs-health-dot.is-warn {
+  background: var(--warning);
+}
+
+.pbs-health-dot.is-crit {
+  background: var(--danger);
+}
+
+.pbs-health-dot.is-unknown {
+  background: var(--text-muted);
+}
+
+.pbs-node-usage {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pbs-node-bar {
+  flex: 1;
+  min-width: 32px;
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.pbs-node-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--grad-accent);
+}
+
+.pbs-node-usage.is-warn .pbs-node-bar > i {
+  background: var(--warning);
+}
+
+.pbs-node-usage.is-crit .pbs-node-bar > i {
+  background: var(--danger);
+}
+
+.pbs-node-pct {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.pbs-node-usage.is-warn .pbs-node-pct {
+  color: var(--warning);
+}
+
+.pbs-node-usage.is-crit .pbs-node-pct {
+  color: var(--danger);
+}
+
+.pbs-node-usage.is-unknown .pbs-node-pct {
+  color: var(--text-muted);
+}
+
+.pbs-node-free {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.pbs-node-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.pbs-node-flag .pbs-status-dot {
+  background: currentColor;
+}
+
+.pbs-node-flag.is-ok {
+  color: var(--success);
+}
+
+.pbs-node-flag.is-bad {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.pbs-node-flag.is-busy {
+  color: var(--info);
+}
+
+.pbs-node-task {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pbs-node-caret {
+  display: inline-flex;
+  justify-content: flex-end;
+  color: var(--text-muted);
+}
+
+/* 展开的明细：和行隔一条虚线，视觉上仍属于这一台节点 */
+.pbs-node-body {
+  padding: 2px 12px 14px;
+  border-top: 1px dashed var(--border-muted);
+  background: var(--bg-surface);
+}
+
+.pbs-node-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 0 2px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.pbs-connection.is-embedded {
+  padding: 6px 0 0;
+  border-top: 0;
+}
+
+@media (max-width: 1100px) {
+  /* 收起「最近任务」列：它是最次要的一列，挤掉它才能保住使用率与状态 */
+  .pbs-node-row {
+    grid-template-columns: minmax(110px, 1.2fr) minmax(90px, 1fr) 72px auto auto 18px;
+  }
+
+  .pbs-node-task {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .pbs-node-row {
+    grid-template-columns: minmax(100px, 1.2fr) minmax(80px, 1fr) auto auto 18px;
+  }
+
+  .pbs-node-free {
+    display: none;
+  }
+}
+
+/* 次要仓库：名称 · 细条 · 百分比 · 用量，一行一条，不与主仓库抢大数字 */
+.pbs-store-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+}
+
+.pbs-store-row {
+  display: grid;
+  grid-template-columns: minmax(64px, 150px) minmax(0, 1fr) 56px auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  font-size: var(--font-size-sm);
+}
+
+.pbs-store-row:hover {
+  background: var(--bg-hover);
+}
+
+.pbs-store-name {
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pbs-store-bar {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.pbs-store-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--success);
+}
+
+.pbs-store-pct {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.pbs-store-row.is-warn .pbs-store-pct {
+  color: var(--warning);
+}
+
+.pbs-store-row.is-crit .pbs-store-pct {
+  color: var(--danger);
+}
+
+.pbs-store-row.is-warn .pbs-store-bar > i {
+  background: var(--warning);
+}
+
+.pbs-store-row.is-crit .pbs-store-bar > i {
+  background: var(--danger);
+}
+
+.pbs-store-size {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+/* 「节点状态读不到（缺 Sys.Audit）」只提一句，不占一整栏 */
+.pbs-need-audit {
+  margin-top: 8px;
+}
+
+.pbs-tasks {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-muted);
+}
+
+/* 标题栏：任务名 → 「仅备份与校验」→ 展开/收起。筛选说明跟在标题后，
+   展开按钮靠右，收起态也不会把它挤到标题旁边。 */
+.pbs-tasks-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.pbs-tasks-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.pbs-tasks-toggle {
+  margin-left: auto;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  font: inherit;
+  font-size: var(--font-size-xs);
+  color: var(--info);
+  cursor: pointer;
+}
+
+.pbs-tasks-toggle:hover {
+  background: var(--bg-hover);
+}
+
+.pbs-task-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 宽屏排两列：任务行只有五段短信息，一行铺满 1100px 会空掉右半边 */
+@media (min-width: 1100px) {
+  .pbs-task-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2px 28px;
+  }
+}
+
+/* 第 3 列必须按内容宽度（auto）：状态徽章是 grid item，落在 1fr 列上会被
+   stretch 拉满整行，绿底铺成一条横带。让最后一列时间吃掉剩余宽度。 */
+/* 耗时占掉剩余宽度并右对齐：右侧形成「耗时 / 多久之前」两条数值列，
+   中间不再是一整片空白。 */
+.pbs-task-row {
+  display: grid;
+  grid-template-columns: 76px 56px auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+/* 耗时紧跟在状态后面，把右侧留给「多久之前」；两者都右对齐，读起来是一列 */
+.pbs-task-dur {
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.pbs-task-kind {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pbs-task-target {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pbs-task-time {
+  color: var(--text-muted);
+  text-align: right;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* 中等宽度先折成一列：主仓库在上、指标格在下，两栏挤在一起时百分比会被压断 */
+@media (max-width: 900px) {
+  .pbs-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 状态条也跟着折：两栏各占一半时，盘容量那一行会被省略号吃掉 */
+  .pbs-status {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .pbs-hero {
+    padding: 12px 14px;
+  }
+
+  .pbs-hero-value {
+    font-size: 28px;
+  }
+
+  /* 大数字与容量三联改上下排，三格等分整行 —— 挤在一行时百分比会被压断 */
+  .pbs-hero-main {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .pbs-hero-stats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0 10px;
+  }
+
+  .pbs-hero-stat {
+    align-items: flex-start;
+    padding-left: 10px;
+  }
+
+  .pbs-hero-stat b {
+    font-size: 14px;
+  }
+
+  .pbs-status-item {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .pbs-status-sub {
+    grid-column: 1 / -1;
+    text-align: left;
+  }
+
+  /* 节点行拆成三行：名称 + 箭头 / 使用率条 / 两个状态点。
+     硬塞成一行时 680px 以下每列都开始省略号，反而什么都看不清。 */
+  .pbs-node-row {
+    grid-template-columns: minmax(0, 1fr) 18px;
+    gap: 6px 8px;
+  }
+
+  .pbs-node-id {
+    order: 1;
+  }
+
+  .pbs-node-caret {
+    order: 2;
+  }
+
+  .pbs-node-usage {
+    order: 3;
+    grid-column: 1 / -1;
+  }
+
+  .pbs-node-flag {
+    order: 4;
+  }
+
+  /* 窄屏只剩「名称 / 百分比 / 用量」，细条挤成一小截反而不如不给 */
+  .pbs-store-row {
+    grid-template-columns: minmax(0, 1fr) 52px auto;
+  }
+
+  .pbs-store-bar { display: none; }
+
+  .pbs-task-row {
+    grid-template-columns: 80px auto minmax(0, 1fr) auto;
+  }
+
+  .pbs-task-target { display: none; }
+}
+
+/* PBS 只读接入的列表与表单已改用连接页通用样式（.set-conn-grid / dyn-row），
+   原先平铺表单的 .pbs-config-* 规则随之删除。 */
+
+/* ---- PBS 接入指引弹窗 ----
+   分步正文，滚动交给 .modal-body（自带 overflow-y）；这里只管节奏与代码块。
+   窄屏把「标签 | 值」两列压成一列，140px 的标签列在手机上会把值挤成窄条。 */
+.pbs-guide {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.pbs-guide-step {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pbs-guide-step .set-form-block-head {
+  margin: 0;
+}
+
+.pbs-guide-step p {
+  margin: 0;
+}
+
+.pbs-guide-step .code-block {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  max-height: 220px;
+}
+
+.pbs-guide .desc-item {
+  font-size: var(--font-size-sm);
+}
+
+@media (max-width: 640px) {
+  .pbs-guide .desc-item {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+    padding: 8px 0;
+  }
+
+  /* 指引按钮在窄屏只留图标：标题栏右侧还有状态徽章与「添加」，文字会挤行 */
+  .pbs-guide-btn .btn-label {
+    display: none;
+  }
+}
+
+/* 任务行是按钮（点开看日志）：清掉 button 的默认外观，保留 grid 排版 */
+button.pbs-task-row {
+  width: 100%;
+  border: 0;
+  background: none;
+  padding: 7px 9px;
+  border-radius: var(--radius);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+button.pbs-task-row:hover {
+  background: var(--bg-hover);
+}
+
+button.pbs-task-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 磁盘与 GC 已升级成指标格（.pbs-tile），胶囊那套样式随之删除 */
+
+/* 任务日志：等宽、可滚动，不让长行把弹窗撑破 */
+.pbs-log {
+  margin: 0;
+  max-height: 52vh;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--bg-subtle, rgba(127, 127, 127, 0.06));
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

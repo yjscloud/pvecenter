@@ -2212,6 +2212,29 @@
   font-weight: 600;
 }
 
+/* 子页面切换与「页面级」开关同处一行：左边是子页面导航，右边是卡片 / 列表这类
+   作用于整页的偏好。放在页头时它和下面的卡片右边缘对不齐，还会单独占掉一行
+   高度；这一行本来就空着右半边。
+
+   `.subnav` 自带的 align-self: flex-start 是给「独占一行」的场景写的，
+   进了这行要按中线对齐：两种控件高度差 3~4px，顶对齐会看出错位。 */
+.subnav-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.subnav-row > .subnav {
+  align-self: center;
+}
+
+/* 折行时保持靠右：space-between 只对行内多个元素生效，独占一行会滑到左边 */
+.subnav-row > .segmented {
+  margin-left: auto;
+}
+
 /* --- 作用域切换条 --- */
 /* 这是整页的主控，用一层很淡的品牌色和品牌色描边把它从「内容卡片」里区分出来。
    SSH 安全（选主机）与节点页（选默认读取的 PVE）共用这一套外观。 */
@@ -3443,6 +3466,114 @@
   flex-wrap: wrap;
   padding-top: 2px;
   border-top: none;
+}
+
+/* ---- 连接配置：列表视图 -------------------------------------------------
+   两种视图共用**同一份 DOM**：编辑 / 自检 / 删除 / 节点展开这些按钮都带状态，
+   复制一套 JSX 迟早会漏掉一个。列表视图只把同一张卡重排成一行 ——
+   左：身份，中：凭据与节点标签，右：操作；展开的节点芯片占第二行整行。
+   PVE 与 PBS 两张卡都挂 `.conn-view-list`，切换一次全页一起变。 */
+.conn-view-list .set-conn-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.conn-view-list .set-conn-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 10px 12px 10px 15px;
+  border-radius: var(--radius-sm);
+}
+
+/* 列表里不要卡片的悬浮抬升：整行上下移动会把相邻两行挤开 */
+.conn-view-list .set-conn-card:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.conn-view-list .set-conn-card::before {
+  width: 2px;
+}
+
+.conn-view-list .set-conn-top {
+  grid-column: 1;
+  grid-row: 1;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+
+.conn-view-list .set-conn-tags {
+  grid-column: 2;
+  grid-row: 1;
+  gap: 6px 12px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.conn-view-list .set-conn-actions {
+  grid-column: 3;
+  grid-row: 1;
+  padding-top: 0;
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+}
+
+.conn-view-list .conn-nodes,
+.conn-view-list .conn-nodes-empty {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
+@media (max-width: 1000px) {
+  .conn-view-list .set-conn-card {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .conn-view-list .set-conn-tags {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .conn-view-list .set-conn-actions {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .conn-view-list .conn-nodes,
+  .conn-view-list .conn-nodes-empty {
+    grid-row: 3;
+  }
+}
+
+@media (max-width: 640px) {
+  .conn-view-list .set-conn-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .conn-view-list .set-conn-top {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .conn-view-list .set-conn-actions {
+    grid-column: 1;
+    grid-row: 2;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .conn-view-list .set-conn-tags {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .conn-view-list .conn-nodes,
+  .conn-view-list .conn-nodes-empty {
+    grid-row: 4;
+  }
 }
 
 /* ---- 表单分组标题 ---- */

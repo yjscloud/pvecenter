@@ -494,8 +494,6 @@ export const enSecurity: Partial<Record<MessageKey, string>> = {
   'ssh.trusted': 'Marked {ip} as known',
   'ssh.untrusted': 'Removed the known mark from {ip}',
   'ssh.trustNote': 'Marked as known by the panel',
-  'nodes.viewCards': 'Cards',
-  'nodes.viewList': 'List',
 
   /* ---------------------------------------------------- Security baseline */
   'baseline.title': 'Security baseline',

@@ -414,10 +414,21 @@ METRIC_LABELS = {
     "offline": "离线",
     # 备份失败率：由 /nodes/{node}/tasks 里最近的 vzdump 任务统计得出
     "backup": "备份失败",
+    # 仅由 app.verifyguard 的内部状态使用（PBS 归档 verify 未通过），
+    # 不出现在规则表的指标下拉里 —— 它是事件而不是可配阈值的百分比
+    "backup_verify": "备份校验",
+    # 仅由 app.pbsguard 使用：GC 失败 / 磁盘健康异常
+    "pbs_health": "PBS 运行状态",
+    # 仅由 app.pbsguard 使用：备份盘（datastore）使用率越过 85 / 95 两条线
+    "pbs_capacity": "备份盘容量",
 }
 
 # 这些指标的「值」不是 0-100 的百分比，卡片与历史记录要换一种呈现方式
 STATE_METRICS = {"offline", "backup"}
+
+# 只在内部巡检状态里出现的指标：标签要能翻译，但不是用户可配的规则指标
+# （它们没有阈值语义，出现在规则表里只会让评估分支走进百分比逻辑）
+INTERNAL_METRICS = {"backup_verify", "pbs_health", "pbs_capacity"}
 
 # 判定「在线」的期望状态：节点是 online，虚拟机是 running
 EXPECTED_STATUS = {"node": "online", "vm": "running"}
@@ -590,6 +601,16 @@ NOTIFY_SOURCES: List[Dict[str, str]] = [
         "description": "受保护备份丢失或被改动",
     },
     {
+        "id": "backupverify",
+        "label": "备份校验巡检",
+        "description": "PBS 归档校验（verify）未通过，备份可能无法恢复",
+    },
+    {
+        "id": "pbsguard",
+        "label": "PBS 运行状态",
+        "description": "PBS 的垃圾回收（GC）失败、磁盘健康异常或备份盘容量越线（需登记只读凭据）",
+    },
+    {
         "id": "quorum",
         "label": "集群仲裁巡检",
         "description": "任意一套 PVE 集群失去仲裁（含非默认读取的连接）",
@@ -617,6 +638,8 @@ SOURCE_PORTGUARD = "portguard"
 SOURCE_SSHGUARD = "sshguard"
 SOURCE_SSHREMOTE = "sshremote"
 SOURCE_BACKUPGUARD = "backupguard"
+SOURCE_BACKUPVERIFY = "backupverify"
+SOURCE_PBSGUARD = "pbsguard"
 SOURCE_QUORUM = "quorum"
 SOURCE_QUOTA = "quota"
 SOURCE_ROOTCAUSE = "alert_rootcause"
@@ -963,7 +986,11 @@ def normalise_rule(raw: Any, username: Optional[str] = None) -> Dict[str, Any]:
         "name": str(item.get("name") or i18n.tr("告警规则")).strip(),
         "target_type": "vm" if item.get("target_type") == "vm" else "node",
         "target": str(item.get("target") or "*").strip() or "*",
-        "metric": metric if metric in METRIC_LABELS else "cpu",
+        "metric": (
+            metric
+            if metric in METRIC_LABELS and metric not in INTERNAL_METRICS
+            else "cpu"
+        ),
         "threshold": max(1.0, min(100.0, threshold)),
         "enabled": bool(item.get("enabled", True)),
         # 归属：新建的规则落到当前登录用户名下，已有归属原样保留

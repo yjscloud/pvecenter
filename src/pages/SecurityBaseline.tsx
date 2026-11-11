@@ -1125,8 +1125,8 @@ export function SecurityBaseline() {
                   onChange={setHostView}
                   ariaLabel={t('baseline.hostViewAria')}
                   options={[
-                    { label: t('nodes.viewCards'), value: 'card' },
-                    { label: t('nodes.viewList'), value: 'list' },
+                    { label: t('common.viewCards'), value: 'card' },
+                    { label: t('common.viewList'), value: 'list' },
                   ]}
                 />
               }

@@ -1280,6 +1280,271 @@ export interface StorageContent {
   parent?: string;
 }
 
+/**
+ * PBS 存储概况（`GET /api/storages/pbs-summary`）。
+ *
+ * 只有 `type === 'pbs'` 的存储才有这一行：归档目录要额外扫一次，所以单独取，
+ * 不塞进存储列表。`console_url` 由后端的存储定义拼出，读不到定义时为 null。
+ */
+export interface PbsStorageSummary {
+  connection_id: string;
+  connection_name: string;
+  node: string;
+  storage: string;
+  /** 该存储里的归档总数 */
+  archive_count: number;
+  /** 最近一份归档的时间戳；空存储为 null */
+  last_ctime: number | null;
+  last_vmid: number | null;
+  /** 最近一份归档的 PBS 校验状态：ok / failed / none */
+  last_verified: BackupVerifyState | null;
+  /** PBS 控制台地址；拿不到 server 时为 null */
+  console_url: string | null;
+  datastore: string;
+}
+
+/* ---------------------------------------------------------------------------
+   PBS 直连（只读凭据 + 概览）
+   --------------------------------------------------------------------------- */
+
+/** 一条 PBS 只读连接（`GET /api/pbs/config` 的返回；不含密钥）。 */
+export interface PbsConfigItem {
+  id: string;
+  name: string;
+  /**
+   * 区域 / 机房：与 PVE 连接（`ConnectionConfig.region`）同一语义，
+   * 只是界面分组标签，不参与连接逻辑；空串 = 未分区。
+   */
+  region?: string;
+  host: string;
+  port: number;
+  token_id: string;
+  /** 已保存过密钥（编辑时留空即沿用） */
+  token_secret_set?: boolean;
+  /** 只在提交时使用：留空表示沿用已保存的密钥 */
+  token_secret?: string;
+  verify_ssl: boolean | null;
+  ca_cert: string;
+  /** 指定读取哪个 PBS 节点；留空取第一台 */
+  node: string;
+  configured?: boolean;
+}
+
+/**
+ * 测试连接时探测到的能力。
+ *
+ * PBS 没有只读的 system 角色（Sys.Audit 只在 Admin 里），所以「连上了」不等于
+ * 「都看得到」。三项各自独立：任务列表只要 Datastore.Audit，节点负载与磁盘健康
+ * 才要 Sys.Audit。
+ */
+export interface PbsCapabilities {
+  datastores: boolean;
+  /** 仓库容量（/admin/datastore/{store}/status）；老后端不返回这个键 */
+  datastore_status?: boolean;
+  tasks: boolean;
+  node_status: boolean;
+}
+
+/** 401 时的凭据形状诊断：只说「长什么样」，绝不回传 secret 明文。 */
+export interface PbsCredentialDiagnostics {
+  token_id: string;
+  token_id_has_bang: boolean;
+  secret_length: number;
+  secret_uuid_like: boolean;
+  secret_hex_like: boolean;
+  secret_has_at: boolean;
+  secret_looks_like_token_id: boolean;
+  secret_has_space: boolean;
+}
+
+/**
+ * 连通性测试结果（`POST /api/pbs/config/test`）。
+ *
+ * 注意后端对**认证失败**也返回 200 + `ok:false`（不是抛错）：这样诊断信息能
+ * 一起带回来。前端因此既看 `ok`，也按 `code` 分流文案。
+ */
+export interface PbsTestResult {
+  ok: boolean;
+  error?: string;
+  code?: string;
+  version?: string;
+  capabilities?: PbsCapabilities;
+  /** 探测失败项的错误码，例如 { datastore_status: 'pbs_permission_denied' } */
+  probe_errors?: Record<string, string>;
+  diagnostics?: PbsCredentialDiagnostics;
+}
+
+/** PBS 任务（备份 / 校验 / 回收 / 同步），字段已由后端白名单化。 */
+export interface PbsTask {
+  upid: string;
+  /** 任务日志接口要按节点取 */
+  node: string;
+  type: string;
+  status: string;
+  starttime: number;
+  endtime: number;
+  /** endtime 为 0：任务还在跑 */
+  running: boolean;
+  worker_id: string;
+  user: string;
+}
+
+/** PBS 自报健康状态异常的磁盘（后端只挑异常盘，正常盘不下发）。 */
+export interface PbsDiskAlert {
+  device: string;
+  model: string;
+  serial: string;
+  health: string;
+}
+
+export interface PbsNodeStatus {
+  name: string;
+  /**
+   * 节点状态是否真的读到了。
+   *
+   * `/nodes` 与 `/nodes/{node}/status` 需要 Sys.Audit，而 PBS 没有只读的
+   * system 角色。缺权限时后端退回 `localhost` 继续读任务，这里为 false，
+   * 界面据此提示“需要 Sys.Audit”，而不是显示一片 0。
+   */
+  status_available?: boolean;
+  /**
+   * 节点状态读不到的原因：
+   * `no_permission` = token 缺 Sys.Audit（补权限即可见）；`error` = 其它上游原因。
+   */
+  status_hint?: 'no_permission' | 'error';
+  /** 读取失败时的上游原文（只用于悬停提示，帮管理员定位） */
+  status_error?: string;
+  /**
+   * 连接里手填的「节点」名在 PBS 上不存在（PBS 回 400）时，这里带回那个写错的值，
+   * 实际使用的名字在 `name` 上（通常是 localhost）。
+   */
+  name_ignored?: string;
+  uptime?: number;
+  cpus?: number;
+  mem_total?: number;
+  mem_used?: number;
+  load1?: number | null;
+  load5?: number | null;
+  load15?: number | null;
+  /** 健康状态不是 PASSED 的盘；读不到时为空数组 */
+  disks?: PbsDiskAlert[];
+  /** 磁盘总数：0 表示没读到（缺权限 / 老版本），用于区分「全正常」与「没数据」 */
+  disks_total?: number;
+  /** 磁盘清单读不到的原因，取值同上 */
+  disks_hint?: 'no_permission' | 'error';
+  /** 读取失败时的上游原文（只用于悬停提示） */
+  disks_error?: string;
+  /** 磁盘汇总：盘数 / 健康数 / 总容量 / SSD·HDD 构成（不做温度等 SMART 明细） */
+  disks_summary?: PbsDiskSummary;
+  /** 全部磁盘的轻量明细，供悬停提示用（型号 / 容量 / 健康） */
+  disks_all?: PbsDiskRow[];
+  /** 最近一次 GC 任务；没有记录时为 null */
+  gc?: PbsGcStatus | null;
+}
+
+/** 单块磁盘的轻量信息（不含温度 / 坏道这类 SMART 明细） */
+export interface PbsDiskRow {
+  device: string;
+  model: string;
+  size: number;
+  health: string;
+}
+
+/** 磁盘汇总：同一句「2 块盘正常」在 128G SSD 与 4T HDD 下含义完全不同 */
+export interface PbsDiskSummary {
+  count: number;
+  healthy: number;
+  total_bytes: number;
+  ssd: number;
+  hdd: number;
+}
+
+/** 最近一次 garbage_collection 任务：卡片只关心成没成、什么时候跑的 */
+export interface PbsGcStatus {
+  status: string;
+  starttime: number;
+  endtime: number;
+  running: boolean;
+}
+
+/** 备份盘使用率级别：阈值由后端判定并随响应下发，前端只负责上色 */
+export type PbsUsageLevel = 'ok' | 'warn' | 'crit' | 'unknown';
+
+export interface PbsDatastore {
+  store: string;
+  path: string;
+  comment: string;
+  /** 总容量（字节） */
+  total: number;
+  /** 已用（字节） */
+  used: number;
+  /** 剩余（字节）= PBS 的 avail */
+  avail: number;
+  /** 剩余空间（与 avail 同值，语义化别名） */
+  free?: number;
+  /** 使用率百分比（后端已夹在 0~100，保留一位小数） */
+  used_percent?: number;
+  level?: PbsUsageLevel;
+  /**
+   * 容量读取失败的原因（权限码或 HTTP 码），成功时为 null/undefined。
+   * 用来区分「403 没权限」和「版本没有这个端点」，两者在界面上都表现为空。
+   */
+  capacity_error?: string | null;
+  gc_schedule: string;
+  verify_new: boolean;
+  maintenance_mode: string;
+}
+
+export interface PbsConnectionOverview {
+  id: string;
+  name: string;
+  /** 区域 / 机房（来自连接配置）；空串或缺失 = 未分区 */
+  region?: string;
+  host: string;
+  port: number;
+  configured: boolean;
+  online: boolean;
+  version: string;
+  /** pbs_not_configured / 上游错误文案；online 时通常为 null */
+  error: string | null;
+  node: PbsNodeStatus | null;
+  datastores: PbsDatastore[];
+  /** 只包含备份与校验两类任务（后端已过滤仓库维护类任务） */
+  tasks: PbsTask[];
+  /**
+   * 仓库列表为空时的原因提示。
+   * `no_permission`：token 在 /datastore 上没有 Datastore.Audit —— PBS 对这种
+   * 情况返回空数组而不是 403，只看列表会误判成「没有仓库」。
+   */
+  datastore_hint?: 'no_permission';
+  /** 被合并掉的重复配置名称（同一 host:port 登记了多次） */
+  shared_with?: string[];
+}
+
+/** PVE 侧登记的 PBS 存储：用于判断「是否已对接」。 */
+export interface PbsPveStorage {
+  connection_id: string;
+  connection_name?: string;
+  storage: string;
+  datastore: string;
+  server: string;
+  port: number;
+  /** 共用这台 PBS 的 PVE 连接名（按 server:port 聚合后） */
+  used_by?: string[];
+}
+
+export interface PbsOverview {
+  /** 是否登记了直连凭据 */
+  configured: boolean;
+  /** PVE 侧有没有 PBS 存储；为空即「未对接」 */
+  pve_storages: PbsPveStorage[];
+  connections: PbsConnectionOverview[];
+  /** 备份盘使用率阈值（%）：达到即标黄 / 标红 */
+  thresholds?: { warn: number; crit: number };
+  /** 服务端采集时刻（unix 秒）；界面「数据更新于」用它，未被 20 秒缓存放大 */
+  generated_at?: number;
+}
+
 /* ---------------------------------------------------------------------------
    虚拟机
    --------------------------------------------------------------------------- */
@@ -2642,6 +2907,20 @@ export interface SnapshotCreateRequest {
    备份
    --------------------------------------------------------------------------- */
 
+/**
+ * PBS 归档的校验状态。
+ *
+ * `ok` 通过、`failed` 未通过（这份备份可能无法恢复）、`none` 尚未校验过。
+ * 目录型存储没有这个概念，后端会返回 null。
+ */
+export type BackupVerifyState = 'ok' | 'failed' | 'none' | string;
+
+export interface BackupVerification {
+  state: BackupVerifyState;
+  /** 校验任务 UPID（后端只在 PVE 给了才带） */
+  upid?: string;
+}
+
 export interface BackupItem {
   volid: string;
   ctime: number;
@@ -2654,8 +2933,8 @@ export interface BackupItem {
   name?: string;
   /** 创建者（用户隔离，见后端 notes 里的归属标记） */
   owner?: string | null;
-  /** PBS 校验状态 */
-  verification?: unknown;
+  /** PBS 校验状态；非 PBS 存储为 null */
+  verification?: BackupVerification | null;
 }
 
 export type BackupMode = 'snapshot' | 'suspend' | 'stop';

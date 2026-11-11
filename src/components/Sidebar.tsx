@@ -14,12 +14,12 @@ import {
   IconBox,
   IconCertificate,
   IconFeishu,
+  IconFrp,
   IconClock,
   IconRestart,
   IconDashboard,
   IconLock,
   IconNetwork,
-  IconPlug,
   IconServer,
   IconSettings,
   IconShieldCheck,
@@ -31,7 +31,7 @@ import {
   IconTemplate,
   IconUser,
   IconUsers,
-  IconVm,
+  IconVmStacked,
   IconChevronLeft,
   IconChevronDown,
 } from './Icons';
@@ -220,7 +220,7 @@ export const NAV_SECTIONS: NavSection[] = [
       {
         to: '/vms',
         labelKey: 'nav.vms',
-        icon: <IconVm size={18} />,
+        icon: <IconVmStacked size={18} />,
         permission: 'vm.view',
       },
       {
@@ -262,7 +262,9 @@ export const NAV_SECTIONS: NavSection[] = [
       {
         to: '/frp',
         labelKey: 'nav.frp',
-        icon: <IconPlug size={18} />,
+        /* 隧道字形：插头 IconPlug 讲的是「接上」，这一项讲的是「穿出去」，
+           两者同屏时也一眼可分（插头留给连接管理那些地方用） */
+        icon: <IconFrp size={18} />,
         permission: 'frp.view',
       },
     ],

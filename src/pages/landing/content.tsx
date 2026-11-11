@@ -32,6 +32,7 @@ import {
   IconDashboard,
   IconDisk,
   IconDownload,
+  IconFrp,
   IconGrip,
   IconInfo,
   IconKey,
@@ -272,7 +273,8 @@ export const DOMAINS: Domain[] = [
           '内置 frp 客户端与服务端，规则、启停与运行日志都在面板里',
           'Built-in frp client and server — rules, start/stop and logs all live in the panel',
         ],
-        icon: <IconPlug size={15} />,
+        /* 与侧边栏 / 页头同一枚隧道字形：同一个功能在哪儿都是同一个标志 */
+        icon: <IconFrp size={15} />,
       },
       {
         name: ['IP 地址池', 'IP pools'],

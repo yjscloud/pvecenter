@@ -24,7 +24,7 @@ from ..pve import (
 from ..formatters import normalize_storage, pve_flag
 from ..schemas import StorageDownloadUrl
 from ..vm_scope import resolve_node_connection
-from .backups import assert_backup_access
+from .backups import BACKUP_CONTENT_TTL, assert_backup_access
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +243,152 @@ async def list_storages(
         )
         for s in (storages or [])
     ]
+
+
+#: PBS 存储概况复用备份页的归档缓存（``BACKUP_CONTENT_TTL``）：两边读的是同一份
+#: ``storage/content``，共用一个 key 才能让「刚建好的备份」同时出现在两处，
+#: 也不会让同一次页面切换把 PVE 扫两遍。
+
+
+def _pbs_console_url(config: Dict[str, Any]) -> Optional[str]:
+    """从 PBS 存储定义拼出控制台地址；缺 ``server`` 时返回 ``None``。
+
+    只用 ``server`` / ``port``：``username`` 之类的字段不该出现在响应里（存储定义
+    是管理员视角的完整配置，前端只需要一个能点开的入口）。PBS 的 Web 服务默认
+    跑在 8007 且只认 HTTPS。
+    """
+    server = str((config or {}).get("server") or "").strip()
+    if not server:
+        return None
+    for prefix in ("https://", "http://"):
+        if server.lower().startswith(prefix):
+            server = server[len(prefix):]
+    server = server.rstrip("/")
+    if not server:
+        return None
+    port = str((config or {}).get("port") or "").strip() or "8007"
+    return f"https://{server}:{port}/"
+
+
+def _verify_state(entry: Optional[Dict[str, Any]]) -> Optional[str]:
+    """PBS 归档的校验状态（``ok`` / ``failed`` / ``none``）；非 PBS 返回 ``None``。"""
+    raw = (entry or {}).get("verification")
+    if not isinstance(raw, dict):
+        return None
+    state = str(raw.get("state") or "").strip().lower()
+    return state or None
+
+
+@router.get("/storages/pbs-summary")
+async def pbs_summary(
+    node: Optional[str] = None,
+    user: Dict[str, Any] = Depends(security.require_permission("storage.view")),
+) -> List[Dict[str, Any]]:
+    """PBS 存储的备份概况，供存储页的「最近备份」列与控制台入口使用。
+
+    为什么要单独一个接口，而不是塞进 ``/storages``：后者是每个节点两次 PVE
+    调用（节点列表 + 存储状态），而这里还要对**每个 PBS 存储**再扫一遍归档目录。
+    把它塞进列表接口等于让「打开存储页」为 PBS 的额外读取买单；独立接口可以让
+    前端只在真的存在 PBS 存储时才请求，且失败时不影响主列表。
+
+    与 ``/backups`` 共用同一份归档缓存（key 前缀 ``backups:content``），备份新建 /
+    删除后的缓存作废对这里同样生效。
+
+    返回项按 ``(连接, 节点, 存储)`` 唯一 —— 两台 PVE 上的同名 PBS 存储是两份
+    独立的数据，前端用它跟存储列表逐行对齐。
+    """
+    from ..store import get_active_connection_id
+
+    fallback = requested_connection() or str(get_active_connection_id() or "")
+    pairs = all_connection_clients()
+    wanted = requested_connection()
+    if wanted:
+        pairs = [p for p in pairs if str((p[0] or {}).get("id") or "") == wanted]
+    if not pairs:
+        # 还没有任何连接配置：保留与 /storages 相同的兜底行为
+        pairs = [({}, get_client())]
+
+    async def _archives(client: ProxmoxClient, cid: str, node_name: str, name: str):
+        async def _load() -> List[Dict[str, Any]]:
+            return await client.storage_content(node_name, name, content="backup")
+
+        key = f"backups:content:{cid or '-'}:{node_name}:{name}:-"
+        try:
+            return await pvecache.cached(key, BACKUP_CONTENT_TTL, _load)
+        except ProxmoxError:
+            # 单个存储读不到（未挂载 / 权限不足）只影响它自己
+            return None
+
+    async def collect(profile: Dict[str, Any], client: ProxmoxClient) -> List[Dict[str, Any]]:
+        cid = str((profile or {}).get("id") or "") or fallback
+        label = connection_label(profile) if profile else ""
+        try:
+            items = (
+                await client.storages(node)
+                if node
+                else await _storages_of_all_nodes(client)
+            )
+        except ProxmoxError as exc:
+            logger.warning("读取 %s 的存储失败：%s", label or cid, exc.message)
+            return []
+
+        pbs_items = [
+            s for s in (items or [])
+            if str(s.get("type") or "").strip().lower() == "pbs"
+        ]
+        if not pbs_items:
+            return []
+        # 存储定义里有 server / port / datastore（节点状态里没有）。读不到就只少了
+        # 控制台入口，其余字段照常返回 —— 不让一次权限不足把整块概况打掉。
+        try:
+            definitions = await client.storages()
+        except (ProxmoxError, Exception) as exc:  # noqa: BLE001
+            logger.info("读取存储定义失败，PBS 控制台入口不可用：%s", exc)
+            definitions = []
+        defs = {str(d.get("storage") or ""): d for d in (definitions or [])}
+
+        rows = await asyncio.gather(
+            *(
+                _archives(client, cid, str(s.get("node") or ""), str(s.get("storage") or ""))
+                for s in pbs_items
+            ),
+            return_exceptions=True,
+        )
+
+        out: List[Dict[str, Any]] = []
+        for item, archives in zip(pbs_items, rows):
+            if isinstance(archives, BaseException) or archives is None:
+                archives = []
+            latest = max(
+                archives or [], key=lambda entry: int(entry.get("ctime") or 0), default=None
+            )
+            definition = defs.get(str(item.get("storage") or "")) or {}
+            out.append(
+                {
+                    "connection_id": cid,
+                    "connection_name": label,
+                    "node": str(item.get("node") or ""),
+                    "storage": str(item.get("storage") or ""),
+                    "archive_count": len(archives or []),
+                    "last_ctime": int(latest.get("ctime") or 0) if latest else None,
+                    "last_vmid": latest.get("vmid") if latest else None,
+                    "last_verified": _verify_state(latest),
+                    "console_url": _pbs_console_url(definition),
+                    "datastore": str(definition.get("datastore") or ""),
+                }
+            )
+        return out
+
+    groups = await asyncio.gather(*(collect(p, c) for p, c in pairs))
+    summary = [row for group in groups for row in group]
+    summary.sort(
+        key=lambda row: (
+            row.get("connection_name") or "",
+            row.get("node") or "",
+            row.get("storage") or "",
+        )
+    )
+    return summary
 
 
 #: 存储内容列表的缓存时长（秒）。

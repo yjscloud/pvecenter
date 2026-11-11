@@ -38,6 +38,7 @@ import {
   IconBell,
   IconChevronRight,
   IconCheck,
+  IconFrp,
   IconLayout,
   IconPlug,
   IconPlus,
@@ -314,7 +315,8 @@ export function Workbench() {
         hint: t('wb.action.frpHint'),
         key: 'f',
         to: '/frp',
-        icon: <IconPlug size={15} />,
+        /* 与侧边栏 / 页头同一枚隧道字形：同一个功能在哪儿都是同一个标志 */
+        icon: <IconFrp size={15} />,
       });
     }
     if (isAdmin) {

@@ -48,6 +48,8 @@ export const PERMISSION_KEYS = [
   'network.view',
   'node.scope',
   'node.view',
+  'pbs.manage',
+  'pbs.view',
   'ports.manage',
   'ports.view',
   'settings.manage',

@@ -229,3 +229,29 @@ def test_vmid_is_parsed_for_both_storage_kinds() -> None:
     assert vmid_from_volid("local:backup/vzdump-lxc-104-2026_11_10-02_00_00.tar.zst") == 104
     assert vmid_from_volid(PBS_VM_VOLID) == 104
     assert vmid_from_volid("local:iso/debian.iso") is None
+
+
+def test_pbs_namespace_volids_still_resolve() -> None:
+    """PVE 8.4+ / PBS 3.x 的 namespace 会在路径里多一段。
+
+    ``ns/<ns>/`` 相对 ``backup/`` 的位置在不同版本里出现过两种排法，判定不能
+    锚定 ``backup/``，否则启用 namespace 后容器归档会被当成虚拟机。
+    """
+    for volid in (
+        "pbs:backup/ct/104/2026_11_10T02_00_00Z",
+        "pbs:ns/team-a/ct/104/2026_11_10T02_00_00Z",
+        "pbs:backup/ns/team-a/ct/104/2026_11_10T02_00_00Z",
+    ):
+        assert archive_guest_type(volid) == "lxc", volid
+        assert vmid_from_volid(volid) == 104, volid
+
+    for volid in (
+        "pbs:backup/vm/105/2026_11_10T02_00_00Z",
+        "pbs:ns/team-a/vm/105/2026_11_10T02_00_00Z",
+    ):
+        assert archive_guest_type(volid) == "qemu", volid
+        assert vmid_from_volid(volid) == 105, volid
+
+    # 目录型存储的卷名不能被新正则误伤
+    assert vmid_from_volid("local:images/vm-104-disk-0") is None
+    assert archive_guest_type("local:images/vm-104-disk-0") is None

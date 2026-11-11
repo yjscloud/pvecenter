@@ -68,7 +68,7 @@ backup.png / console.png / audit-log.png / certificates.png / users-rbac.png
 - **Networking and firewall**: bridge / bond / VLAN, IP address pools, PVE native firewall, security groups, IP sets
 - **Internal tunneling**: a built-in frpc that maps guest ports to the internet, with port ranges, target allowlists and per-user grants
 - **Monitoring and alerting**: live metrics, RRD charts, capacity forecasting, disk SMART / ZFS; notifications over mail, Feishu, webhooks and the in-app inbox
-- **Backup and restore**: back up now or on a schedule, browse volumes, restore to a given VMID, delete protection and integrity checks
+- **Backup and restore**: back up now or on a schedule, browse volumes, restore to a given VMID, delete protection, integrity checks and PBS verification state; optional read-only PBS access for repository usage, GC / verify tasks and disk health
 - **Certificates**: Tencent Cloud / Alibaba Cloud / Huawei Cloud / ACME / hosted certificates, auto-renewed and deployed to the local host, SSH hosts, PVE guests or nodes
 - **Security operations**: SSH brute-force protection, login audit, security baseline, port and process inspection, emergency response
 - **AI assistant**: attributes findings from inspection data, read-only command allowlist, write commands approved one by one
@@ -693,6 +693,21 @@ restore to a given VMID, delete; create PVE scheduled backup jobs visually. Volu
 protected and the panel's delete endpoint refuses them; a background job periodically compares registered
 backups with actual PVE content (a `volid|size|ctime` fingerprint) and alerts when one disappears or its
 metadata changes.
+
+### Proxmox Backup Server (optional)
+
+Once PBS is registered as a storage in PVE, the storage page shows a PBS badge, the last backup time, the
+archive count and verification state, plus a console link — no extra configuration needed.
+
+To also see PBS's own repository usage, GC schedule, node load, recent tasks and disk health, register a
+read-only token under Nodes → Connections → PBS read-only access (`Datastore.Audit` / `Sys.Audit` is
+enough). The panel only issues GETs against PBS: prune / GC / verify / sync stay in the PBS console, and the
+credential itself carries no write permission. Without a token the whole block stays hidden — no empty
+card on the backup page.
+
+Two complementary inspections feed the alerting pipeline: PBS archive verification failures
+(`backup verification`), and GC failures / disk health problems (`PBS health`). See
+[docs/PBS监控.md](docs/PBS监控.md) (Chinese).
 
 <!-- screenshot: docs/screenshots/backup.png -->
 ![Backup and restore: back up now, scheduled jobs, backup volumes and restore](docs/screenshots/backup.png)

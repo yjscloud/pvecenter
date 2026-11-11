@@ -72,7 +72,12 @@ function metricOptions(t: TFunc) {
  * 状态型指标：它们不看阈值，只看「状态是否偏离预期」。
  * 配规则时应当隐藏阈值输入 —— 让用户填一个用不上的百分比只会造成困惑。
  */
-const STATE_METRICS = new Set(["offline", "backup"]);
+const STATE_METRICS = new Set([
+  "offline",
+  "backup",
+  "backup_verify",
+  "pbs_health",
+]);
 
 /**
  * **内置来源自建**、历史里会出现、但**不该出现在规则下拉里**的指标。
@@ -85,6 +90,13 @@ const STATE_METRICS = new Set(["offline", "backup"]);
  */
 const INTERNAL_METRIC_LABELS: Record<string, MessageKey> = {
   quota: "alerts.metric.quota",
+  /* PBS 校验失败由 app.verifyguard 自建状态写入；它同样不参与规则判定，
+     但历史与活动告警里要能翻成人话 */
+  backup_verify: "alerts.metric.backupVerify",
+  /* PBS 的 GC / 磁盘巡检（app.pbsguard）同样自建状态，不进规则下拉 */
+  pbs_health: "alerts.metric.pbsHealth",
+  /* 备份盘容量越过 85 / 95 也由 pbsguard 写入，阈值固定、不可配置 */
+  pbs_capacity: "alerts.metric.pbsCapacity",
 };
 
 const isStateMetric = (metric: string) => STATE_METRICS.has(metric);

@@ -1328,6 +1328,12 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'backups.guestKindCt': 'container',
   'backups.colVolid': 'Volume ID',
   'backups.unknownFormat': 'unknown format',
+  'backups.colVerify': 'Verify',
+  'backups.verifyOk': 'Verified',
+  'backups.verifyFailed': 'Verify failed',
+  'backups.verifyNone': 'Not verified',
+  'backups.verifyHint':
+    'Verification comes from PBS; directory-based storage has none. “Not verified” means this archive has not been through verify yet.',
   'backups.colCreator': 'Created by',
   'backups.colActions': 'Actions',
   'backups.restoreAria': 'Restore backup {volid}',
@@ -1338,6 +1344,13 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'backups.notImplMessage': 'The backend /backups returns not-implemented. The frontend is wired up already and starts working once the backend provides data.',
   'backups.kpiFiles': 'Backup files',
   'backups.kpiSpace': 'Space used',
+  'backups.kpiSpaceHintPbs': 'PBS datastore used (deduplicated and compressed)',
+  'backups.kpiSpaceHintDir': 'Actual archive file size',
+  'backups.kpiSpaceHintFallback':
+    'Some storages are unreadable — estimated from archive sizes',
+  'backups.colDataSize': 'Data size',
+  'backups.colDataSizeHint':
+    'For PBS archives this is the pre-dedup data size, not on-disk usage; see the “Space used” card for real disk usage',
   'backups.kpiVms': 'VMs covered',
   'backups.kpiSuccess': 'Recent success rate',
   'backups.kpiRecent': '{ok} succeeded / {failed} failed in the last {days} days',

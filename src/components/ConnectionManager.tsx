@@ -64,9 +64,14 @@ import type {
 
 export interface ConnectionManagerProps {
   isAdmin: boolean;
+  /** 卡片 / 列表由页面统一切换；PVE 与 PBS 两组共用同一个 mode */
+  viewMode?: 'card' | 'list';
 }
 
-export function ConnectionManager({ isAdmin }: ConnectionManagerProps) {
+export function ConnectionManager({
+  isAdmin,
+  viewMode = 'card',
+}: ConnectionManagerProps) {
   const t = useT();
   const toast = useToast();
   const queryClient = useQueryClient();
@@ -523,12 +528,13 @@ export function ConnectionManager({ isAdmin }: ConnectionManagerProps) {
 
   return (
     <>
-      <Card>
+      <Card className={`conn-view-${viewMode}`}>
         <CardHeader
           title={t('conn.title')}
-        subtitle={t('conn.subtitle')}
-        icon={<IconPlug size={17} />}
-        actions={
+          subtitle={t('conn.subtitle')}
+          /* 与侧边栏「集群节点」同款图标：本卡属于节点域，不该再用插头 */
+          icon={<IconServer size={17} />}
+          actions={
           <>
             <Badge variant={configured ? 'success' : 'warning'} dot size="sm">
               {configured ? t('conn.configured') : t('conn.notConfigured')}

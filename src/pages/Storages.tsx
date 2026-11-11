@@ -28,6 +28,7 @@ import {
   IconSearch,
   IconChevronDown,
   IconLayers,
+  IconLink,
   IconServer,
 } from '../components/Icons';
 import {
@@ -41,7 +42,7 @@ import { useTaskRunner } from '../hooks/useTaskRunner';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
 import { useToast } from '../hooks/useToast';
 import { useAuth } from '../hooks/useAuth';
-import type { Storage, StorageContent } from '../api/types';
+import type { PbsStorageSummary, Storage, StorageContent } from '../api/types';
 
 const CONTENT_FILTERS: ReadonlyArray<{ label: MessageKey; value: string }> = [
   { label: 'storages.contentAll', value: '' },
@@ -77,6 +78,15 @@ function contentQueryKey(storage: Storage | null, contentFilter: string) {
     storage?.storage,
     contentFilter,
   ] as const;
+}
+
+/** PBS 概况的匹配键：存储行与概况行必须逐行对齐，同名存储要按连接区分。 */
+function pbsKey(connectionId: string | undefined, node: string, storage: string) {
+  return `${connectionId ?? ''}::${node}::${storage}`;
+}
+
+function isPbs(s: Storage): boolean {
+  return String(s.type ?? '').toLowerCase() === 'pbs';
 }
 
 /**
@@ -195,6 +205,30 @@ export function Storages() {
   });
 
   const storages = storagesQuery.data ?? [];
+
+  /* PBS 概况：只有真的存在 PBS 存储时才请求。这个接口要为每个 PBS 存储额外扫
+     一遍归档目录，普通的存储页不该为它买单；没有 PBS 时连一次空请求都不发。 */
+  const hasPbs = useMemo(() => storages.some(isPbs), [storages]);
+  const pbsQuery = useQuery({
+    queryKey: ['storages', 'pbs-summary', filterConn ?? '', filterNode ?? 'all'],
+    queryFn: () => storagesApi.pbsSummary(filterNode, filterConn),
+    enabled: pveReady && hasPbs,
+    staleTime: 30_000,
+    refetchInterval: pveReady ? refresh : false,
+  });
+
+  /* 按 (连接, 节点, 存储) 索引：两台 PVE 上的同名 PBS 存储是两份独立数据，
+     不能只按名字匹配。 */
+  const pbsMap = useMemo(() => {
+    const map = new Map<string, PbsStorageSummary>();
+    for (const row of pbsQuery.data ?? []) {
+      map.set(pbsKey(row.connection_id, row.node, row.storage), row);
+    }
+    return map;
+  }, [pbsQuery.data]);
+
+  const pbsOf = (s: Storage): PbsStorageSummary | undefined =>
+    pbsMap.get(pbsKey(s.connection_id, s.node, s.storage));
 
   /* ---- 区域 / 节点 / 存储 三层 ----
      与「节点」页同一套层级：区域是填在连接上的标签（见连接配置），节点是存储实际
@@ -438,9 +472,11 @@ export function Storages() {
     {
       key: 'type',
       header: t('storages.colType'),
+      /* PBS 单独着色：它不是普通的备份目录，容量之外还有校验 / 去重这类概念，
+         和 dir / nfs 混成一片中性灰时用户很难一眼找到它 */
       render: (s) => (
-        <Badge variant="neutral" size="sm">
-          {s.type}
+        <Badge variant={isPbs(s) ? 'info' : 'neutral'} size="sm">
+          {isPbs(s) ? 'PBS' : s.type}
         </Badge>
       ),
       width: 110,
@@ -511,6 +547,43 @@ export function Storages() {
       sortValue: (s) => (s.total > 0 ? s.used / s.total : 0),
     },
     {
+      /* 只有 PBS 有「最近备份」这个概念：它管的是备份仓库，dir / nfs 也可以放
+         备份，但 PVE 不会告诉你「最近一次是什么时候」，硬凑一格只会误导。 */
+      key: 'lastBackup',
+      header: t('storages.colLastBackup'),
+      title: t('storages.lastBackupHint'),
+      width: 190,
+      render: (s) => {
+        if (!isPbs(s)) return <span className="fs-sm text-muted">—</span>;
+        const summary = pbsOf(s);
+        if (!summary) {
+          return <span className="fs-sm text-muted">{t('storages.pbsLoading')}</span>;
+        }
+        if (!summary.last_ctime) {
+          return <span className="fs-sm text-muted">{t('storages.pbsNoBackup')}</span>;
+        }
+        return (
+          <div className="vm-name-cell">
+            <span className="mono fs-sm">{formatDateTime(summary.last_ctime)}</span>
+            <span
+              className={
+                summary.last_verified === 'failed'
+                  ? 'fs-xs text-danger'
+                  : 'fs-xs text-muted'
+              }
+            >
+              {t('storages.pbsArchiveCount', { n: String(summary.archive_count) })}
+              {summary.last_verified === 'failed'
+                ? ` · ${t('storages.pbsVerifyFailed')}`
+                : ''}
+            </span>
+          </div>
+        );
+      },
+      sortable: true,
+      sortValue: (s) => pbsOf(s)?.last_ctime ?? 0,
+    },
+    {
       key: 'active',
       header: t('common.status'),
       width: 100,
@@ -539,24 +612,41 @@ export function Storages() {
     {
       key: 'actions',
       header: t('common.actions'),
-      width: 130,
+      width: 170,
       align: 'right',
-      render: (s) => (
-        <span className="row-actions">
-          <Button
-            variant="secondary"
-            size="sm"
-            icon={<IconFolder size={14} />}
-            onClick={() => {
-              setSelected(s);
-              setContentFilter('');
-              setSearch('');
-            }}
-          >
-            {t('storages.browse')}
-          </Button>
-        </span>
-      ),
+      render: (s) => {
+        const consoleUrl = isPbs(s) ? pbsOf(s)?.console_url : null;
+        return (
+          <span className="row-actions">
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<IconFolder size={14} />}
+              onClick={() => {
+                setSelected(s);
+                setContentFilter('');
+                setSearch('');
+              }}
+            >
+              {t('storages.browse')}
+            </Button>
+            {/* 外链用 <a> 而不是 Button：Button 渲染的是 <button>，套 target=_blank
+                会变成「点了没反应」。样式复用图标按钮的类，视觉上仍是一排按钮。 */}
+            {consoleUrl ? (
+              <a
+                className="btn-icon-only btn-ghost"
+                href={consoleUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={t('storages.pbsConsole')}
+                aria-label={t('storages.pbsConsoleAria', { storage: s.storage })}
+              >
+                <IconLink size={15} />
+              </a>
+            ) : null}
+          </span>
+        );
+      },
     },
   ];
 

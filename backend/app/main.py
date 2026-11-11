@@ -53,6 +53,8 @@ from .routers import (
     network,
     node_notes,
     node_scope,
+    # PBS 概览与只读连接配置（/api/pbs/*）
+    pbs as pbs_router,
     # 站内通知（顶部铃铛）与跨资源全局搜索（Ctrl+K）。
     # 通知这里必须取别名：下面还有一句 `from . import notifications`（模块），
     # 同名会把路由模块覆盖掉。
@@ -120,6 +122,8 @@ from . import i18n
 from .routers import frp as frp_router
 from . import backupguard
 from . import buildinfo
+from . import verifyguard
+from . import pbsguard
 from . import portguard
 from . import quotaalert
 from . import quorumguard
@@ -937,6 +941,9 @@ app.include_router(vms.router)
 app.include_router(lxc.router)
 app.include_router(templates.router)
 app.include_router(storages.router)
+# PBS 概览与只读凭据（/api/pbs/*）：与存储页互补 —— 存储页回答「PVE 眼里的
+# PBS 存储」，这里回答「PBS 自己眼里的仓库与任务」
+app.include_router(pbs_router.router)
 app.include_router(network.router)
 app.include_router(node_notes.router)
 app.include_router(node_scope.router)
@@ -1595,6 +1602,32 @@ scheduler.register(
         "核对受保护备份是否仍然存在且未被篡改（防删 / 防篡改）",
         backupguard.evaluate,
         BACKUP_CHECK_INTERVAL,
+        summarize=_count("命中"),
+    )
+)
+# PBS 校验巡检：备份跑成功不等于能恢复，verify 未通过才是真正危险的信号。
+# 与备份完整性核对同频：两者都要逐存储拉归档目录，共用同一类读取成本。
+scheduler.register(
+    _job(
+        "backup_verify",
+        "备份校验巡检",
+        "安全巡检",
+        "检查 PBS 归档的 verify 结果，未通过校验即告警（备份可能无法恢复）",
+        verifyguard.evaluate,
+        BACKUP_CHECK_INTERVAL,
+        summarize=_count("命中"),
+    )
+)
+# PBS 运行状态：GC 失败与磁盘健康。走 PBS 直连，没登记只读凭据时该作业安静返回，
+# 不会每周目刷一条“未配置”。10 分钟一次足够 —— GC 通常一天一次，磁盘更慢。
+scheduler.register(
+    _job(
+        "pbs_health",
+        "PBS 运行状态",
+        "安全巡检",
+        "检查 PBS 的 GC 任务、磁盘健康与备份盘容量，异常即告警（需登记只读凭据）",
+        pbsguard.evaluate,
+        600,
         summarize=_count("命中"),
     )
 )

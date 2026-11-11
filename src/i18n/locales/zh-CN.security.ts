@@ -468,8 +468,6 @@ export const zhSecurity = {
   'ssh.trusted': '已把 {ip} 标记为已知',
   'ssh.untrusted': '已取消 {ip} 的已知标记',
   'ssh.trustNote': '面板标记为已知',
-  'nodes.viewCards': '卡片',
-  'nodes.viewList': '列表',
 
   /* --------------------------------------------------------- 安全基线 */
   'baseline.title': '安全基线',

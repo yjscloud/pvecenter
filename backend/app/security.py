@@ -254,6 +254,20 @@ PERMISSION_CATALOG: List[Dict[str, Any]] = [
         "permissions": [
             {"key": "storage.view", "label": "查看", "desc": "查看存储池与内容"},
             {"key": "storage.manage", "label": "管理", "desc": "上传 ISO / 删除卷"},
+            # PBS 与普通存储是两件事：它读的是**备份服务器自身**的仓库容量与
+            # 备份 / 校验 / 回收任务，没有「哪台机器归谁」这个维度。因此这两项
+            # 默认不进内置的 operator / viewer（与 ssh.view / baseline.view 同类），
+            # 需要时由管理员在自定义角色里单独授予。
+            {
+                "key": "pbs.view",
+                "label": "备份服务器",
+                "desc": "查看 PBS 节点状态、仓库容量与备份 / 校验 / 回收任务",
+            },
+            {
+                "key": "pbs.manage",
+                "label": "备份服务器凭据",
+                "desc": "登记 / 修改 PBS 只读凭据（含证书指纹）并测试连通性",
+            },
         ],
     },
     {

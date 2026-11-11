@@ -897,6 +897,8 @@ ZH_EN: Dict[str, str] = {
     "受管远程主机的登录安全": "Login security of managed remote hosts",
     "受保护备份核对": "Protected backup verification",
     "受保护备份丢失或被改动": "Protected backups lost or modified",
+    "备份校验巡检": "Backup verification inspection",
+    "PBS 归档校验（verify）未通过，备份可能无法恢复": "PBS archive verification failed; the backup may not be restorable",
     "集群仲裁巡检": "Cluster quorum inspection",
     "任意一套 PVE 集群失去仲裁（含非默认读取的连接）": "Any PVE cluster loses quorum (including connections other than the default one)",
     "定期把各主机巡检结论汇总成报告推送": "Periodically summarise host inspection findings into a report and push it",
@@ -1012,6 +1014,29 @@ ZH_EN: Dict[str, str] = {
     "原因": "Reason",
     "登记人 / 时间": "Registered by / at",
     "备份防护告警：": "Backup protection alert: ",
+    # ---- 巡检告警：PBS 校验（verifyguard）----
+    "pvecenter 备份校验告警": "pvecenter backup verification alert",
+    "PBS 归档校验失败": "PBS archive verification failed",
+    "备份时间": "Backup time",
+    "校验任务": "Verify task",
+    "备份校验告警：": "Backup verification alert: ",
+    # ---- 巡检告警：PBS 运行状态（pbsguard）----
+    "PBS 运行状态": "PBS health",
+    "PBS 的垃圾回收（GC）失败、磁盘健康异常或备份盘容量越线（需登记只读凭据）": (
+        "PBS garbage collection failed, disk health is degraded, or a datastore "
+        "is running low (requires a read-only token)"
+    ),
+    "pvecenter PBS 运行告警": "pvecenter PBS health alert",
+    "垃圾回收失败": "Garbage collection failed",
+    "磁盘健康异常": "Disk health degraded",
+    "任务状态": "Task status",
+    "磁盘": "Disk",
+    "SMART 状态": "SMART status",
+    "型号 / 序列号": "Model / serial",
+    "PBS 运行告警：": "PBS health alert: ",
+    # 备份盘容量（datastore 使用率越线）与磁盘项的新标签
+    "备份盘容量": "Datastore usage",
+    "健康状态": "Health",
     # ---- 站内消息（notifications）----
     "外部通道未送达：": "External channels did not deliver: ",
     # ---- 端口巡检：可疑进程信号（portguard.SUSPICIOUS_PATTERNS）----

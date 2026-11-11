@@ -27,6 +27,7 @@ import { ErrorState, Notice, CollapsibleCard } from '../components/ui/EmptyState
 import { PveQueryError } from '../components/SetupRequired';
 import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import { BackupOwnerDriftDialog } from '../components/BackupOwnerDriftDialog';
+import { PbsOverviewCard } from '../components/PbsOverviewCard';
 import {
   IconBackup,
   IconRefresh,
@@ -268,9 +269,11 @@ function archiveGuestKind(
   const text = volid || '';
   if (text.includes('vzdump-lxc')) return 'lxc';
   if (text.includes('vzdump-qemu')) return 'qemu';
-  /* ``pbs:backup/ct/104/…``：``backup`` 前面是存储名后的冒号，不是斜杠 */
-  if (/(?:^|[:/])backup\/ct\//.test(text)) return 'lxc';
-  if (/(?:^|[:/])backup\/vm\//.test(text)) return 'qemu';
+  /* PBS 带 namespace 时前缀会多一段（``ns/<ns>/``），不同版本放在 ``backup``
+     前后都出现过，所以不锚定 ``backup/``，只认 ``/ct|vm/<vmid>/`` 这段结构。
+     与 ``backend/app/backup_volid.py`` 的判定保持一致。 */
+  if (/(?:^|[:/])ct\/\d+(?:\/|$)/.test(text)) return 'lxc';
+  if (/(?:^|[:/])vm\/\d+(?:\/|$)/.test(text)) return 'qemu';
   const fmt = (format || '').toLowerCase();
   if (fmt === 'pbs-ct' || fmt.startsWith('tar') || fmt === 'tgz') return 'lxc';
   if (fmt === 'pbs-vm') return 'qemu';
@@ -876,11 +879,14 @@ function BackupFilesTab({
     queryKey: ['backups', 'list', conn, node, storage, connectionIds],
     queryFn: async () => {
       if (node) {
-        // 选了具体节点：只问它所在的那台主机
-        return backupsApi.list(
+        // 选了具体节点：只问它所在的那台主机。
+        // 这里也要补 connection_id：占用空间按「连接 + 存储」匹配存储状态，
+        // 少了来源标识就匹配不上，会退回归档大小相加（PBS 上会明显偏大）。
+        const list = await backupsApi.list(
           { node, storage: storage || undefined },
           conn,
         );
+        return list.map((b) => ({ ...b, connection_id: conn }));
       }
       const conns = connectionsQuery.data ?? [];
       const results = await Promise.all(
@@ -955,12 +961,72 @@ function BackupFilesTab({
      否则排的只是当前这一页。 */
   const pager = usePaged(items, `${search}|${node}|${storage}`);
 
+  /* 「占用空间」必须是盘上的**真实占用**：PBS 归档行里的 size 是去重前的逻辑大小
+     （10 份归档加起来 334 GB，仓库实际只占 567 MB —— 同一批数据块被反复计数），
+     直接相加会把数字放大约两个数量级。真实数字只能到存储侧取：
+       · PBS 存储 → 存储状态里的 used（PBS 已去重 / 压缩，就是仓库真实占用）；
+       · 目录型存储 → 归档文件大小之和（本地文件本来就等于真实字节）。
+     同一存储被多个节点挂载时 PVE 每个节点各报一行，按「连接 + 存储名」取最大值去重，
+     否则一份容量会被算成 N 份。 */
+  const storagesQuery = useQuery({
+    queryKey: ['storages', 'backup-usage'],
+    queryFn: () => storagesApi.list(),
+    staleTime: 30_000,
+    retry: false,
+  });
+
   const stats = useMemo(() => {
     const list = listQuery.data ?? [];
-    const totalSize = list.reduce((acc, b) => acc + (b.size ?? 0), 0);
     const vms = new Set(list.map((b) => b.vmid)).size;
-    return { count: list.length, totalSize, vms };
-  }, [listQuery.data]);
+
+    const usage = new Map<string, { type: string; used: number | null }>();
+    for (const s of storagesQuery.data ?? []) {
+      const name = s.storage ?? '';
+      if (!name) continue;
+      const key = `${s.connection_id ?? ''}|${name}`;
+      const used = typeof s.used === 'number' && s.used >= 0 ? s.used : null;
+      const prev = usage.get(key);
+      if (!prev || (used ?? -1) > (prev.used ?? -1)) {
+        usage.set(key, { type: String(s.type ?? '').toLowerCase(), used });
+      }
+    }
+
+    /* 每个存储的归档文件大小之和：目录型存储的真实占用就是这个数 */
+    const fileBytes = new Map<string, number>();
+    for (const b of list) {
+      const key = `${b.connection_id ?? ''}|${b.storage ?? ''}`;
+      fileBytes.set(key, (fileBytes.get(key) ?? 0) + (b.size ?? 0));
+    }
+
+    let totalSize = 0;
+    let allReal = true;
+    let hasPbs = false;
+    for (const [key, bytes] of fileBytes) {
+      const meta = usage.get(key);
+      if (meta?.type === 'pbs') {
+        if (meta.used !== null) {
+          /* PBS：用仓库已用，整个仓库只算一次 */
+          totalSize += meta.used;
+          hasPbs = true;
+          continue;
+        }
+        /* 仓库容量读不到（缺 Datastore.Audit / 老版本）→ 退回逻辑大小，
+           并在提示里说清这是估算，避免又给出一个看起来精确的假数字 */
+        totalSize += bytes;
+        allReal = false;
+        continue;
+      }
+      if (meta) {
+        totalSize += bytes;
+        continue;
+      }
+      /* 存储状态读不到（缺 storage.view / 存储已卸载）：同样退回归档大小 */
+      totalSize += bytes;
+      allReal = false;
+    }
+
+    return { count: list.length, totalSize, vms, allReal, hasPbs };
+  }, [listQuery.data, storagesQuery.data]);
 
   /* 下载：新标签页会自动带上 HttpOnly Cookie，不再把令牌拼进 URL */
   const download = (item: BackupRow) => {
@@ -1037,13 +1103,50 @@ function BackupFilesTab({
       sortValue: (b) => b.ctime ?? 0,
     },
     {
+      /* 列名写「数据量」而不是「大小」：PBS 归档的这个数**不是盘上占用**，
+         是去重前的数据量（10 份归档 334 GB，仓库其实只占 567 MB）。
+         盘上真实占用在上面的「占用空间」卡里。 */
       key: 'size',
-      header: t('vmDetail.backupColSize'),
+      header: t('backups.colDataSize'),
+      title: t('backups.colDataSizeHint'),
       width: 110,
       align: 'right',
       render: (b) => <span className="mono fs-sm">{formatBytes(b.size)}</span>,
       sortable: true,
       sortValue: (b) => b.size ?? 0,
+    },
+    {
+      /* PBS 才会给出 verification；目录型存储没有这个字段，显示「—」而不是
+         「未验证」—— 后者会让人以为「该验证但没验证」，与事实不符。 */
+      key: 'verify',
+      header: t('backups.colVerify'),
+      title: t('backups.verifyHint'),
+      width: 110,
+      render: (b) => {
+        const state = b.verification?.state;
+        if (!state) return <span className="fs-sm text-muted">—</span>;
+        if (state === 'ok') {
+          return (
+            <Badge variant="success" size="sm" dot>
+              {t('backups.verifyOk')}
+            </Badge>
+          );
+        }
+        if (state === 'failed') {
+          return (
+            <Badge variant="danger" size="sm" dot>
+              {t('backups.verifyFailed')}
+            </Badge>
+          );
+        }
+        return (
+          <Badge variant="neutral" size="sm">
+            {t('backups.verifyNone')}
+          </Badge>
+        );
+      },
+      sortable: true,
+      sortValue: (b) => b.verification?.state ?? '',
     },
     {
       key: 'owner',
@@ -1127,59 +1230,72 @@ function BackupFilesTab({
 
   return (
     <>
-      <div className="grid grid-4">
-        <KpiCard
-          label={t('backups.kpiFiles')}
-          value={stats.count}
-          icon={<IconBackup size={18} />}
-          tone="accent"
-          loading={listQuery.isLoading}
-        />
-        <KpiCard
-          label={t('backups.kpiSpace')}
-          value={formatBytes(stats.totalSize)}
-          icon={<IconShield size={18} />}
-          tone="neutral"
-          loading={listQuery.isLoading}
-        />
-        <KpiCard
-          label={t('backups.kpiVms')}
-          value={stats.vms}
-          icon={<IconCheck size={18} />}
-          tone="success"
-          loading={listQuery.isLoading}
-        />
-        <KpiCard
-          label={t('backups.kpiSuccess')}
-          value={
-            backupStats?.success_rate === null ||
-            backupStats?.success_rate === undefined
-              ? '—'
-              : `${backupStats.success_rate}%`
-          }
-          hint={
-            backupStats
-              ? t('backups.kpiRecent', {
-                  days: backupStats.days,
-                  ok: backupStats.ok,
-                  failed: backupStats.failed,
-                })
-              : undefined
-          }
-          icon={<IconActivity size={18} />}
-          tone={
-            backupStats?.failed ? 'danger' : backupStats?.success_rate === 100 ? 'success' : 'neutral'
-          }
-          loading={statsQuery.isLoading}
-          /* 有失败才可点：把「几天里失败了几次」变成「哪几次、哪台机器」 */
-          onClick={
-            backupStats?.failed
-              ? () => setFailuresOpen(true)
-              : undefined
-          }
-          title={backupStats?.failed ? t('backups.failuresOpen') : undefined}
-        />
-      </div>
+      {/* PBS 概览与备份 KPI 合并成一张监控面板。
+          PBS 未对接 / 无权限时组件会把 children 原样交回，KPI 不会跟着消失。 */}
+      <PbsOverviewCard>
+        <div className="grid grid-4">
+          <KpiCard
+            label={t('backups.kpiFiles')}
+            value={stats.count}
+            icon={<IconBackup size={18} />}
+            tone="accent"
+            loading={listQuery.isLoading}
+          />
+          <KpiCard
+            label={t('backups.kpiSpace')}
+            value={formatBytes(stats.totalSize)}
+            /* 口径写在卡片里：PBS 去重后的数字会明显小于「把归档大小相加」，
+               不说明反而像少了数据 */
+            hint={
+              !stats.allReal
+                ? t('backups.kpiSpaceHintFallback')
+                : stats.hasPbs
+                  ? t('backups.kpiSpaceHintPbs')
+                  : t('backups.kpiSpaceHintDir')
+            }
+            icon={<IconShield size={18} />}
+            tone="neutral"
+            loading={listQuery.isLoading || storagesQuery.isLoading}
+          />
+          <KpiCard
+            label={t('backups.kpiVms')}
+            value={stats.vms}
+            icon={<IconCheck size={18} />}
+            tone="success"
+            loading={listQuery.isLoading}
+          />
+          <KpiCard
+            label={t('backups.kpiSuccess')}
+            value={
+              backupStats?.success_rate === null ||
+              backupStats?.success_rate === undefined
+                ? '—'
+                : `${backupStats.success_rate}%`
+            }
+            hint={
+              backupStats
+                ? t('backups.kpiRecent', {
+                    days: backupStats.days,
+                    ok: backupStats.ok,
+                    failed: backupStats.failed,
+                  })
+                : undefined
+            }
+            icon={<IconActivity size={18} />}
+            tone={
+              backupStats?.failed ? 'danger' : backupStats?.success_rate === 100 ? 'success' : 'neutral'
+            }
+            loading={statsQuery.isLoading}
+            /* 有失败才可点：把「几天里失败了几次」变成「哪几次、哪台机器」 */
+            onClick={
+              backupStats?.failed
+                ? () => setFailuresOpen(true)
+                : undefined
+            }
+            title={backupStats?.failed ? t('backups.failuresOpen') : undefined}
+          />
+        </div>
+      </PbsOverviewCard>
 
       {/* 正在跑的备份不在这张列表里（归档要等任务结束才出现），单独给一条提示，
           否则用户会以为「点了没反应」 */}
