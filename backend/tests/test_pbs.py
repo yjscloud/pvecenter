@@ -689,3 +689,161 @@ def test_clean_secret_accepts_colon_form() -> None:
         pbs.clean_secret("pvecenter@pbs!readonly:0a4bb8ad-4636-4c24-addd-abf6ad4a7900")
         == "0a4bb8ad-4636-4c24-addd-abf6ad4a7900"
     )
+
+
+# ------------------------------------------------------------------ 暂停接入
+def test_paused_connection_is_listed_but_not_polled(monkeypatch) -> None:
+    """暂停接入：概览仍留一行（界面要看见它、能一键恢复），但不发任何请求。
+
+    这一行 ``online`` 恒为 False、``error`` 为空 —— 「已暂停」不是错误，前端
+    据此显示灰标而不是红的「不可达」。
+    """
+
+    async def fake_load():
+        return [_conn(paused=True)]
+
+    def boom(conn):
+        raise AssertionError("暂停的连接不该被探测")
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "PbsClient", boom)
+
+    row = _run(pbs.collect_overview())["connections"][0]
+    assert row["paused"] is True
+    assert row["online"] is False
+    assert row["error"] is None
+    assert row["datastores"] == []
+    assert row["tasks"] == []
+    assert row["node"] is None
+
+
+def test_pause_endpoint_touches_only_that_row_and_audits(monkeypatch) -> None:
+    """暂停只改一条记录的一个字段：整份 PUT 会把别人那份旧数据一起带回来。"""
+    from app.routers import pbs as pbs_router
+    from app.schemas import ConnectionPauseIn
+
+    saved: List[Dict[str, Any]] = []
+    audits: List[Dict[str, Any]] = []
+
+    async def fake_load():
+        return [_conn(id="a"), _conn(id="b", host="pbs2.lan")]
+
+    async def fake_save(rows):
+        saved.extend(rows)
+
+    async def fake_audit(request, user, action, **kw):
+        audits.append({"action": action, **kw})
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "save_connections", fake_save)
+    monkeypatch.setattr(pbs_router.security, "audit", fake_audit)
+
+    result = _run(
+        pbs_router.pause_connection(
+            "b", ConnectionPauseIn(paused=True), None, {"username": "admin"}
+        )
+    )
+
+    by_id = {row["id"]: row for row in saved}
+    assert by_id["b"]["paused"] is True
+    # 另一条原样不动（老记录本来就没有这个键，读出来按「未暂停」解释）
+    assert bool(by_id["a"].get("paused")) is False
+    assert audits[0]["action"] == "pbs.connection.pause"
+    assert audits[0]["detail"] == {"paused": True}
+    # 回给前端的是公开视图：密钥不外泄
+    assert all("token_secret" not in row for row in result)
+    assert {row["id"]: row["paused"] for row in result} == {"a": False, "b": True}
+
+
+def test_resume_uses_its_own_audit_action(monkeypatch) -> None:
+    from app.routers import pbs as pbs_router
+    from app.schemas import ConnectionPauseIn
+
+    saved: List[Dict[str, Any]] = []
+    audits: List[str] = []
+
+    async def fake_load():
+        return [_conn(id="a", paused=True)]
+
+    async def fake_save(rows):
+        saved.extend(rows)
+
+    async def fake_audit(request, user, action, **kw):
+        audits.append(action)
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "save_connections", fake_save)
+    monkeypatch.setattr(pbs_router.security, "audit", fake_audit)
+
+    _run(
+        pbs_router.pause_connection(
+            "a", ConnectionPauseIn(paused=False), None, {"username": "admin"}
+        )
+    )
+
+    assert saved[0]["paused"] is False
+    assert audits == ["pbs.connection.resume"]
+
+
+def test_pausing_an_unknown_connection_is_404(monkeypatch) -> None:
+    from fastapi import HTTPException
+
+    from app.routers import pbs as pbs_router
+    from app.schemas import ConnectionPauseIn
+
+    async def fake_load():
+        return [_conn(id="a")]
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+
+    try:
+        _run(
+            pbs_router.pause_connection(
+                "nope", ConnectionPauseIn(paused=True), None, {"username": "admin"}
+            )
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 404
+    else:  # pragma: no cover - 没抛异常就是失败
+        raise AssertionError("未知连接应返回 404")
+
+
+def test_save_config_keeps_paused_unless_explicitly_set(monkeypatch) -> None:
+    """整份保存不该顺手清掉暂停状态：没传就沿用库里的值。
+
+    前端编辑一条已暂停的连接时提交的是「整份配置」，若这里用零值默认，一次
+    改名称就会把它悄悄恢复成采集状态。
+    """
+    from app.routers import pbs as pbs_router
+    from app.schemas import PbsConfigIn
+
+    saved: List[Dict[str, Any]] = []
+
+    async def fake_load():
+        return [_conn(id="a", paused=True)]
+
+    async def fake_save(rows):
+        saved.extend(rows)
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "save_connections", fake_save)
+
+    def body(paused: Any = None) -> PbsConfigIn:
+        item: Dict[str, Any] = {
+            "id": "a",
+            "name": "pbs-01",
+            "host": "pbs.lan",
+            "port": 8007,
+            "token_id": "root@pam!panel",
+            "token_secret": "",
+        }
+        if paused is not None:
+            item["paused"] = paused
+        return PbsConfigIn(connections=[item])
+
+    _run(pbs_router.save_config(body(), {"username": "admin"}))
+    assert saved[-1]["paused"] is True
+
+    # 显式传 false 才是「恢复」
+    _run(pbs_router.save_config(body(False), {"username": "admin"}))
+    assert saved[-1]["paused"] is False

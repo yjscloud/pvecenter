@@ -61,8 +61,10 @@ import {
   IconServer,
 } from './Icons';
 
-/** 排序：不可达 → 仓库越线 → 其余。同档按名称，刷新时行不会来回跳。 */
+/** 排序：不可达 → 仓库越线 → 其余 → 已暂停。同档按名称，刷新时行不会来回跳。 */
 function rowRank(conn: PbsConnectionOverview): number {
+  /* 暂停接入排在最后：它不是故障，不该顶到列表最上面抢注意力 */
+  if (conn.paused) return 4;
   if (!conn.online) return 0;
   if (conn.datastores.some((store) => store.level === 'crit')) return 1;
   if (conn.datastores.some((store) => store.level === 'warn')) return 2;
@@ -332,8 +334,17 @@ function PbsNodeCard({
             >
               {nodeName}
             </span>
-            <Badge variant={online ? 'success' : 'danger'} dot size="sm">
-              {online ? t('pbs.online') : t('pbs.offline')}
+            <Badge
+              variant={conn.paused ? 'neutral' : online ? 'success' : 'danger'}
+              dot
+              size="sm"
+              title={conn.paused ? t('pbs.pausedHint') : undefined}
+            >
+              {conn.paused
+                ? t('pbs.paused')
+                : online
+                  ? t('pbs.online')
+                  : t('pbs.offline')}
             </Badge>
             {critStores > 0 ? (
               <Badge variant="danger" size="sm">
@@ -435,7 +446,9 @@ function PbsNodeCard({
             <IconClock size={12} />
             {lastTaskText}
           </span>
-          {!online && conn.error ? (
+          {conn.paused ? (
+            <span className="fs-xs text-muted">{t('pbs.pausedHint')}</span>
+          ) : !online && conn.error ? (
             <span className="fs-xs text-danger">{conn.error}</span>
           ) : null}
         </div>
@@ -509,8 +522,13 @@ function PbsConnectionRow({
           <Badge variant="neutral" size="sm" title={t('pbs.title')}>
             {t('pbs.stripPbsCount', { n: pbsCount })}
           </Badge>
-          {/* 在线是常态，不再常驻一枚绿徽章；只有不可达才出声 */}
-          {conn.online ? null : (
+          {/* 在线是常态，不再常驻一枚绿徽章；只有不可达才出声。
+              已暂停单独一档：主动停用不该显示成红的「不可达」 */}
+          {conn.online ? null : conn.paused ? (
+            <Badge variant="neutral" dot size="sm" title={t('pbs.pausedHint')}>
+              {t('pbs.paused')}
+            </Badge>
+          ) : (
             <Badge variant="danger" dot size="sm">
               {t('pbs.offline')}
             </Badge>

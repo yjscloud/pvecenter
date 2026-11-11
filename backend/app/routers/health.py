@@ -15,8 +15,8 @@ from .. import security
 from ..formatters import pve_flag
 from ..pve import (
     ProxmoxError,
-    all_connection_clients,
     connection_label,
+    collection_targets,
     get_client,
 )
 from ..vm_scope import bind_node_connection
@@ -192,10 +192,8 @@ async def ceph_status(
     user: Dict[str, Any] = Depends(security.require_permission("node.view")),
 ) -> Dict[str, Any]:
     """Ceph 集群状态。未部署时返回 ``installed: false`` 而非报错。"""
-    pairs = all_connection_clients()
-    if not pairs:
-        client = get_client()
-        pairs = [({}, client)]
+    # 全部连接都被暂停时不回退：兜底那台往往正是被停用的机器
+    pairs = collection_targets()
 
     results: List[Dict[str, Any]] = []
 

@@ -686,6 +686,10 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'pbs.openConnections': 'Add read-only token',
   'pbs.online': 'Online',
   'pbs.offline': 'Unreachable',
+  'pbs.paused': 'Paused',
+  'pbs.pausedHint':
+    'Ingest paused: no polling, no alerts; settings and credentials are kept',
+  'pbs.fleetPaused': '{n} paused',
   'pbs.openConsole': 'Open the PBS console',
   'pbs.nodeTitle': 'Node',
   'pbs.nodeUnavailable': 'Node status unavailable (the token may lack Sys.Audit)',
@@ -825,6 +829,13 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'pbs.badgeIncomplete': 'Incomplete',
   'pbs.connected': 'Reachable',
   'pbs.disconnected': 'Unreachable',
+  'pbs.pause': 'Pause',
+  'pbs.resume': 'Resume',
+  'pbs.pauseHint':
+    'Use it while the server is offline for maintenance: no requests will be sent to this PBS (overview, GC, disks and capacity stop); settings and credentials are kept',
+  'pbs.resumeHint': 'Resume ingest: the next poll reconnects automatically',
+  'pbs.resumed': 'Ingest resumed',
+  'pbs.pauseFailed': 'Could not pause / resume',
   'pbs.addTitle': 'Add a PBS connection',
   'pbs.editTitle': 'Edit the PBS connection',
   'pbs.addDesc':

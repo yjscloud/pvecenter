@@ -43,8 +43,8 @@ from ..backup_volid import archive_guest_type, vmid_from_volid
 from ..formatters import paginate_rows, pve_flag
 from ..pve import (
     ProxmoxError,
-    all_connection_clients,
     connection_label,
+    collection_targets,
     get_client,
     parallel,
     requested_connection,
@@ -132,7 +132,7 @@ async def backup_stats(
         # 每节点的任务条数按窗口推算。原先写死 300：一周窗口下每个节点 100 条
         # 已经远超实际（每天几十次备份的集群极少），拉多了只是白解析。
         task_limit = max(100, min(300, days * 40))
-        pairs = all_connection_clients() or [({}, get_client())]
+        pairs = collection_targets()
 
         # 第一层并发：各连接的节点清单（串行时总耗时是各连接 RTT 的和）
         node_lists = await parallel(

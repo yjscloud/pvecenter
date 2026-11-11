@@ -453,6 +453,11 @@ export interface ConnectionConfig {
    * 多机房时节点列表按「区域 → 连接 → 节点」展开。空串 = 未分区。
    */
   region?: string;
+  /**
+   * 暂停接入：面板不再向这台 PVE 采集（节点列表、机队状态、连接探测、告警巡检
+   * 全部跳过），界面显示「已暂停」而不是「不可达」。配置与凭据保留，随时可恢复。
+   */
+  paused?: boolean;
 }
 
 /** 一条已保存的 PVE 连接（多连接列表项） */
@@ -971,6 +976,11 @@ export interface HealthStatus {
    * 该做的是排查。
    */
   pve_configured?: boolean;
+  /**
+   * 兜底读取的那台连接被「暂停接入」：`pve_connected` 为 false 但不是故障，
+   * 界面应该说「已暂停」并指向连接配置，而不是让用户去排查网络与令牌。
+   */
+  pve_paused?: boolean;
   /** 面板自身版本（仅登录后返回） */
   version?: string;
   /** 当前连接到的 Proxmox VE 版本（仅登录后返回） */
@@ -1328,6 +1338,12 @@ export interface PbsConfigItem {
   /** 指定读取哪个 PBS 节点；留空取第一台 */
   node: string;
   configured?: boolean;
+  /**
+   * 暂停接入：停用这条连接（不发请求、不告警、不参与在线率），配置与凭据
+   * 全部保留。只由 `POST /pbs/config/{id}/pause` 改动 —— 整份保存时后端会
+   * 原样带回，前端也不要自己往 `saveConfig` 里塞这个字段。
+   */
+  paused?: boolean;
 }
 
 /**
@@ -1504,6 +1520,11 @@ export interface PbsConnectionOverview {
   port: number;
   configured: boolean;
   online: boolean;
+  /**
+   * 暂停接入：这一行只是「占位」—— 后端不发请求，`online` 恒为 false。
+   * 界面必须显示「已暂停」而不是「不可达」，且不计入在线率与健康判定。
+   */
+  paused?: boolean;
   version: string;
   /** pbs_not_configured / 上游错误文案；online 时通常为 null */
   error: string | null;

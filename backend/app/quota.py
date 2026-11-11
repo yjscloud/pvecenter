@@ -50,7 +50,7 @@ from fastapi import HTTPException, Request
 from . import database, ownership, pvecache, security, store
 from .pve import (
     ProxmoxError,
-    all_connection_clients,
+    collection_targets,
     client_for_connection,
     get_client,
     parallel,
@@ -590,7 +590,7 @@ async def _build_guest_rows() -> Tuple[List[Dict[str, Any]], str]:
     **调用方必须看错误** —— 少了半边的用量会偏小，直接放行等于把额度开在最不该
     开的地方（见模块说明里的 fail-closed）。
     """
-    targets = list(all_connection_clients()) or [(None, get_client())]
+    targets = collection_targets()
     rows: List[Dict[str, Any]] = []
     error = ""
 
@@ -1726,7 +1726,7 @@ async def reconcile_owners() -> Dict[str, Any]:
     返回 ``{"removed", "orphans", "orphan_pct", "refused"}``；``orphans`` 是
     「机器在、没人认领」的台数 —— **只报告，不自动指派**：该给谁是人来决定的。
     """
-    targets = list(all_connection_clients()) or [(None, get_client())]
+    targets = collection_targets()
     live: set = set()
     scopes: set = set()
     rows: List[Dict[str, Any]] = []

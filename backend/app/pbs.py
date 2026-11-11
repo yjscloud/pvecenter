@@ -116,9 +116,13 @@ class PbsConnection:
         region: str = "",
         node: str = "",
         conn_id: str = "",
+        paused: bool = False,
     ) -> None:
         self.id = conn_id
         self.name = name
+        # 暂停接入：只停采集，不删配置。凭据、区域、节点名全部原样保留，
+        # 恢复时不需要重新填写（见 routers/pbs.pause_connection）。
+        self.paused = bool(paused)
         # 区域 / 机房：与 PVE 连接的 region 同一语义 —— 纯界面分组标签，
         # 留空 = 「未分区」；不参与连接逻辑，也不需要迁移老记录
         self.region = (region or "").strip()
@@ -156,6 +160,8 @@ class PbsConnection:
             region=str(item.get("region") or ""),
             node=str(item.get("node") or ""),
             conn_id=str(item.get("id") or ""),
+            # 老记录没有这个键 = 未暂停
+            paused=bool(item.get("paused")),
         )
 
     @property
@@ -430,6 +436,8 @@ def public_connection(conn: Dict[str, Any]) -> Dict[str, Any]:
         "verify_ssl": cfg.verify_ssl,
         "ca_cert": cfg.ca_cert,
         "node": cfg.node,
+        # 暂停接入：界面据此显示「已暂停」并关掉该行的采集类操作
+        "paused": cfg.paused,
         "configured": cfg.configured,
     }
 
@@ -707,6 +715,8 @@ async def _collect_one(conn: Dict[str, Any]) -> Dict[str, Any]:
         "host": cfg.host,
         "port": cfg.port,
         "configured": cfg.configured,
+        # 走到这里的连接一定没被暂停（暂停的行在 _collect_all 里直接构造）
+        "paused": False,
         "online": False,
         "version": "",
         "error": None,
@@ -953,11 +963,40 @@ async def _collect_all() -> Dict[str, Any]:
             "thresholds": {"warn": PBS_USAGE_WARN, "crit": PBS_USAGE_CRIT},
             "generated_at": int(time.time()),
         }
+
+    # 暂停接入的连接**不发请求**，但仍保留一行：界面要能看见它、能一键恢复。
+    # 这一行 online 为 False 且带 paused 标记，前端据此显示「已暂停」而不是
+    # 「不可达」，在线率与告警也不把它算进去。
+    paused_rows: List[Dict[str, Any]] = []
+    active: List[Dict[str, Any]] = []
+    for item in conns:
+        cfg = PbsConnection.from_dict(item)
+        if cfg.paused:
+            paused_rows.append(
+                {
+                    "id": cfg.id,
+                    "name": cfg.name or cfg.host,
+                    "region": cfg.region,
+                    "host": cfg.host,
+                    "port": cfg.port,
+                    "configured": cfg.configured,
+                    "paused": True,
+                    "online": False,
+                    "version": "",
+                    "error": None,
+                    "node": None,
+                    "datastores": [],
+                    "tasks": [],
+                }
+            )
+        else:
+            active.append(item)
+
     rows = await asyncio.gather(
-        *(_collect_one(item) for item in conns), return_exceptions=True
+        *(_collect_one(item) for item in active), return_exceptions=True
     )
     connections: List[Dict[str, Any]] = []
-    for conn, row in zip(conns, rows):
+    for conn, row in zip(active, rows):
         if isinstance(row, BaseException):
             cfg = PbsConnection.from_dict(conn)
             connections.append(
@@ -978,6 +1017,7 @@ async def _collect_all() -> Dict[str, Any]:
             )
             continue
         connections.append(row)
+    connections.extend(paused_rows)
     return {
         "configured": True,
         "connections": _dedupe_by_host(connections),

@@ -1470,6 +1470,41 @@ def connection_ids() -> List[str]:
     return []
 
 
+def paused_connection_ids() -> List[str]:
+    """被「暂停接入」的连接 id 列表（**不解密密钥**）。
+
+    暂停 = 面板不再向这台 PVE 采集数据：节点列表、fleet 状态、连接探测、告警巡检
+    一律跳过它。所以这个判断落在每请求路径上，必须和 :func:`connection_ids` 一样
+    便宜 —— 只读 settings 原文（带进程内缓存）、不解密任何凭据。
+
+    留空 / 没有这个键的老连接视为「未暂停」。
+    """
+    ids: List[str] = []
+    raw = _read_setting_raw(CONNECTIONS_KEY)
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            data = []
+        if isinstance(data, list):
+            ids = [
+                str(d.get("id") or "")
+                for d in data
+                if isinstance(d, dict) and d.get("paused")
+            ]
+    if ids:
+        return ids
+    if _read_json_dict(CONNECTION_KEY).get("paused"):
+        return ["default"]
+    return []
+
+
+def is_connection_paused(connection_id: str) -> bool:
+    """这条连接是否已暂停接入。空 id（= 兜底连接）按当前兜底连接判断。"""
+    target = str(connection_id or "") or get_active_connection_id()
+    return bool(target) and target in paused_connection_ids()
+
+
 def get_active_connection_id() -> str:
     """「兜底读取」连接的 id，**保证是当前真实存在的连接**。
 
@@ -1575,6 +1610,8 @@ def public_connection_config(config: Optional[Dict[str, Any]] = None) -> Dict[st
         # 钉扎用的证书 PEM（公开材料，不需要加密）
         "ca_cert": str(cfg.get("ca_cert") or ""),
         "node_default": cfg.get("node_default", ""),
+        # 暂停接入：面板停止向这台 PVE 采集，界面显示「已暂停」而不是「未连接」
+        "paused": bool(cfg.get("paused")),
         "configured": bool(
             cfg.get("host") and cfg.get("token_id") and cfg.get("token_secret")
         ),
@@ -1595,6 +1632,8 @@ def public_connection_brief(config: Dict[str, Any]) -> Dict[str, Any]:
         "id": str(config.get("id", "")),
         "name": str(config.get("name", "")),
         "region": str(config.get("region", "")),
+        # 精简视图也要带暂停标记：节点页/筛选器据此把这台标成「已暂停」
+        "paused": bool(config.get("paused")),
         "configured": bool(
             config.get("host") and config.get("token_id") and config.get("token_secret")
         ),

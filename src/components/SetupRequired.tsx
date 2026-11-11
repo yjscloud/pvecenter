@@ -42,7 +42,10 @@ export function pveFailureKind(
 ): PveFailure | null {
   if (isNotConfigured(error)) return 'not-configured';
   if (!(error instanceof ApiError)) return null;
+  /* 暂停接入时后端同样回 503，但那不是故障：别把人带进「排查网络 / 令牌」
+     的引导里（恢复入口在连接配置页）。 */
   if (!status.hasData || !status.configured || status.reachable) return null;
+  if (status.paused) return null;
   if (error.status === 502 || error.status === 503 || error.status === 504) {
     return 'unreachable';
   }

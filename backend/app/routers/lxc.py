@@ -38,8 +38,8 @@ from .. import (
 from ..formatters import guest_summary_rows, paginate_rows, pve_flag
 from ..pve import (
     ProxmoxError,
-    all_connection_clients,
     connection_label,
+    collection_targets,
     get_client,
     parallel,
     requested_connection,
@@ -123,7 +123,7 @@ async def list_containers(
         )
         targets: List[Any] = [(profile, get_client())]
     else:
-        targets = list(all_connection_clients()) or [(None, get_client())]
+        targets = collection_targets()
 
     # 每条连接一次 cluster_resources：串行时 C 条连接就是 C 个 RTT（4 条连接、
     # 每条 300ms = 1.2 秒，全压在这一个接口上）。并发拉，失败的那条只跳过自己。

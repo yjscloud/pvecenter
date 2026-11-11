@@ -20,6 +20,13 @@ export interface PveStatus {
   configured: boolean;
   /** 是否真的连上了 PVE（configured 为 true 时才可能有意义） */
   reachable: boolean;
+  /**
+   * 兜底读取的那台是否被「暂停接入」。
+   *
+   * 暂停不是故障：`reachable` 会是 false，但该做的是去连接配置页恢复，而不是
+   * 排查地址 / 令牌。凡是要弹「PVE 连不上，请排查」的地方都得先看这一位。
+   */
+  paused: boolean;
   /** 首次探测还没回来 */
   loading: boolean;
   /**
@@ -50,6 +57,7 @@ export function usePveStatus(): PveStatus {
   return {
     configured,
     reachable: query.data?.pve_connected ?? false,
+    paused: query.data?.pve_paused ?? false,
     loading: query.isLoading,
     hasData: query.data !== undefined,
   };

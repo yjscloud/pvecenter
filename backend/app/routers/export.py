@@ -23,8 +23,8 @@ from .. import aiaudit, alerting, exporting, i18n, ownership, security, store
 from ..formatters import normalize_task
 from ..pve import (
     ProxmoxError,
-    all_connection_clients,
     connection_label,
+    collection_targets,
     get_client,
     requested_connection,
 )
@@ -182,7 +182,7 @@ async def export_tasks(
                 None,
             )
             return [(profile, get_client())]
-        return list(all_connection_clients()) or [(None, get_client())]
+        return collection_targets()
 
     async def rows() -> AsyncIterator[Sequence[Any]]:
         for profile, client in targets():

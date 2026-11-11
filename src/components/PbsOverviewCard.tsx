@@ -191,6 +191,9 @@ function connGcState(conn: PbsConnectionOverview): GcState {
 type NodeHealth = 'crit' | 'warn' | 'unknown' | 'ok';
 
 function connHealth(conn: PbsConnectionOverview): NodeHealth {
+  /* 暂停接入不是故障：给灰点（排在问题之后），否则整块面板会为一次主动停用
+     报红 */
+  if (conn.paused) return 'unknown';
   if (!conn.online) return 'crit';
   if (connDiskState(conn) === 'bad') return 'crit';
   if (connGcState(conn) === 'bad') return 'crit';
@@ -455,8 +458,17 @@ function ConnectionBlock({
               {conn.region}
             </Badge>
           ) : null}
-          <Badge variant={conn.online ? 'success' : 'danger'} size="sm" dot>
-            {conn.online ? t('pbs.online') : t('pbs.offline')}
+          <Badge
+            variant={conn.paused ? 'neutral' : conn.online ? 'success' : 'danger'}
+            size="sm"
+            dot
+            title={conn.paused ? t('pbs.pausedHint') : undefined}
+          >
+            {conn.paused
+              ? t('pbs.paused')
+              : conn.online
+                ? t('pbs.online')
+                : t('pbs.offline')}
           </Badge>
           {conn.version ? (
             <span className="fs-xs text-muted">v{conn.version}</span>
@@ -522,9 +534,11 @@ function ConnectionBlock({
           ) : (
             <div className="pbs-hero is-empty">
               <div className="fs-xs text-muted">
-                {conn.datastore_hint === 'no_permission'
-                  ? t('pbs.datastoreNoPerm')
-                  : t('pbs.noDatastore')}
+                {conn.paused
+                  ? t('pbs.pausedHint')
+                  : conn.datastore_hint === 'no_permission'
+                    ? t('pbs.datastoreNoPerm')
+                    : t('pbs.noDatastore')}
               </div>
             </div>
           )}
@@ -572,7 +586,11 @@ function ConnectionBlock({
                 {conn.node?.uptime ? formatUptimeShort(conn.node.uptime) : '—'}
               </span>
               <span className="pbs-tile-sub">
-                {conn.online ? t('pbs.online') : t('pbs.offline')}
+                {conn.paused
+                  ? t('pbs.paused')
+                  : conn.online
+                    ? t('pbs.online')
+                    : t('pbs.offline')}
               </span>
             </div>
           </div>
@@ -706,7 +724,11 @@ function PbsFleet({
 
   /* 聚合：容量按仓库跨节点求和（加权使用率，而不是把各节点的百分比平均），
      这样「一台 90% 一台 10%」不会显示成 50% 的假象。 */
-  const onlineCount = connections.filter((conn) => conn.online).length;
+  /* 在线率只算「在采的」：暂停接入的连接后端根本不发请求，算进分母等于把
+     一次主动停用显示成一台掉线 */
+  const activeConns = connections.filter((conn) => !conn.paused);
+  const pausedCount = connections.length - activeConns.length;
+  const onlineCount = activeConns.filter((conn) => conn.online).length;
   const stores = connections.flatMap((conn) => conn.datastores);
   const knownStores = stores.filter((store) => store.total > 0);
   const totalBytes = knownStores.reduce((sum, store) => sum + store.total, 0);
@@ -732,13 +754,18 @@ function PbsFleet({
     <>
       {/* 聚合带：整块面板先给一个「全部节点加起来怎么样」的结论 */}
       <div className="pbs-fleet">
-        <span className={`pbs-fleet-chip${onlineCount < connections.length ? ' is-bad' : ''}`}>
+        <span className={`pbs-fleet-chip${onlineCount < activeConns.length ? ' is-bad' : ''}`}>
           <i className="pbs-status-dot" />
           {t('pbs.fleetOnline', {
             online: onlineCount,
-            total: connections.length,
+            total: activeConns.length,
           })}
         </span>
+        {pausedCount > 0 ? (
+          <span className="pbs-fleet-chip is-unknown" title={t('pbs.pausedHint')}>
+            {t('pbs.fleetPaused', { n: pausedCount })}
+          </span>
+        ) : null}
         <span className="pbs-fleet-chip">{t('pbs.fleetStores', { n: stores.length })}</span>
         {totalBytes > 0 ? (
           <span className={`pbs-fleet-chip${worstLevel ? ` is-${worstLevel}` : ''}`}>
@@ -800,15 +827,17 @@ function PbsFleet({
             0,
           );
           const lastTask = conn.tasks[0];
+          /* 暂停接入：没采集不等于「未知」，更不等于「坏」—— 直接说已暂停 */
+          const idleLabel = conn.paused ? t('pbs.paused') : t('pbs.diskUnknownShort');
           const diskFlag = !conn.online
-            ? t('pbs.diskUnknownShort')
+            ? idleLabel
             : diskState === 'bad'
               ? t('pbs.diskAbnormal', { n: conn.node?.disks?.length ?? 0 })
               : diskState === 'ok'
                 ? t('pbs.diskOk', { n: conn.node?.disks_summary?.count ?? conn.node?.disks_total ?? 0 })
                 : t('pbs.diskUnknownShort');
           const gcFlag = !conn.online
-            ? t('pbs.diskUnknownShort')
+            ? idleLabel
             : gcState === 'bad'
               ? t('pbs.taskFailed')
               : gcState === 'busy'
@@ -830,8 +859,17 @@ function PbsFleet({
                   <span className="pbs-node-name" title={`${conn.host}:${conn.port}`}>
                     {conn.name}
                   </span>
-                  <Badge variant={conn.online ? 'success' : 'danger'} size="sm" dot>
-                    {conn.online ? t('pbs.online') : t('pbs.offline')}
+                  <Badge
+                    variant={conn.paused ? 'neutral' : conn.online ? 'success' : 'danger'}
+                    size="sm"
+                    dot
+                    title={conn.paused ? t('pbs.pausedHint') : undefined}
+                  >
+                    {conn.paused
+                      ? t('pbs.paused')
+                      : conn.online
+                        ? t('pbs.online')
+                        : t('pbs.offline')}
                   </Badge>
                   {conn.version ? <span className="pbs-node-ver">v{conn.version}</span> : null}
                 </span>

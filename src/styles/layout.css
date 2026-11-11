@@ -3643,6 +3643,10 @@
 .set-conn-card.is-unknown::before {
   background: var(--border);
 }
+/* 已暂停：灰条而不是红条 —— 主动停用不能和「连不上」长成同一个样子 */
+.set-conn-card.is-paused::before {
+  background: var(--text-muted);
+}
 
 /* 卡片里的标签排布：全局默认是 14px 的元信息行，这里要密集芯片 */
 .set-conn-card .set-conn-tags {

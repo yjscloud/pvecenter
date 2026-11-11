@@ -122,12 +122,9 @@ def active_connection() -> Dict[str, str]:
     return {"id": "", "name": ""}
 
 
-async def probe(profile: Dict[str, Any], client: Any) -> Dict[str, Any]:
-    """探测一条连接：可达性 / 版本 / 节点数 / 仲裁 / HA。
-
-    ``can_manage`` 由调用方决定是否把主机地址带出去（调用 :func:`collect`）。
-    """
-    item: Dict[str, Any] = {
+def blank_item(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """一条连接的初始结果（``ok=False``）：字段齐全，前端不必判空。"""
+    return {
         "id": str(profile.get("id") or ""),
         "name": connection_label(profile),
         "ok": False,
@@ -139,6 +136,14 @@ async def probe(profile: Dict[str, Any], client: Any) -> Dict[str, Any]:
         "ha_enabled": False,
         "ha_resources": 0,
     }
+
+
+async def probe(profile: Dict[str, Any], client: Any) -> Dict[str, Any]:
+    """探测一条连接：可达性 / 版本 / 节点数 / 仲裁 / HA。
+
+    ``can_manage`` 由调用方决定是否把主机地址带出去（调用 :func:`collect`）。
+    """
+    item = blank_item(profile)
     try:
         version = await client.version() or {}
         nodes = await client.nodes() or []
@@ -189,7 +194,17 @@ async def collect(*, can_manage: bool = False) -> Dict[str, Any]:
     pairs = all_connection_clients()
 
     async def one(profile: Dict[str, Any], client: Any) -> Dict[str, Any]:
-        item = await probe(profile, client)
+        try:
+            item = await probe(profile, client)
+        except Exception as exc:  # noqa: BLE001 - 一条出意外不能拖垮整份机队状态
+            # ``probe`` 只认 ``ProxmoxError``；其余异常（响应结构不符预期之类）
+            # 在这里降级成「这条不可达」，否则整份结果会被 ``parallel`` 原样
+            # 带出来的异常顶掉。
+            logger.warning(
+                "机队探测失败（%s）", connection_label(profile), exc_info=True
+            )
+            item = blank_item(profile)
+            item["error"] = str(exc) or exc.__class__.__name__
         if can_manage:
             item["host"] = str(profile.get("host") or "")
         return item

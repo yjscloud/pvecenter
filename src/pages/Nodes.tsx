@@ -208,7 +208,10 @@ export function Nodes() {
      这一层是三级树的第二级：哪怕只有一条连接也照渲染 —— 它是「区域」与
      「节点」中间的那一级，省掉它区域下面就直接挂着节点，层级读不出来。 */
   const groups = useMemo(() => {
-    const map = new Map<string, { label: string; nodes: NodeInfo[] }>();
+    const map = new Map<
+      string,
+      { label: string; nodes: NodeInfo[]; paused: boolean }
+    >();
     for (const node of visible) {
       const key = node.connection_id ?? '';
       const existing = map.get(key);
@@ -218,11 +221,24 @@ export function Nodes() {
         map.set(key, {
           label: node.connection_name || node.node || t('nodes.defaultConnection'),
           nodes: [node],
+          paused: false,
         });
       }
     }
+    /* 暂停接入的连接后端不再采集，节点数据里根本没有它 —— 但这一页仍要能看见
+       它，并像 PBS 那样标「已暂停」。否则「列表里少了一台」会被读成连接被删了
+       或面板坏了。补一个不挂节点的空分组：标题条照常可点开，里面写明已暂停。 */
+    const q = search.trim().toLowerCase();
+    for (const conn of conns) {
+      const id = String(conn.id ?? '');
+      if (!id || map.has(id) || !conn.paused) continue;
+      if (connFilter && connFilter !== id) continue;
+      const label = String(conn.name || id);
+      if (q && !label.toLowerCase().includes(q)) continue;
+      map.set(id, { label, nodes: [], paused: true });
+    }
     return [...map.entries()].map(([id, value]) => ({ id, ...value }));
-  }, [visible, t]);
+  }, [visible, conns, connFilter, search, t]);
 
   /* ---- 区域 / 机房（填在连接上的标签）----
      三级树的最外层：区域 / 机房 → 连接 → 节点（与网络页同一套层级语言）。
@@ -336,6 +352,14 @@ export function Nodes() {
 
   const connectionOptions = useMemo(() => {
     const seen = new Map<string, string>();
+    /* 以连接列表为准、再用节点补：暂停接入的连接没有节点数据，只按节点构造的
+       话它根本不会出现在筛选器里，用户也就没法把它单独筛出来看 */
+    for (const c of conns) {
+      const id = String(c.id ?? '');
+      if (id && !seen.has(id)) {
+        seen.set(id, c.name || t('nodes.defaultConnection'));
+      }
+    }
     for (const n of list) {
       const id = n.connection_id ?? '';
       if (!seen.has(id)) seen.set(id, n.connection_name || t('nodes.defaultConnection'));
@@ -344,7 +368,7 @@ export function Nodes() {
       { label: t('nodes.allHosts'), value: '' },
       ...[...seen.entries()].map(([value, label]) => ({ label, value })),
     ];
-  }, [list, t]);
+  }, [conns, list, t]);
 
   /* ---- 仲裁（告警全机队、标题跟随作用域）----
      告警逐个连接看，而不是只看兜底那台：失去仲裁意味着那个集群进入只读保护，
@@ -612,7 +636,7 @@ export function Nodes() {
             onRetry={() => void nodesQuery.refetch()}
           />
         )
-      ) : list.length === 0 ? (
+      ) : list.length === 0 && groups.length === 0 ? (
         <Card>
           {/* 「列表空」有两种原因，不该共用一句文案：真没接主机（该去添加），
               还是接了但令牌读不到节点（该去修权限）。后者提示「添加节点」会让人
@@ -650,7 +674,7 @@ export function Nodes() {
             }
           />
         </Card>
-      ) : visible.length === 0 ? (
+      ) : groups.length === 0 ? (
         <Card>
           <EmptyState
             title={t('nodes.noMatchTitle')}
@@ -730,7 +754,11 @@ export function Nodes() {
                               type="button"
                               className="tree-head"
                               aria-expanded={connOpen}
-                              title={onlineRatioOf(group.nodes)}
+                              title={
+                                group.paused
+                                  ? t('conn.pausedHint')
+                                  : onlineRatioOf(group.nodes)
+                              }
                               onClick={() => toggleOpenConn(group.id)}
                             >
                               <span className="tree-head-icon">
@@ -739,18 +767,33 @@ export function Nodes() {
                               <IconServer size={15} />
                               <span className="tree-name">{group.label}</span>
                               <span className="tree-meta">
-                                <Badge variant="neutral" size="sm">
-                                  {t('nodes.nodeCount', {
-                                    n: group.nodes.length,
-                                  })}
-                                </Badge>
-                                {offlineCount > 0 ? (
-                                  <Badge variant="warning" size="sm" dot>
-                                    {t('nodes.offlineCount', {
-                                      n: offlineCount,
-                                    })}
+                                {/* 已暂停的连接没有节点数据：报「0 个节点」会让人
+                                    以为这台机器上真没有节点，只标状态就够了 */}
+                                {group.paused ? (
+                                  <Badge
+                                    variant="neutral"
+                                    size="sm"
+                                    dot
+                                    title={t('conn.pausedHint')}
+                                  >
+                                    {t('conn.paused')}
                                   </Badge>
-                                ) : null}
+                                ) : (
+                                  <>
+                                    <Badge variant="neutral" size="sm">
+                                      {t('nodes.nodeCount', {
+                                        n: group.nodes.length,
+                                      })}
+                                    </Badge>
+                                    {offlineCount > 0 ? (
+                                      <Badge variant="warning" size="sm" dot>
+                                        {t('nodes.offlineCount', {
+                                          n: offlineCount,
+                                        })}
+                                      </Badge>
+                                    ) : null}
+                                  </>
+                                )}
                               </span>
                             </button>
                           ) : null}
@@ -762,13 +805,21 @@ export function Nodes() {
                                 grouped ? 'tree-body' : 'flex flex-col gap-16'
                               }
                             >
-                              {group.nodes.map((node) => (
-                                <NodeCard
-                                  key={`${node.connection_id ?? ''}:${node.node}`}
-                                  node={node}
-                                  onOpen={() => openDetail(node)}
-                                />
-                              ))}
+                              {group.paused ? (
+                                /* 暂停接入：没有节点数据是预期行为，不是「这台机器
+                                   上没有节点」。写明原因，并指向恢复入口所在的页面 */
+                                <div className="conn-nodes-empty">
+                                  {t('conn.pausedEmpty')}
+                                </div>
+                              ) : (
+                                group.nodes.map((node) => (
+                                  <NodeCard
+                                    key={`${node.connection_id ?? ''}:${node.node}`}
+                                    node={node}
+                                    onOpen={() => openDetail(node)}
+                                  />
+                                ))
+                              )}
                             </div>
                           ) : null}
                         </section>

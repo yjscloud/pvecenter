@@ -28,9 +28,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import alerting, i18n, pbs, store
+from .pve import parallel
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +42,39 @@ METRIC = "pbs_health"
 #: 也不至于让一条“盘快坏了”被埋在重复消息里。
 COOLDOWN = 6 * 3600
 
+#: 单次巡检的并发上限。每条连接要发 4 类请求（节点 / 任务 / 磁盘 / 仓库），
+#: 连接一多，全并发只是把「慢」换成 PBS 侧的排队与超时。
+SCAN_CONCURRENCY = 4
 
-async def scan_failures() -> List[Dict[str, Any]]:
-    """扫全部 PBS 连接，返回 GC 失败与磁盘异常。"""
+
+async def scan() -> Tuple[List[Dict[str, Any]], Set[str]]:
+    """扫全部 PBS 连接，返回 ``(GC 失败 / 磁盘异常 / 容量越线, 被暂停的主机)``。
+
+    暂停名单一并返回，是因为它决定「恢复通知」能不能发：暂停的连接不再被探
+    测，自然也不出现在失败项里 —— 但那是停用，不是恢复，见 :func:`evaluate`。
+    """
     conns = await pbs.load_connections()
     failures: List[Dict[str, Any]] = []
 
-    async def _one(conn: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # 暂停接入的连接**不探**：与 :func:`app.pbs._collect_all` 同一口径 ——
+    # 界面上它显示「已暂停」，采集与告警都不该再碰它。
+    live: List[pbs.PbsConnection] = []
+    paused_hosts: Set[str] = set()
+    for conn in conns:
         cfg = pbs.PbsConnection.from_dict(conn)
-        if not cfg.configured:
-            return []
+        if cfg.paused:
+            # 空主机名不进名单：否则会匹配到 target 为空的历史告警
+            if cfg.host:
+                paused_hosts.add(cfg.host)
+            continue
+        if cfg.configured:
+            live.append(cfg)
+
+    # 同一台 PBS 登记了两条、只暂停其中一条时，另一条仍在采集：不能因为被暂停
+    # 的那条就把这台主机的活动告警一直挂住。
+    paused_hosts -= {cfg.host for cfg in live}
+
+    async def _one(cfg: pbs.PbsConnection) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         client = pbs.PbsClient(cfg)
         try:
@@ -157,14 +181,19 @@ async def scan_failures() -> List[Dict[str, Any]]:
         finally:
             await client.aclose()
 
-    groups = await asyncio.gather(
-        *(_one(conn) for conn in conns), return_exceptions=True
-    )
+    # ``parallel`` 把异常原样返回，逐条判断：一条连接整体失败不连累其它连接。
+    groups = await parallel([_one(cfg) for cfg in live], limit=SCAN_CONCURRENCY)
     for group in groups:
         if isinstance(group, BaseException):
             logger.info("PBS 巡检：一条连接整体失败：%s", group)
             continue
         failures.extend(group)
+    return failures, paused_hosts
+
+
+async def scan_failures() -> List[Dict[str, Any]]:
+    """只要失败项（「什么算故障」的唯一入口；通知流程见 :func:`evaluate`）。"""
+    failures, _paused = await scan()
     return failures
 
 
@@ -180,6 +209,16 @@ def _subject(item: Dict[str, Any]) -> str:
     if item["kind"] == "disk":
         return f"{item['host']} / {item['device']}"
     return item["host"]
+
+
+def _subject_host(target: str) -> str:
+    """:func:`_subject` 的逆运算：取「PBS 主机」那一段。
+
+    三种形状（``host`` / ``host / store`` / ``host / device``）都以主机名打头，
+    所以取第一个 `` / `` 之前的部分就够了 —— 活动告警里只存了人话 target，
+    没有单列主机字段。
+    """
+    return target.split(" / ", 1)[0].strip()
 
 
 def _alert_text(item: Dict[str, Any], at: Optional[float] = None) -> str:
@@ -289,7 +328,7 @@ def _card(item: Dict[str, Any], at: float) -> Dict[str, Any]:
 
 async def evaluate(owner: Optional[str] = None) -> List[Dict[str, Any]]:
     """巡检 GC 失败、磁盘健康与备份盘容量；``owner=None`` 发给第一个管理员。"""
-    failures = await scan_failures()
+    failures, paused_hosts = await scan()
     target_owner = owner or await store.first_admin_username() or ""
     if not target_owner:
         return []
@@ -366,6 +405,10 @@ async def evaluate(owner: Optional[str] = None) -> List[Dict[str, Any]]:
 
     for key, row in list(active.items()):
         if key in still:
+            continue
+        # 暂停接入的连接不是「恢复了」，是「不采了」：不发恢复通知，也不清活动
+        # 告警（先清掉等于让它静默消失）。恢复接入后这一条会重新判定。
+        if _subject_host(str(row.get("target") or "")) in paused_hosts:
             continue
         if not await alerting.recovery_confirmed(key, row):
             continue

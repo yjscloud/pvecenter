@@ -683,6 +683,11 @@ export const zhApp = {
   'pbs.openConnections': '登记只读凭据',
   'pbs.online': '在线',
   'pbs.offline': '不可达',
+  /* 暂停接入：主动停用（不发请求、不告警）。必须与「不可达」分开显示，
+     否则一次主动维护会被读成一台机器挂了 */
+  'pbs.paused': '已暂停',
+  'pbs.pausedHint': '已暂停接入（常用于临时下线维护）：不采集、不告警；配置与凭据保留，可随时恢复',
+  'pbs.fleetPaused': '{n} 台已暂停',
   'pbs.openConsole': '打开 PBS 控制台',
   'pbs.nodeTitle': '节点',
   'pbs.nodeUnavailable': '读不到节点状态（凭据可能缺少 Sys.Audit）',
@@ -819,6 +824,13 @@ export const zhApp = {
   'pbs.badgeIncomplete': '待补全',
   'pbs.connected': '已连通',
   'pbs.disconnected': '不可达',
+  /* 暂停 / 恢复：只改一个字段的专用端点，不走整份保存 */
+  'pbs.pause': '暂停接入',
+  'pbs.resume': '恢复接入',
+  'pbs.pauseHint': '临时下线 / 维护期间用它：暂停后不再向这台 PBS 发请求（概览、GC、磁盘与容量均停采），配置与凭据保留',
+  'pbs.resumeHint': '恢复接入：下一轮采集会自动重连',
+  'pbs.resumed': '已恢复接入',
+  'pbs.pauseFailed': '暂停 / 恢复失败',
   'pbs.addTitle': '添加 PBS 连接',
   'pbs.editTitle': '编辑 PBS 连接',
   'pbs.addDesc': '登记 PBS 只读 token；secret 只在 generate-token 时显示一次',

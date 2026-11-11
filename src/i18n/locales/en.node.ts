@@ -186,6 +186,18 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'conn.readonlyBody': 'Only administrators can change connection settings. The token secret shown on this page is always masked by the backend and is never returned in plain text.',
   'conn.connected': 'Connected',
   'conn.disconnected': 'Unreachable',
+  'conn.paused': 'Paused',
+  'conn.pausedHint':
+    'Ingest paused (typical for maintenance windows): no polling, no alerts; settings and credentials are kept',
+  'conn.pausedEmpty':
+    'Ingest paused (typical for maintenance windows): no polling, no alerts; the next poll reconnects automatically once resumed',
+  'conn.pause': 'Pause',
+  'conn.resume': 'Resume',
+  'conn.pauseHint':
+    'Use it while the host is offline for maintenance: no requests will be sent to this PVE host (nodes, VMs, storage and alert checks stop); settings and credentials are kept',
+  'conn.resumeHint': 'Resume ingest: the next poll reconnects automatically',
+  'conn.resumed': 'Ingest resumed',
+  'conn.pauseFailed': 'Could not pause / resume',
   'conn.cannotConnect': 'Cannot connect',
   'conn.checking': 'Checking…',
   'conn.defaultRead': 'Fallback read',

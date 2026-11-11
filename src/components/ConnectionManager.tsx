@@ -113,6 +113,8 @@ export function ConnectionManager({
   const [dirty, setDirty] = useState(false);
   /* 正在执行「一键修复令牌权限」的连接 id */
   const [repairingId, setRepairingId] = useState<string | null>(null);
+  /* 正在切换「暂停接入」的连接 id：只锁它自己，不锁整张卡片网格 */
+  const [pausingId, setPausingId] = useState<string | null>(null);
 
   /* ---- 读取配置（当前连接）与全部连接 ---- */
   const configQuery = useQuery({
@@ -447,6 +449,26 @@ export function ConnectionManager({
     }
   };
 
+  /* ---- 暂停 / 恢复接入 ---- */
+  /* 走专用端点而不是 update：整份保存会覆盖所有字段，开关状态容易被别人那份
+     旧数据带回旧值。成功后要把站点级缓存一起刷掉 —— 暂停会改变节点、虚拟机、
+     连接状态与机队读数，只刷连接列表会留下一屏旧数字。 */
+  const pauseProfile = async (p: ConnectionProfile, paused: boolean) => {
+    setPausingId(p.id);
+    try {
+      await connectionsApi.pause(p.id, paused);
+      toast.success(
+        paused ? t('conn.paused') : t('conn.resumed'),
+        p.name || p.host,
+      );
+      void queryClient.invalidateQueries();
+    } catch (err) {
+      toast.error(t('conn.pauseFailed'), errorMessage(err));
+    } finally {
+      setPausingId(null);
+    }
+  };
+
   /* ---- 保存 ---- */
   /* editingId 有值 = 更新该连接；为 null = 新增一条（不再覆盖已有连接） */
   const save = async () => {
@@ -565,8 +587,17 @@ export function ConnectionManager({
             const connStatus = statusById.get(c.id);
             const nodes = nodesByConnection.get(c.id) ?? [];
             const expanded = expandedNodes.has(c.id);
-            const state = connStatus ? (connStatus.ok ? 'ok' : 'down') : 'unknown';
+            /* 已暂停优先于「探过 / 没探过」：暂停的连接根本没被探测，
+               画成红的「无法连接」会让人以为机器挂了 */
+            const state = c.paused
+              ? 'paused'
+              : connStatus
+                ? connStatus.ok
+                  ? 'ok'
+                  : 'down'
+                : 'unknown';
             const repairing = repairingId === c.id;
+            const pausing = pausingId === c.id;
             return (
               <div key={c.id} className={`set-conn-card is-${state}`}>
                 <div className="set-conn-top">
@@ -581,8 +612,17 @@ export function ConnectionManager({
                       {c.host}:{c.port}
                     </span>
                   </div>
-                  {/* 状态来自逐条探测：连得上 / 连不上（带原因） */}
-                  {connStatus ? (
+                  {/* 状态来自逐条探测：连得上 / 连不上（带原因）；已暂停单独一档 */}
+                  {c.paused ? (
+                    <Badge
+                      variant="neutral"
+                      size="sm"
+                      dot
+                      title={t('conn.pausedHint')}
+                    >
+                      {t('conn.paused')}
+                    </Badge>
+                  ) : connStatus ? (
                     connStatus.ok ? (
                       <Badge variant="success" size="sm" dot>
                         {t('conn.connected')}
@@ -680,6 +720,17 @@ export function ConnectionManager({
                       title={t('conn.repairTitle')}
                     >
                       修复权限
+                    </Button>
+                    {/* 暂停 / 恢复：配置与凭据都留着，随时能接回来 */}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={!isAdmin}
+                      loading={pausing}
+                      onClick={() => void pauseProfile(c, !c.paused)}
+                      title={c.paused ? t('conn.resumeHint') : t('conn.pauseHint')}
+                    >
+                      {c.paused ? t('conn.resume') : t('conn.pause')}
                     </Button>
                   </div>
                   <IconButton

@@ -16,11 +16,11 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from .. import pbs, pve, security
 from ..pve import ProxmoxError
-from ..schemas import PbsConfigIn, PbsConnectionTestIn
+from ..schemas import ConnectionPauseIn, PbsConfigIn, PbsConnectionTestIn
 
 router = APIRouter(prefix="/api/pbs", tags=["pbs"])
 
@@ -107,6 +107,11 @@ async def save_config(
         secret = str(raw.get("token_secret") or "").strip()
         if not secret:
             secret = str((existing.get(conn_id) or {}).get("token_secret") or "")
+        # 暂停状态：没传就沿用已保存的值。开关只由 pause 端点改，整份保存不该
+        # 顺手把它清掉（早先 PVE 连接在这里踩过坑）。
+        paused = raw.get("paused")
+        if paused is None:
+            paused = (existing.get(conn_id) or {}).get("paused")
         saved.append(
             {
                 "id": conn_id,
@@ -120,10 +125,49 @@ async def save_config(
                 "verify_ssl": raw.get("verify_ssl"),
                 "ca_cert": str(raw.get("ca_cert") or ""),
                 "node": str(raw.get("node") or "").strip(),
+                "paused": bool(paused),
             }
         )
     await pbs.save_connections(saved)
     return [pbs.public_connection(item) for item in saved]
+
+
+@router.post("/config/{conn_id}/pause")
+async def pause_connection(
+    conn_id: str,
+    body: ConnectionPauseIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(MANAGE),
+) -> List[Dict[str, Any]]:
+    """暂停 / 恢复某台 PBS 的接入。
+
+    暂停后不再向这台 PBS 发任何请求（仓库容量、任务、磁盘、GC 全停），概览里
+    仍保留一行并标 ``paused``：界面显示「已暂停」，在线率与告警都把它排除在外。
+    配置、凭据、区域、节点名全部保留，恢复后下一轮采集自动重连。
+
+    只改这一条记录的一个字段：整份 ``PUT /config`` 会覆盖所有连接，两个人同时
+    编辑时开关状态容易被对方那份旧数据带回旧值。
+    """
+    conns = await pbs.load_connections()
+    if not any(str(item.get("id") or "") == conn_id for item in conns):
+        raise HTTPException(status_code=404, detail="PBS 连接不存在")
+
+    updated: List[Dict[str, Any]] = []
+    for item in conns:
+        if str(item.get("id") or "") == conn_id:
+            updated.append({**item, "paused": bool(body.paused)})
+        else:
+            updated.append(item)
+    await pbs.save_connections(updated)
+
+    await security.audit(
+        request,
+        user,
+        "pbs.connection.pause" if body.paused else "pbs.connection.resume",
+        target=f"pbs/{conn_id}",
+        detail={"paused": bool(body.paused)},
+    )
+    return [pbs.public_connection(item) for item in updated]
 
 
 @router.post("/config/test")

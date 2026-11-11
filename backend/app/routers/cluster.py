@@ -12,6 +12,7 @@ from ..nodeaccess import require_node_visible
 from ..pve import (
     ProxmoxError,
     all_connection_clients,
+    collection_targets,
     connection_label,
     get_client,
     parallel,
@@ -317,7 +318,7 @@ async def list_nodes(
         # 区域管理员只向本区域的连接取节点；普通用户的收窄发生在节点级
         targets = [
             (profile, client)
-            for profile, client in (all_connection_clients() or [(None, get_client())])
+            for profile, client in collection_targets()
             if security.region_in_scope(user, str((profile or {}).get("region") or ""))
         ]
         if not targets:

@@ -39,10 +39,10 @@ from ..formatters import (
 from ..vm_scope import bind_vm_connection
 from ..pve import (
     ProxmoxError,
-    all_connection_clients,
     client_for_connection,
     connection_label,
     explain_clone_error,
+    collection_targets,
     get_client,
     node_from_upid,
     parallel,
@@ -203,7 +203,7 @@ async def collect_vms(
         )
         targets: List[Any] = [(profile, get_client())]
     else:
-        targets = list(all_connection_clients()) or [(None, get_client())]
+        targets = collection_targets()
 
     result: List[Dict[str, Any]] = []
     failure: Optional[ProxmoxError] = None

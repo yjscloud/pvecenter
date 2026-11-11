@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
-from app import pbs, pbsguard  # noqa: E402
+from app import alerting, pbs, pbsguard  # noqa: E402
 
 
 def _run(coro):
@@ -240,3 +240,162 @@ def test_unconfigured_connection_is_skipped(monkeypatch) -> None:
     monkeypatch.setattr(pbs, "load_connections", fake_load)
     monkeypatch.setattr(pbs, "PbsClient", lambda conn: _FakePbs(conn))
     assert _run(pbsguard.scan_failures()) == []
+
+
+# ------------------------------------------------------------------ 暂停接入
+
+
+def test_paused_connection_is_not_probed(monkeypatch) -> None:
+    """暂停接入 = 采集停了：与 pbs._collect_all 同口径，连请求都不该发。"""
+
+    async def fake_load():
+        return [_conn(paused=True)]
+
+    def boom(conn: pbs.PbsConnection) -> Any:
+        raise AssertionError("暂停的连接不该被探测")
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "PbsClient", boom)
+    assert _run(pbsguard.scan_failures()) == []
+
+
+def test_paused_hosts_are_returned_to_the_caller(monkeypatch) -> None:
+    """暂停名单要单独带出来：否则 evaluate 会把「停用」当「恢复」发通知。"""
+
+    async def fake_load():
+        return [_conn(paused=True)]
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    failures, paused = _run(pbsguard.scan())
+    assert failures == []
+    assert paused == {"pbs.lan"}
+
+
+def test_paused_host_with_a_live_twin_is_not_suppressed(monkeypatch) -> None:
+    """同一台 PBS 登记两条、只暂停一条时，另一条还在采集，不能压制它的告警。"""
+
+    async def fake_load():
+        return [_conn(id="a", paused=True), _conn(id="b")]
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "PbsClient", lambda conn: _FakePbs(conn))
+    failures, paused = _run(pbsguard.scan())
+    assert failures == []
+    assert paused == set()
+
+
+def test_subject_host_handles_every_subject_shape() -> None:
+    assert pbsguard._subject_host("pbs.lan / backup") == "pbs.lan"
+    assert pbsguard._subject_host("pbs.lan / /dev/sdb") == "pbs.lan"
+    assert pbsguard._subject_host("pbs.lan") == "pbs.lan"
+
+
+class _Stub:
+    """把 evaluate 要碰的告警侧函数记下来，跑完断言「发了什么、清了什么」。"""
+
+    def __init__(self, active: Optional[Dict[str, Any]] = None) -> None:
+        self.active: Dict[str, Any] = dict(active or {})
+        self.dispatched: List[Dict[str, Any]] = []
+        self.marked: List[str] = []
+        self.cleared: List[str] = []
+        self.recover_calls: List[str] = []
+
+    async def load_active(self) -> Dict[str, Any]:
+        return dict(self.active)
+
+    async def dispatch(self, owner, feishu, email_cfg, title, text, card, **kw):
+        self.dispatched.append({"title": title, "text": text, "source": kw.get("source")})
+        return True, "sent"
+
+    async def record(self, entry, *, source="", repeat=False, channels=None):
+        return None
+
+    async def mark_active(self, key, row):
+        self.marked.append(key)
+        self.active[key] = dict(row, alarm_key=key)
+
+    async def clear_active(self, key):
+        self.cleared.append(key)
+        self.active.pop(key, None)
+
+    async def recovery_confirmed(self, key, row):
+        self.recover_calls.append(key)
+        return True
+
+    async def load_feishu(self, owner=""):
+        return {"enabled": True}
+
+    async def load_alert_email(self, owner=""):
+        return {"enabled": False}
+
+    async def load_webhook(self, owner=""):
+        return {"enabled": False}
+
+    async def resolve_language(self, owner):
+        return "zh-CN"
+
+
+def _active_capacity_alarm() -> Dict[str, Any]:
+    key = alerting.alarm_key("admin", pbsguard.RULE_ID, "capacity:pbs.lan:backup")
+    return {
+        key: {
+            "username": "admin",
+            "rule_id": pbsguard.RULE_ID,
+            "rule_name": pbsguard.RULE_NAME,
+            "target_type": "host",
+            "target": "pbs.lan / backup",
+            "metric": "pbs_capacity",
+            "value": 96.0,
+            "threshold": 95.0,
+            "node": "pbs",
+            "ts": 1,
+        }
+    }
+
+
+def _patch_evaluate(monkeypatch, stub: _Stub, paused: bool) -> None:
+    async def fake_load():
+        return [_conn(paused=paused)]
+
+    async def admin():
+        return "admin"
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbsguard.pbs, "PbsClient", lambda conn: _FakePbs(conn))
+    monkeypatch.setattr(pbsguard.store, "first_admin_username", admin)
+    for name in (
+        "load_active",
+        "dispatch",
+        "record",
+        "mark_active",
+        "clear_active",
+        "recovery_confirmed",
+        "load_feishu",
+        "load_alert_email",
+        "load_webhook",
+        "resolve_language",
+    ):
+        monkeypatch.setattr(pbsguard.alerting, name, getattr(stub, name))
+
+
+def test_paused_connection_does_not_send_fake_recovery(monkeypatch) -> None:
+    """暂停 ≠ 恢复：既不发「已恢复」，也不清活动告警（先清等于让它静默消失）。"""
+    stub = _Stub(_active_capacity_alarm())
+    _patch_evaluate(monkeypatch, stub, paused=True)
+
+    assert _run(pbsguard.evaluate()) == []
+    assert stub.dispatched == []
+    assert stub.recover_calls == []
+    assert stub.cleared == []
+    assert stub.active  # 活动告警原样留着，等恢复接入后重新判定
+
+
+def test_unpaused_connection_still_sends_recovery(monkeypatch) -> None:
+    """对照组：没暂停时容量已回落，恢复通知照发，证明上面的静默只针对暂停。"""
+    stub = _Stub(_active_capacity_alarm())
+    _patch_evaluate(monkeypatch, stub, paused=False)
+
+    fired = _run(pbsguard.evaluate())
+    assert [item["kind"] for item in fired] == ["recovery"]
+    assert stub.cleared
+    assert not stub.active

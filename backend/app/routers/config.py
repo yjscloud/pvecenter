@@ -38,6 +38,7 @@ from ..pve import (
 )
 from ..schemas import (
     ConnectionConfigIn,
+    ConnectionPauseIn,
     ConnectionTestIn,
     FaqIn,
     LoginCaptchaIn,
@@ -81,13 +82,27 @@ async def health(
         # 未配置和配了但连不上，用户要做的事完全不同（去添加 vs 去排查），
         # 只给一个 false 的话前端只能把两者都渲染成报错。
         "pve_configured": False,
+        # 兜底读取的那台被「暂停接入」时为真：前端据此说「已暂停」而不是「连不上」
+        "pve_paused": False,
         "version": __version__,
         "pve_version": None,
         "node_count": 0,
         "error": None,
     }
 
-    client = get_client()
+    try:
+        client = get_client()
+    except ProxmoxError as exc:
+        # 目标连接被暂停（503）或已被删除（404）：这是可解释状态，不该 500
+        result["pve_paused"] = exc.status_code == 503
+        result["pve_configured"] = exc.status_code == 503
+        result["error"] = exc.message
+        if security.has_user_permission(user, "node.view"):
+            result["fleet"] = fleetstatus.panel_fleet_cached(
+                security.has_user_permission(user, "settings.manage")
+            )
+        return result
+
     if not client.conn.configured:
         result["error"] = "Proxmox 连接未配置"
         return result
@@ -332,6 +347,51 @@ async def activate_connection(
     rebuild_client()
     await security.audit(request, user, "connection.activate", target=f"connection/{conn_id}")
     return {"active": conn_id}
+
+
+@router.post("/connections/{conn_id}/pause")
+async def pause_connection(
+    conn_id: str,
+    payload: ConnectionPauseIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+) -> Dict[str, Any]:
+    """暂停 / 恢复某条 PVE 连接的接入。
+
+    暂停期间的语义（与界面文案一一对应）：
+
+    * **不再采集**：节点列表、fleet 状态、连接探测、告警巡检一律跳过这台机器
+      （``pve.all_connection_clients`` 过滤，``get_client`` 对它是 503）；
+    * **不算异常**：它不会出现在逐连接的探测里、不会被计成离线，也不会触发
+      离线 / 阈值 / 仲裁类告警；
+    * **数据保留**：只是不再写入新数据，已有的指标历史、告警记录、受保护备份
+      登记全部照旧；恢复后下一轮轮询自动重连，不需要重新填写凭据。
+
+    只改 ``paused`` 一个字段：编辑连接时提交的是整份配置，开关状态不该被一次
+    无关的保存覆盖，也不该因为两个人同时编辑而互相打架。
+    """
+    conns = store.get_connections()
+    if _find_connection(conns, conn_id) is None:
+        raise HTTPException(status_code=404, detail="连接不存在")
+
+    updated: List[Dict[str, Any]] = [
+        {**c, "paused": bool(payload.paused)} if str(c.get("id")) == conn_id else c
+        for c in conns
+    ]
+    await store.save_connections(updated)
+    # 兜底客户端缓存里可能还留着这台机器的连接对象，重建一次让它立即让位
+    rebuild_client()
+
+    await security.audit(
+        request,
+        user,
+        "connection.pause" if payload.paused else "connection.resume",
+        target=f"connection/{conn_id}",
+        detail={"paused": bool(payload.paused)},
+    )
+    pub = store.public_connection_config(_find_connection(updated, conn_id) or {})
+    pub["active"] = store.get_active_connection_id() == conn_id
+    return pub
 
 
 @router.post("/connections/{conn_id}/repair-permissions")

@@ -97,6 +97,8 @@ export function PbsConnectionCard({
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [busyRow, setBusyRow] = useState('');
+  /* 暂停 / 恢复正在提交的那一行：只锁它自己，别把整张卡片网格都锁住 */
+  const [pausingId, setPausingId] = useState('');
   const [testResult, setTestResult] = useState<PbsTestResult | null>(null);
   const [rowState, setRowState] = useState<Record<string, RowState>>({});
 
@@ -322,6 +324,27 @@ export function PbsConnectionCard({
     }
   };
 
+  /* ---- 暂停 / 恢复 ----
+     走专用端点而不是 saveConfig：整份保存会覆盖所有连接，开关状态容易被
+     别人那份旧数据带回旧值。返回的整份列表直接写回缓存，省一次往返。 */
+  const togglePause = async (item: PbsConfigItem, paused: boolean) => {
+    setPausingId(item.id);
+    try {
+      const saved = await pbsApi.pauseConnection(item.id, paused);
+      queryClient.setQueryData(['pbs', 'config'], saved);
+      /* 概览与状态条读的是另一份缓存：暂停会改变在线率，必须一起刷新 */
+      void queryClient.invalidateQueries({ queryKey: ['pbs', 'overview'] });
+      toast.success(
+        paused ? t('pbs.paused') : t('pbs.resumed'),
+        item.name || item.host,
+      );
+    } catch (err) {
+      toast.error(t('pbs.pauseFailed'), errorMessage(err));
+    } finally {
+      setPausingId('');
+    }
+  };
+
   const remove = async (item: PbsConfigItem) => {
     try {
       await persist(rows.filter((row) => row.id !== item.id));
@@ -415,8 +438,17 @@ export function PbsConnectionCard({
               const configured =
                 item.configured ?? Boolean(item.host && item.token_id);
               const state = rowState[item.id];
-              const tone = state ? (state.ok ? 'ok' : 'down') : 'unknown';
+              /* 已暂停优先于「测过 / 没测过」：暂停的连接根本没发过请求，
+                 画成红的「不可达」会让人以为机器坏了 */
+              const tone = item.paused
+                ? 'paused'
+                : state
+                  ? state.ok
+                    ? 'ok'
+                    : 'down'
+                  : 'unknown';
               const busy = busyRow === item.id;
+              const pausing = pausingId === item.id;
               return (
                 <div key={item.id} className={`set-conn-card is-${tone}`}>
                   <div className="set-conn-top">
@@ -431,7 +463,11 @@ export function PbsConnectionCard({
                         {item.host}:{item.port}
                       </span>
                     </div>
-                    {state ? (
+                    {item.paused ? (
+                      <Badge variant="neutral" size="sm" dot>
+                        {t('pbs.paused')}
+                      </Badge>
+                    ) : state ? (
                       state.ok ? (
                         <Badge variant="success" size="sm" dot>
                           {t('pbs.connected')}
@@ -501,6 +537,16 @@ export function PbsConnectionCard({
                         onClick={() => void runTest(item, false)}
                       >
                         {t('pbs.test')}
+                      </Button>
+                      {/* 暂停 / 恢复：配置与凭据都留着，随时能接回来 */}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        loading={pausing}
+                        title={item.paused ? t('pbs.resumeHint') : t('pbs.pauseHint')}
+                        onClick={() => void togglePause(item, !item.paused)}
+                      >
+                        {item.paused ? t('pbs.resume') : t('pbs.pause')}
                       </Button>
                     </div>
                     <IconButton

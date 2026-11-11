@@ -30,7 +30,7 @@ export function PveSetupNotice() {
   const navigate = useNavigate();
   const location = useLocation();
   const { isAdmin } = useAuth();
-  const { configured, loading, reachable, hasData } = usePveStatus();
+  const { configured, loading, reachable, paused, hasData } = usePveStatus();
 
   if (loading || location.pathname.startsWith(SETUP_PATH)) {
     return null;
@@ -43,7 +43,8 @@ export function PveSetupNotice() {
      要求 hasData：探测没回来时不能断言 PVE 连不上，那是把面板自己的故障
      算到 PVE 头上（同 usePveStatus 里的说明）。 */
   if (configured) {
-    if (!hasData || reachable) return null;
+    /* 暂停接入不是「连不上」：那是管理员主动停用，提示排查只会把人带偏 */
+    if (!hasData || reachable || paused) return null;
     return (
       <Notice
         tone="warning"

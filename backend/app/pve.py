@@ -1554,21 +1554,46 @@ def all_connection_clients() -> List[Tuple[Dict[str, Any], ProxmoxClient]]:
     它自己，不会波及其它主机。
     """
     try:
-        from .store import get_connections
+        from .store import get_connections, paused_connection_ids
 
         conns = get_connections()
+        # 暂停接入的连接不进入采集集合：所有逐连接的只读聚合（虚拟机 / 容器 /
+        # 备份 / 存储 / 指标 / 告警巡检 / 机队状态）都从这里取目标，过滤一次就够了。
+        paused = set(paused_connection_ids())
     except Exception:  # noqa: BLE001 - 存储异常不应让只读接口整体失败
         return []
 
     result: List[Tuple[Dict[str, Any], ProxmoxClient]] = []
     for profile in conns:
         cid = str(profile.get("id") or "")
-        if not cid:
+        if not cid or cid in paused:
             continue
         client = _scoped_client(cid)
         if client is not None:
             result.append((profile, client))
     return result
+
+
+def collection_targets() -> List[Tuple[Optional[Dict[str, Any]], Any]]:
+    """逐连接采集的目标列表：有连接就用未暂停的那些，没连接才回退兜底客户端。
+
+    ``all_connection_clients() or [(None, get_client())]`` 这个写法有个漏洞：所有
+    连接都被「暂停接入」时它回退到兜底客户端 —— 而兜底那台往往正是被停用的机器，
+    于是暂停在这些接口上又失效了（还会因为 get_client 抛 503 变成整页报错）。
+    所以「有没有保存过连接」与「有没有可采集的连接」必须分开判断。
+    """
+    pairs = all_connection_clients()
+    if pairs:
+        return list(pairs)
+    try:
+        from .store import connection_ids
+
+        if connection_ids():
+            # 连接是有的，只是全被暂停了：返回空列表，让调用方按「没有数据」处理
+            return []
+    except Exception:  # noqa: BLE001 - 判定失败时按老行为回退
+        pass
+    return [(None, get_client())]
 
 
 def connection_label(profile: Dict[str, Any]) -> str:
@@ -1621,6 +1646,24 @@ def get_client() -> ProxmoxClient:
 
     # 硬指定与软作用域都算「本次请求要打哪一台」，只是前者不允许被自动定位覆盖
     scoped = requested_connection()
+
+    # 暂停接入：目标连接停用后不再向它发请求。这里必须挡住 —— 走单连接路径
+    # 的接口（/health、/cluster/status 等）不经过 all_connection_clients，
+    # 少了这道判断，「暂停」在这些接口上就是空的。
+    target_id = scoped or _active_connection_id()
+    if target_id:
+        try:
+            from .store import is_connection_paused
+
+            paused = is_connection_paused(target_id)
+        except Exception:  # noqa: BLE001 - 判定失败不阻断正常读取
+            paused = False
+        if paused:
+            raise ProxmoxError(
+                f"连接已暂停接入（id={target_id}）：在「连接配置」里恢复后才会继续采集",
+                status_code=503,
+                endpoint="get_client",
+            )
     if scoped and scoped != _active_connection_id():
         scoped_client = _scoped_client(scoped)
         if scoped_client is None:

@@ -36,9 +36,9 @@ from .. import (
 from ..formatters import pve_flag
 from ..pve import (
     ProxmoxError,
-    all_connection_clients,
     connection_label,
     explain_clone_error,
+    collection_targets,
     get_client,
     parallel,
     requested_connection,
@@ -151,7 +151,7 @@ async def list_templates(
         )
         targets: List[Any] = [(profile, get_client())]
     else:
-        targets = list(all_connection_clients()) or [(None, get_client())]
+        targets = collection_targets()
 
     # 与 /lxc 同一取舍：连接之间彼此无关，串行等 C 个 RTT 没有意义。
     resources_list = await parallel(
@@ -248,7 +248,7 @@ async def list_ct_system_templates(
     **两份不同的文件**，必须都保留 —— 所以「卷的标识里要不要带节点」取决于这个
     存储是不是共享的，这也是这里必须读 ``shared`` 字段的原因。
     """
-    targets: List[Any] = list(all_connection_clients()) or [(None, get_client())]
+    targets: List[Any] = collection_targets()
     # 结果只按连接集合分档（这个接口不按用户 / 作用域过滤，口径是「全平台」），
     # 连接增删会直接改变 key，不会拿旧连接的模板糊弄人。
     ids = ",".join(

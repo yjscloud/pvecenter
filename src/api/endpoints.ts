@@ -720,6 +720,16 @@ export const connectionsApi = {
   /** 一键修复：给该连接的 API Token 授予 PVEAdmin（需已保存 PVE 账号密码） */
   repair: (id: string) =>
     post<ConnectionRepairResult>(`/connections/${id}/repair-permissions`),
+  /**
+   * 暂停 / 恢复某条连接的接入。
+   *
+   * 单独一个接口、只改这一个字段：整份 `update` 会覆盖所有字段，两个人同时
+   * 编辑时开关容易被对方那份旧数据带回旧值。
+   */
+  pause: (id: string, paused: boolean) =>
+    post<ConnectionProfile>(`/connections/${encodeURIComponent(id)}/pause`, {
+      paused,
+    }),
 };
 
 /* ---------------------------------------------------------------------------
@@ -805,6 +815,16 @@ export const pbsApi = {
   /** 整份保存：留空的 token_secret 表示沿用已保存的密钥 */
   saveConfig: (connections: PbsConfigItem[]) =>
     put<PbsConfigItem[]>('/pbs/config', { connections }),
+  /**
+   * 暂停 / 恢复某台 PBS 的接入。
+   *
+   * 单独一个接口、只改这一个字段：整份 `saveConfig` 会覆盖所有连接，两个人
+   * 同时编辑时开关容易被对方那份旧数据带回旧值。
+   */
+  pauseConnection: (id: string, paused: boolean) =>
+    post<PbsConfigItem[]>(`/pbs/config/${encodeURIComponent(id)}/pause`, {
+      paused,
+    }),
   /**
    * 连通性测试：`/version` 通过后再探一次仓库与任务能力。
    *

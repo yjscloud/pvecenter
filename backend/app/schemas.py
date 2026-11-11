@@ -113,6 +113,21 @@ class ConnectionConfigIn(BaseModel):
     node_default: str = ""
     console_user: str = ""
     console_password: Optional[str] = None
+    #: 暂停接入：面板不再向这台 PVE 采集，也不再计入异常与告警。
+    #: 用 ``Optional`` 而不是 ``bool = False``：PUT 走 ``exclude_none=True``，
+    #: 不传时保持原值；传 False 才是「恢复」。用零值默认会让每次编辑连接都把
+    #: 暂停状态清掉。
+    paused: Optional[bool] = None
+
+
+class ConnectionPauseIn(BaseModel):
+    """暂停 / 恢复一条连接的接入（PVE 与 PBS 共用）。
+
+    单独一个接口、只改这一个字段：编辑连接要提交整份配置（含凭据、区域），
+    开关状态不该被一次无关的保存覆盖，也不该因为两个人同时编辑而互相打架。
+    """
+
+    paused: bool = True
 
 
 class ConnectionTestIn(BaseModel):
@@ -1723,6 +1738,11 @@ class PbsConnectionIn(BaseModel):
     ca_cert: str = ""
     # 多节点 PBS 时指定读哪一台；留空取 /nodes 的第一台
     node: str = ""
+    #: 暂停接入：面板不再采集这台 PBS（不读仓库容量 / 任务 / 磁盘），
+    #: 也不再计入在线率与告警。恢复后下一轮采集自动重连。
+    #: 用 ``Optional`` 而不是 ``bool = False``：不传时沿用已保存的值，否则一次
+    #: 无关的连接编辑就会把暂停状态清掉（与 PVE 连接早先踩过的坑同一个）。
+    paused: Optional[bool] = None
 
 
 class PbsConfigIn(BaseModel):
