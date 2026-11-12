@@ -777,10 +777,10 @@ export const zhApp = {
   'pbs.authFailedHint':
     '请逐项确认：① Token ID 必须形如 user@realm!tokenname（!tokenname 不能少）；② Secret 是 generate-token 输出的一次性值，不是账号密码；③ 该 token 未被禁用、所属用户存在；④ 改过 Token ID 后必须重填 Secret。',
   'pbs.permissionDeniedHint':
-    'token 有效但权限不足（403）。请在 PBS 上为它授予 DatastoreAudit 与 SysAudit。',
+    'token 有效但权限不足（403）。授权要落在 token 本身（形如 pvecenter@pbs!readonly），不是用户：在 PBS 上执行 acl update /datastore DatastoreAudit --auth-id <token-id>；节点负载与磁盘健康再加一条 /system Audit。',
   'pbs.tokenIdFormat': 'Token ID 缺少“!”：应形如 user@realm!tokenname',
   'pbs.testPartialHint':
-    '连接成功。缺少 Sys.Audit：节点负载与磁盘健康不可见；仓库容量与任务列表正常。PBS 没有只读的 system 角色，需要时只能授 /system 的 Admin。',
+    '连接成功。缺少 Sys.Audit：节点负载与磁盘健康不可见；仓库容量与任务列表正常。补授 /system 的 Audit 角色即可 —— 它是纯只读角色，不必用 Admin。',
   'pbs.testNoDatastorePerm':
     '连接成功，但 token 缺少 Datastore.Audit：仓库列表与任务都读不到。请补授 /datastore 的 DatastoreAudit。',
   'pbs.secretNotUuid':
@@ -850,22 +850,24 @@ export const zhApp = {
     '用 root 登录 PBS 主机执行；用户已存在时会提示 already exists，跳过即可。',
   'pbs.guideStep1Code': [
     "proxmox-backup-manager user create pvecenter@pbs --password '<随机口令>'",
+    '# 已有同名 token 时先删：对已存在的 token 再 generate 只报 already exists，不会给新 secret',
+    'proxmox-backup-manager user delete-token pvecenter@pbs readonly',
     'proxmox-backup-manager user generate-token pvecenter@pbs readonly',
   ].join('\n'),
-  'pbs.guideStep2': '② 授予权限（路径很关键）',
+  'pbs.guideStep2': '② 授予权限（必须授给 token 本身）',
   'pbs.guideStep2Body':
-    'PBS 的权限按路径生效：`/datastore` 上的 DatastoreAudit 才能读仓库列表、容量、GC 与任务；`/system` 上的 Admin 只额外给节点负载与磁盘健康（PBS 没有只读的 system 角色）。两条路互不替代。',
+    '授权对象是 token（形如 pvecenter@pbs!readonly，带感叹号），不是用户 pvecenter@pbs —— PBS 的 token 默认权限分离，不继承用户的 ACL，授给用户时调用 API 依旧是 403。权限还按路径生效：/datastore 的 DatastoreAudit 解锁仓库列表、容量、GC 与任务；/system 的 Audit 只额外给节点负载与磁盘健康，是纯只读角色。',
   'pbs.guideStep2Code': [
-    '# 必做：仓库列表 + 容量 + 任务（可向下传播到 /datastore/{store}）',
-    'proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id pvecenter@pbs',
-    '# 可选：节点负载 / 磁盘健康（会连带 /system 写权限）',
-    'proxmox-backup-manager acl update /system Admin --auth-id pvecenter@pbs',
-    '# 复核：应能看到 /datastore 那一行',
-    'proxmox-backup-manager acl list | grep pvecenter',
+    '# 必做：仓库列表 + 容量 + 任务（会向下传播到 /datastore/{store}）',
+    "proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id 'pvecenter@pbs!readonly'",
+    '# 节点负载 / 磁盘健康：Audit 只含 Datastore.Audit + Sys.Audit，不含任何写权限',
+    "proxmox-backup-manager acl update /system Audit --auth-id 'pvecenter@pbs!readonly'",
+    '# 复核：输出为空 = 权限没落到 token 上；有内容则应看到 /datastore 与 /system 两段',
+    "proxmox-backup-manager user permissions 'pvecenter@pbs!readonly'",
   ].join('\n'),
-  'pbs.guideStep2WarnTitle': '别只授 /system',
+  'pbs.guideStep2WarnTitle': '别把权限授给用户',
   'pbs.guideStep2Warn':
-    '最常见的坑：只把 Admin 授在 /system 上。此时节点信息正常，但仓库列表是空的 —— PBS 对没有 /datastore 权限的 token 返回空数组，而不是 403。',
+    '最常见的坑：写成 --auth-id pvecenter@pbs（用户）。acl list 里能看到记录，但 token 调 API 仍是 403 —— 两个地方分开看都像是对的。用 user permissions <token-id> 复核，输出只有表头就是没授上。另外 PBS 没有 SysAudit 角色，写 /system SysAudit 会报 value is not defined。',
   'pbs.guideStep3': '③ 填写接入参数',
   'pbs.guideAddrLabel': '地址 / 端口',
   'pbs.guideAddrValue': 'PBS 的 Web 地址，端口默认 8007（形如 10.0.0.5:8007）',
@@ -885,9 +887,9 @@ export const zhApp = {
   'pbs.guideTrouble401':
     '401：Token ID 或 Secret 不对 —— 检查 !tokenname 是否缺失、Secret 是否被换行或空格污染。',
   'pbs.guideTrouble403':
-    '403：路径上有这个端点但没有权限 —— 补第 ② 步对应的 ACL（仓库相关加在 /datastore）。',
+    '403：token 有效但权限不足 —— 先跑 user permissions <token-id>：输出为空说明 ACL 授给了用户而不是 token；只有 /datastore 说明缺 /system 的 Audit。',
   'pbs.guideTroubleAcl':
-    '仓库列表为空 / 只显示“没有仓库”：几乎都是 ACL 没落在 /datastore 上。PBS 会回空数组而不是报错，用 acl list 确认后再授一次。',
+    '仓库列表为空 / 只显示“没有仓库”：几乎都是 ACL 没落在 token 的 /datastore 上。PBS 对无权限的 token 回空数组而不是报错，用 acl list 看 ugid 是否带 !tokenname。',
   'pbs.guideTroubleNet':
     '连不上：确认面板所在机器能访问 8007；PBS 自签时粘贴 PEM 做证书钉扎，比关闭校验安全。',
   'pbs.guideClose': '知道了',
@@ -913,7 +915,7 @@ export const zhApp = {
   'pbs.testNoCapacityPerm':
     '能连上、也能列出仓库，但容量接口读取失败（{code}）。请确认 token 在 /datastore 上拥有 DatastoreAudit；若返回 404，说明该 PBS 版本没有这个端点。',
   'pbs.testNoDatastoreAudit':
-    '连上了，但仓库列表是空的：权限表里没有落在 /datastore 下的 Datastore.Audit。PBS 对无权限的 token 返回空数组而不是 403 —— 请在 PBS 上执行 acl update /datastore DatastoreAudit（只授 /system 的 Admin 不够）。',
+    '连上了，但仓库列表是空的：权限表里没有落在 /datastore 下的 Datastore.Audit。PBS 对无权限的 token 返回空数组而不是 403 —— 请执行 acl update /datastore DatastoreAudit --auth-id <token-id>，且要授给带 !tokenname 的 token（只授 /system 不够）。',
   'pbs.datastoreNoPerm':
     'token 在 /datastore 上没有 Datastore.Audit，PBS 因此返回空列表（不是「没有仓库」）。授权后即可看到容量。',
   'pbs.tasksFiltered': '仅备份与校验',
@@ -925,7 +927,7 @@ export const zhApp = {
   'pbs.capMissing': '不可读',
   'pbs.permissionGuideTitle': '需要哪些权限',
   'pbs.permissionGuideBody':
-    '/datastore 的 DatastoreAudit 可读仓库与任务；节点负载与磁盘健康需要 /system 的 Admin —— PBS 没有只读的 system 角色，这一项会连带写配置权限。',
+    '两条都要授给 token 本身（形如 user@realm!tokenname），不是用户：/datastore 的 DatastoreAudit 可读仓库与任务；节点负载与磁盘健康加 /system 的 Audit，它是纯只读角色，不含写权限。',
   'pbs.errHostRequired': '请填写 PBS 地址',
   'pbs.errHostFormat': '只填主机名或 IP，不要带 https:// 或路径',
   'pbs.errPort': '端口需在 1-65535 之间',

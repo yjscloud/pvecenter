@@ -355,6 +355,38 @@ def test_datastore_usage_percent_and_level(monkeypatch) -> None:
     assert store["level"] == "crit"
 
 
+def test_datastore_total_uses_avail_plus_used(monkeypatch) -> None:
+    """总容量跟随 PBS 界面用 avail + used，而不是 status.total。
+
+    ext4 默认给 root 留 5% 的保留块，于是 status 的 total 比 avail + used 多
+    一截：线上那台并排显示「已用 259 MiB / 剩余 279 GiB / 总容量 294 GiB」，
+    看起来就像算错了。PBS 自己的界面用 avail + used 抹平这个缺口（它的 total
+    列是 calculate 出来的），面板必须用同一个口径，否则两个页面并排就对不上。
+    """
+
+    class _Ext4(_FakePbs):
+        async def datastore_status(self, name: str) -> Dict[str, Any]:
+            # 线上真实值：315 GiB 总块数里有 15 GiB 是永远写不进去的保留块
+            return {
+                "total": 315925245952,
+                "used": 271679488,
+                "avail": 299530719232,
+            }
+
+    async def fake_load():
+        return [_conn()]
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "PbsClient", lambda conn: _Ext4(conn))
+    store = _run(pbs.collect_overview())["connections"][0]["datastores"][0]
+    assert store["used"] == 271679488
+    assert store["free"] == 299530719232
+    assert store["total"] == 299530719232 + 271679488
+    # 三者自洽是这条改动的全部意义：界面上并排显示的就是这三个数
+    assert store["used"] + store["free"] == store["total"]
+    assert store["used_percent"] == 0.1
+
+
 def test_usage_level_thresholds() -> None:
     assert pbs.usage_level(0) == "ok"
     assert pbs.usage_level(84.9) == "ok"

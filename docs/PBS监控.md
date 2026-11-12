@@ -29,15 +29,19 @@
 # 1. 建用户（已存在时 PBS 会报 “already exists”，跳过即可）
 proxmox-backup-manager user create pvecenter@pbs --password '<随机口令>'
 
-# 2. 仓库只读：容量、校验状态、GC 计划
-proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id pvecenter@pbs
-
-# 3. 生成 token（已存在时先删再建；secret 只显示一次）
+# 2. 生成 token（已存在时先删再建；secret 只显示一次）
 proxmox-backup-manager user delete-token pvecenter@pbs readonly
 proxmox-backup-manager user generate-token pvecenter@pbs readonly
+
+# 3. 授权给 token（ugid 必须带 !readonly 后缀）
+proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id 'pvecenter@pbs!readonly'
+proxmox-backup-manager acl update /system    Audit          --auth-id 'pvecenter@pbs!readonly'
+
+# 4. 确认权限真的落到了 token 上（输出为空就是没落上）
+proxmox-backup-manager user permissions 'pvecenter@pbs!readonly'
 ```
 
-输出形如：
+其中 `generate-token` 的输出形如：
 
 ```
 Result: {
@@ -48,37 +52,70 @@ Result: {
 
 **注意字段名是 `value`，不是 `secret`。** 面板里 Token ID 填 `tokenid`，Secret 填 `value`。secret 只在生成时显示一次；token 已存在时再执行 `generate-token` 只会报 `already exists` 而**不会**给出值，所以拿不到就先 `delete-token` 再建。
 
-> **PBS 没有只读的 system 角色。** 内置角色只有 `DatastoreAudit` / `DatastoreAdmin` / `DatastoreBackup` / `DatastoreReader` / `Remote*` / `Admin` / `NoAccess`，没有 `SysAudit` —— 写 `acl update /system SysAudit` 会直接报
-> `'role': value 'SysAudit' is not defined in the enumeration`。
->
-> `Sys.Audit` 只包含在 `Admin` 里，而它在 `/system` 上同时带 `Sys.Modify`。所以「节点负载 / 磁盘健康」有一个明确取舍：
->
-> | 授权 | 能看到 | 代价 |
-> |---|---|---|
-> | 只授 `/datastore DatastoreAudit` | 仓库容量、GC 计划、校验状态、任务列表 | 节点负载与磁盘健康为空 |
-> | 再授 `/system Admin` | 加上节点负载与磁盘健康 | 该 token 在 `/system` 上可改配置（面板只发 GET，风险在凭据泄露后的影响面） |
->
-> 注意**任务列表只需要 `Datastore.Audit`**：它走 `/nodes/{node}/tasks`，与 `Sys.Audit` 无关。所以只授 `/datastore` 时任务照常显示，不要因为"节点空着"就以为任务也读不到。
->
-> 需要节点负载/磁盘健康时：
+#### 授权必须落在 token 上
+
+PBS 的 API token 默认开启权限分离（`privsep`）：**token 不继承用户的 ACL**，只认自己名下的条目。所以下面这种写法对 token 完全无效：
+
+```bash
+proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id pvecenter@pbs   # 用户，不是 token
+```
+
+`acl list` 里能看到这条记录、"看着已经授权了"，但 token 调 API 仍然 403。这是最难查的一类：分开看两个地方都像是对的，只有用 token 实际请求才暴露。
+
+唯一可靠的判定：
+
+```bash
+proxmox-backup-manager user permissions 'pvecenter@pbs!readonly'
+```
+
+输出只有表头 `Privileges with (*) have the propagate flag set` 后面空无一物，就是权限没落到 token 上。
+
+#### 角色怎么选
+
+`proxmox-backup-manager` **没有 `role list` 子命令**（会报 `no such command 'role'`），`SysAudit` / `PVEAuditor` 这两个名字也不存在 —— 写进去会报 `value 'SysAudit' is not defined in the enumeration`。PBS 4.x 实际可分配的角色是：
+
+```
+Audit  DatastoreAudit  DatastoreReader  DatastoreBackup  DatastoreAdmin
+DatastorePowerUser  RemoteAudit  RemoteAdmin  RemoteSyncOperator
+TapeAudit  TapeOperator  TapeAdmin  TapeReader  Admin  NoAccess
+```
+
+只读接入用这两个就够，**不需要 `Admin`**：
+
+| 授权 | 得到的权限 | 换来什么 |
+|---|---|---|
+| `/datastore DatastoreAudit` | `Datastore.Audit` | 仓库列表与容量、GC 计划、校验状态、任务列表 |
+| `/system Audit` | `Datastore.Audit` + `Sys.Audit` | 节点负载 / 内存 / 运行时长、磁盘健康 |
+
+`Audit` 是纯审计角色，只含这两个 `.Audit` 权限，**不含 `Sys.Modify` / `Datastore.Modify`** —— 这是它与 `Admin` 的关键差别。本手册早期版本写过"PBS 没有只读的 system 角色，只能用 `Admin`"，那是错的：`Audit` 一直存在，只是没有 `role list` 能把它列出来。
+
+> 想确认某个 auth-id 最终拿到什么权限，一律用 `user permissions <auth-id>` 看，别凭角色名猜：
 >
 > ```bash
-> proxmox-backup-manager acl update /system Admin --auth-id pvecenter@pbs
+> proxmox-backup-manager user permissions 'pvecenter@pbs!readonly'
+> # Path: /datastore
+> # - Datastore.Audit (*)
+> # Path: /system
+> # - Datastore.Audit (*)
+> # - Sys.Audit (*)
 > ```
->
-> **最容易踩的坑：只把 `Admin` 授在 `/system` 上。** 此时 `/access/permissions` 只有
-> `"/system"` 一个路径，`Sys.Audit` 生效（节点状态能读），但 `Datastore.*` 对
-> `/datastore/{store}` 不生效 —— `GET /admin/datastore` 会返回**空数组而不是 403**，
-> 界面于是显示“没有仓库”，而 `GET /admin/datastore/{store}/status` 单独调是 403。
-> 遇到“有仓库但看不到容量”，先用 `proxmox-backup-manager acl list | grep pvecenter`
-> 确认 `/datastore` 那一行存在。
->
-> 面板的「测试」会分别探测仓库列表、仓库容量、任务、节点状态四项能力，并附错误码
-> （`pbs_permission_denied` / `HTTP 403` / `no_datastore_audit`），不会让你对着空白猜。
-> 仓库列表为空且权限表里没有 `/datastore` 时，概览会直接写“token 在 /datastore 上没有
-> Datastore.Audit”，而不是“没有仓库”。
->
-> 不要给 `Datastore.Modify` / `Datastore.Prune`。面板只发 GET，多出来的写权限没有任何用处，只会在凭据泄露时放大损失。
+
+#### 一个不影响使用的已知限制
+
+`GET /nodes`（节点**列表**）在只授 `Audit` 时仍返回 403 —— 它要的权限比 `Sys.Audit` 更多，补上去就得引入写权限，不值得。这**不影响面板功能**：
+
+- 采集按「配置里的节点 → `/nodes` 第一台 → `localhost`」回退，节点名填对即可；
+- `/nodes/{node}/status`、`/nodes/{node}/tasks`、`/nodes/{node}/disks/list` 都只要 `Sys.Audit`，实测全部 200。
+
+所以看到这个 403 不要急着加 `Admin`。
+
+#### 其它注意
+
+- **任务列表只需要 `Datastore.Audit`**：它走 `/nodes/{node}/tasks`，与 `Sys.Audit` 无关。只授 `/datastore` 时任务照常显示，不要因为"节点空着"就以为任务也读不到。
+- **只授 `/system`、漏掉 `/datastore`** 时：`GET /admin/datastore` 返回**空数组而不是 403**，界面显示"没有仓库"，而 `GET /admin/datastore/{store}/status` 单独调是 403。遇到"有仓库但看不到容量"，先用 `acl list` 确认 `/datastore` 那一行存在。
+- 面板的「测试」会分别探测仓库列表、仓库容量、任务、节点状态四项能力并附错误码（`pbs_permission_denied` / `HTTP 403` / `no_datastore_audit`），不会让你对着空白猜。仓库列表为空且权限表里没有 `/datastore` 时，概览会直接写"token 在 /datastore 上没有 Datastore.Audit"，而不是"没有仓库"。
+- **不要给 `Datastore.Modify` / `Datastore.Prune`**。面板只发 GET，多出来的写权限没有任何用处，只会在凭据泄露时放大损失。
+- **排查时不要拿数据库里的 secret 去 curl**。面板落库前会加密（`settings.pbs_connections` 里约 99 字符密文，解密后才是 36 位 UUID），直接拿去请求必然 401。要么用 `generate-token` 输出的明文，要么走面板的「测试连接」。
 
 ### 2. 在面板上登记
 
@@ -101,21 +138,35 @@ Result: {
 > `pbs_backup` 填进节点）会被 PBS 回 400 —— 早先的实现在这种情况下把内存、负载、
 > 运行时长、磁盘健康、任务与 GC 一起清零了，看起来就像「监控全丢了」。
 
-点「测试」只调一次 `/version`，不触发数据读取；「保存」后概览缓存立即作废。
+点「测试」会依次调 `/version`、仓库列表、首个仓库的容量、任务与节点状态 —— 这几步都是 GET，不触发 PBS 侧的重活。返回的 `capabilities` 与 `probe_errors` 能直接指出是认证失败还是某一项权限缺失；认证失败时还会附一份凭据形状诊断（区分"填成账号密码" / "填成 token ID" / "整行粘贴带前缀"）。「保存」后概览缓存立即作废。
 
 ### 3. 先手工验证一次（可选，但能省很多时间）
 
-在面板所在机器上直接打一次 API，最快区分「凭据问题」与「网络 / 证书问题」：
+在面板所在机器上直接打几次 API，最快区分「认证」「权限」「网络」三类问题。
+
+**请求头是 `PBSAPIToken=<id>:<secret>`（冒号）**，照抄 PVE 的 `PVEAPIToken=<id>=<secret>`（等号）会一律 401 —— 这是排查时最常见的一次性错误。
 
 ```bash
-curl -k -s -o /dev/null -w '%{http_code}\n' \
-  -H 'Authorization: PBSAPIToken=pvecenter@pbs!readonly:<secret>' \
-  https://10.0.0.5:8007/api2/json/version
+TOK='pvecenter@pbs!readonly:<secret>'
+BASE=https://10.0.0.5:8007/api2/json
+
+curl -k -s -o /dev/null -w 'version      %{http_code}\n' -H "Authorization: PBSAPIToken=$TOK" $BASE/version
+curl -k -s -w 'permissions  %{http_code}\n' -H "Authorization: PBSAPIToken=$TOK" $BASE/access/permissions
+curl -k -s -w 'datastore    %{http_code}\n' -H "Authorization: PBSAPIToken=$TOK" $BASE/admin/datastore
+curl -k -s -o /dev/null -w 'node status  %{http_code}\n' -H "Authorization: PBSAPIToken=$TOK" $BASE/nodes/localhost/status
 ```
 
-- `200`：凭据没问题，回去查面板里填的地址 / 证书；
-- `401`：token ID 或 secret 不对（`!tokenname` 不能少，secret 不能被换行污染）；
-- `000` 或连接被拒：网络不通、端口不对，或被防火墙挡住。
+判读：
+
+| 结果 | 含义 | 下一步 |
+|---|---|---|
+| `/version` 200，`permissions` 返回 `{"data":{}}` | 认证通过，但 token 没有任何 ACL | 回到第 1 步，把 ACL 授给带 `!tokenname` 的 auth-id |
+| `/version` 200，`permissions` 只有 `/datastore` | 缺 `Sys.Audit`，节点负载与磁盘健康为空 | `acl update /system Audit --auth-id '…!tokenname'` |
+| `/admin/datastore` 返回空数组 | 缺 `Datastore.Audit`，或该 PBS 上确实没有仓库 | 先补 `/datastore` 授权；补完仍为空才是真没有仓库 |
+| `/version` 401 | token ID / secret 不对 | `!tokenname` 是否漏了；secret 是否被换行污染；改过 ID 后是否重填 |
+| `/version` 000 或连接被拒 | 网络 / 端口 / 防火墙 | 加 `--max-time 5` 重试；用 `cat < /dev/null > /dev/tcp/<host>/8007` 探端口 |
+
+`000` 之外还有一种常见形态：**`No route to host` 或 ICMP 100% 丢包**（`ping` 全丢）—— 那是主机层不可达（机器关机 / 换了 IP），不是端口问题，调防火墙没有用。
 
 ### 4. 暂停接入（不删配置地停用）
 
@@ -136,6 +187,10 @@ PBS 仓库自身的 `maintenance_mode` 在概览里已经叫「维护模式」�
   自动重连，不需要重新填写；
 - **界面显示灰色「已暂停」**：不是红的「不可达」。概览的在线率、节点页排序、
   聚合带健康判定都不把它算进去 —— 主动停用不该被读成一台机器挂了；
+- **多节点时自动折叠**：节点对比表里暂停的连接默认收起（只剩名称、状态徽标与
+  各列摘要），正常接入的全部展开。暂停的连接不再产生数据，摊开只是一片「已暂停」
+  占位，会把正常节点的明细挤出一屏。开关状态变化时折叠状态跟着变，但手动折叠过
+  的连接不会被轮询刷新重新撑开；
 - **活动告警保持原状**：暂停期间既不发「已恢复」也不清掉，恢复接入后重新判定
   （先清掉等于让一条真实故障静默消失）。
 
@@ -343,6 +398,7 @@ PBS 仓库自身的 `maintenance_mode` 在概览里已经叫「维护模式」�
 - **校验列只反映最新归档**。旧归档失败、新归档成功时会显示"已验证" —— 需要逐份核对请到 PBS 控制台。
 - **namespace**：PVE 8.4+ / PBS 3.x 会在 volid 里多一段 `ns/<ns>/`。面板的类型判定只认 `/ct|vm/<vmid>/` 结构，不锚定 `backup/`，因此两种排法都能识别。
 - **版本差异**：`/admin/datastore/{store}/status` 在较老版本上没有，此时仓库容量显示"该 PBS 版本不提供"，其余字段照常。
+- **「总容量」= `avail` + `used`，不是 `status.total`**：PBS 的 `total` 是**文件系统**总块数，含 ext4 默认留给 root 的保留块（线上那台 294 GiB 里有 15 GiB 永远写不进去）。直接用它会出现「已用 259 MiB + 剩余 279 GiB ≠ 总容量 294 GiB」，看着像算错。PBS 自己的界面也是 `avail + used` 算总量（`total` 列是 calculate 出来的），面板跟随同一口径，两个页面的数字才对得上；容量告警的百分比分母也是这个自洽值。
 - **不做磁盘 I/O 展示**：读写速率 / IOPS / 延迟属于主机指标，PBS API 多数版本也不下发 IOPS 与
   延迟；为了不让「备份盘还剩多少」被无关曲线挤走，这一块不再采集、不再展示。
 - **多套 PVE 共用一台 PBS**：PVE 侧按 `server:port` 聚合，直连侧按 `host:port` 去重；告警按归档 volid / 磁盘设备去重，不会因为多套 PVE 重复轰炸。
@@ -355,10 +411,13 @@ PBS 仓库自身的 `maintenance_mode` 在概览里已经叫「维护模式」�
 |---|---|
 | 备份页没有 PBS 卡片 | 是否已对接（PVE 侧有没有 pbs 存储）；账号是否有 `pbs.view`（默认只给管理员） |
 | 卡片显示"不可达" | 面板到 PBS 的 8007 是否通；token 是否过期；证书是否可信 |
-| 测试连接返回 **401** | Token ID 是否形如 `user@realm!tokenname`（少 `!tokenname`、或 realm 写错都会 401）；Secret 是否为 `generate-token` 的一次性输出（**不是账号密码**）；复制时是否带了换行 / 空格；改过 Token ID 后是否重填了 Secret |
-| 测试连接返回 **403** | token 存在但权限不足：缺 `DatastoreAudit` 或 `SysAudit` |
+| 测试连接返回 **401** | Token ID 是否形如 `user@realm!tokenname`（少 `!tokenname`、或 realm 写错都会 401）；Secret 是否为 `generate-token` 的一次性输出（**不是账号密码**）；复制时是否带了换行 / 空格；改过 Token ID 后是否重填了 Secret。手工 curl 时确认头是 `PBSAPIToken=<id>:<secret>`（冒号），别抄 PVE 的等号写法 |
+| 测试连接返回 **403** | token 存在但权限不足。先跑 `proxmox-backup-manager user permissions 'user@realm!tokenname'`：**输出为空** = ACL 授给了用户而不是 token（token 默认权限分离）；只有 `/datastore` = 缺 `Sys.Audit` |
+| 授权了但仍是 403 | 看 `acl list` 的 `ugid` 列有没有 `!tokenname` 后缀 —— 授给 `pvecenter@pbs` 对 token 无效 |
+| 节点列表 403 / `/nodes` 读不到 | 预期行为，`Audit` 角色不含该接口所需权限；面板会自动回退到配置里的节点名或 `localhost`，不影响展示 |
+| 手工 curl 一直 401，但面板「测试」是通的 | secret 用了数据库里的密文（`settings.pbs_connections` 里约 99 字符）。用 `generate-token` 输出的 36 位明文，或走面板「测试」 |
 | 有仓库但没容量 | PBS 版本是否提供 `datastore/status`；token 是否有 `Datastore.Audit` |
-| 有节点没磁盘 | token 是否缺 `Sys.Audit`；PBS 版本是否提供 `/nodes/{node}/disks` |
+| 有节点没磁盘 | token 是否缺 `Sys.Audit`（在 `/system` 授 `Audit` 角色即可，不必用 `Admin`）；PBS 版本是否提供 `/nodes/{node}/disks` |
 | 任务日志打不开 | 多连接时必须带 `connection_id`（前端已自动带上）；日志接口不缓存，任务还在跑时可能只有几行 |
 | 刚保存的凭据没生效 | 概览有 20 秒缓存，保存会立即作废；前端 60 秒轮询一次，可手动刷新 |
 | 显示「已暂停」但没数据 | 这台被暂停接入了（不发请求是预期行为）；在连接配置页点「恢复接入」，下一轮采集自动重连 |

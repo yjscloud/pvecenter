@@ -659,9 +659,15 @@ async def datastore_row(client: "PbsClient", item: Dict[str, Any]) -> Dict[str, 
                 capacity_error,
                 exc.message,
             )
-    total = int(_num(status.get("total")) or 0)
+    raw_total = int(_num(status.get("total")) or 0)
     used = int(_num(status.get("used")) or 0)
-    avail = int(_num(status.get("avail")) or max(total - used, 0))
+    avail = int(_num(status.get("avail")) or max(raw_total - used, 0))
+    # 「总容量」用 avail + used，而不是 status.total。PBS 的 total 是**文件系统**
+    # 的总块数，含 ext4 默认留给 root 的 5%（本机 294 GiB 里有 15 GiB 永远写不进去）。
+    # 照它直接显示会出现「已用 259 MB + 剩余 279 GB ≠ 总容量 294 GB」，看起来像
+    # 算错了 —— 实际是保留块。PBS 自己的界面也是这么算的（www 的 total 列 =
+    # avail + used），跟随它用户才不会在两个页面之间对不上。
+    total = avail + used
     # 百分比与告警级别在服务端算：前端只负责上色，
     # 免得「85% / 95%」这两个数字在多个组件里各写一遍。
     used_percent = (

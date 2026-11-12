@@ -175,7 +175,12 @@ async def test_config(
     body: PbsConnectionTestIn,
     user: Dict[str, Any] = Depends(MANAGE),
 ) -> Dict[str, Any]:
-    """连通性测试：只调 ``/version``，不触发任何数据读取。"""
+    """连通性测试：先调 ``/version`` 验认证，再逐项探测能力（都是 GET）。
+
+    探测项是仓库列表、首个仓库的容量、任务与节点状态 —— 每一项都对应一条独立
+    ACL，一次测全才能直接告诉用户「连上了，但缺哪一项权限」。全是 GET，不会
+    触发 PBS 侧的备份 / GC / verify 等重活。
+    """
     raw = body.model_dump()
     conn_id = str(raw.get("id") or "").strip()
     secret = str(raw.get("token_secret") or "")

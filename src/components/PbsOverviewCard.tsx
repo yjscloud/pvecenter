@@ -19,7 +19,7 @@
    不是浏览器收到响应的时间（那会被缓存拉开误差）。
    ========================================================================== */
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router';
 import { pbsApi } from '../api/endpoints';
@@ -714,13 +714,40 @@ function PbsFleet({
 }) {
   const t = useT();
   const sorted = sortConnections(connections);
-  /* 默认展开排序后的第一行：保证进来就能看到一份完整明细，
-     同时表格本身仍可横向比较；其余节点点一下展开 */
+  /* 暂停接入的连接默认折叠：它已经不再采集，摊开只是一片「已暂停」的占位，
+     会把正常节点的明细挤出首屏。正常接入的全部展开，进来就能横向比较。 */
   const [openIds, setOpenIds] = useState<string[]>(() =>
-    sorted.length > 0 ? [sorted[0].id] : [],
+    sorted.filter((conn) => !conn.paused).map((conn) => conn.id),
   );
   const toggle = (id: string) =>
     setOpenIds((ids) => (ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]));
+
+  /* 只在 paused 真的发生变化时同步折叠状态：连接被暂停就收起来，恢复接入就
+     展开。不能用「每次都按 paused 重算」的写法 —— 前端 60 秒轮询一次，那样会
+     把用户手动折起来的那一节反复撑开。 */
+  const pausedSignature = sorted
+    .filter((conn) => conn.paused)
+    .map((conn) => conn.id)
+    .join(',');
+  const lastPausedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = lastPausedRef.current;
+    lastPausedRef.current = pausedSignature;
+    /* 首次渲染由上面的 useState 初始值负责，这里只处理后续变更 */
+    if (previous === null || previous === pausedSignature) return;
+    const before = new Set(previous ? previous.split(',') : []);
+    const after = new Set(pausedSignature ? pausedSignature.split(',') : []);
+    setOpenIds((ids) => {
+      const next = new Set(ids);
+      after.forEach((id) => {
+        if (!before.has(id)) next.delete(id);
+      });
+      before.forEach((id) => {
+        if (!after.has(id)) next.add(id);
+      });
+      return [...next];
+    });
+  }, [pausedSignature]);
 
   /* 聚合：容量按仓库跨节点求和（加权使用率，而不是把各节点的百分比平均），
      这样「一台 90% 一台 10%」不会显示成 50% 的假象。 */
