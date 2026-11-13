@@ -700,10 +700,11 @@ Once PBS is registered as a storage in PVE, the storage page shows a PBS badge, 
 archive count and verification state, plus a console link — no extra configuration needed.
 
 To also see PBS's own repository usage, GC schedule, node load, recent tasks and disk health, register a
-read-only token under Nodes → Connections → PBS read-only access. Grant the ACLs to the **token itself**
-(`user@realm!tokenname`, not the user — PBS tokens are privilege-separated by default, so user-level ACLs
-do not apply to them): `DatastoreAudit` on `/datastore` and `Audit` on `/system`. Those two roles contain
-only `Datastore.Audit` + `Sys.Audit`, no write privileges — `Admin` is unnecessary. The panel only issues
+read-only token under Nodes → Connections → PBS read-only access. Grant the ACLs to **both the user and
+the token** — 4 rows in total: `DatastoreAudit` on `/datastore` and `Audit` on `/system`, once per auth ID.
+User-only grants leave the token at 403 (tokens are privilege-separated and do not inherit user ACLs);
+token-only grants leave the web UI without datastores. Those two roles contain only `Datastore.Audit` +
+`Sys.Audit`, no write privileges — `Admin` is unnecessary. The panel only issues
 GETs against PBS: prune / GC / verify / sync stay in the PBS console, and the credential itself carries no
 write permission. Without a token the whole block stays hidden — no empty
 card on the backup page.

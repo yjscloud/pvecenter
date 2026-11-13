@@ -32,13 +32,6 @@ proxmox-backup-manager user create pvecenter@pbs --password '<随机口令>'
 # 2. 生成 token（已存在时先删再建；secret 只显示一次）
 proxmox-backup-manager user delete-token pvecenter@pbs readonly
 proxmox-backup-manager user generate-token pvecenter@pbs readonly
-
-# 3. 授权给 token（ugid 必须带 !readonly 后缀）
-proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id 'pvecenter@pbs!readonly'
-proxmox-backup-manager acl update /system    Audit          --auth-id 'pvecenter@pbs!readonly'
-
-# 4. 确认权限真的落到了 token 上（输出为空就是没落上）
-proxmox-backup-manager user permissions 'pvecenter@pbs!readonly'
 ```
 
 其中 `generate-token` 的输出形如：
@@ -52,23 +45,65 @@ Result: {
 
 **注意字段名是 `value`，不是 `secret`。** 面板里 Token ID 填 `tokenid`，Secret 填 `value`。secret 只在生成时显示一次；token 已存在时再执行 `generate-token` 只会报 `already exists` 而**不会**给出值，所以拿不到就先 `delete-token` 再建。
 
-#### 授权必须落在 token 上
+### 2. 补齐权限：4 行，用户与 token 各一份
 
-PBS 的 API token 默认开启权限分离（`privsep`）：**token 不继承用户的 ACL**，只认自己名下的条目。所以下面这种写法对 token 完全无效：
+最终在 PBS 的 **访问控制 → 权限** 里应当看到下面 4 行，`继承` 全部为「是」：
+
+| 路径 | 用户/组/API 令牌 | 角色 | 继承 |
+|---|---|---|---|
+| `/datastore` | `pvecenter@pbs` | `DatastoreAudit` | 是 |
+| `/datastore` | `pvecenter@pbs!readonly` | `DatastoreAudit` | 是 |
+| `/system` | `pvecenter@pbs` | `Audit` | 是 |
+| `/system` | `pvecenter@pbs!readonly` | `Audit` | 是 |
+
+**两套 auth-id 都要授，少任何一行都算没配完**：
+
+- 只给**用户**授 → 面板用 token 调 API 一律 403。PBS 的 token 默认权限分离，不继承用户的 ACL。
+- 只给 **token** 授 → 面板能读，但同一个账号用密码登录 PBS 网页端看不到仓库与节点数据，排查时容易误以为权限已配好。
+
+网页端的加法（就是上图那 4 行）：
+
+1. 左侧选 **访问控制 → 权限**，点「新增」；
+2. 路径填 `/datastore`，用户/组/API 令牌选 `pvecenter@pbs`，角色选 `DatastoreAudit`，勾上「继承」，确定；
+3. 同样的路径与角色，用户改选 `pvecenter@pbs!readonly`，再加一条；
+4. 路径换成 `/system`、角色换成 `Audit`，把上面两个 auth-id 再各加一条。
+
+CLI 等价写法（四条一起跑）：
 
 ```bash
-proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id pvecenter@pbs   # 用户，不是 token
+# 仓库：列表、容量、GC、校验状态、任务
+proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id 'pvecenter@pbs'
+proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id 'pvecenter@pbs!readonly'
+
+# 系统：节点负载、内存、运行时长、磁盘健康
+proxmox-backup-manager acl update /system    Audit          --auth-id 'pvecenter@pbs'
+proxmox-backup-manager acl update /system    Audit          --auth-id 'pvecenter@pbs!readonly'
+
+# 复核：两行都要有内容
+proxmox-backup-manager user permissions 'pvecenter@pbs'
+proxmox-backup-manager user permissions 'pvecenter@pbs!readonly'
 ```
 
-`acl list` 里能看到这条记录、"看着已经授权了"，但 token 调 API 仍然 403。这是最难查的一类：分开看两个地方都像是对的，只有用 token 实际请求才暴露。
+> 注意 `--auth-id` 里的 `!` 在交互式 shell 会触发历史扩展，**必须用单引号包住**；直接粘贴不带引号的写法可能被 bash 吃掉后面的字符，导致授权落到一个不存在的 auth-id 上。
 
-唯一可靠的判定：
+#### 为什么两套 auth-id 都要授
+
+PBS 的 API token 默认开启权限分离（`privsep`）：token 只认自己名下的 ACL，**不继承**用户的那一份。所以最容易踩的坑是「只加了 `pvecenter@pbs` 那一行」—— 权限页面上明明有记录，token 调 API 却仍然 403：
+
+```bash
+# 只有这一行时，面板一定读不到数据
+proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id pvecenter@pbs
+```
+
+反过来也一样：只加 token 那行时，同一个账号用密码登录网页端看不到仓库，排查时很容易误判成「权限已经配好了」。
+
+判断某个 auth-id 最终拿到了什么，一律用这个看，别凭角色名猜：
 
 ```bash
 proxmox-backup-manager user permissions 'pvecenter@pbs!readonly'
 ```
 
-输出只有表头 `Privileges with (*) have the propagate flag set` 后面空无一物，就是权限没落到 token 上。
+输出为空（只剩表头 `Privileges with (*) have the propagate flag set`）就说明这一行没落上。
 
 #### 角色怎么选
 
@@ -419,8 +454,8 @@ PBS 仓库自身的 `maintenance_mode` 在概览里已经叫「维护模式」�
 | 备份页没有 PBS 卡片 | 是否已对接（PVE 侧有没有 pbs 存储）；账号是否有 `pbs.view`（默认只给管理员） |
 | 卡片显示"不可达" | 面板到 PBS 的 8007 是否通；token 是否过期；证书是否可信 |
 | 测试连接返回 **401** | Token ID 是否形如 `user@realm!tokenname`（少 `!tokenname`、或 realm 写错都会 401）；Secret 是否为 `generate-token` 的一次性输出（**不是账号密码**）；复制时是否带了换行 / 空格；改过 Token ID 后是否重填了 Secret。手工 curl 时确认头是 `PBSAPIToken=<id>:<secret>`（冒号），别抄 PVE 的等号写法 |
-| 测试连接返回 **403** | token 存在但权限不足。先跑 `proxmox-backup-manager user permissions 'user@realm!tokenname'`：**输出为空** = ACL 授给了用户而不是 token（token 默认权限分离）；只有 `/datastore` = 缺 `Sys.Audit` |
-| 授权了但仍是 403 | 看 `acl list` 的 `ugid` 列有没有 `!tokenname` 后缀 —— 授给 `pvecenter@pbs` 对 token 无效 |
+| 测试连接返回 **403** | token 存在但权限不足。先跑 `proxmox-backup-manager user permissions 'user@realm!tokenname'`：**输出为空** = ACL 只授给了用户、没授 token（token 默认权限分离）；只有 `/datastore` = 缺 `/system` 的 `Audit` |
+| 授权了但仍是 403 | `acl list` 里应当有 4 行（用户与 token 各两条，见第二节）；只有 2 行说明另一半没授 —— 只授用户 token 必 403，只授 token 网页端看不到仓库 |
 | 节点列表 403 / `/nodes` 读不到 | 预期行为，`Audit` 角色不含该接口所需权限；面板会自动回退到配置里的节点名或 `localhost`，不影响展示 |
 | 手工 curl 一直 401，但面板「测试」是通的 | secret 用了数据库里的密文（`settings.pbs_connections` 里约 99 字符）。用 `generate-token` 输出的 36 位明文，或走面板「测试」 |
 | 有仓库但没容量 | PBS 版本是否提供 `datastore/status`；token 是否有 `Datastore.Audit` |

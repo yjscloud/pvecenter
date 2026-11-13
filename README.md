@@ -438,7 +438,7 @@ VM 总数与运行分布、CPU / 内存 / 存储环形图、节点一览、最�
 
 PVE 里把 PBS 注册成存储之后，存储页就会显示 PBS 徽标、最近备份时间、归档数与校验状态，并给出控制台入口 —— 这一步零配置。
 
-想进一步看到 PBS 自己的仓库容量、GC 计划、节点负载、最近任务和磁盘健康，去「节点 → 连接配置 → PBS 只读接入」登记一个只读 token。授权要落在**token 本身**（`user@realm!tokenname`，不是用户 —— PBS 的 token 默认权限分离，授给用户它对 token 无效）：`/datastore` 给 `DatastoreAudit`、`/system` 给 `Audit`。这两个角色只含 `Datastore.Audit` + `Sys.Audit`，不含任何写权限，`Admin` 是多余的。面板对 PBS **只发 GET**：prune / GC / verify / sync 都交给 PBS 控制台，凭据层面也不给写权限。没登记凭据时整块安静隐藏，不会在备份页留一个空盒子。
+想进一步看到 PBS 自己的仓库容量、GC 计划、节点负载、最近任务和磁盘健康，去「节点 → 连接配置 → PBS 只读接入」登记一个只读 token。授权要**同时落在用户与 token 两套 auth-id 上**，共 4 行：`/datastore` 给 `DatastoreAudit`、`/system` 给 `Audit`，两个 auth-id 各一份。只授用户时 token 一律 403（token 默认权限分离，不继承用户 ACL）；只授 token 时网页端登录看不到仓库。这两个角色只含 `Datastore.Audit` + `Sys.Audit`，不含任何写权限，`Admin` 是多余的。面板对 PBS **只发 GET**：prune / GC / verify / sync 都交给 PBS 控制台，凭据层面也不给写权限。没登记凭据时整块安静隐藏，不会在备份页留一个空盒子。
 
 两条互补的巡检会走告警通道：PBS 归档 verify 未通过（`备份校验巡检`），以及 GC 失败 / 磁盘健康异常（`PBS 运行状态`）。详见 [docs/PBS监控.md](docs/PBS监控.md)。
 

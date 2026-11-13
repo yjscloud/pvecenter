@@ -780,7 +780,7 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'pbs.authFailedHint':
     'Check each item: ① the token ID must look like user@realm!tokenname (the !tokenname part is required); ② the secret is the one-time value printed by generate-token, not the account password; ③ the token is enabled and its user exists; ④ after changing the token ID you must re-enter the secret.',
   'pbs.permissionDeniedHint':
-    'The token is valid but lacks privileges (403). Grant to the token itself (user@realm!tokenname), not the user: run acl update /datastore DatastoreAudit --auth-id <token-id> on the PBS, plus /system Audit for node load and disk health.',
+    'The token is valid but lacks privileges (403). There are 4 rows to grant: DatastoreAudit on /datastore and Audit on /system, once for the user and once for the token. Without the token rows the panel always gets 403; without the user rows the web UI shows no datastores.',
   'pbs.tokenIdFormat':
     'The token ID is missing “!” — it must look like user@realm!tokenname',
   'pbs.testPartialHint':
@@ -866,20 +866,23 @@ export const enApp: Partial<Record<MessageKey, string>> = {
     'proxmox-backup-manager user delete-token pvecenter@pbs readonly',
     'proxmox-backup-manager user generate-token pvecenter@pbs readonly',
   ].join('\n'),
-  'pbs.guideStep2': '② Grant privileges — to the token itself',
+  'pbs.guideStep2': '② Grant all 4 rows — user and token each',
   'pbs.guideStep2Body':
-    'Grant to the token (user@realm!tokenname, with the exclamation mark), not to the user user@realm — PBS tokens are privilege-separated by default and do not inherit user ACLs, so user-level grants still give you 403. Privileges also apply per path: DatastoreAudit on /datastore unlocks the datastore list, usage, GC and tasks; Audit on /system only adds node load and disk health, and is a pure read-only role.',
+    'Both auth IDs need their own grants, 4 rows in total: DatastoreAudit on /datastore (datastore list, usage, GC, tasks) and Audit on /system (node load, disk health — read-only). Granting only the user pvecenter@pbs still gives the token 403, because tokens are privilege-separated and do not inherit user ACLs; granting only the token means the same account cannot see datastores when logging into the web UI with a password. In the UI: Access Control → Permissions → Add, four times, with Propagate checked.',
   'pbs.guideStep2Code': [
-    '# required: datastore list + usage + tasks (propagates to /datastore/{store})',
+    '# datastore: list + usage + GC + tasks — one row per auth ID',
+    "proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id 'pvecenter@pbs'",
     "proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id 'pvecenter@pbs!readonly'",
-    '# node load / disk health: Audit holds only Datastore.Audit + Sys.Audit, no write privileges',
+    '# system: node load + disk health; Audit holds only Datastore.Audit + Sys.Audit',
+    "proxmox-backup-manager acl update /system Audit --auth-id 'pvecenter@pbs'",
     "proxmox-backup-manager acl update /system Audit --auth-id 'pvecenter@pbs!readonly'",
-    '# verify: empty output means nothing landed on the token; otherwise /datastore and /system should both appear',
+    '# verify: both commands must print something; empty means that row did not land',
+    "proxmox-backup-manager user permissions 'pvecenter@pbs'",
     "proxmox-backup-manager user permissions 'pvecenter@pbs!readonly'",
   ].join('\n'),
-  'pbs.guideStep2WarnTitle': 'Do not grant to the user',
+  'pbs.guideStep2WarnTitle': 'All 4 rows are required',
   'pbs.guideStep2Warn':
-    'The usual trap: --auth-id pvecenter@pbs (the user). acl list shows the entry, yet the token still gets 403 — each place looks correct on its own. Check with user permissions <token-id>: header only means nothing was granted. Also note PBS has no SysAudit role; /system SysAudit fails with “value is not defined”.',
+    'User-only grants leave the token at 403; token-only grants leave the web UI without datastores — both directions bite. Also quote the exclamation mark in --auth-id, or an interactive shell will eat it as history expansion; and PBS has no SysAudit role, so /system SysAudit fails with “value is not defined”.',
   'pbs.guideStep3': '③ Fill in the connection',
   'pbs.guideAddrLabel': 'Host / port',
   'pbs.guideAddrValue':
@@ -900,9 +903,9 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'pbs.guideTrouble401':
     '401: wrong token ID or secret — check for a missing !tokenname, or a secret polluted by a newline or spaces.',
   'pbs.guideTrouble403':
-    '403: the token is valid but lacks privileges — run user permissions <token-id> first: empty output means the ACL went to the user instead of the token; only /datastore means /system Audit is missing.',
+    '403: the token is valid but lacks privileges — run user permissions <token-id> first: empty output means the ACL went to the user only, not the token; only /datastore means /system Audit is missing. The complete setup is 4 rows, two per auth ID.',
   'pbs.guideTroubleAcl':
-    'Empty datastore list / “no datastores”: almost always an ACL that is not on the token’s /datastore. PBS answers an unprivileged token with an empty array, not an error — check whether acl list shows !tokenname in the ugid column.',
+    'Empty datastore list / “no datastores”: almost always an ACL that is not on /datastore. PBS answers an unprivileged token with an empty array, not an error — check that acl list has a /datastore row for both the user and the token.',
   'pbs.guideTroubleNet':
     'Cannot connect: make sure the panel host can reach port 8007; for a self-signed PBS paste the PEM to pin the certificate instead of disabling verification.',
   'pbs.guideClose': 'Got it',
@@ -927,7 +930,7 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'pbs.testNoCapacityPerm':
     'Connected and the datastore list works, but the capacity endpoint failed ({code}). Make sure the token has DatastoreAudit on /datastore; a 404 means this PBS version has no such endpoint.',
   'pbs.testNoDatastoreAudit':
-    'Connected, but the datastore list is empty: no Datastore.Audit is granted under /datastore. PBS answers an unprivileged token with an empty array, not a 403 — run acl update /datastore DatastoreAudit --auth-id <token-id>, granted to the token with !tokenname (/system alone is not enough).',
+    'Connected, but the datastore list is empty: no Datastore.Audit is granted under /datastore. PBS answers an unprivileged token with an empty array, not a 403 — add DatastoreAudit on /datastore for both the user and the token; /system alone is not enough.',
   'pbs.datastoreNoPerm':
     'The token has no Datastore.Audit under /datastore, so PBS returns an empty list (the datastore does exist). Grant it to see capacity.',
   'pbs.tasksFiltered': 'backup & verify only',
@@ -939,7 +942,7 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'pbs.capMissing': 'unreadable',
   'pbs.permissionGuideTitle': 'Which privileges are needed',
   'pbs.permissionGuideBody':
-    'Both go to the token itself (user@realm!tokenname), not the user: DatastoreAudit on /datastore covers repositories and tasks; add Audit on /system for node load and disk health — a pure read-only role with no write privileges.',
+    'Grant both the user and the token — 4 rows in total. DatastoreAudit on /datastore covers repositories and tasks; add Audit on /system for node load and disk health (a pure read-only role). One-sided grants fail either way: user-only leaves the token at 403, token-only leaves the web UI without datastores.',
   'pbs.errHostRequired': 'Enter the PBS host',
   'pbs.errHostFormat': 'Hostname or IP only — no https:// or path',
   'pbs.errPort': 'Port must be between 1 and 65535',
