@@ -34,6 +34,7 @@ import {
   IconGlobe,
   IconInfo,
   IconKey,
+  IconLayers,
   IconPlus,
   IconRefresh,
   IconServer,
@@ -482,12 +483,15 @@ export function PbsConnectionCard({
                           {t('pbs.disconnected')}
                         </Badge>
                       )
+                    ) : configured ? (
+                      /* 没测过就是「未测试」，不能画成绿的 —— 与上方 PVE 卡的
+                         「检测中…」同理：不知道的事不能显示成已知的好结果 */
+                      <Badge variant="neutral" size="sm" title={t('pbs.untestedHint')}>
+                        {t('pbs.untested')}
+                      </Badge>
                     ) : (
-                      <Badge
-                        variant={configured ? 'success' : 'warning'}
-                        size="sm"
-                      >
-                        {configured ? t('pbs.badgeConfigured') : t('pbs.badgeIncomplete')}
+                      <Badge variant="warning" size="sm">
+                        {t('pbs.badgeIncomplete')}
                       </Badge>
                     )}
                   </div>
@@ -501,6 +505,13 @@ export function PbsConnectionCard({
                         {item.region}
                       </span>
                     ) : null}
+                    {/* 顺序与上方 PVE 卡逐项对齐：区域 → 节点 → 凭据 → 密钥。
+                        PBS 的「节点」是读取目标（单节点，不可展开），PVE 是节点数
+                        （可展开），两者位置与图标保持一致，差异只体现在内容上。 */}
+                    <span className="set-conn-tag" title={t('pbs.fieldNode')}>
+                      <IconLayers size={12} />
+                      {item.node || t('pbs.fieldNodeAuto')}
+                    </span>
                     <span
                       className="set-conn-tag"
                       title={item.token_id || t('pbs.fieldTokenId')}
@@ -508,12 +519,8 @@ export function PbsConnectionCard({
                       <IconKey size={12} />
                       {item.token_id || '—'}
                     </span>
-                    <span className="set-conn-tag">
-                      <IconServer size={12} />
-                      {item.node || t('pbs.fieldNodeAuto')}
-                    </span>
                     {item.token_secret_set ? (
-                      <span className="set-conn-tag">
+                      <span className="set-conn-tag" title={t('pbs.secretSavedHint')}>
                         <IconShield size={12} />
                         {t('pbs.secretSaved')}
                       </span>

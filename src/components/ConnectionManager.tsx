@@ -37,6 +37,7 @@ import { Notice, EmptyState, ErrorState, CollapsibleCard } from './ui/EmptyState
 import {
   IconPlug,
   IconKey,
+  IconGlobe,
   IconShield,
   IconActivity,
   IconServer,
@@ -559,7 +560,9 @@ export function ConnectionManager({
           actions={
           <>
             <Badge variant={configured ? 'success' : 'warning'} dot size="sm">
-              {configured ? t('conn.configured') : t('conn.notConfigured')}
+              {configured
+                ? t('conn.configuredCount', { n: connections.length })
+                : t('conn.notConfigured')}
             </Badge>
             <Button
               variant="secondary"
@@ -647,7 +650,7 @@ export function ConnectionManager({
                       里更换；其余连接一律同级，列表页始终汇总全部连接 */}
                   {c.active ? (
                     <Badge
-                      variant="accent"
+                      variant="neutral"
                       size="sm"
                       title={t('conn.defaultReadTitle')}
                     >
@@ -657,6 +660,15 @@ export function ConnectionManager({
                 </div>
 
                 <div className="set-conn-tags">
+                  {/* 标签顺序与下方 PBS 卡逐项对齐：区域 → 节点 → 凭据 → 密钥 →
+                      控制台。两张卡上下相邻，同一种信息必须落在同一位置，
+                      否则来回扫视时眼睛每次都要重新找。 */}
+                  {c.region ? (
+                    <span className="set-conn-tag" title={t('conn.fieldRegion')}>
+                      <IconGlobe size={12} />
+                      {c.region}
+                    </span>
+                  ) : null}
                   {/* 节点数 + 可展开的名字：节点一多时收成一行「N 个节点」，
                       展开才铺芯片，列表不会被几十个节点名撑成一面墙 */}
                   <button
@@ -681,6 +693,12 @@ export function ConnectionManager({
                     <IconKey size={12} />
                     {c.token_id || t('conn.noToken')}
                   </span>
+                  {c.token_secret_set ? (
+                    <span className="set-conn-tag" title={t('conn.secretSavedHint')}>
+                      <IconShield size={12} />
+                      {t('conn.secretSaved')}
+                    </span>
+                  ) : null}
                   <span className="set-conn-tag">
                     <IconConsole size={12} />
                     {c.console_user || t('conn.noConsoleCreds')}
@@ -719,7 +737,7 @@ export function ConnectionManager({
                       onClick={() => void repairProfile(c)}
                       title={t('conn.repairTitle')}
                     >
-                      修复权限
+                      {t('conn.repair')}
                     </Button>
                     {/* 暂停 / 恢复：配置与凭据都留着，随时能接回来 */}
                     <Button

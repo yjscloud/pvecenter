@@ -770,6 +770,8 @@ export const enApp: Partial<Record<MessageKey, string>> = {
     'No PBS credential yet. Click “Add” to start — the token only needs Datastore.Audit / Sys.Audit.',
   'pbs.configNew': 'New PBS connection',
   'pbs.secretSaved': 'Secret saved',
+  'pbs.secretSavedHint':
+    'The token secret is stored server-side and never echoed back; leave the field blank when editing to keep it',
   'pbs.test': 'Test',
   'pbs.testOk': 'Connection succeeded',
   'pbs.testFailed': 'Connection failed',
@@ -824,11 +826,14 @@ export const enApp: Partial<Record<MessageKey, string>> = {
     'Disabling verification allows MITM; use it only temporarily on isolated networks',
   'pbs.fieldNodeAuto': 'Auto (first node)',
   'pbs.notConfigured': 'Not configured',
-  'pbs.configuredCount': '{n} registered',
+  'pbs.configuredCount': '{n} configured',
   'pbs.badgeConfigured': 'Configured',
   'pbs.badgeIncomplete': 'Incomplete',
-  'pbs.connected': 'Reachable',
-  'pbs.disconnected': 'Unreachable',
+  'pbs.untested': 'Not tested',
+  'pbs.untestedHint':
+    'Credentials are saved but this connection has never been tested. Run “Test” to verify reachability — until then it is not shown as online',
+  'pbs.connected': 'Connected',
+  'pbs.disconnected': 'Cannot connect',
   'pbs.pause': 'Pause',
   'pbs.resume': 'Resume',
   'pbs.pauseHint':

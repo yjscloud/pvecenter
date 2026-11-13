@@ -180,7 +180,11 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'conn.title': 'Proxmox connections',
   'conn.subtitle': 'The panel reaches the cluster with an API token; credentials stay on the backend and are never sent to the browser',
   'conn.configured': 'Configured',
+  'conn.configuredCount': '{n} configured',
   'conn.notConfigured': 'Not configured',
+  'conn.secretSaved': 'Secret saved',
+  'conn.secretSavedHint':
+    'The API token secret is stored server-side and never echoed back; leave the field blank when editing to keep it',
   'conn.add': 'Add connection',
   'conn.readonlyTitle': 'Read-only view',
   'conn.readonlyBody': 'Only administrators can change connection settings. The token secret shown on this page is always masked by the backend and is never returned in plain text.',
