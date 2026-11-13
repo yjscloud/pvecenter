@@ -905,7 +905,22 @@ function BackupFilesTab({
           }
         }),
       );
-      return results.flat();
+      /* 跨连接去重。后端在**单次请求内**已经按 volid 合并了「共享存储被每个
+         节点各报一次」（见 routers/backups.py 的 seen_volid），但那层作用域被
+         连接钉死。同一个 PVE 集群若登记成两条连接（比如 pve-master 与
+         pve-slave 各一条），两条连接会各返回一遍同一批归档 → 3 份备份显示成
+         6 份，占用空间也跟着翻倍。
+         volid 里已经含存储名、vmid 与秒级备份时间戳，跨节点完全一致，因此
+         「存储名 + volid」可以直接当合并键；本地存储的归档名同样带时间戳，
+         不同节点出现同名同秒的概率可以忽略，合并不会吃掉真实数据。 */
+      const merged = new Map<string, BackupRow>();
+      for (const row of results.flat()) {
+        const key = row.volid
+          ? `${row.storage ?? ''}|${row.volid}`
+          : `${row.connection_id ?? ''}|${row.node ?? ''}|${row.storage ?? ''}`;
+        if (!merged.has(key)) merged.set(key, row);
+      }
+      return [...merged.values()];
     },
     enabled: Boolean(node) || connectionsQuery.isSuccess,
     staleTime: 20_000,
