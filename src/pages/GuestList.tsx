@@ -65,6 +65,7 @@ import { OwnerAssignDialog } from '../components/OwnerAssignDialog';
 import { useAiAssistantEntry } from '../components/AskAiButton';
 import { useSnapshotQuota } from '../hooks/useSnapshotQuota';
 import { useNodeStorages } from '../hooks/useNodeStorages';
+import { useGuestPins } from '../hooks/useGuestPins';
 import { VmCreateWizard } from '../components/VmCreateWizard';
 import { LxcCreateWizard } from '../components/LxcCreateWizard';
 /* VMware 互操作：OVF/OVA 导入与镜像导出（只有虚拟机有这两件事，容器不参与） */
@@ -94,6 +95,8 @@ import {
   IconKey,
   IconUpload,
   IconSparkle,
+  IconStar,
+  IconPin,
 } from '../components/Icons';
 import {
   formatBytes,
@@ -209,6 +212,11 @@ interface RowMenuProps {
    * 空串 = 还没登记为受管主机，此时「问 AI」只带问题过去，让用户自己选主机。
    */
   askHostId?: string;
+  /** 是否已置顶 / 已收藏（决定菜单项文案与星标填充态） */
+  pinned: boolean;
+  starred: boolean;
+  onTogglePin: () => void;
+  onToggleStar: () => void;
 }
 
 function RowMenu({
@@ -227,6 +235,10 @@ function RowMenu({
   canResetPassword,
   canExport,
   askHostId,
+  pinned,
+  starred,
+  onTogglePin,
+  onToggleStar,
 }: RowMenuProps) {
   const t = useT();
   const navigate = useNavigate();
@@ -252,17 +264,9 @@ function RowMenu({
      anyAction 也换成它 —— 否则「只有 AI 入口可用」的用户在容器列表上会看到一个
      能点亮、点开却空空的菜单。 */
   const showAskAi = aiAvailable && !isLxc;
-  /* 菜单里有没有可做的事：一件都没有就把整个入口禁掉（点开是空壳） */
-  const anyAction =
-    canCloneRow ||
-    canToTemplate ||
-    canSnapshotRow ||
-    canExport ||
-    canMigrateRow ||
-    canAssign ||
-    canResetPassword ||
-    canDeleteRow ||
-    showAskAi;
+  /* 菜单入口不再需要「有没有可做的事」的判断：置顶与收藏永远可用（纯本地
+     偏好，不看机器权限、也不看机器是否在忙），所以点开必有内容。
+     其余条目仍各自按权限 / busy 决定 disabled。 */
   const [open, setOpen] = useState(false);
   const anchorRef = useRef<HTMLSpanElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -366,11 +370,7 @@ function RowMenu({
     >
       {/* 一个可做的动作都没有（例如只读用户）就别摆这个菜单：点开是个空壳。
           这里的判断**不**依赖角色名 —— 自定义角色完全可能只有一个 power 权限。 */}
-      <IconButton
-        label={t('guestList.moreActions')}
-        onClick={toggle}
-        disabled={disabled || !anyAction}
-      >
+      <IconButton label={t('guestList.moreActions')} onClick={toggle}>
         <IconMore size={16} />
       </IconButton>
       {open && pos ? (
@@ -433,6 +433,20 @@ function RowMenu({
           {canResetPassword
             ? item(t('guestList.resetPassword'), <IconKey size={15} />, onResetPassword)
             : null}
+          {/* 置顶 / 收藏是纯个人偏好：不写 PVE、不改机器状态，所以走
+              readonlyItem —— 机器正在忙、或账号只有只读权限时照样能标（这恰恰
+              是最想收藏几台常看的机器的场景）。也因此它们排在分隔线之上，
+              分隔线以下只有「删除」这种不可逆动作。 */}
+          {readonlyItem(
+            pinned ? t('guestList.unpin') : t('guestList.pin'),
+            <IconPin size={15} />,
+            onTogglePin,
+          )}
+          {readonlyItem(
+            starred ? t('guestList.unstar') : t('guestList.star'),
+            <IconStar size={15} filled={starred} />,
+            onToggleStar,
+          )}
           <div className="user-dropdown-divider" />
           {canDeleteRow
             ? item(t('guestList.deleteTitle', { noun: L.noun }), <IconTrash size={15} />, onDelete, true)
@@ -518,6 +532,9 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
      额度里不算任何人 —— 面板外建的、或归属记录丢了的，就是一份白送的额度，
      而此前在界面上完全看不见。 */
   const [ownerFilter, setOwnerFilter] = useState<'all' | 'unowned'>('all');
+  /* 「只看收藏」：与「无人认领」同一种 chip 交互（工具栏右侧），不额外占一行。
+     它是**与**关系 —— 收藏只是缩小范围，状态、搜索、连接筛选仍然生效。 */
+  const [starredOnly, setStarredOnly] = useState(false);
   /* 默认按创建时间升序：先建的排在最上面。取不到创建时间的存量机器
      （created 为 null，PVE 8 之前建的、或 meta 里没写 ctime 的）按 0 参与比较，
      会排在最前面 —— 它们的时间确实最早（未知）。用户点表头仍可改排序。 */
@@ -765,9 +782,20 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   const guestTotal = guestsQuery.data?.total ?? guestRows.length;
   const guestTruncated = guestTotal > guestRows.length;
 
+  /* 置顶 / 收藏：按账号存在服务端（/api/prefs 的 guest_pins），换设备也跟着走 */
+  const pins = useGuestPins();
+
+  /* 多台 PVE 合并展示时，不同主机的同名节点/VMID 会撞车，键里必须带连接。
+     放在 filtered 之前：收藏筛选要用它，选择逻辑也用同一把键。 */
+  const rowKeyOf = useCallback(
+    (vm: VmSummary) => `${vm.connection_id ?? ''}:${vm.node}/${vm.vmid}`,
+    [],
+  );
+
   const filtered = useMemo(() => {
     const list = guestRows;
     const tokens = search.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const starred = pins.starredSet;
 
     return list.filter((vm) => {
       // 状态过滤
@@ -782,6 +810,9 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       // 归属过滤。只认真实的空值：后端只给能看全量的人回填这个字段，
       // 拿不到时不会误判成「无归属」。
       if (ownerFilter === 'unowned' && vm.owner) return false;
+
+      // 只看收藏：放在搜索之前，先按最粗的条件剪枝
+      if (starredOnly && !starred.has(rowKeyOf(vm))) return false;
 
       if (tokens.length === 0) return true;
       const haystack = [
@@ -799,7 +830,16 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         .toLowerCase();
       return tokens.every((token) => haystack.includes(token));
     });
-  }, [guestRows, search, statusFilter, ownerFilter, manualIpOf]);
+  }, [
+    guestRows,
+    search,
+    statusFilter,
+    ownerFilter,
+    starredOnly,
+    pins.starredSet,
+    rowKeyOf,
+    manualIpOf,
+  ]);
 
   /* 「无人认领」的台数。从已加载的清单里数，不另发请求 —— 列表本来就是它算出来的。
      模板不算在内：模板页另有归属语义，这里要的是「能认领的机器」。 */
@@ -808,11 +848,14 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
     [guestRows],
   );
 
-  /* ---- 选择 ---- */
-  /* 多台 PVE 合并展示时，不同主机的同名节点/VMID 会撞车，键里必须带连接 */
-  const rowKeyOf = (vm: VmSummary) =>
-    `${vm.connection_id ?? ''}:${vm.node}/${vm.vmid}`;
+  /* 收藏台数：只数**已加载**的清单。收藏里可能存着已被删除、或不在当前
+     500 条窗口里的机器，那些数不进来 —— 否则 chip 会显示 5 台、点开只有 3 行。 */
+  const starredCount = useMemo(
+    () => guestRows.filter((vm) => pins.starredSet.has(rowKeyOf(vm))).length,
+    [guestRows, pins.starredSet, rowKeyOf],
+  );
 
+  /* ---- 选择 ---- */
   const allSelected =
     filtered.length > 0 && filtered.every((vm) => selected.has(rowKeyOf(vm)));
   const someSelected = filtered.some((vm) => selected.has(rowKeyOf(vm)));
@@ -1199,19 +1242,48 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
          宽屏下被撑得很长；给一个上限后超出部分由 truncate 省略。
          178 = 原来的 160 + 改名按钮所占的宽度：按钮是 flex-shrink:0 的，
          不补回来的话名字会比加按钮之前更早被省略。 */
-      width: 178,
-      render: (vm) => (
+      /* 206 → 224：名称后面多了星标按钮（约 22px），名称前还可能多一枚图钉
+         （约 14px）。不补回来的话，名字会比加星标之前更早被省略。 */
+      width: 224,
+      render: (vm) => {
+        const ref = rowKeyOf(vm);
+        const pinned = pins.isPinned(ref);
+        const starred = pins.isStarred(ref);
+        return (
         <div className="vm-name-cell">
           {/* 名称与改名按钮单独包一层横向行：.vm-name-cell 是纵向布局
               （名称在上、徽标在下），按钮直接放进去会掉到第二行，
               看起来像是在修饰下面那串徽标而不是名字。 */}
           <span className="vm-name-line">
+            {/* 图钉标记：告诉人「它为什么排在最前面」。不可点 —— 取消置顶走菜单，
+                行内再给一个可点图标会让名称区挤成一排按钮。 */}
+            {pinned ? (
+              <span className="vm-pin-mark" title={t('guestList.pinnedTitle')}>
+                <IconPin size={12} />
+              </span>
+            ) : null}
             <span
               className="fw-500 truncate"
               title={vm.name || `${meta.codePrefix} ${vm.vmid}`}
             >
               {vm.name || `${meta.codePrefix} ${vm.vmid}`}
             </span>
+            {/* 星标：收藏是**个人偏好**，不跟机器权限走 —— 只读账号一样可以
+                把常看的几台标出来，这正是收藏的用处。默认淡显，收藏后点亮。 */}
+            <IconButton
+              label={
+                starred
+                  ? t('guestList.unstarAria', { name: vm.name || vm.vmid })
+                  : t('guestList.starAria', { name: vm.name || vm.vmid })
+              }
+              className={starred ? 'vm-star-btn is-starred' : 'vm-star-btn'}
+              onClick={(e) => {
+                e.stopPropagation();
+                pins.toggleStar(ref);
+              }}
+            >
+              <IconStar size={13} filled={starred} />
+            </IconButton>
             {/* 就地改名：编辑入口贴着被编辑的对象，比塞进「更多」菜单更好找。
                 模板不给入口 —— 模板名改动会牵连克隆来源，属于要谨慎对待的操作。 */}
             {canConfig && !vm.template ? (
@@ -1241,7 +1313,8 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             </Badge>
           ) : null}
         </div>
-      ),
+        );
+      },
       sortable: true,
       sortValue: (vm) => vm.name ?? '',
     },
@@ -1543,6 +1616,10 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
               canExport={canExport}
               onDelete={() => setDeleteTarget(vm)}
               askHostId={hostForGuest(vm)}
+              pinned={pins.isPinned(rowKeyOf(vm))}
+              starred={pins.isStarred(rowKeyOf(vm))}
+              onTogglePin={() => pins.togglePin(rowKeyOf(vm))}
+              onToggleStar={() => pins.toggleStar(rowKeyOf(vm))}
             />
           </span>
         );
@@ -1560,13 +1637,28 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
      翻页时排序看起来像坏了。排序规则与表格内部共用同一个 sortRows。
      筛选条件（连接 / 节点 / 状态 / 关键词）作为重置键：换了条件还停在第 5 页
      只会看到一张空表。 */
-  const sorted = useMemo(
-    () => sortRows(filtered, cols.columns, sort),
-    [filtered, cols.columns, sort],
-  );
+  const sorted = useMemo(() => {
+    /* 置顶分区发生在排序**之前**，而且只排「非置顶」那一半：
+       置顶组的顺序由用户建立置顶的先后决定（pinned 数组顺序），不能被点表头
+       打散；非置顶组照常跟着表头走。这样「点两次表头取消排序」也不会让置顶
+       消失 —— 分区和排序是两件事。 */
+    const byKey = new Map(filtered.map((vm) => [rowKeyOf(vm), vm]));
+    const pinnedRows: VmSummary[] = [];
+    for (const ref of pins.pinned) {
+      const vm = byKey.get(ref);
+      if (vm) pinnedRows.push(vm);
+    }
+    if (pinnedRows.length === 0) return sortRows(filtered, cols.columns, sort);
+
+    const pinnedKeys = new Set(pinnedRows.map(rowKeyOf));
+    const rest = filtered.filter((vm) => !pinnedKeys.has(rowKeyOf(vm)));
+    return [...pinnedRows, ...sortRows(rest, cols.columns, sort)];
+  }, [filtered, pins.pinned, rowKeyOf, cols.columns, sort]);
   const guestPage = usePaged(
     sorted,
-    `${connFilter}|${nodeFilter}|${statusFilter}|${ownerFilter}|${search}`,
+    /* starredOnly 也进重置键：在第 3 页点「只看收藏」（往往只有两三台）时，
+       不回到第 1 页就会看到一张空表。 */
+    `${connFilter}|${nodeFilter}|${statusFilter}|${ownerFilter}|${starredOnly}|${search}`,
   );
 
   /* 未配置时查询被 enabled 关掉、不出错也不出数据：这里一并按「取不到数据」处理，
@@ -1860,6 +1952,24 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
                 {t('guestList.unownedCount', { n: unownedCount })}
               </button>
             ) : null}
+            {/* 只看收藏：与「无人认领」同一套 chip 交互，点一下筛到标了星的那几台，
+                再点一下取消。没有收藏时不显示 —— 一枚永远是 0 的入口只会占地方。 */}
+            {/* 条件里带 starredOnly：否则「开着筛选又取消了最后一颗星」会让 chip
+                消失，而筛选还生效着 —— 用户面对一张空表却找不到关掉它的地方。 */}
+            {starredCount > 0 || starredOnly ? (
+              <button
+                type="button"
+                className={`unowned-chip starred-chip${
+                  starredOnly ? ' is-active' : ''
+                }`}
+                aria-pressed={starredOnly}
+                onClick={() => setStarredOnly((prev) => !prev)}
+                title={t('guestList.starredOnlyHint')}
+              >
+                <IconStar size={12} filled />
+                {t('guestList.starredCount', { n: starredCount })}
+              </button>
+            ) : null}
             <span className="fs-sm text-muted">
               {t('guestList.showing', {
                 shown: filtered.length,
@@ -1895,6 +2005,8 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             />
           </div>
         ) : (
+          /* presorted：上面的 sorted 已经做过「置顶分区 + 组内排序」，Table
+             内部再排一次会把置顶项按字段放回原位，置顶看起来就失效了。 */
           <Table<VmSummary>
             columns={cols.columns}
             rows={guestPage.rows}
@@ -1903,6 +2015,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             caption={t('guestList.caption', { noun: L.noun })}
             sort={sort}
             onSortChange={setSort}
+            presorted
             onRowClick={(vm) => navigate(guestPath(vm))}
             isRowSelected={(vm) => selected.has(rowKeyOf(vm))}
             emptyTitle={

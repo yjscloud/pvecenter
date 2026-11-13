@@ -182,6 +182,17 @@ export interface TableProps<T> {
   /** 排序状态（受控）*/
   sort?: SortState | null;
   onSortChange?: (sort: SortState | null) => void;
+  /**
+   * `rows` 已由调用方排好序，Table 不再重排。
+   *
+   * 给「排序不只是按字段比大小」的列表用 —— 例如虚拟机列表的置顶分区：
+   * 置顶项固定在最前、其余按表头排序，这是一次**分区**，内部再排一遍会把
+   * 分区打散（置顶项按字段回到原位，看起来就像置顶没生效）。
+   *
+   * 默认 false：分页页面已经把整份数据排好再切页传进来，内部重排当前页
+   * 结果不变（只是保证两条路径同一套规则），保持原行为。
+   */
+  presorted?: boolean;
   className?: string;
   /** 行悬浮提示 */
   rowTitle?: (row: T) => string;
@@ -226,6 +237,7 @@ export function Table<T>({
   dense = false,
   sort,
   onSortChange,
+  presorted = false,
   className,
   rowTitle,
   onRowHover,
@@ -330,10 +342,14 @@ export function Table<T>({
   /* ---- 排序处理 ----
      用的是与分页列表同一个 sortRows（见它的注释）：分页的页面已经先把整份数据
      排好、再切页传进来，这里重排当前这一页结果不变，只是保证两条路径的排序
-     规则一模一样。 */
+     规则一模一样。
+
+     `presorted` 例外：调用方的排序不是「按字段比大小」（虚拟机的置顶分区就是
+     先分组再排），这里再排一遍会把分组打散 —— 置顶项按字段回到原位，看起来
+     就像置顶根本没生效。 */
   const displayRows = useMemo(
-    () => sortRows(rows, columns, sort),
-    [rows, columns, sort],
+    () => (presorted ? rows : sortRows(rows, columns, sort)),
+    [rows, columns, sort, presorted],
   );
 
   const handleSortClick = (col: Column<T>) => {

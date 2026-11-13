@@ -2708,6 +2708,23 @@
   border-color: var(--warning);
 }
 
+/* 收藏筛选：与「无人认领」同一个外形，但换成主色 —— 两者可能同时出现在
+   工具栏上，一个是「需要处理」（橙），一个是「我挑出来的」（蓝），颜色分开
+   才不会看成同一类入口。 */
+.starred-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.starred-chip:hover,
+.starred-chip.is-active {
+  border-color: var(--accent);
+}
+
 /* 明细浮层：贴触发控件下方绝对定位，与详情页的「更多操作」菜单同一套处理
    （页面一滚就收起）。两个宿主共用这套外观，差别只在展开方向：
      * .quota-popover —— 额度胶囊，在工具栏最右侧，right: 0 向左展开；
@@ -4260,6 +4277,33 @@ body.is-col-resizing * {
 .vm-name-line:hover > button,
 .vm-name-line > button:focus-visible {
   opacity: 1;
+}
+
+/* 星标按钮：未收藏时压得比改名按钮更暗（每行都亮一颗星会很吵），
+   收藏后常亮且转主色 —— 扫列表时，那颗亮着的星就是视觉锚点。 */
+.vm-name-line > .vm-star-btn {
+  opacity: 0.3;
+}
+
+.vm-name-line:hover > .vm-star-btn,
+.vm-name-line > .vm-star-btn:focus-visible {
+  opacity: 0.75;
+}
+
+.vm-name-line > .vm-star-btn.is-starred,
+.vm-name-line:hover > .vm-star-btn.is-starred {
+  opacity: 1;
+  color: var(--accent);
+}
+
+/* 置顶图钉：名称前的小标记，只解释「它为什么排在最上面」，
+   不可点击 —— 取消置顶走「更多操作」菜单，行内再塞一个按钮会把名称挤没。 */
+.vm-pin-mark {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: var(--accent);
+  opacity: 0.8;
 }
 
 .checkbox-grid {

@@ -53,8 +53,16 @@ PREF_LANGUAGE = "language"
 # 存服务端还有一层意义：原先「读哪一台」是 settings 里的全局指针，管理员甲切一下
 # 管理员乙的读数立刻跟着变；改成按用户之后，各人的视角互不干扰。
 PREF_CLUSTER_SCOPE = "cluster_scope"
+# 虚拟机 / 容器的「置顶」与「加星」：
+#   {"pinned": ["<conn>:<node>/<vmid>", ...], "starred": [...]}
+# pinned 是**有序**数组，顺序即置顶顺序（先置顶的排在前）；starred 只表示归属。
+#
+# 与 dashboard_layout 的 order/hidden 完全无关 —— 那边是 widget id，上限 60，
+# 这里是几百台机器。存服务端而不是 localStorage，是因为「收藏了哪几台」属于
+# 账号级认知，换台机器打开也该还在。
+PREF_GUEST_PINS = "guest_pins"
 ALLOWED_KEYS = frozenset(
-    {PREF_DASHBOARD_LAYOUT, PREF_LANGUAGE, PREF_CLUSTER_SCOPE}
+    {PREF_DASHBOARD_LAYOUT, PREF_LANGUAGE, PREF_CLUSTER_SCOPE, PREF_GUEST_PINS}
 )
 
 # 单个偏好的体积上限。布局就是个 widget id 数组，几 KB 顶天；留 64 KB 是给

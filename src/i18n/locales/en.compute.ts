@@ -350,6 +350,17 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'guestList.unownedCount': '{n} unclaimed',
   'guestList.unownedHint':
     'These guests belong to nobody, so they do not count against anyone’s quota. Click to show only them, then assign an owner.',
+  'guestList.pin': 'Pin to top',
+  'guestList.unpin': 'Unpin',
+  'guestList.pinnedTitle':
+    'Pinned: always shown first in the list. Unpin from the “More actions” menu.',
+  'guestList.star': 'Add star',
+  'guestList.unstar': 'Remove star',
+  'guestList.starAria': 'Star {name}',
+  'guestList.unstarAria': 'Remove star from {name}',
+  'guestList.starredCount': '{n} starred',
+  'guestList.starredOnlyHint': 'Show only starred guests. Click again to clear the filter.',
+  'guestList.pinSaveFailed': 'Could not save the pin / star change',
   'guestList.status.all': 'All statuses',
   'guestList.status.running': 'Running',
   'guestList.status.stopped': 'Stopped',

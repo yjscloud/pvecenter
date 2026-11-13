@@ -264,6 +264,25 @@ export const IconEyeOff = (p: IconProps) => (
   </Icon>
 );
 
+/* 星标：收藏。filled 区分「已收藏」——填充与描边一眼可辨，不必再加一层颜色；
+   颜色仍由 currentColor 决定，放在任何语境里都能跟着变色。 */
+export const IconStar = (p: IconProps & { filled?: boolean }) => {
+  const { filled, ...rest } = p;
+  return (
+    <Icon {...rest} fill={filled ? 'currentColor' : 'none'}>
+      <path d="M12 3.6l2.63 5.33 5.87.86-4.25 4.14 1 5.85L12 17.02l-5.25 2.76 1-5.85L3.5 9.79l5.87-.86z" />
+    </Icon>
+  );
+};
+
+/* 图钉：置顶。竖杆画到 21，读起来像「钉在列表顶部」而不是一枚别针。 */
+export const IconPin = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M9 3h6l-.8 5.2 2.8 2.8v1.5H7v-1.5l2.8-2.8z" />
+    <path d="M12 12.5V21" />
+  </Icon>
+);
+
 export const IconMore = (p: IconProps) => (
   <Icon {...p} strokeWidth="2.4">
     <circle cx="5" cy="12" r="1.2" fill="currentColor" />

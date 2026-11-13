@@ -95,7 +95,61 @@ def _validate_cluster_scope(value: Any) -> str:
     return cid
 
 
+# 收藏 / 置顶最多允许多少台机器。默认一页只加载 500 台，但打开「加载全部」后
+# 收藏数可能更多；64 KB 的偏好上限下，1000 个 "conn:node/vmid" 约 25 KB，安全。
+MAX_GUEST_REFS = 1000
+
+# 单个机器标识（connection_id:node/vmid）的长度上限，挡住把偏好表当仓库用
+MAX_GUEST_REF_LEN = 64
+
+
+def _guest_ref_list(value: Any, field: str) -> List[str]:
+    """把一个引用数组规整成去重、保序的字符串列表。
+
+    `pinned` 的顺序就是置顶顺序（先置顶的先显示），所以这里必须保序去重，
+    不能用 set —— 那会把用户的置顶次序随机打散。
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise HTTPException(status_code=400, detail=f"{field} 必须是字符串数组")
+
+    seen: List[str] = []
+    for item in value:
+        ref = item.strip()
+        if not ref:
+            continue
+        if len(ref) > MAX_GUEST_REF_LEN:
+            raise HTTPException(status_code=400, detail=f"{field} 里的机器标识过长")
+        if ref not in seen:
+            seen.append(ref)
+    if len(seen) > MAX_GUEST_REFS:
+        raise HTTPException(
+            status_code=400, detail=f"{field} 过多（上限 {MAX_GUEST_REFS} 台）"
+        )
+    return seen
+
+
+def _validate_guest_pins(value: Any) -> Dict[str, Any]:
+    """校验「置顶 / 星标」的**结构**。
+
+    与布局同理，不校验这些机器是否真实存在：机器会被删、会迁移，而「偏好里
+    存着一台已经消失的机器」不该让保存失败。前端拿到当前列表后自行对账，
+    认不出的键自然不显示。
+
+    真正要挡住的是结构错误 —— 前端会直接 `pinned.map()`，拿到非数组会崩。
+    """
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="置顶 / 星标必须是一个对象")
+    return {
+        "pinned": _guest_ref_list(value.get("pinned"), "pinned"),
+        "starred": _guest_ref_list(value.get("starred"), "starred"),
+    }
+
+
 def _validate(key: str, value: Any) -> Any:
+    if key == prefs.PREF_GUEST_PINS:
+        return _validate_guest_pins(value)
     if key == prefs.PREF_DASHBOARD_LAYOUT:
         return _validate_dashboard_layout(value)
     if key == prefs.PREF_LANGUAGE:
