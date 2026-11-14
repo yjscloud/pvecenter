@@ -41,7 +41,7 @@ import { guestPath, guestPower, guestsApi, guestTypeOf } from '../api/guests';
 import { BulkResultNotice, bulkActionKey } from '../components/BulkResultNotice';
 import { errorMessage } from '../api/client';
 import { PageShell } from '../components/Layout';
-import { Badge, TagList } from '../components/ui/Badge';
+import { Badge } from '../components/ui/Badge';
 import { Button, IconButton } from '../components/ui/Button';
 import {
   Checkbox,
@@ -102,7 +102,6 @@ import {
   formatBytes,
   formatDateTime,
   formatUptimeShort,
-  parseTags,
   toPercent,
 } from '../utils/format';
 import { isRunning, isStopped, isTransient, vmStatusMeta } from '../utils/status';
@@ -823,6 +822,8 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         // 手动填的地址也要能搜到：它往往是用户手上唯一记得的标识
         manualIpOf(vm),
         vm.tags,
+        // 列里显示的是来源模板名，搜索也要能按它命中
+        vm.source_template?.name,
         vm.connection_name,
       ]
         .filter(Boolean)
@@ -1242,8 +1243,8 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
          宽屏下被撑得很长；给一个上限后超出部分由 truncate 省略。
          178 = 原来的 160 + 改名按钮所占的宽度：按钮是 flex-shrink:0 的，
          不补回来的话名字会比加按钮之前更早被省略。 */
-      /* 206 → 224：名称后面多了星标按钮（约 22px），名称前还可能多一枚图钉
-         （约 14px）。不补回来的话，名字会比加星标之前更早被省略。 */
+      /* 206 → 224：已收藏的行名称后面会有星标按钮（约 22px），名称前还可能
+         多一枚图钉（约 14px）。按最宽的那一行留位，名字才不会提前被省略。 */
       width: 224,
       render: (vm) => {
         const ref = rowKeyOf(vm);
@@ -1268,22 +1269,22 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             >
               {vm.name || `${meta.codePrefix} ${vm.vmid}`}
             </span>
-            {/* 星标：收藏是**个人偏好**，不跟机器权限走 —— 只读账号一样可以
-                把常看的几台标出来，这正是收藏的用处。默认淡显，收藏后点亮。 */}
-            <IconButton
-              label={
-                starred
-                  ? t('guestList.unstarAria', { name: vm.name || vm.vmid })
-                  : t('guestList.starAria', { name: vm.name || vm.vmid })
-              }
-              className={starred ? 'vm-star-btn is-starred' : 'vm-star-btn'}
-              onClick={(e) => {
-                e.stopPropagation();
-                pins.toggleStar(ref);
-              }}
-            >
-              <IconStar size={13} filled={starred} />
-            </IconButton>
+            {/* 星标：只有**已收藏**的行才画这颗星。收藏是个人偏好，不跟机器权限
+                走 —— 只读账号一样可以把常看的几台标出来，这正是收藏的用处。
+                未收藏时不出现空星（每行一颗灰星太吵），收藏入口在「更多操作」里。
+                已收藏的星可直接点掉，等于取消收藏。 */}
+            {starred ? (
+              <IconButton
+                label={t('guestList.unstarAria', { name: vm.name || vm.vmid })}
+                className="vm-star-btn is-starred"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  pins.toggleStar(ref);
+                }}
+              >
+                <IconStar size={13} filled />
+              </IconButton>
+            ) : null}
             {/* 就地改名：编辑入口贴着被编辑的对象，比塞进「更多」菜单更好找。
                 模板不给入口 —— 模板名改动会牵连克隆来源，属于要谨慎对待的操作。 */}
             {canConfig && !vm.template ? (
@@ -1476,10 +1477,28 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       sortValue: (vm) => vm.created ?? 0,
     },
     {
-      key: 'tags',
-      header: t('guestList.colTags'),
+      key: 'sourceTemplate',
+      header: t('guestList.colSourceTemplate'),
+      /* 与原来的「标签」列同宽，表格的列宽总和不变，不会把后面的归属 /
+         操作列挤出去。只展示名称，节点 / VMID / 路径一律不进单元格。 */
       width: 140,
-      render: (vm) => <TagList tags={parseTags(vm.tags)} max={2} />,
+      className: 'col-source-template',
+      render: (vm) => {
+        const source = vm.source_template;
+        const name = source?.name?.trim();
+        /* 名字取不到（来源模板被改名 / 被删，或不在当前这一页的清单里）时退回
+           `#VMID` —— VMID 是来源里唯一不会变的部分，比「—」有用得多。
+           容器用系统模板新建时 vmid 是 0，只有文件名，所以两样都空才算没有。 */
+        const label = name || (source?.vmid ? `#${source.vmid}` : '');
+        if (!label) {
+          return <span className="fs-sm text-muted">—</span>;
+        }
+        return (
+          <span className="fs-sm" title={label}>
+            {label}
+          </span>
+        );
+      },
     },
       /* 「归属」列只对**能看全量机器**的人存在：管理员与区域管理员
          （后者有 vm.assign / ct.assign，进来就是为了改派归属）。

@@ -54,7 +54,7 @@ import {
 } from '../components/Icons';
 import { LxcCreateWizard } from '../components/LxcCreateWizard';
 import { formatBytes, formatUptime, formatUptimeShort, parseTags } from '../utils/format';
-import { ostypeLabel } from '../utils/status'
+import { isTaskSuccess, ostypeLabel } from '../utils/status'
 import { useT } from '../i18n';
 import { ostypeOptions, cpuTypeOptions } from '../utils/status';
 import { useTaskRunner } from '../hooks/useTaskRunner';
@@ -1727,7 +1727,9 @@ function TemplateCreateWizard({
           ],
         },
       );
-      if (task?.exitstatus === 'OK' && holder.res) {
+      /* WARNINGS 也代表下载任务已完成（例如存储回执里有告警），不能拦下后续
+         的 volid 回填 —— 那是「任务成功但带告警」而不是失败 */
+      if (task && isTaskSuccess(task) && holder.res) {
         const done = holder.res;
         setImageVolId(done.volid);
         setDlUrl('');

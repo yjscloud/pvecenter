@@ -366,6 +366,38 @@ class TestStoredSnapshot:
         assert run(guestip.resolve_batch(client, [dict(self.ROW)])) == ["10.0.0.77"]
         assert client.calls == ["qemu_agent_network"]
 
+    def test_running_empty_row_is_retried_sooner(self, monkeypatch) -> None:
+        """运行中的机器「没有地址」压得更短。
+
+        刚下发的容器 / 刚启动的虚拟机，网卡与 Agent 都要几秒才就绪，那一轮拿不到
+        是常态。按关机那一档（120 秒）压住，再叠上 120 秒的预热周期，最坏要四分
+        钟才显示出地址 —— 用户看到的就是「IP 回填很慢」。
+        """
+        guestip.clear()
+        stale = int(time.time()) - int(guestip.MISS_TTL_RUNNING_SECONDS) - 1
+        monkeypatch.setattr(
+            guestip, "_load_many", _table({("c1", "pve", 103): ("", stale)})
+        )
+        monkeypatch.setattr(guestip, "_load_one", _one(None))
+        client = FakeClient(agent=self.AGENT)
+
+        assert run(guestip.resolve_batch(client, [dict(self.ROW)])) == ["10.0.0.77"]
+        assert int(guestip.MISS_TTL_RUNNING_SECONDS) < int(guestip.EMPTY_TTL_SECONDS)
+
+    def test_stopped_empty_row_keeps_its_long_shelf_life(self, monkeypatch) -> None:
+        """关机机器本来就拿不到地址：同样的 60 秒旧记录不该再去问一遍。"""
+        guestip.clear()
+        row = dict(self.ROW, status="stopped")
+        monkeypatch.setattr(
+            guestip,
+            "_load_many",
+            _table({("c1", "pve", 103): ("", int(time.time()) - 60)}),
+        )
+        client = FakeClient(agent=self.AGENT)
+
+        assert run(guestip.resolve_batch(client, [row])) == [""]
+        assert client.calls == []
+
     def test_single_lookup_also_retries_stale_empty_rows(self, monkeypatch) -> None:
         """``resolve``（单台）与批量走同一套判断，不能只修批量那一条。"""
         guestip.clear()
@@ -374,3 +406,48 @@ class TestStoredSnapshot:
         client = FakeClient(agent=self.AGENT)
         assert run(guestip.resolve(client, dict(self.ROW))) == "10.0.0.77"
         assert client.calls == ["qemu_agent_network"]
+
+
+class TestContainerInterfaceBudget:
+    """容器取地址的等待上限：列表用短超时，后台预热用长超时。"""
+
+    def test_list_path_keeps_the_short_timeout(self, monkeypatch) -> None:
+        guestip.clear()
+        seen: List[float] = []
+
+        async def fake_iface(_client, _node, _vmid, timeout):
+            seen.append(timeout)
+            return "10.0.0.9"
+
+        monkeypatch.setattr(guestip, "_container_iface_ip", fake_iface)
+        client = FakeClient(ct_config={"net0": "ip=dhcp"})
+
+        assert run(guestip.resolve(client, ct())) == "10.0.0.9"
+        assert seen == [guestip.AGENT_TIMEOUT_SECONDS]
+
+    def test_warm_path_may_wait_longer(self, monkeypatch) -> None:
+        """预热放宽到 ``CT_IFACE_TIMEOUT_SECONDS``：进容器执行 ``ip`` 常常慢过 1.2 秒。
+
+        那一次超时会被当成「没有地址」缓存起来，于是一次超时等于一两分钟看不到
+        IP —— 预热在后台跑，多等几秒换来的是这一轮就落库。
+        """
+        guestip.clear()
+        seen: List[float] = []
+
+        async def fake_iface(_client, _node, _vmid, timeout):
+            seen.append(timeout)
+            return "10.0.0.9"
+
+        monkeypatch.setattr(guestip, "_container_iface_ip", fake_iface)
+        client = FakeClient(ct_config={"net0": "ip=dhcp"})
+
+        out = run(
+            guestip.resolve(
+                client,
+                ct(),
+                ct_iface_timeout=guestip.CT_IFACE_TIMEOUT_SECONDS,
+            )
+        )
+        assert out == "10.0.0.9"
+        assert seen == [guestip.CT_IFACE_TIMEOUT_SECONDS]
+        assert guestip.CT_IFACE_TIMEOUT_SECONDS > guestip.AGENT_TIMEOUT_SECONDS

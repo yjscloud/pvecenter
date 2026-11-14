@@ -297,6 +297,58 @@ class TestEvaluate:
         assert key in stub.cleared
         assert stub.recorded[0]["kind"] == "recovery"
 
+    def test_just_deployed_user_is_not_alarmed_yet(self, monkeypatch) -> None:
+        """刚下发完不新开告警。
+
+        新建接口在返回之前就把用量记上了（``set_owner`` + ``quota.invalidate``），
+        所以「下发成功」与「额度即将用完（剩余 5%）」会前后脚到达 —— 判定没错，
+        但用户读到的次序像是「刚才那次下发出了问题」。宽限窗口就是为这一刻设的。
+        """
+        stub = _Stub()
+        limits, usage, remaining = _vm(100, 95, 5)
+        _patch(
+            monkeypatch,
+            stub,
+            {"users": [_row("alice", limits=limits, usage=usage, remaining=remaining)], "error": ""},
+        )
+
+        async def just_now(_name: str) -> int:
+            return int(time.time())
+
+        monkeypatch.setattr(quotaalert.ownership, "last_created", just_now)
+
+        assert _run(quotaalert.evaluate()) == []
+        assert stub.dispatched == [] and stub.recorded == []
+
+    def test_grace_never_silences_an_alarm_already_sent(self, monkeypatch) -> None:
+        """宽限只压**新开**的告警：已经在告警中的人照常按冷却重复提醒。
+
+        否则「下发一台机器」就会把某人正在报的额度告警一起吞掉，真正快满额的人
+        要等下一次冷却结束才会再看到。
+        """
+        stub = _Stub()
+        limits, usage, remaining = _vm(100, 95, 5)
+        _patch(
+            monkeypatch,
+            stub,
+            {"users": [_row("alice", limits=limits, usage=usage, remaining=remaining)], "error": ""},
+        )
+        _run(quotaalert.evaluate())
+        assert len(stub.dispatched) == 1
+
+        # 冷却已过 + 刚刚又下发了一台：仍然要重复提醒
+        for row in stub.active.values():
+            row["ts"] = time.time() - quotaalert.COOLDOWN - 5
+
+        async def just_now(_name: str) -> int:
+            return int(time.time())
+
+        monkeypatch.setattr(quotaalert.ownership, "last_created", just_now)
+        stub.dispatched.clear()
+        _run(quotaalert.evaluate())
+
+        assert len(stub.dispatched) == 1
+
     def test_foreign_source_active_state_is_ignored(self, monkeypatch) -> None:
         """别把「集群仲裁」之类的告警状态当成额度预警来处理。"""
         stub = _Stub(

@@ -98,6 +98,7 @@ from . import apitokens
 from . import certmonitor as cert_monitor
 from . import certs as cert_manager
 from . import frp
+from . import ippool
 from . import metrics as metrics_history
 from . import notifications
 from . import ownership
@@ -183,6 +184,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await inspection.init_table()
     # 客户机 IP 落库缓存：虚拟机列表读它，不再在请求内逐台问 Guest Agent
     await guestip.init_table()
+    # IP 地址池的分配登记表：DHCP 自动分配在配置落盘前先把地址占住
+    await ippool.init_table()
     # 站内通知表：告警发生时由 alerting.record 往里写未读消息
     await notifications.init_table()
     # 启动时清一遍「链接指向的机器已不属于收件人」的存量消息：升级前的告警规则
@@ -291,12 +294,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 间隔 / 启停配置恢复出来，run_forever 才会按恢复后的间隔算唤醒时刻。
     await scheduler.load_state()
     scheduler.start()
+    # IP 地址池的占用快照预热：第一次打开创建向导 / 批量部署时不必现场扫全集群。
+    # 放在后台跑，PVE 暂时不可达也不影响启动。
+    ippool.start_warmup()
     yield
 
     # 停止路径**逐步打点**：这几步里任何一步卡住，systemd 都会在 TimeoutStopSec
     # （15 秒）到点后直接 SIGKILL —— 进程被硬杀，数据库连接池与远端 SSH 都来不及
     # 收口，而且日志里只会留下一句「stop-sigterm timed out」，看不出卡在哪。
     # 打点之后，最后一条日志指向的就是卡住的那一步。
+    logger.info("正在停止：IP 池后台刷新")
+    await ippool.stop()
     logger.info("正在停止：后台调度器")
     await scheduler.stop()
     # 打开的远程终端各挂着一条 SSH 连接：进程退出前主动收口，

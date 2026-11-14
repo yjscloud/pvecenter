@@ -50,13 +50,14 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import database
-from .pve import ProxmoxClient, all_connection_clients, parallel
+from .pve import ProxmoxClient, collection_targets, parallel
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,18 @@ _AUDIT_ACTIONS = ("vm.clone", "ct.clone")
 #:
 #: 与 _AUDIT_ACTIONS 刻意分开：重装不是「建机」，它的时间不能拿去回填创建时间。
 _SOURCE_ACTIONS = ("vm.clone", "ct.clone", "vm.reinstall")
+
+#: 容器「从系统模板新建」的审计动作。它的 ``detail`` 里带 ``ostemplate``。
+#:
+#: 容器与虚拟机在这一点上不一样：虚拟机的常规建机是「挂 ISO / 导入磁盘」，来源
+#: 只可能是克隆；而容器**绝大多数**都是 ``pct create`` 直接吃一个 ``vztmpl`` 模板
+#: 文件建出来的 —— 它根本没有「来源机器」，来源就是那个模板文件。PVE 不把这个
+#: 信息放进 ``cluster/resources``，只能从面板自己建机时写下的审计里取。
+_CREATE_ACTION = "ct.create"
+
+#: 容器的来源会出现在这几种审计里：克隆 / 重装（``来源 -> 目标``），以及
+#: 「用系统模板新建」（detail 里带 ostemplate）。合成一处，查询只跑一趟。
+_CLONE_ACTIONS = _SOURCE_ACTIONS + (_CREATE_ACTION,)
 
 # 回填出来的时间必须**比继承来的 meta 晚**这么久，才算「这台的 meta 是继承的」。
 # 用同一秒创建时不该被误判（克隆的 meta 来自几天前甚至几个月前的模板）。
@@ -322,7 +335,13 @@ async def _node_names_are_unique() -> Dict[str, int]:
         return counts
 
     result: Dict[str, int] = {}
-    for _profile, client in all_connection_clients():
+    # 用 collection_targets：单连接 / 尚未保存连接的部署走的是兜底客户端，
+    # 只看 all_connection_clients 会得到空集合，来源模板整列都填不出来。
+    try:
+        targets = collection_targets()
+    except Exception:  # noqa: BLE001 - 探测不到就当作不可判定
+        return {}
+    for _profile, client in targets:
         try:
             nodes = await client.nodes() or []
         except Exception:  # noqa: BLE001 - 探测不到就当作不可判定
@@ -453,12 +472,14 @@ async def source_of(
     actions = ", ".join("?" for _ in _SOURCE_ACTIONS)
     try:
         async with database.connect() as db:
-            # 只看成功的：失败的那次重装没动过系统盘，来源仍然是上一个模板
+            # 只看成功的：失败的那次重装没动过系统盘，来源仍然是上一个模板。
+            # 用 target_guest（审计表上的虚拟列 + 索引）而不是前置通配的 LIKE：
+            # 后者每台机器一次全表扫描，而它跑在详情 / 列表首屏路径上。
             cursor = await db.execute(
                 f"SELECT target FROM audit_log WHERE action IN ({actions}) "
-                "AND result = 'success' AND target LIKE ? "
-                "ORDER BY timestamp DESC LIMIT 1",
-                (*_SOURCE_ACTIONS, f"%-> {node}/{vmid}"),
+                "AND result = 'success' AND target_guest = ? "
+                "ORDER BY timestamp DESC, id DESC LIMIT 1",
+                (*_SOURCE_ACTIONS, f"{node}/{vmid}"),
             )
             row = await cursor.fetchone()
     except Exception:  # noqa: BLE001 - 查不到就当「没有来源」，不影响详情页
@@ -472,6 +493,180 @@ async def source_of(
     if not src_vmid.isdigit():
         return {}
     return {"node": src_node or str(node), "vmid": int(src_vmid)}
+
+
+async def sources_for(
+    items: Iterable[Dict[str, Any]],
+) -> Dict[Tuple[str, str, int], Dict[str, Any]]:
+    """批量解析一页机器的来源模板（列表页用）。
+
+    与 :func:`source_of` 的区别只在查询方式：列表一次要出几百行，逐台查审计
+    是 N 次往返；这里用 ``target_guest IN (...)`` 一次取回本页所有目标，再在
+    内存里按键取**最近一条**。索引是 ``(target_guest, timestamp)``，不会全表扫。
+
+    返回 ``{(connection_id, node, vmid): {"node", "vmid"}}``。节点名在多台 PVE
+    上重名时整页都不填（审计的 target 里没有连接信息，猜错比空着更糟）。
+    """
+    wanted: Dict[str, Tuple[str, str, int]] = {}
+    for item in items:
+        node = str(item.get("node") or "")
+        vmid = item.get("vmid")
+        if not node or vmid is None:
+            continue
+        wanted[f"{node}/{vmid}"] = (
+            str(item.get("connection_id") or ""),
+            node,
+            int(vmid),
+        )
+    if not wanted:
+        return {}
+
+    counts = await _node_names_are_unique()
+    refs = [ref for ref in wanted if counts.get(wanted[ref][1], 0) == 1]
+    if not refs:
+        return {}
+
+    out: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    actions = ", ".join("?" for _ in _SOURCE_ACTIONS)
+    # 一页最多几百台，400 一批留出余量；MySQL 的占位符上限远高于此
+    for start in range(0, len(refs), 400):
+        chunk = refs[start : start + 400]
+        marks = ", ".join("?" for _ in chunk)
+        try:
+            async with database.connect() as db:
+                cursor = await db.execute(
+                    f"SELECT target_guest, target FROM audit_log "
+                    f"WHERE action IN ({actions}) AND result = 'success' "
+                    f"AND target_guest IN ({marks}) "
+                    "ORDER BY timestamp DESC, id DESC",
+                    (*_SOURCE_ACTIONS, *chunk),
+                )
+                rows = await cursor.fetchall()
+        except Exception:  # noqa: BLE001 - 取不到来源不该让列表失败
+            logger.debug("批量查询克隆来源失败", exc_info=True)
+            continue
+        for row in rows:
+            ref = str(row["target_guest"] or "")
+            key = wanted.get(ref)
+            if key is None or key in out:
+                # ORDER BY timestamp DESC：每个目标只认第一条（最近一次）
+                continue
+            origin = str(row["target"] or "").split("->", 1)[0].strip()
+            src_node, _, src_vmid = origin.rpartition("/")
+            if not src_vmid.isdigit():
+                continue
+            out[key] = {"node": src_node or key[1], "vmid": int(src_vmid)}
+    return out
+
+
+def template_file_name(volid: Any) -> str:
+    """把模板卷标识裁成文件名：``local:vztmpl/debian-12.tar.zst`` → 文件名。
+
+    与 ``GET /lxc/templates`` 的口径一致（那边也是取最后一段）—— 用户在选择模板
+    时看到的就是这个名字，列表里换成别的东西他会认不出来。带 ``?`` 的受限卷
+    （``local:vztmpl/x.tar.zst?uid=...``）只取问号之前的部分。
+    """
+    text = str(volid or "").strip().split("?", 1)[0].rstrip("/")
+    if not text:
+        return ""
+    return text.rsplit("/", 1)[-1] if "/" in text else text
+
+
+def _ostemplate_of(detail: Any) -> str:
+    """从 ``ct.create`` 的审计 detail 里取出 ``ostemplate``。
+
+    detail 由 :func:`app.store.add_audit` 编码成 JSON 落库（见 ``routers/lxc.py``
+    的建机审计），所以这里要解一次。解不开就当「没有」—— 一条读不懂的审计不该
+    让整列来源变成报错。
+    """
+    if not detail:
+        return ""
+    data: Any = detail
+    if isinstance(detail, (str, bytes)):
+        try:
+            data = json.loads(detail)
+        except (TypeError, ValueError):
+            return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("ostemplate") or "").strip()
+
+
+async def lxc_sources_for(
+    items: Iterable[Dict[str, Any]],
+) -> Dict[Tuple[str, str, int], Dict[str, Any]]:
+    """批量解析一页**容器**的来源（列表页用）。返回值的两种形状：
+
+    * ``{"node": ..., "vmid": ...}`` —— 克隆 / 重装来的，来源是那台模板机；
+    * ``{"file": "debian-12-standard_12.7-1_amd64.tar.zst"}`` —— 用系统模板新建的，
+      来源是模板**文件**，没有 VMID 可言。
+
+    为什么不能直接用 :func:`sources_for`：那个只认 ``来源 -> 目标`` 形态的克隆
+    审计，而容器最常见的建法（选一个 vztmpl、``pct create``）压根不是克隆 ——
+    来源只写在 ``ct.create`` 审计的 detail 里。列表页的「来源模板」列对整页容器
+    全是「—」，根因就是这里少了一条数据来源。
+
+    每个目标只认**最近一次**成功记录：先新建、后来重装成别的模板，当前这块盘来自
+    最后一次；而克隆与新建不会同时成立（同一 VMID 只能被建一次）。
+
+    节点名在多台 PVE 上重名时整页都不填（审计的 target 里没有连接信息），与
+    :func:`sources_for` 同一条前提。
+    """
+    wanted: Dict[str, Tuple[str, str, int]] = {}
+    for item in items:
+        node = str(item.get("node") or "")
+        vmid = item.get("vmid")
+        if not node or vmid is None:
+            continue
+        wanted[f"{node}/{vmid}"] = (
+            str(item.get("connection_id") or ""),
+            node,
+            int(vmid),
+        )
+    if not wanted:
+        return {}
+
+    counts = await _node_names_are_unique()
+    refs = [ref for ref in wanted if counts.get(wanted[ref][1], 0) == 1]
+    if not refs:
+        return {}
+
+    out: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    actions = ", ".join("?" for _ in _CLONE_ACTIONS)
+    # 一页最多几百台，400 一批留出余量（与 sources_for 同一个理由）
+    for start in range(0, len(refs), 400):
+        chunk = refs[start : start + 400]
+        marks = ", ".join("?" for _ in chunk)
+        try:
+            async with database.connect() as db:
+                cursor = await db.execute(
+                    f"SELECT target_guest, target, action, detail FROM audit_log "
+                    f"WHERE action IN ({actions}) AND result = 'success' "
+                    f"AND target_guest IN ({marks}) "
+                    "ORDER BY timestamp DESC, id DESC",
+                    (*_CLONE_ACTIONS, *chunk),
+                )
+                rows = await cursor.fetchall()
+        except Exception:  # noqa: BLE001 - 取不到来源不该让列表失败
+            logger.debug("批量查询容器来源失败", exc_info=True)
+            continue
+        for row in rows:
+            ref = str(row["target_guest"] or "")
+            key = wanted.get(ref)
+            if key is None or key in out:
+                # ORDER BY timestamp DESC：每个目标只认第一条（最近一次）
+                continue
+            if str(row["action"] or "") == _CREATE_ACTION:
+                name = template_file_name(_ostemplate_of(row["detail"]))
+                if name:
+                    out[key] = {"file": name}
+                continue
+            origin = str(row["target"] or "").split("->", 1)[0].strip()
+            src_node, _, src_vmid = origin.rpartition("/")
+            if not src_vmid.isdigit():
+                continue
+            out[key] = {"node": src_node or key[1], "vmid": int(src_vmid)}
+    return out
 
 
 # ------------------------------------------------------------------ 取数

@@ -987,6 +987,23 @@ export function LxcDetail() {
                   label={t('lxcDetail.fieldTemplate')}
                   value={ct.ostemplate || '-'}
                 />
+                {/* 来源模板与上面的「系统模板」不是一回事：系统模板是这台机器的
+                    根盘当初用哪个 tar 包铺的；来源模板回答的是「它从谁那儿来的」。
+                    克隆来的显示模板机（带 VMID），直接从系统模板新建的只显示
+                    模板文件名 —— 那种容器没有来源机，`vmid` 是 0。 */}
+                <InfoRow
+                  label={t('lxcDetail.fieldSourceTemplate')}
+                  title={t('lxcDetail.fieldSourceTemplateTitle')}
+                  value={
+                    ct.source_template
+                      ? ct.source_template.name
+                        ? ct.source_template.vmid > 0
+                          ? `${ct.source_template.name}（#${ct.source_template.vmid}）`
+                          : ct.source_template.name
+                        : `#${ct.source_template.vmid}`
+                      : '—'
+                  }
+                />
                 <InfoRow
                   label={t('lxcDetail.fieldSshKeys')}
                   value={

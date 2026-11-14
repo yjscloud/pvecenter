@@ -1634,6 +1634,11 @@ export interface VmSummary {
    * 那种机器在按人分配的额度里**不算任何人**，而平台台数上限是算它的。
    */
   owner?: string | null;
+  /**
+   * 来源模板（克隆 / 重装产生的机器才有）。列表只展示 ``name``；``node`` /
+   * ``vmid`` 留给排查与跳转，不显示在表格里，避免出现完整路径或多余信息。
+   */
+  source_template?: { node: string; vmid: number; name: string } | null;
 }
 
 /** guest 类型：虚拟机 / 容器 */
@@ -1737,8 +1742,18 @@ export interface BulkResponse {
 
 export interface BatchCreateItemResult extends BulkItemResult {
   index: number;
+  /**
+   * 创建请求是否已被受理 —— **不代表 PVE 任务已经成功完成**。
+   *
+   * 真正的终态由 ``task``（UPID）轮询得出：``stopped + OK`` 才是成功，
+   * ``stopped + WARNINGS: n`` 是「完成但有警告」，只有其它 exitstatus 才是失败。
+   * 页面不能拿这里的 ``ok`` 直接当最终结果。
+   */
+  ok: boolean;
   /** PVE 任务 UPID；创建请求被拒时为 null */
   task: string | null;
+  /** 因前序任务失败被跳过（``stop_on_error=true``）；跳过不是失败 */
+  skipped?: boolean;
   post_steps?: string[];
   disk_note?: string;
   template?: boolean;
@@ -1749,8 +1764,12 @@ export interface BatchCreateResponse {
   batch_id: string;
   kind: 'vm' | 'lxc';
   total: number;
+  /** 已受理台数（不是最终成功台数） */
   ok: number;
+  /** 未受理台数，**包含被跳过的**；逐台明细里的 skipped 才是可区分的跳过 */
   failed: number;
+  /** 因前序失败被跳过的台数（failed 的子集，仅为展示方便） */
+  skipped?: number;
   results: BatchCreateItemResult[];
 }
 
@@ -2088,6 +2107,14 @@ export interface LxcDetail {
   searchdomain?: string;
   /** 是否已注入 SSH 公钥（后端只回布尔值，不回明文） */
   ssh_keys_set?: boolean;
+  /**
+   * 来源模板。两种形态：
+   * - 克隆 / 重装来的：`vmid > 0`，`name` 是来源模板机的名字；
+   * - 用系统模板（vztmpl）新建的：`vmid === 0`，`name` 是模板文件名 ——
+   *   这种容器没有「来源机器」，来源就是那个模板文件。
+   * 都没有时为 null（确实没有来源，不是没查到）。
+   */
+  source_template?: { node: string; vmid: number; name: string } | null;
 
   /* 实时资源 */
   cpu?: number;

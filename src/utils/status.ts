@@ -119,22 +119,35 @@ export function taskStatusMeta(
   return resolveStatus(TASK_STATUS_KEYS, status, t);
 }
 
-/** exitstatus: "OK" 为成功，其余（含 "WARNINGS"）为失败/警告 */
+/**
+ * exitstatus 的展示映射。
+ *
+ * ``WARNINGS: n`` 是「任务完成但有警告」，不是失败 —— 例如批量创建 LXC 时
+ * PVE 返回 ``WARNINGS: 1``，容器已经建好并在运行，页面必须显示为警告而不是失败。
+ */
 export function taskExitMeta(exitstatus: string, t: TFunc): StatusMeta {
-  if (exitstatus === 'OK') {
-    return { label: t('status.exit.ok'), variant: 'success' };
-  }
-  if (exitstatus.startsWith('WARNINGS')) {
+  const outcome = classifyTaskExit('stopped', exitstatus);
+  if (outcome === 'warning') {
     return { label: t('status.exit.warnings'), variant: 'warning' };
   }
-  return { label: t('status.exit.failed'), variant: 'danger' };
+  if (outcome === 'failed') {
+    return { label: t('status.exit.failed'), variant: 'danger' };
+  }
+  return { label: t('status.exit.ok'), variant: 'success' };
 }
 
+/**
+ * 任务是否算「成功结束」。
+ *
+ * ``WARNINGS`` 也属于成功结束（只是有告警），否则任务列表的「成功」筛选与
+ * 「失败」筛选会同时把它排除，出现一个既不算成功也不算失败的第三态。
+ */
 export function isTaskSuccess(task: {
   status?: TaskStatus;
   exitstatus?: string;
 }): boolean {
-  return task.status === 'stopped' && task.exitstatus === 'OK';
+  const outcome = classifyTaskExit(task.status, task.exitstatus);
+  return outcome === 'ok' || outcome === 'warning';
 }
 
 export function isTaskRunning(status?: TaskStatus | null): boolean {
@@ -488,6 +501,35 @@ const FAILURE_HINTS: Array<{ re: RegExp; key: MessageKey }> = [
   { re: /timed? ?out|timeout/i, key: 'task.hintTimeout' },
   { re: /not exist|not found|no such|does not exist|404/i, key: 'task.hintMissing' },
 ];
+
+/**
+ * PVE 任务终态的「结果分类」。
+ *
+ * 关键点：**``exitstatus`` 不是只有 ``OK`` 与错误两种**。PVE 在任务完成但伴随
+ * 警告时会返回 ``WARNINGS: 1``（LXC 创建尤其常见），此时机器已经建好并可能在
+ * 运行；把它按失败处理，就会出现「页面说失败、实际容器在跑」的错位。反过来，
+ * 只有 ``stopped`` 而没有 ``exitstatus`` 也不能算失败（老版本 / 任务被中断时
+ * 都可能没有）。
+ *
+ * ``unknown`` 表示「没拿到可判定的终态」，调用方应展示「待确认」，而不是失败。
+ */
+export type TaskOutcome = 'running' | 'ok' | 'warning' | 'failed' | 'unknown';
+
+export function classifyTaskExit(
+  status?: TaskStatus | null,
+  exitstatus?: string | null,
+): TaskOutcome {
+  const exit = (exitstatus ?? '').trim();
+  if (exit) {
+    if (/^OK\b/i.test(exit)) return 'ok';
+    /* PVE 的写法是 ``WARNINGS: <n>``；个别版本会在前面加 ``TASK``。 */
+    if (/^(?:TASK\s+)?WARNINGS?\b/i.test(exit)) return 'warning';
+    return 'failed';
+  }
+  if (status === 'running') return 'running';
+  if (status === 'stopped') return 'ok';
+  return 'unknown';
+}
 
 export function taskFailureHint(exit: string | undefined, t: TFunc): string | null {
   const text = (exit ?? '').trim();

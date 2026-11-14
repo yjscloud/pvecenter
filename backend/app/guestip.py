@@ -41,9 +41,32 @@ logger = logging.getLogger(__name__)
 #: 到 1.2 秒（仍是实测峰值的 5 倍余量）。
 AGENT_TIMEOUT_SECONDS = 1.2
 
+#: 容器网卡接口（``/lxc/{vmid}/interfaces``）的单次等待上限，**只给后台预热用**。
+#:
+#: 这一路与 Guest Agent 不一样：PVE 是要**进容器里**执行 ``ip`` 才拿到地址的，
+#: 容器刚起来、init 还没把网卡配好时，这个请求会一直卡到 PVE 自己超时。实测刚
+#: 下发的容器在这个窗口里几乎必然超过 1.2 秒 —— 那一次就算「回填失败」，而失败
+#: 会被当成「确实没有地址」缓存起来，于是一次超时等于一到两分钟看不到 IP。
+#:
+#: 预热跑在后台，多等几秒不要紧（列表请求仍然用 AGENT_TIMEOUT_SECONDS，响应
+#: 时间不能被一台容器拖长）。放宽后这些「慢一拍」的容器能在预热的这一轮里就
+#: 拿到地址并落库，列表下一轮直接命中。
+CT_IFACE_TIMEOUT_SECONDS = 6.0
+
 # 进程内缓存，见下面「缓存」一节的说明。
 HIT_TTL_SECONDS = 60.0
-MISS_TTL_SECONDS = 120.0
+#: 「问过了，没有地址」的保鲜期，**按读取时的运行状态分两档**：
+#:
+#: * 运行中（30 秒）：刚下发 / 刚启动的机器，网卡与 Agent 都要几秒才就绪，
+#:   这一轮拿不到是**常态**，不是结论。原先一律按 120 秒缓存，再叠上 120 秒的
+#:   预热周期，最坏要 4 分钟才显示出地址 —— 用户看到的就是「IP 回填很慢」；
+#: * 非运行（120 秒）：关机机器本来就拿不到地址，反复问没有意义，也白拖超时。
+MISS_TTL_RUNNING_SECONDS = 30.0
+MISS_TTL_STOPPED_SECONDS = 120.0
+
+#: 兼容旧名：落库表里「没有地址」的记录按非运行的时长保鲜（见 :func:`_fresh`，
+#: 读取时会按当时的运行状态再选一次）。
+MISS_TTL_SECONDS = MISS_TTL_STOPPED_SECONDS
 
 #: 默认连接的占位标识（空连接 id 归一成它）。取值与 metrics / ownership 一致 ——
 #: 少了它，默认连接下的列表项会因「connection_id 为空」而用不上缓存与落库结果。
@@ -56,7 +79,9 @@ DEFAULT_CONNECTION = "-"
 #: Agent、或者 DHCP 续到地址之后，那条空记录会让它永远翻不了身：列表读到空记录就
 #: 不再现场解析，而唯一会写这条记录的恰恰是「现场解析」，于是再也不会解析（死锁）。
 #: 现在按时间给它一个保鲜期：过期就当没缓存，重新问一次。
-#: 取与内存缓存 MISS_TTL_SECONDS 同一个值，理由相同（都是「没地址」的重试间隔）。
+#: 时长与内存缓存同一套口径，按**读取时**的运行状态取两档（见
+#: :func:`_fresh`）—— 运行中的机器只是还没就绪，30 秒后必须再试；关机的按
+#: :data:`MISS_TTL_SECONDS` 保鲜。
 EMPTY_TTL_SECONDS = MISS_TTL_SECONDS
 
 #: 落库表里「有地址」的那条记录能保鲜多久（秒）。
@@ -188,9 +213,10 @@ def static_ip_from_config(cfg: Dict[str, Any]) -> str:
 #
 # * **有值**的条目按 :data:`HIT_TTL_SECONDS`（60 秒）过期。刻意短命：地址是会变的
 #   （DHCP 续租、换网卡、改静态下发），不能像创建时间那样缓存一整天；
-# * **没值**的条目按 :data:`MISS_TTL_SECONDS`（120 秒）过期 —— 这才是上面那台慢机
-#   的解药：问过一次之后两分钟内不再问它。代价是它万一把 agent 跑起来了，最晚两
-#   分钟后才会显示地址（在那之前本来也一直显示「—」）；
+# * **没值**的条目按运行状态取两档（:data:`MISS_TTL_RUNNING_SECONDS` 30 秒 /
+#   :data:`MISS_TTL_STOPPED_SECONDS` 120 秒）过期 —— 这才是上面那台慢机的解药：
+#   问过一次之后一段时间内不再问它。运行中的机器压得短，是因为「刚下发还没起来」
+#   与「真的没有地址」在这一刻分不开，压久了就成了「IP 回填很慢」；
 # * 取不到（异常）与「确实没有」按同一条处理：对调用方来说都是「这台现在没有地址」。
 #
 # 缓存键带**连接**：多台 PVE 上可以有同名节点、同 VMID 的机器，少一段就会把别人家
@@ -284,9 +310,19 @@ async def init_table() -> None:
         await db.commit()
 
 
-def _remember(key: str, ip: str) -> None:
-    """写进程内缓存：有值与没值用不同时长（理由见上面的「缓存」一节）。"""
-    _cache[key] = (time.time() + (HIT_TTL_SECONDS if ip else MISS_TTL_SECONDS), ip)
+def _miss_ttl(running: bool) -> float:
+    """「没有地址」这条结论能保鲜多久（理由见那两处常量说明）。"""
+    return MISS_TTL_RUNNING_SECONDS if running else MISS_TTL_STOPPED_SECONDS
+
+
+def _remember(key: str, ip: str, *, running: bool) -> None:
+    """写进程内缓存：有值与没值用不同时长（理由见上面的「缓存」一节）。
+
+    「没值」还要看机器在不在跑：运行中的只是**还没就绪**，几十秒后必须再问一次，
+    否则刚下发的机器会一直挂着「—」。
+    """
+    ttl = HIT_TTL_SECONDS if ip else _miss_ttl(running)
+    _cache[key] = (time.time() + ttl, ip)
 
 
 def _row_key(conn_id: Any, node: Any, vmid: Any) -> Optional[Tuple[str, str, int]]:
@@ -331,13 +367,15 @@ async def _load_one(guest: Dict[str, Any]) -> Optional[Tuple[str, int]]:
     return (str(row["ip"] or ""), int(row["resolved_at"] or 0))
 
 
-def _fresh(ip: str, resolved_at: int) -> bool:
+def _fresh(ip: str, resolved_at: int, *, running: bool) -> bool:
     """这条落库记录现在还算不算数。
 
-    有地址的按 ``VALUE_TTL_SECONDS`` 算，没地址的按 ``EMPTY_TTL_SECONDS`` 算；
-    过期就当没命中、重新现场解析一次。两个时长各自的理由见那两处说明。
+    有地址的按 ``VALUE_TTL_SECONDS`` 算，没地址的按运行状态取两档（运行中
+    ``MISS_TTL_RUNNING_SECONDS``、关机 ``MISS_TTL_STOPPED_SECONDS``）—— 与内存
+    缓存同一套口径：刚起来的机器那一次「没有」不能当真。过期就当没命中、重新
+    现场解析一次。
     """
-    ttl = VALUE_TTL_SECONDS if ip else EMPTY_TTL_SECONDS
+    ttl = VALUE_TTL_SECONDS if ip else _miss_ttl(running)
     return (time.time() - resolved_at) < ttl
 
 
@@ -430,18 +468,27 @@ async def _container_iface_ip(client: Any, node: str, vmid: Any, timeout: float)
 
 
 async def resolve(
-    client: Any, guest: Dict[str, Any], *, timeout: float = AGENT_TIMEOUT_SECONDS
+    client: Any,
+    guest: Dict[str, Any],
+    *,
+    timeout: float = AGENT_TIMEOUT_SECONDS,
+    ct_iface_timeout: Optional[float] = None,
 ) -> str:
     """列表用：尽力解析一台客户机的 IP（虚拟机与容器都走这里）。
 
     ``guest`` 就是列表项（或 PVE 的 cluster resources 行）：至少要有 ``node`` /
     ``vmid``，并带上 ``type``（``lxc`` 或其它）与 ``status``。
 
+    ``ct_iface_timeout`` 只对容器生效（容器要进里面执行 ``ip``，见
+    :data:`CT_IFACE_TIMEOUT_SECONDS`）；不传就与 ``timeout`` 一致 —— 列表请求走
+    默认值，后台预热才放宽。
+
     带进程内缓存（见上面「缓存」一节）：列表每刷新一次都会把每台机器重新问一遍，
-    而其中总有一两台会一直拖到超时 —— 缓存让这种机器两分钟内只问一次。
+    而其中总有一两台会一直拖到超时 —— 缓存让这种机器几十秒内只问一次。
     """
     if not guest.get("node") or guest.get("vmid") is None:
         return ""
+    running = str(guest.get("status") or "") == "running"
 
     # 只在**带连接 id** 时走缓存。列表项都带（``collect_vms`` / ``list_containers``
     # 在解析前就填好了 connection_id）；而「手上只有 node/vmid」的一次性调用刻意
@@ -463,27 +510,38 @@ async def resolve(
         # 还没装 Agent 的机器等满超时。空记录过了保鲜期就当没命中，照常去现场问
         # 一次 —— 否则「当时没地址」会被永久锁死（见 EMPTY_TTL_SECONDS）。
         stored = await _load_one(guest)
-        if stored is not None and _fresh(*stored):
-            _remember(key, stored[0])
+        if stored is not None and _fresh(stored[0], stored[1], running=running):
+            _remember(key, stored[0], running=running)
             return stored[0]
 
-    ip = await _resolve_uncached(client, guest, timeout=timeout)
+    ip = await _resolve_uncached(
+        client, guest, timeout=timeout, ct_iface_timeout=ct_iface_timeout
+    )
     if key:
         # 有值与没值用不同时长：地址会变，有值也只是一分钟；而「没有」要压住那台
-        # 拖满超时的机器，否则每次列表刷新都要陪它等一遍。
-        _remember(key, ip)
+        # 拖满超时的机器，否则每次列表刷新都要陪它等一遍（运行中的压得短些，
+        # 刚下发的机器几十秒后就会再试）。
+        _remember(key, ip, running=running)
         await _store_one(guest, ip)
     return ip
 
 
 async def resolve_batch(
-    client: Any, items: List[Dict[str, Any]], *, limit: int = 12
+    client: Any,
+    items: List[Dict[str, Any]],
+    *,
+    limit: int = 12,
+    timeout: float = AGENT_TIMEOUT_SECONDS,
+    ct_iface_timeout: Optional[float] = None,
 ) -> List[str]:
     """列表用：批量解析一批客户机的地址。
 
     顺序：进程内缓存 → 落库表 → 现场解析（并写回两级缓存）。稳态下全部命中
     前两级，列表不再为「一台没装 Agent 的机器」等满超时 —— 这正是改造前
     列表最慢的那个点。
+
+    两个超时参数会原样传给 :func:`resolve`：后台预热用更宽的 ``ct_iface_timeout``
+    （见 :data:`CT_IFACE_TIMEOUT_SECONDS`），把「慢一拍」的容器也在本轮拿到手。
     """
     results: Dict[int, str] = {}
     pending: List[int] = []
@@ -496,6 +554,7 @@ async def resolve_batch(
 
     for index, guest in enumerate(guests):
         key = cache_key(guest)
+        running = str(guest.get("status") or "") == "running"
         hit = _cache.get(key)
         if hit is not None and time.time() < hit[0]:
             results[index] = hit[1]
@@ -505,10 +564,10 @@ async def resolve_batch(
         )
         if row_key is not None and row_key in table:
             ip, resolved_at = table[row_key]
-            # 空记录过了保鲜期就重新解析：DHCP 的机器刚建出来时 Agent 还没起来，
-            # 那一轮会记下空值；没有这条判断，它以后永远显示不出地址。
-            if _fresh(ip, resolved_at):
-                _remember(key, ip)
+            # 空记录过了保鲜期就重新解析：DHCP 的机器刚建出来时 Agent / 网卡还没
+            # 就绪，那一轮会记下空值；没有这条判断，它以后永远显示不出地址。
+            if _fresh(ip, resolved_at, running=running):
+                _remember(key, ip, running=running)
                 results[index] = ip
                 continue
         pending.append(index)
@@ -518,7 +577,16 @@ async def resolve_batch(
         from .pve import parallel
 
         resolved = await parallel(
-            (resolve(client, guests[index]) for index in pending), limit=limit
+            (
+                resolve(
+                    client,
+                    guests[index],
+                    timeout=timeout,
+                    ct_iface_timeout=ct_iface_timeout,
+                )
+                for index in pending
+            ),
+            limit=limit,
         )
         for index, ip in zip(pending, resolved):
             results[index] = ip if isinstance(ip, str) else ""
@@ -527,7 +595,11 @@ async def resolve_batch(
 
 
 async def _resolve_uncached(
-    client: Any, guest: Dict[str, Any], *, timeout: float
+    client: Any,
+    guest: Dict[str, Any],
+    *,
+    timeout: float,
+    ct_iface_timeout: Optional[float] = None,
 ) -> str:
     """真正去问 PVE 的那部分（顺序与降级规则见模块说明）。"""
     node = guest.get("node")
@@ -541,7 +613,13 @@ async def _resolve_uncached(
         ip = static_ip_from_config(await _fetch_config(client, node, vmid, True, timeout))
         if ip or not running:
             return ip
-        return await _container_iface_ip(client, node, vmid, timeout)
+        # 进容器取地址比读配置慢得多，预热可以多等（见 CT_IFACE_TIMEOUT_SECONDS）
+        return await _container_iface_ip(
+            client,
+            node,
+            vmid,
+            timeout if ct_iface_timeout is None else max(timeout, ct_iface_timeout),
+        )
 
     if running:
         # 虚拟机的真实地址优先：配置里写的可能与客户机内实际生效的不一致

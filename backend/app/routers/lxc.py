@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
@@ -28,6 +31,7 @@ from .. import (
     guestip,
     guestnotify,
     guestpasswd,
+    ippool,
     ownership,
     pvecache,
     quota,
@@ -54,6 +58,7 @@ from ..schemas import (
     LxcCreateRequest,
     LxcMigrateRequest,
     LxcMoveRequest,
+    LxcNetworkSpec,
     LxcResizeRequest,
     PowerRequest,
     SnapshotCreate,
@@ -97,6 +102,19 @@ async def _resolve_ct_ip(client: Any, ct: Dict[str, Any]) -> str:
     ``/lxc/{vmid}/interfaces`` 才拿得到地址，那部分以前只在虚拟机侧有）。
     """
     return await guestip.resolve(client, ct)
+
+
+async def _template_name(client: Any, node: str, vmid: int) -> str:
+    """来源模板机的名字（容器的名字就是它的 hostname）。
+
+    模板已经被删时返回空串：来源**仍然成立**（VMID 是真的），所以只让名字空着，
+    由界面退化成 ``#9000``，不至于把整条来源一起抹掉。
+    """
+    try:
+        cfg = await client.get(f"/nodes/{node}/lxc/{vmid}/config") or {}
+    except ProxmoxError:
+        return ""
+    return str(cfg.get("hostname") or cfg.get("name") or "")
 
 
 @router.get("/lxc")
@@ -235,6 +253,42 @@ async def list_containers(
         item.pop("connection_region", None)
 
     result.sort(key=lambda c: (c.get("node") or "", c.get("vmid") or 0))
+
+    # 来源模板：与 /vms 同一列。容器的来源有两类来路 —— 克隆自某台模板机，或者
+    # 直接用系统模板（vztmpl）新建；判定都在 guest_created 里，这里只负责补名字：
+    # 模板机的名字取自本页清单（它也在这份 cluster_resources 里，不必再问 PVE），
+    # 模板文件名则直接来自建机审计的 detail。
+    if result and not summary:
+        sources = await guest_created.lxc_sources_for(result)
+        if sources:
+            names = {
+                (
+                    str(item.get("connection_id") or ""),
+                    str(item.get("node") or ""),
+                    int(item.get("vmid") or 0),
+                ): str(item.get("name") or "")
+                for item in result
+            }
+            for item in result:
+                key = (
+                    str(item.get("connection_id") or ""),
+                    str(item.get("node") or ""),
+                    int(item.get("vmid") or 0),
+                )
+                source = sources.get(key)
+                if not source:
+                    continue
+                origin_node = str(source.get("node") or "")
+                origin_vmid = int(source.get("vmid") or 0)
+                item["source_template"] = {
+                    "node": origin_node,
+                    "vmid": origin_vmid,
+                    # 克隆来的取来源机的名字；模板文件来的直接用文件名（此时
+                    # origin_vmid 是 0，界面只显示名字）。
+                    "name": str(source.get("file") or "")
+                    or names.get((key[0], origin_node, origin_vmid), ""),
+                }
+
     result = guest_summary_rows(result) if summary else result
     return paginate_rows(result, response, limit)
 
@@ -305,6 +359,24 @@ async def get_container(
     mounts = vmconfig.parse_lxc_mounts(config)
     networks = vmconfig.parse_lxc_networks(config)
 
+    # 来源模板：克隆 / 重装会在审计里留下来源机器；用系统模板新建的容器没有来源
+    # 机器，来源就是配置里的 ostemplate（模板**文件**）。两样都没有时留 None ——
+    # 那是「确实没有来源」，不是「没查到」。
+    source = await guest_created.source_of(_op_connection(), node, vmid, "lxc")
+    source_template: Optional[Dict[str, Any]] = None
+    if source.get("vmid"):
+        origin_node = str(source.get("node") or node)
+        source_template = {
+            "node": origin_node,
+            "vmid": int(source["vmid"]),
+            "name": await _template_name(client, origin_node, int(source["vmid"])),
+        }
+    else:
+        file_name = guest_created.template_file_name(config.get("ostemplate"))
+        if file_name:
+            # vmid 留 0：模板文件不是一台机器，界面据此只显示名字、不拼 ``#0``
+            source_template = {"node": "", "vmid": 0, "name": file_name}
+
     return {
         "node": node,
         "vmid": vmid,
@@ -345,6 +417,8 @@ async def get_container(
         "nameserver": config.get("nameserver", ""),
         "searchdomain": config.get("searchdomain", ""),
         "ssh_keys_set": bool(config.get("ssh-public-keys")),
+        # 来源模板；新建（直接用系统模板）时是模板文件名，克隆时是模板机
+        "source_template": source_template,
     }
 
 
@@ -418,6 +492,67 @@ async def create_container(
     return await _create_lxc_core(payload, request, user, client)
 
 
+def _is_dhcp(value: Any) -> bool:
+    """这个 IP 取值是不是「自动获取」。空串按 DHCP 处理（与 format 层一致）。"""
+    text = str(value or "").strip().lower()
+    return not text or text in ("dhcp", "auto")
+
+
+async def _assign_dhcp_ips(
+    payload: LxcCreateRequest, user: Dict[str, Any], vmid: int
+) -> List[ippool.Allocation]:
+    """把容器 ``netN`` 里的 ``ip=dhcp`` 换成地址池中的一个空闲静态地址。
+
+    容器没有 cloud-init，IP 直接写在网卡行里 —— 所以分配结果就是最终下发值
+    （``ip=<地址>/<掩码>`` 加 ``gw=<网关>``），地址池的占用判定下一轮扫描就能
+    从 PVE 配置里读到它（见 :mod:`app.ippool`）。
+
+    没有匹配的池时保持 DHCP（存量环境可能没配池）；有池但满了由
+    :class:`ippool.PoolExhausted` 抛给调用方，不静默退回外部 DHCP。
+    """
+    if not payload.networks:
+        # 与 build_lxc_config 的默认行为对齐：没填网卡也至少给一张 net0。
+        # 先建出来，自动分配到的地址才有地方落。
+        payload.networks = [LxcNetworkSpec()]
+
+    targets = [i for i, net in enumerate(payload.networks) if _is_dhcp(net.ip)]
+    if not targets:
+        return []
+
+    allocations = await ippool.allocate(
+        [
+            ippool.PoolScope(
+                bridge=str(payload.networks[i].bridge or ""),
+                vlan=payload.networks[i].vlan_tag,
+            )
+            for i in targets
+        ],
+        owner_scope=security.visible_owner(user),
+        node=str(payload.node or ""),
+        connection_id=_op_connection(),
+        vmid=int(vmid),
+        guest_type="lxc",
+    )
+
+    assigned: List[ippool.Allocation] = []
+    for index, allocation in zip(targets, allocations):
+        if allocation is None:
+            continue
+        net = payload.networks[index]
+        net.ip = allocation.cidr
+        if allocation.gateway and not str(net.gateway or "").strip():
+            net.gateway = allocation.gateway
+        assigned.append(allocation)
+    if assigned:
+        logger.info(
+            "容器 %s/%s 的 DHCP 地址来自地址池：%s",
+            payload.node,
+            vmid,
+            ", ".join(item.cidr for item in assigned),
+        )
+    return assigned
+
+
 async def _create_lxc_core(
     payload: LxcCreateRequest,
     request: Request,
@@ -439,11 +574,20 @@ async def _create_lxc_core(
         except ProxmoxError as exc:
             _raise(exc)
 
+    # --- DHCP → 地址池 ------------------------------------------------
+    # 容器选 DHCP 时同样由面板从地址池分配静态地址，而不是问外部 DHCP 服务器。
+    try:
+        await _assign_dhcp_ips(payload, user, vmid)
+    except ippool.PoolExhausted as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     config = vmconfig.build_lxc_config(payload, vmid=vmid)
 
     try:
         result = await client.lxc_create(payload.node, config)
     except ProxmoxError as exc:
+        # 建机没成功：释放刚占住的池地址
+        await ippool.release_guest(_op_connection(), payload.node, vmid)
         await security.audit(
             request, user, "ct.create", target=f"{payload.node}/{vmid}",
             result="failed", detail=exc.message,
@@ -629,6 +773,8 @@ async def delete_container(
     await guest_created.drop_record(_op_connection(), node, vmid, "lxc")
     # 同虚拟机：IP 缓存一并清掉，免得贴在重建的同号容器上
     await guestip.forget(_op_connection(), node, vmid, "lxc")
+    # 地址池的分配登记同样释放（见 app.ippool 的「分配登记」一节）
+    await ippool.release_guest(_op_connection(), node, vmid)
     # 归属记录不删的话额度不会还给用户（见 ownership.forget_guest 的说明）；
     # 读数缓存也要主动作废，否则删除后几秒内额度读数仍是旧的。
     await ownership.forget_guest(_op_connection(), node, vmid)

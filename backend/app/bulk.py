@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Request
 
-from . import frp, ownership, quota, security, store, vm_scope
+from . import frp, ippool, ownership, quota, security, store, vm_scope
 from .pve import (
     ProxmoxError,
     client_for_connection,
@@ -293,6 +293,8 @@ async def _run_one(
             # 这里不吞异常 —— 批量操作本来就要逐台给出结果，清理失败同样该让
             # 这一台报出来，而不是默默留着一条会错伤别人的记录。
             await ownership.forget_guest(conn_id, node, vmid)
+            # 从地址池分配出去的地址同样立即释放（与单机删除同一口径）
+            await ippool.release_guest(conn_id, node, vmid)
 
         elif action == "tag":
             config_getter = client.qemu_config if gtype == "qemu" else client.lxc_config

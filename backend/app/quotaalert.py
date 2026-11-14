@@ -43,7 +43,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from . import alerting, i18n, quota
+from . import alerting, i18n, ownership, quota
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,20 @@ THRESHOLD = 20.0
 #: 给得很长是刻意的：额度不会自己涨回去，而**回落已经由恢复通知负责告知**，
 #: 没必要再为「还在告警中」每半小时重喊一遍同一个数字。默认 4 小时。
 COOLDOWN = 4 * 60 * 60
+
+#: 「刚下发完」的宽限窗口（秒）。
+#:
+#: 为什么需要：新建接口在返回之前就把归属写进表里、并作废额度缓存（见
+#: ``routers/lxc.py`` 的 ``set_owner`` 与 ``quota.invalidate``），于是**下发成功
+#: 的那一刻**用量就已经涨上去了。一个额度只剩两三台的人，下发完刚好跌破 20%
+#: 剩余线 —— 他收到的次序是「容器已下发」紧跟着「额度即将用完」，读起来就像
+#: 「刚才那次下发出了问题」。判定没错，时机不对，这类告警在用户眼里就是误报。
+#:
+#: 只压**新开**的告警（``prev`` 为空时），已经在告警中的人照常按 COOLDOWN
+#: 重复提醒 —— 不能因为一次下发把旧账一起吞掉，否则真的快满额的人会静默到
+#: 下一次冷却结束。窗口取 5 分钟：足够盖住「下发 → 打开列表 → 看到告警」这一段，
+#: 又短到不会拖到用户已经忘了这台机器。
+GRACE_SECONDS = 5 * 60
 
 #: 额度维度 → 展示时的单位与后缀。内存换算成 GB，其余照原样带单位。
 _UNIT: Dict[str, tuple] = {
@@ -263,6 +277,11 @@ async def evaluate(owner: Optional[str] = None) -> List[Dict[str, Any]]:
         # prev 非空 = 上一轮就在告警中，这一轮只是重复提醒（不写新历史）
         prev = active.get(key) or {}
         if now - float(prev.get("ts") or 0) < COOLDOWN:
+            continue
+        # 刚下发完先别喊（理由见 GRACE_SECONDS）。注意这时**已经**把它记进
+        # still_alarming：否则回落分支会把这条（本来就没发出去的）告警当成
+        # 「已恢复」，过几轮补一条莫名其妙的恢复通知。
+        if not prev and now - await ownership.last_created(username) < GRACE_SECONDS:
             continue
 
         # 按收件人的语言渲染：巡检是后台跑的，没有请求上下文

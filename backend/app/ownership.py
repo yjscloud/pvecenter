@@ -126,6 +126,38 @@ async def set_owner(kind: str, ref: str, username: str) -> None:
         await db.commit()
 
 
+async def last_created(username: str) -> int:
+    """这个人最近一次拿到客户机归属的时刻（秒级时间戳）；没有记录返回 0。
+
+    用途只有一个：让「刚下发完」这类告警别在用户眼前立刻弹出来（见
+    :mod:`app.quotaalert` 的宽限窗口）。新建接口在**返回之前**就把归属写进表里
+    （``routers/lxc.py`` / ``routers/vms.py`` 的 ``set_owner``），而 ``created``
+    只在第一次写入时落定（改派只覆盖 ``username``），所以它就是「这台机器什么
+    时候到他名下」—— 不必为一个宽限窗口再去查建机记录表。
+
+    读失败返回 0（按「没有刚下发」处理）：宁可多提醒一次，也不要因为一次读库
+    失败把某人正在告警的额度彻底压住。
+    """
+    name = str(username or "").strip()
+    if not name:
+        return 0
+    try:
+        async with database.connect() as db:
+            cursor = await db.execute(
+                "SELECT MAX(created) FROM resource_owner WHERE username = ?", (name,)
+            )
+            row = await cursor.fetchone()
+    except Exception:  # noqa: BLE001 - 见 docstring
+        logger.debug("读取最近一次归属时间失败（%s）", name, exc_info=True)
+        return 0
+    if not row or row[0] is None:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return 0
+
+
 async def delete_owner(kind: str, ref: str) -> None:
     async with database.connect() as db:
         await db.execute(

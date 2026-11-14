@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +18,7 @@ from .. import (
     guestip,
     guestnotify,
     guestpasswd,
+    ippool,
     ownership,
     panelkey,
     pvecache,
@@ -207,6 +208,9 @@ async def collect_vms(
 
     result: List[Dict[str, Any]] = []
     failure: Optional[ProxmoxError] = None
+    # 整页（所有节点 / 所有连接）的 VMID -> 名称。来源模板可能不在当前 node
+    # 过滤条件里（克隆到另一节点时），所以不能只从 result 里找名字。
+    guest_names: Dict[Tuple[str, str, int], str] = {}
 
     # 多套 PVE 连接并发取列表：它们彼此独立、互不依赖，串行时总耗时是各连接的
     # **和**（早先为了「单套失败只跳过它自己」写成 for + try，顺带把并发也丢了）。
@@ -234,6 +238,14 @@ async def collect_vms(
         cid = str(profile.get("id") or "") if profile else str(requested_connection() or "")
         label = connection_label(profile) if profile else ""
         region = str((profile or {}).get("region") or "").strip()
+        for resource in resources or []:
+            guest_names[
+                (
+                    cid,
+                    str(resource.get("node") or ""),
+                    int(resource.get("vmid") or 0),
+                )
+            ] = str(resource.get("name") or "")
         items: List[Dict[str, Any]] = [
             {
                 "id": vm.get("id"),
@@ -291,6 +303,35 @@ async def collect_vms(
 
     if not result and failure is not None:
         _raise(failure)
+
+    # 来源模板：列表页的「来源模板」列只需要名字，不展示节点 / VMID / 路径。
+    # 一次审计查询解析整页来源，再在**本页已取到的清单**里找名字 —— 模板也在
+    # cluster_resources 里，所以不需要为每一行再问一次 PVE。
+    # 轻量列表（仪表盘只数台数）跳过，别为一个附加列多打一次库。
+    if result and not lightweight:
+        sources = await guest_created.sources_for(result)
+        if sources:
+            for item in result:
+                key = (
+                    str(item.get("connection_id") or ""),
+                    str(item.get("node") or ""),
+                    int(item.get("vmid") or 0),
+                )
+                source = sources.get(key)
+                if not source:
+                    continue
+                item["source_template"] = {
+                    "node": source["node"],
+                    "vmid": source["vmid"],
+                    "name": guest_names.get(
+                        (
+                            key[0],
+                            str(source["node"]),
+                            int(source["vmid"]),
+                        ),
+                        "",
+                    ),
+                }
 
     # 用户隔离：普通用户只保留自己创建的虚拟机 / 容器。
     # 没有归属记录的存量机器同样不返回（严格隔离），管理员不受限制。
@@ -1013,6 +1054,115 @@ async def create_vm(
     return await _create_vm_core(payload, request, user, client)
 
 
+def _is_dhcp(value: Any) -> bool:
+    """这个 IP 取值是不是「自动获取」。空串按 DHCP 处理（与 ``format_ipconfig`` 一致）。"""
+    text = str(value or "").strip().lower()
+    return not text or text in ("dhcp", "auto")
+
+
+def _vlan_of(value: Any) -> Optional[int]:
+    try:
+        tag = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return tag if 1 <= tag <= 4094 else None
+
+
+async def _assign_dhcp_ips(
+    payload: VmCreateRequest,
+    client: Any,
+    user: Dict[str, Any],
+    vmid: int,
+) -> List[ippool.Allocation]:
+    """把 cloud-init 里的 ``ip=dhcp`` 换成地址池中的一个空闲静态地址。
+
+    为什么在**创建时**做而不是等客户机起来：DHCP 的语义在这里被改成「由面板从
+    地址池自动分配」，地址必须在写 PVE 配置之前就定下来，否则机器仍会去找外部
+    DHCP 服务器。分配结果直接写进 ``ipconfigN``（``ip=<地址>/<掩码>,gw=<网关>``），
+    后续的占用判定就能从配置里扫到它（见 :mod:`app.ippool`）。
+
+    没有匹配的池时保持 ``ip=dhcp`` —— 存量环境可能根本没配池，那种情况下外部
+    DHCP 仍是唯一选择。**有池但满了**则由 :class:`ippool.PoolExhausted` 抛给调用方，
+    不会悄悄退回外部 DHCP。
+
+    返回本次真正分配出去的地址，供调用方在创建失败时释放。
+    """
+    ci = payload.cloudinit
+    if not ci or not ci.enabled or payload.template_mode:
+        return []
+
+    networks = list(payload.networks or [])
+    entries = list(ci.ip_configs or [])
+    count = max(len(networks), len(entries), 1)
+
+    scopes: List[ippool.PoolScope] = []
+    for index in range(count):
+        if index < len(networks):
+            net = networks[index]
+            scopes.append(
+                ippool.PoolScope(bridge=str(net.bridge or ""), vlan=net.vlan_tag)
+            )
+        else:
+            # 克隆模式下请求体里没有 networks：克隆体会继承模板的网卡，按源机
+            # 配置取网桥 / VLAN，否则会把别的二层网络的地址填进来。
+            scopes.append(ippool.PoolScope())
+
+    if not networks and payload.clone_from:
+        try:
+            source_cfg = await client.qemu_config(
+                payload.clone_from.node, int(payload.clone_from.vmid)
+            ) or {}
+        except Exception:  # noqa: BLE001 - 读不到就按「不限」处理
+            source_cfg = {}
+        parsed = vmconfig.parse_config_networks(source_cfg)
+        for index in range(min(count, len(parsed))):
+            item = parsed[index]
+            scopes[index] = ippool.PoolScope(
+                bridge=str(item.get("bridge") or ""),
+                vlan=_vlan_of(item.get("tag")),
+            )
+
+    targets = [
+        index
+        for index in range(count)
+        if index >= len(entries) or _is_dhcp(entries[index].ip)
+    ]
+    if not targets:
+        return []
+
+    allocations = await ippool.allocate(
+        [scopes[index] for index in targets],
+        owner_scope=security.visible_owner(user),
+        node=str(payload.node or ""),
+        connection_id=_op_connection(),
+        vmid=int(vmid),
+        guest_type="qemu",
+    )
+
+    # 补齐到 count：``build_cloudinit_config`` 会按 max(网卡数, 条目数, 1) 写
+    # ipconfigN，缺的条目本来就是 ip=dhcp；这里显式建出来才能把地址填进去。
+    while len(ci.ip_configs) < count:
+        ci.ip_configs.append(IpConfig())
+
+    assigned: List[ippool.Allocation] = []
+    for index, allocation in zip(targets, allocations):
+        if allocation is None:
+            continue
+        entry = ci.ip_configs[index]
+        entry.ip = allocation.cidr
+        if allocation.gateway and not str(entry.gateway or "").strip():
+            entry.gateway = allocation.gateway
+        assigned.append(allocation)
+    if assigned:
+        logger.info(
+            "虚拟机 %s/%s 的 DHCP 地址来自地址池：%s",
+            payload.node,
+            vmid,
+            ", ".join(item.cidr for item in assigned),
+        )
+    return assigned
+
+
 async def _create_vm_core(
     payload: VmCreateRequest,
     request: Request,
@@ -1052,9 +1202,23 @@ async def _create_vm_core(
         except ProxmoxError as exc:
             _raise(exc)
 
+    # --- DHCP → 地址池 ------------------------------------------------
+    # 用户选 DHCP 时，面板从 IP 地址池里挑一个空闲地址写成静态下发，而不是让
+    # 客户机去问外部 DHCP 服务器。没有匹配的池时保持 DHCP（存量环境兼容）；
+    # 池满则直接报错，不静默退回外部 DHCP。
+    try:
+        await _assign_dhcp_ips(payload, client, user, vmid)
+    except ippool.PoolExhausted as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     # --- clone path ---------------------------------------------------
     if payload.clone_from:
-        result = await _create_from_clone(payload, vmid, request, user)
+        try:
+            result = await _create_from_clone(payload, vmid, request, user)
+        except Exception:
+            # 克隆失败（或配置覆盖失败）：把刚占住的地址还回池里
+            await ippool.release_guest(_op_connection(), payload.node, vmid)
+            raise
         # 克隆也要登记 —— 快速部署走的正是这条路（链接克隆模板）。公钥在上面
         # 的 cloud-init 块里已经注入过了（那块在克隆委派之前），这里只差把主机
         # 记下来。少了这一步，勾了「接入安全管控」的快速部署会静默失效。
@@ -1072,11 +1236,14 @@ async def _create_vm_core(
     except ValueError as exc:
         # 参数本身就不合法（如启动顺序写成旧版的 cdn）：当场说清楚，
         # 别等 PVE 回一句看不懂的格式错误。
+        await ippool.release_guest(_op_connection(), payload.node, vmid)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         result = await client.qemu_create(payload.node, config)
     except ProxmoxError as exc:
+        # 建机没成功：把刚占住的池地址还回去（等保鲜期太慢，池会白少一个地址）
+        await ippool.release_guest(_op_connection(), payload.node, vmid)
         await security.audit(
             request, user, "vm.create", target=f"{payload.node}/{vmid}",
             result="failed", detail=exc.message,
@@ -1608,6 +1775,9 @@ async def delete_vm(
     await guest_created.drop_record(_op_connection(), node, vmid, "qemu")
     # IP 缓存同样要清：VMID 回收后，旧地址会贴着同号的新机器显示一分钟
     await guestip.forget(_op_connection(), node, vmid, "qemu")
+    # 从地址池分配出去的地址也一并释放：配置已经没了，登记行若还留着会白占
+    # 一个地址（扫描结果接管后本来就该由删除来回收，这里只是立刻生效）
+    await ippool.release_guest(_op_connection(), node, vmid)
     # 归属记录不删的话额度不会还给用户：用量是「归属表 ∩ PVE 实时清单」，
     # PVE 又把最小的空闲 VMID 分给新机器 —— 旧记录撞上同号的新机器，那台机器
     # 就被算到旧用户名下（见 ownership.forget_guest 的说明）。

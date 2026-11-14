@@ -4247,6 +4247,16 @@ body.is-col-resizing * {
    表格单元格辅助
    --------------------------------------------------------------------------- */
 
+/* 「来源模板」列：只放模板名，不换行、超长省略。
+   table-layout: fixed + overflow: hidden 已经裁掉溢出，这里补 white-space
+   让长名字走省略号而不是把行高撑成两行 —— 与其它单行文本列保持同一行高。 */
+.table th.col-source-template,
+.table td.col-source-template {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .vm-name-cell {
   display: flex;
   flex-direction: column;
@@ -4279,19 +4289,9 @@ body.is-col-resizing * {
   opacity: 1;
 }
 
-/* 星标按钮：未收藏时压得比改名按钮更暗（每行都亮一颗星会很吵），
-   收藏后常亮且转主色 —— 扫列表时，那颗亮着的星就是视觉锚点。 */
-.vm-name-line > .vm-star-btn {
-  opacity: 0.3;
-}
-
-.vm-name-line:hover > .vm-star-btn,
-.vm-name-line > .vm-star-btn:focus-visible {
-  opacity: 0.75;
-}
-
-.vm-name-line > .vm-star-btn.is-starred,
-.vm-name-line:hover > .vm-star-btn.is-starred {
+/* 星标按钮：只在已收藏的行出现（未收藏不画空星），所以常亮且用主色 ——
+   扫列表时，那颗亮着的星就是视觉锚点。 */
+.vm-name-line > .vm-star-btn.is-starred {
   opacity: 1;
   color: var(--accent);
 }

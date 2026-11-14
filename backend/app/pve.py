@@ -118,6 +118,22 @@ def node_from_upid(upid: str) -> str:
     return match.group("node") if match else ""
 
 
+def task_exit_ok(exitstatus: Optional[str]) -> bool:
+    """PVE 任务终态是否算「成功完成」。
+
+    **``WARNINGS: n`` 是成功完成，不是失败**：LXC 创建、模板转换等任务经常以
+    ``exitstatus="WARNINGS: 1"`` 结束，但机器 / 模板已经建好。只有 ``OK``
+    （或没有告警前缀的空值）之外的具体错误串才算失败。
+
+    没有 ``exitstatus``（任务还没进入终态 / 状态读取不全）**不算**成功 ——
+    调用方应等待或报「无法确认」，而不是默默往下走。
+    """
+    text = str(exitstatus or "").strip()
+    if not text:
+        return False
+    return text.upper() == "OK" or text.upper().startswith("WARNINGS")
+
+
 def vm_id_from_upid(upid: str) -> Optional[int]:
     """取出虚拟机任务对应的 VMID，非虚拟机任务返回 None。
 

@@ -150,6 +150,11 @@ async def run_batch(
     """逐台执行 ``create_one``，返回与 ``BulkResponse`` 兼容的逐台清单。
 
     ``kind`` 是 ``vm`` / ``lxc``，结果里的 ``type`` 用 PVE 叫法（qemu / lxc）。
+
+    注意这里的 ``ok`` 只表示**创建请求已被受理**，不代表 PVE 任务已经跑完 ——
+    建机是异步任务，真正的终态由前端按每台的 ``task`` 轮询得出（``stopped``
+    之后的 ``exitstatus`` 才是结果，``WARNINGS: n`` 属于「完成但有警告」）。
+    ``skipped`` 单独计数并写进逐台明细，避免把「前序失败后没执行」混进失败数。
     """
     result: Dict[str, Any] = {
         "action": "create",
@@ -158,6 +163,7 @@ async def run_batch(
         "total": len(items),
         "ok": 0,
         "failed": 0,
+        "skipped": 0,
         "results": [],
     }
     stopped = False
@@ -171,10 +177,12 @@ async def run_batch(
         }
         if stopped:
             result["failed"] += 1
+            result["skipped"] += 1
             result["results"].append(
                 {
                     **base,
                     "ok": False,
+                    "skipped": True,
                     "task": None,
                     "error": "已跳过：前序任务失败（stop_on_error=true）",
                 }
@@ -189,7 +197,13 @@ async def run_batch(
             )
             result["failed"] += 1
             result["results"].append(
-                {**base, "ok": False, "task": None, "error": _error_text(exc)}
+                {
+                    **base,
+                    "ok": False,
+                    "skipped": False,
+                    "task": None,
+                    "error": _error_text(exc),
+                }
             )
             stopped = bool(stop_on_error)
             continue
@@ -199,7 +213,13 @@ async def run_batch(
             )
             result["failed"] += 1
             result["results"].append(
-                {**base, "ok": False, "task": None, "error": _error_text(exc)}
+                {
+                    **base,
+                    "ok": False,
+                    "skipped": False,
+                    "task": None,
+                    "error": _error_text(exc),
+                }
             )
             stopped = bool(stop_on_error)
             continue
@@ -212,6 +232,7 @@ async def run_batch(
                 "node": str(created.get("node") or base["node"]),
                 "vmid": int(created.get("vmid") or base["vmid"] or 0),
                 "ok": True,
+                "skipped": False,
                 "task": created.get("task") or None,
                 "error": None,
                 "post_steps": created.get("post_steps") or [],

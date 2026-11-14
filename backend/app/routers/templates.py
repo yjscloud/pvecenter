@@ -43,6 +43,7 @@ from ..pve import (
     parallel,
     requested_connection,
     set_request_connection,
+    task_exit_ok,
 )
 from ..vm_scope import resolve_vm_connection
 from ..schemas import (
@@ -114,9 +115,10 @@ async def _await(client: Any, result: Any, timeout: float = 600.0) -> str:
     if isinstance(upid, str) and upid.startswith("UPID:"):
         status = await client.wait_for_task(upid, timeout=timeout)
         exit_status = status.get("exitstatus")
-        if exit_status and exit_status != "OK":
+        # WARNINGS 也代表任务完成（模板可能已经建好），不能当失败拦下后续步骤
+        if not task_exit_ok(exit_status):
             raise ProxmoxError(
-                f"任务执行失败（{exit_status}），详见任务日志 {upid}",
+                f"任务执行失败（{exit_status or '未知'}），详见任务日志 {upid}",
                 status_code=500,
             )
     return upid if isinstance(upid, str) else ""

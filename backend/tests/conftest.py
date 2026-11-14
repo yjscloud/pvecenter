@@ -87,6 +87,9 @@ TABLES = (
     "inspection_host_report",
     "inspection_history",
     "guest_ip",
+    # IP 地址池的分配登记：不清的话上一条用例占住的地址会让下一条用例
+    # 「池里应该有空闲地址」的断言命中残留登记。
+    "ip_allocation",
     "inspection_lease",
     # 节点可见性：不清的话上一条用例把某节点设成受限，下一条用例里它就「凭空
     # 消失」，建机与节点列表的断言会跟着误判。

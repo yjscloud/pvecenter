@@ -39,7 +39,11 @@ import {
   formatRelative,
   formatUptime,
 } from '../utils/format';
-import { taskStatusMeta, isTaskSuccess } from '../utils/status'
+import {
+  classifyTaskExit,
+  taskStatusMeta,
+  isTaskSuccess,
+} from '../utils/status'
 import { useT, type MessageKey, type TFunc } from '../i18n';
 import { useWebSocket, type WsStatus } from '../hooks/useWebSocket';
 import { useToast } from '../hooks/useToast';
@@ -196,7 +200,7 @@ export function Tasks() {
       if (statusFilter === 'ok' && !isTaskSuccess(t)) return false;
       if (
         statusFilter === 'failed' &&
-        !(t.status === 'stopped' && t.exitstatus !== 'OK')
+        classifyTaskExit(t.status, t.exitstatus) !== 'failed'
       ) {
         return false;
       }
@@ -225,7 +229,7 @@ export function Tasks() {
     const running = list.filter((t) => t.status === 'running').length;
     const success = list.filter((t) => isTaskSuccess(t)).length;
     const failed = list.filter(
-      (t) => t.status === 'stopped' && t.exitstatus !== 'OK',
+      (t) => classifyTaskExit(t.status, t.exitstatus) === 'failed',
     ).length;
     return { total: list.length, running, success, failed };
   }, [tasksQuery.data]);

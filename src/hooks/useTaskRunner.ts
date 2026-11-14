@@ -9,7 +9,7 @@ import { ApiError, errorMessage } from '../api/client';
 import { invalidateQuota } from './quotaCache';
 import { useToast } from './useToast';
 import { useT } from '../i18n';
-import { taskFailureHint } from '../utils/status';
+import { classifyTaskExit, taskFailureHint } from '../utils/status';
 import type { TaskDetail, TaskInfo } from '../api/types';
 
 export interface RunTaskOptions {
@@ -239,10 +239,12 @@ export function useTaskRunner(): TaskRunner {
 
           if (task.status !== 'running') {
             const exit = task.exitstatus ?? '';
-            const ok = exit === 'OK';
-            const warn = !ok && exit.startsWith('WARNINGS');
+            /* WARNINGS 也是完成：PVE 在 LXC 创建等场景会返回 ``WARNINGS: 1``，
+               机器已经建好；按失败处理会让页面与真实状态错位。分类逻辑与
+               批量下发共用 classifyTaskExit，避免两处各写一套。 */
+            const outcome = classifyTaskExit(task.status, task.exitstatus);
 
-            if (ok) {
+            if (outcome === 'ok') {
               toast.update(toastId, {
                 type: destructive ? 'destructive' : 'success',
                 title: t('task.succeeded', { title }),
@@ -252,7 +254,7 @@ export function useTaskRunner(): TaskRunner {
               });
               flush(invalidate);
               onSuccess?.(task);
-            } else if (warn) {
+            } else if (outcome === 'warning') {
               toast.update(toastId, {
                 type: 'warning',
                 title: t('task.doneWarn', { title }),
@@ -302,6 +304,27 @@ export function useTaskRunner(): TaskRunner {
    简易轮询等待（不依赖 toast，供内部使用）
    --------------------------------------------------------------------------- */
 
+export type TaskWaitFailure = 'timeout' | 'unreachable' | 'missing';
+
+/**
+ * 等待任务时**没能拿到终态**的错误。
+ *
+ * 与「任务失败」区分：PVE 任务可能仍在执行，只是轮询超时 / 网络中断 / 任务记录
+ * 被清理。批量结果页据此显示「待确认」，而不是把实际已创建的机器标成失败。
+ */
+export class TaskWaitError extends Error {
+  readonly kind: TaskWaitFailure;
+  /** 最后一次成功读到的任务（如果有），供调用方展示更多信息 */
+  readonly task?: TaskInfo;
+
+  constructor(kind: TaskWaitFailure, message: string, task?: TaskInfo) {
+    super(message);
+    this.name = 'TaskWaitError';
+    this.kind = kind;
+    this.task = task;
+  }
+}
+
 export async function waitForTask(
   upid: string,
   node?: string,
@@ -309,11 +332,35 @@ export async function waitForTask(
 ): Promise<TaskInfo> {
   const { interval = 1_500, timeout = 600_000 } = options;
   const started = Date.now();
+  let last: TaskInfo | null = null;
+  let failures = 0;
+  const MAX_FAILURES = 5;
 
   for (;;) {
-    const task = await tasksApi.detail(upid, node);
-    if (task.status !== 'running') return task;
-    if (Date.now() - started > timeout) return task;
+    try {
+      const task = await tasksApi.detail(upid, node);
+      failures = 0;
+      last = task;
+      if (task.status !== 'running') return task;
+    } catch (err) {
+      const msg = errorMessage(err);
+      if (/登录|认证|login|auth/i.test(msg)) throw err;
+
+      const missing = err instanceof ApiError && err.status === 404;
+      failures += 1;
+      if (missing) {
+        throw new TaskWaitError('missing', msg, last ?? undefined);
+      }
+      /* 连续失败若干次才放弃：单次网络抖动不代表任务没执行，直接标失败
+         会把已经建好的机器报成失败。 */
+      if (failures >= MAX_FAILURES) {
+        throw new TaskWaitError('unreachable', msg, last ?? undefined);
+      }
+    }
+
+    if (Date.now() - started > timeout) {
+      throw new TaskWaitError('timeout', 'task timeout', last ?? undefined);
+    }
     await sleep(interval);
   }
 }

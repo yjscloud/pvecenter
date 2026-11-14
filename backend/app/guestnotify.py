@@ -225,7 +225,12 @@ async def notify_deployed(user: Dict[str, Any], info: DeployInfo) -> None:
                 kind="deploy",
                 level="success",
             )
-            sent, detail = await alerting.send_alert_email(owner, title, body)
+            # 这封邮件走的是**告警邮件**那套通道（同一个开关、同一套模板）。不加
+            # 记号的话，收件人在「告警邮件」里看到的是一封标题为「已下发容器：xxx」
+            # 的信，反过来会以为这次下发途中报过警。站内信不加：那边 ``kind=deploy``
+            # 已经分了类，而口令就在正文第一屏，别在标题上挤掉信息。
+            subject = i18n.pick("[下发通知] ", "[Deploy notice] ") + title
+            sent, detail = await alerting.send_alert_email(owner, subject, body)
         if not sent:
             # 最常见的原因是「没开邮件提醒」，那是正常路径，不该刷 warning
             logger.debug("下发通知没给 %s 发邮件：%s", owner, detail)

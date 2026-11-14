@@ -76,10 +76,47 @@ def test_run_batch_reports_per_item_and_stops_on_error() -> None:
     )
 
     assert result["ok"] == 1
+    # failed 保持「未成功」的口径（含跳过），skipped 单独给出可区分的数量
     assert result["failed"] == 2
+    assert result["skipped"] == 1
     assert [row["ok"] for row in result["results"]] == [True, False, False]
+    assert [row["skipped"] for row in result["results"]] == [False, False, True]
     assert result["results"][1]["error"] == "boom"
     assert "已跳过" in result["results"][2]["error"]
+
+
+def test_run_batch_continues_after_a_single_failure() -> None:
+    """界面批量下发用 ``stop_on_error=false``：单台失败不连坐其余台。"""
+    async def create_one(item):
+        if item.name == "bad":
+            raise HTTPException(status_code=400, detail="boom")
+        return {
+            "task": f"UPID:{item.name}",
+            "vmid": item.vmid,
+            "node": "pve1",
+            "post_steps": [],
+        }
+
+    items = [
+        SimpleNamespace(vmid=101, node="pve1", name="ok-1"),
+        SimpleNamespace(vmid=102, node="pve1", name="bad"),
+        SimpleNamespace(vmid=103, node="pve1", name="ok-2"),
+    ]
+    result = _run(
+        batchcreate.run_batch(
+            batch_id="b2",
+            kind="lxc",
+            items=items,
+            create_one=create_one,
+            stop_on_error=False,
+        )
+    )
+
+    assert result["ok"] == 2
+    assert result["failed"] == 1
+    assert result["skipped"] == 0
+    assert [row["ok"] for row in result["results"]] == [True, False, True]
+    assert all(row["skipped"] is False for row in result["results"])
 
 
 def test_batch_cache_is_scoped_by_user_and_expires() -> None:

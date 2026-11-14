@@ -34,6 +34,7 @@ from app.pve import (  # noqa: E402
     ProxmoxError,
     error_code_headers,
     node_from_upid,
+    task_exit_ok,
 )
 
 # --------------------------------------------------------------------------
@@ -960,6 +961,15 @@ class TestTaskHandling:
     def test_node_derived_from_upid(self) -> None:
         upid = "UPID:pve1:0000A1B2:00C3D4E5:65F00000:qmstart:100:root@pam:"
         assert node_from_upid(upid) == "pve1"
+
+    def test_warnings_count_as_completed(self) -> None:
+        """LXC 创建常见 ``WARNINGS: 1``：容器已建好，不能当失败。"""
+        assert task_exit_ok("OK")
+        assert task_exit_ok("WARNINGS: 1")
+        assert task_exit_ok("warnings: 2")
+        assert not task_exit_ok("command 'pct create' failed: exit code 1")
+        assert not task_exit_ok(None)
+        assert not task_exit_ok("")
 
     def test_task_status_and_log(self, mock_pve) -> None:
         client = make_client(mock_pve)

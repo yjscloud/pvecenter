@@ -861,7 +861,9 @@ export function QuickDeployForm({
       });
 
       /* 批量：一次请求交给后端做总量预检与 VMID 分配，返回逐台 UPID；
-         表单留在原地，由 BatchCreateProgress 继续轮询每台任务（方案 A）。 */
+         表单留在原地，由 BatchCreateProgress 继续轮询每台任务（方案 A）。
+         stop_on_error=false：单台失败（命名冲突、某一节点存储不足等）不应
+         连坐后面的机器；结果页会按「部分成功」展示，剩余台数照常尝试。 */
       if (quantity > 1) {
         const batchId =
           typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -872,7 +874,7 @@ export function QuickDeployForm({
               {
                 items: batchNames.map((item, index) => buildVmPayload(item, index)),
                 batch_id: batchId,
-                stop_on_error: true,
+                stop_on_error: false,
               },
               targetConn,
             )
@@ -880,7 +882,7 @@ export function QuickDeployForm({
               {
                 items: batchNames.map((item, index) => buildLxcPayload(item, index)),
                 batch_id: batchId,
-                stop_on_error: true,
+                stop_on_error: false,
               },
               targetConn,
             );

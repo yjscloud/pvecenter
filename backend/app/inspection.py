@@ -712,7 +712,12 @@ async def warm_guest_ip() -> Dict[str, Any]:
                     }
                 )
             if items:
-                await guestip.resolve_batch(client, items)
+                # 容器取地址要进里面执行 ``ip``，刚起来的容器常常慢过列表那 1.2 秒
+                # 的上限。预热在后台跑，给一个更宽的上限把这批「慢一拍」的机器也
+                # 收进来 —— 落库之后列表下一轮直接命中，不必再赌一次超时。
+                await guestip.resolve_batch(
+                    client, items, ct_iface_timeout=guestip.CT_IFACE_TIMEOUT_SECONDS
+                )
                 resolved += len(items)
     finally:
         await release_lease("guest_ip_warm")
