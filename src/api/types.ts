@@ -4359,8 +4359,10 @@ export interface ReinstallNetwork {
   mode: 'static' | 'dhcp' | '';
   /** 带掩码，与 PVE 里的写法一致（如 10.0.0.10/24） */
   ip: string;
-  gateway: string;
-  dns: string;
+  /** 网关；没配（或老后端字段缺失）时按空串处理 */
+  gateway?: string;
+  /** DNS；VM 没配 nameserver 时后端返回空串（老版本可能直接缺键，调用方要兜底） */
+  dns?: string;
   /** 网卡当前接在哪个网桥（重装向导的默认值；与静态/DHCP 无关） */
   bridge?: string;
 }

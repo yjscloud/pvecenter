@@ -25,6 +25,33 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 from app import reinstall  # noqa: E402
 
 
+def test_network_from_config_always_returns_dns_key():
+    """响应里 ``dns`` 必须是键（空串也算）。
+
+    重装向导拿到响应后直接把 ``net.dns`` 写进表单、提交时再 ``trim()``：
+    缺这个键就是 ``undefined.trim()``，界面上只剩一句
+    ``Cannot read properties of undefined (reading 'trim')``。所以这里三个分支
+    都要有 ``dns`` —— 尤其是「没配 nameserver」的机器（静态 IP 但 DNS 没写进
+    PVE 配置），那正是线上报错的那批。
+    """
+    static = reinstall.network_from_config(
+        {"ipconfig0": "ip=10.0.0.10/24,gw=10.0.0.1"}
+    )
+    assert static["mode"] == "static"
+    assert static["gateway"] == "10.0.0.1"
+    assert static["dns"] == ""
+
+    static_no_gw = reinstall.network_from_config({"ipconfig0": "ip=10.0.0.10/24"})
+    assert static_no_gw["gateway"] == ""
+    assert static_no_gw["dns"] == ""
+
+    dhcp = reinstall.network_from_config({"ipconfig0": "ip=dhcp"})
+    assert dhcp["dns"] == ""
+
+    empty = reinstall.network_from_config({})
+    assert empty["dns"] == ""
+
+
 def test_entry_forwards_every_pipeline_argument():
     """start_reinstall 的参数必须能完整喂给 reinstall，一个都不能少。"""
     pipeline = inspect.signature(reinstall.reinstall)

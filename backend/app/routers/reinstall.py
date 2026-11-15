@@ -77,6 +77,9 @@ async def reinstall_network(
     except ProxmoxError as exc:
         _raise(exc)
     result = reinstall.network_from_config(cfg)
+    # 兜底：响应里 dns 必须是字符串。前端会把它直接写进表单再 trim，缺字段就是
+    # TypeError。network_from_config 已保证有键，这里再兜一次防将来改漏。
+    result.setdefault("dns", "")
     dns = str(cfg.get("nameserver") or "").strip()
     if dns:
         result["dns"] = dns

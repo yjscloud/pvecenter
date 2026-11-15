@@ -292,9 +292,14 @@ _IPCONFIG_GW_RE = re.compile(r"(?:^|,)\s*gw=([^,]+)")
 def network_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
     """读出原虚拟机在用的网络参数，重装时默认沿用它。
 
-    返回 ``{"mode": "static"|"dhcp"|"", "ip": "10.0.0.10/24", "gateway": "10.0.0.1"}``
-    —— ``mode`` 为空串表示这台机器没配过 cloud-init 网络（老机器手工配的地址不在
-    PVE 里），界面自己决定用什么兜底。
+    返回 ``{"mode": "static"|"dhcp"|"", "ip": "10.0.0.10/24",
+    "gateway": "10.0.0.1", "dns": ""}`` —— ``mode`` 为空串表示这台机器没配过
+    cloud-init 网络（老机器手工配的地址不在 PVE 里），界面自己决定用什么兜底。
+
+    ``dns`` 这里恒为空串，由路由层读 PVE 的 ``nameserver`` 覆盖。**但它必须是
+    一个有的键**：重装向导拿到响应后直接把 ``net.dns`` 写进表单状态，缺键就是
+    ``undefined``，提交时的 ``dns.trim()`` 会抛 TypeError（界面上只显示一句
+    「Cannot read properties of undefined (reading 'trim')」）。
 
     为什么 ``ip=`` 整段原样带回、连 ``/24`` 都不拆：``ipconfigN`` 的语法是
     ``ip=<地址>/<掩码>`` 加一段独立的 ``gw=``。拆开再拼回去，掩码这份唯一的信息就
@@ -313,7 +318,7 @@ def network_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
             continue
         low = value.lower()
         if low in ("dhcp", "auto"):
-            return {"mode": "dhcp", "ip": "", "gateway": ""}
+            return {"mode": "dhcp", "ip": "", "gateway": "", "dns": ""}
         if low in ("manual", "none"):
             # 手工配置：里面写的地址面板管不着，接着看下一张网卡有没有静态的
             continue
@@ -322,8 +327,9 @@ def network_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
             "mode": "static",
             "ip": value,
             "gateway": gateway.group(1).strip() if gateway else "",
+            "dns": "",
         }
-    return {"mode": "", "ip": "", "gateway": ""}
+    return {"mode": "", "ip": "", "gateway": "", "dns": ""}
 
 
 async def _wipe_data_disks(

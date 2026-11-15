@@ -45,6 +45,13 @@ export interface VmReinstallWizardProps {
   onDone: () => void;
 }
 
+/** 接口给的字段可能缺键（老后端 / 各字段可选），赋进表单后就是 ``undefined``。
+    提交前统一兜成字符串再 trim —— 不能让一个缺字段把整次提交打崩，前端只会在
+    界面上显示一句看不懂的 ``Cannot read properties of undefined``。 */
+function cleanText(value: string | null | undefined): string {
+  return (value ?? '').trim();
+}
+
 export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWizardProps) {
   const t = useT();
   const toast = useToast();
@@ -189,15 +196,18 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     /* 拿面板记录兜底之前，要确认「确实没记录」而不是「还没查到」，否则会把用户
        已有的手动 IP 当成没有，直接落到 DHCP。 */
     if (!metaQuery.isSuccess && !metaQuery.isError) return;
-    networkAuto.current = true;
     const net = netQuery.data;
+    if (!net) return;
+    networkAuto.current = true;
     /* 网桥跟着原机器走：不填就是「沿用原来的桥」，与下面选静态还是 DHCP 无关 */
     if (net.bridge) setBridge(net.bridge);
     if (net.mode === 'static' && net.ip) {
       setIpMode('static');
       setIp(net.ip);
-      setGateway(net.gateway);
-      setDns(net.dns);
+      /* 老后端 / 缺 nameserver 时响应里可能没有 dns 键：先兜成空串，
+         否则 state 变成 undefined，提交时的 trim 直接抛 TypeError。 */
+      setGateway(net.gateway ?? '');
+      setDns(net.dns ?? '');
       return;
     }
     /* 原系统就是 DHCP 的，维持 DHCP；没配过 cloud-init 网络的，退回面板记录 */
@@ -240,16 +250,16 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
         template_node: selected.node,
         template_vmid: selected.vmid,
         target_storage: storage,
-        hostname: hostname.trim(),
-        ci_user: ciUser.trim(),
+        hostname: cleanText(hostname),
+        ci_user: cleanText(ciUser),
         ci_password: ciPassword,
         ssh_keys: sshKeys,
         ip_mode: ipMode,
-        ip: ipMode === 'static' ? ip.trim() : '',
-        gateway: ipMode === 'static' ? gateway.trim() : '',
-        dns: dns.trim(),
+        ip: ipMode === 'static' ? cleanText(ip) : '',
+        gateway: ipMode === 'static' ? cleanText(gateway) : '',
+        dns: cleanText(dns),
         /* 空串 = 沿用原网桥；静态与 DHCP 都会带上它 */
-        bridge: bridge.trim(),
+        bridge: cleanText(bridge),
         start: startAfter,
         wipe_data_disks: wipeDisks,
       });
@@ -412,8 +422,8 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
               const net = netQuery.data;
               if (net?.mode === 'static' && net.ip) {
                 setIp(net.ip);
-                if (!gateway) setGateway(net.gateway);
-                if (!dns) setDns(net.dns);
+                if (!gateway) setGateway(net.gateway ?? '');
+                if (!dns) setDns(net.dns ?? '');
               } else if (metaIp) {
                 setIp(metaIp);
               }
