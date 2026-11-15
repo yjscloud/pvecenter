@@ -289,6 +289,16 @@ _IPCONFIG_IP_RE = re.compile(r"(?:^|,)\s*ip=([^,]+)")
 _IPCONFIG_GW_RE = re.compile(r"(?:^|,)\s*gw=([^,]+)")
 
 
+def guest_ostype(cfg: Dict[str, Any]) -> str:
+    """配置里的系统类型（PVE 的 ``ostype``，如 ``l26`` / ``win11``）。
+
+    重装向导拿它判断「原系统是什么」：跨平台时据此定位分类，同平台时据此
+    过滤掉不兼容的模板（Windows ↔ Linux）。PVE 对 Linux 一律记 ``l26``，
+    分不出发行版 —— 发行版靠模板名判断，这里只负责大类。
+    """
+    return str((cfg or {}).get("ostype") or "").strip()
+
+
 def network_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
     """读出原虚拟机在用的网络参数，重装时默认沿用它。
 

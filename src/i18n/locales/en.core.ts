@@ -137,6 +137,17 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'vmReinstall.templateHint':
     'The new system disk is copied from this template (only templates on this node are listed)',
   'vmReinstall.templateSize': 'system disk {size}',
+  'vmReinstall.osCurrent': 'Current OS: {os}',
+  'vmReinstall.templateFiltered':
+    '{n} templates from other systems are hidden',
+  'vmReinstall.templateNoPlatform':
+    'No {os} templates on this node — showing all templates instead.',
+  'vmReinstall.templateCompatible': 'Show compatible templates only',
+  'vmReinstall.templateCompatibleHint':
+    'The current OS is {os}: only same-platform templates are listed by default so you cannot pick a system that will not boot. Turn this off to switch systems.',
+  /* OS family labels: distribution names are not translated, only these two */
+  'osFamily.linux': 'Linux',
+  'osFamily.other': 'Other OS',
   'vmReinstall.targetStorage': 'Where the new system disk goes',
   'vmReinstall.storageLinkedHint':
     'Linked clone: seconds to build and hardly any extra space; the disk is based on the template, so the machine breaks if the template is deleted.',

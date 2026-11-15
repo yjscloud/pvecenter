@@ -4365,6 +4365,12 @@ export interface ReinstallNetwork {
   dns?: string;
   /** 网卡当前接在哪个网桥（重装向导的默认值；与静态/DHCP 无关） */
   bridge?: string;
+  /**
+   * 原机器的系统类型（PVE 的 `ostype`，如 `l26` / `win11`）：向导据此判断
+   * 「原来装的是什么」并过滤掉跨平台（Windows ↔ Linux）的模板。
+   * 老后端可能没有这个键，调用方要按空串处理。
+   */
+  ostype?: string;
 }
 
 export interface ReinstallStep {

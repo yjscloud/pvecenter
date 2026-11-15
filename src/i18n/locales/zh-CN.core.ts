@@ -135,6 +135,16 @@ export const zhCore = {
   'vmReinstall.template': '重装来源模板',
   'vmReinstall.templateHint': '新系统盘由该模板复制而来（只列本节点的模板）',
   'vmReinstall.templateSize': '系统盘 {size}',
+  'vmReinstall.osCurrent': '原系统：{os}',
+  'vmReinstall.templateFiltered': '已隐藏 {n} 个其他系统的模板',
+  'vmReinstall.templateNoPlatform':
+    '当前节点没有与原系统（{os}）同类型的模板，已改为显示全部模板。',
+  'vmReinstall.templateCompatible': '只显示兼容模板',
+  'vmReinstall.templateCompatibleHint':
+    '原系统是 {os}：默认只列同平台的模板，避免选到装不上的系统；要换系统时关掉它。',
+  /* 操作系统分类名：发行版专名不翻译，只有这两类需要 */
+  'osFamily.linux': 'Linux',
+  'osFamily.other': '其它系统',
   'vmReinstall.targetStorage': '新系统盘存放位置',
   'vmReinstall.storageLinkedHint':
     '链接克隆：秒级完成、几乎不额外占空间；磁盘以模板为基点，模板被删这台机器就起不来了。',

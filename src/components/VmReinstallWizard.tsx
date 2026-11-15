@@ -36,6 +36,15 @@ import { Field, Input, SegmentedControl, Select, Switch, Textarea } from './ui/I
 import { Notice } from './ui/EmptyState';
 import { IconAlert } from './Icons';
 import { formatBytes } from '../utils/format';
+import { ostypeLabel } from '../utils/status';
+import {
+  groupTemplates,
+  osFamilyLabel,
+  osFamilyOf,
+  recommendTemplate,
+  samePlatform,
+  templateFamily,
+} from '../utils/osFamily';
 import type { VmSummary } from '../api/types';
 
 export interface VmReinstallWizardProps {
@@ -62,6 +71,9 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
   const [ciUser, setCiUser] = useState('root');
   const [ciPassword, setCiPassword] = useState('');
   const [sshKeys, setSshKeys] = useState('');
+  /* 只显示与原系统同平台的模板（Windows ↔ Linux 是硬边界）。原系统认不出、
+     或一张同平台模板都没有时，这个开关不出现，直接列全部。 */
+  const [compatibleOnly, setCompatibleOnly] = useState(true);
   const [ipMode, setIpMode] = useState<'dhcp' | 'static'>('dhcp');
   /* 静态地址时可选「网段」（IP 地址池）：选中后从该池取一个空闲地址填进 IP/网关。
      与新建 / 快速部署 / 导入共用同一套池筛选，不新增接口。 */
@@ -83,6 +95,8 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
      自动覆盖：预填是异步到的，用户可能已经在自己填了。 */
   const networkAuto = useRef(false);
   const networkTouched = useRef(false);
+  /* 用户是不是自己挑过模板。挑过就不再按「与原系统匹配」覆盖他的选择 */
+  const templateTouched = useRef(false);
 
   const node = vm?.node ?? '';
   const stopped = (vm?.status ?? '') === 'stopped';
@@ -147,11 +161,55 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     setPoolId('');
   }, [poolId, poolsQuery.isSuccess, usablePools]);
 
-  const templates = templatesQuery.data?.templates ?? [];
+  const templates = useMemo(
+    () => templatesQuery.data?.templates ?? [],
+    [templatesQuery.data],
+  );
   const targets = (storagesQuery.data ?? []).filter((item) =>
     String(item.content ?? '')
       .split(',')
       .some((c) => c === 'images' || c === 'rootdir'),
+  );
+
+  /* 原机器是什么系统：来源模板名最可信（重装 / 克隆时记下来的），其次机器名，
+     最后才是 PVE 的 ostype —— 它对 Linux 一律 l26，只够分 Windows / Linux */
+  const originalFamily = useMemo(
+    () => osFamilyOf([vm?.source_template?.name, vm?.name], netQuery.data?.ostype),
+    [vm?.source_template?.name, vm?.name, netQuery.data?.ostype],
+  );
+
+  /* 同平台模板：Windows 与 Linux 不能互相重装；发行版之间都属于 Linux，可以换 */
+  const compatibleTemplates = useMemo(() => {
+    if (originalFamily.key === 'other') return templates;
+    const same = templates.filter((item) =>
+      samePlatform(originalFamily, templateFamily(item)),
+    );
+    /* 一张同平台的都没有（原系统是 Windows、节点上全是 Linux 模板）：再过滤就是
+       空下拉，放开全部并由下面的提示说明现状，别让人对着选不出东西的框发呆 */
+    return same.length ? same : templates;
+  }, [templates, originalFamily]);
+
+  /* 有异平台的模板才需要开关；否则开了也没东西可过滤 */
+  const filterable =
+    originalFamily.key !== 'other' && compatibleTemplates.length < templates.length;
+  const noPlatformMatch =
+    originalFamily.key !== 'other' &&
+    templates.length > 0 &&
+    !templates.some((item) => samePlatform(originalFamily, templateFamily(item)));
+
+  const visibleTemplates = compatibleOnly ? compatibleTemplates : templates;
+  const templateGroups = useMemo(
+    () => groupTemplates(visibleTemplates),
+    [visibleTemplates],
+  );
+  const recommendedTemplate = useMemo(
+    () =>
+      recommendTemplate(
+        visibleTemplates,
+        [vm?.source_template?.name, vm?.name],
+        netQuery.data?.ostype,
+      ),
+    [visibleTemplates, vm?.source_template?.name, vm?.name, netQuery.data?.ostype],
   );
   /* 面板侧记录的手动 IP：**只在 PVE 里读不到网络配置时**才拿它兜底 ——
      它是人手填的，可能带掩码也可能不带，不如 ipconfigN 可靠。 */
@@ -175,16 +233,25 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     setWipeDisks(true);
     setBusy(false);
     setConfirmOpen(false);
+    setCompatibleOnly(true);
     networkAuto.current = false;
     networkTouched.current = false;
+    templateTouched.current = false;
   }, [open, vm?.node, vm?.vmid]);
 
-  /* 数据到了以后补默认选项（用户已经改过就不覆盖） */
+  /* 数据到了以后补默认选项（用户已经改过就不覆盖）。
+     模板优先选「与原系统同类型」的那个，而不是列表里的第一个 —— 列表第一个
+     很可能是另一种系统，装上去直接起不来。切换兼容开关后，原来选的模板若已
+     不在可见列表里，也回到推荐项。 */
   useEffect(() => {
     if (!open) return;
-    setTemplateId((prev) => prev || (templates[0] ? String(templates[0].vmid) : ''));
     setStorage((prev) => prev || (targets[0]?.storage ?? ''));
-  }, [open, templates, targets]);
+    if (!visibleTemplates.length) return;
+    const keeps = visibleTemplates.some((item) => String(item.vmid) === templateId);
+    if (templateTouched.current && keeps) return;
+    const next = recommendedTemplate ?? visibleTemplates[0];
+    if (next) setTemplateId(String(next.vmid));
+  }, [open, visibleTemplates, recommendedTemplate, targets, templateId]);
 
   /* 默认「沿用原系统在用的地址」。
      重装最气人的结果不是装失败，而是装完机器换了个 IP —— 用户按记忆里的地址连不上，
@@ -327,20 +394,68 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
             </Notice>
           ) : null}
 
+          <Field label={t('vmReinstall.template')} hint={t('vmReinstall.templateHint')}>
+            <Select
+              value={templateId}
+              onChange={(e) => {
+                templateTouched.current = true;
+                setTemplateId(e.target.value);
+              }}
+              disabled={!visibleTemplates.length}
+            >
+              {templateGroups.map((group) => (
+                <optgroup
+                  key={group.family.key}
+                  label={osFamilyLabel(group.family, t)}
+                >
+                  {group.items.map((item) => (
+                    <option key={String(item.vmid)} value={String(item.vmid)}>
+                      {`${item.name}（${ostypeLabel(item.ostype, t)} · ${t(
+                        'vmReinstall.templateSize',
+                        { size: formatBytes(item.size) },
+                      )}）`}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </Select>
+          </Field>
+
+          {/* 原系统识别结果 + 过滤说明。没有这个提示，用户只会看到「模板少了几个」
+              却不知道为什么 */}
+          {originalFamily.key !== 'other' ? (
+            <div className="fs-xs text-muted">
+              {t('vmReinstall.osCurrent', {
+                os: osFamilyLabel(originalFamily, t),
+              })}
+              {filterable && compatibleOnly
+                ? ` ${t('vmReinstall.templateFiltered', {
+                    n: templates.length - compatibleTemplates.length,
+                  })}`
+                : ''}
+            </div>
+          ) : null}
+
+          {noPlatformMatch ? (
+            <Notice tone="warning">
+              {t('vmReinstall.templateNoPlatform', {
+                os: osFamilyLabel(originalFamily, t),
+              })}
+            </Notice>
+          ) : null}
+
+          {filterable ? (
+            <Switch
+              checked={compatibleOnly}
+              onChange={setCompatibleOnly}
+              label={t('vmReinstall.templateCompatible')}
+              hint={t('vmReinstall.templateCompatibleHint', {
+                os: osFamilyLabel(originalFamily, t),
+              })}
+            />
+          ) : null}
+
           <div className="field-row">
-            <Field label={t('vmReinstall.template')} hint={t('vmReinstall.templateHint')}>
-              <Select
-                value={templateId}
-                onChange={(e) => setTemplateId(e.target.value)}
-                options={templates.map((item) => ({
-                  label: `${item.name}（${item.ostype || '—'} · ${t('vmReinstall.templateSize', {
-                    size: formatBytes(item.size),
-                  })}）`,
-                  value: String(item.vmid),
-                }))}
-                disabled={!templates.length}
-              />
-            </Field>
             <Field
               label={t('vmReinstall.targetStorage')}
               hint={
@@ -360,11 +475,14 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
                 }))}
               />
             </Field>
+            <Field label={t('vmReinstall.hostname')} hint={t('vmReinstall.hostnameHint')}>
+              <Input
+                value={hostname}
+                onChange={(e) => setHostname(e.target.value)}
+                mono
+              />
+            </Field>
           </div>
-
-          <Field label={t('vmReinstall.hostname')} hint={t('vmReinstall.hostnameHint')}>
-            <Input value={hostname} onChange={(e) => setHostname(e.target.value)} mono />
-          </Field>
 
           <div className="section-label">{t('vmReinstall.account')}</div>
           <div className="field-row">

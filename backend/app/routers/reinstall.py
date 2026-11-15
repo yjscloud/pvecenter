@@ -80,6 +80,9 @@ async def reinstall_network(
     # 兜底：响应里 dns 必须是字符串。前端会把它直接写进表单再 trim，缺字段就是
     # TypeError。network_from_config 已保证有键，这里再兜一次防将来改漏。
     result.setdefault("dns", "")
+    # 原机器的系统类型：重装向导据此预选 / 过滤模板。和网络一起返回，
+    # 省得为这一个字段再打一次 config 请求（cfg 本来就已经读到手了）。
+    result["ostype"] = reinstall.guest_ostype(cfg)
     dns = str(cfg.get("nameserver") or "").strip()
     if dns:
         result["dns"] = dns
