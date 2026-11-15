@@ -923,3 +923,40 @@
     max-height: 240px;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   15. 模板页：分类筛选条与分组卡片
+   ---------------------------------------------------------------------------
+   窄屏上筛选条**不换行**：发行版一多就会折成两三行，把首屏高度全吃掉。
+   改成横向滑动，配 -webkit-overflow-scrolling 保持手感；滚动条隐藏，
+   因为右侧被切掉半颗 chip 本身已经是「还能往右滑」的提示。 */
+@media (max-width: 767px) {
+  .os-filter {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding: 8px 10px;
+  }
+
+  .os-filter::-webkit-scrollbar {
+    display: none;
+  }
+
+  .os-filter-label,
+  .os-chip {
+    flex: 0 0 auto;
+  }
+
+  .os-groups {
+    gap: 20px;
+  }
+
+  .os-group-head {
+    margin-bottom: 10px;
+  }
+
+  .tpl-card {
+    padding: 14px;
+  }
+}

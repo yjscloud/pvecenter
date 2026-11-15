@@ -924,6 +924,12 @@ export const zhCompute = {
   'templates.viewCards': '卡片',
   'templates.viewList': '列表',
   'templates.totalShown': '共 {count} 个',
+  /* 分类筛选条：按操作系统家族收窄，卡片与列表共用同一套筛选结果 */
+  'templates.filterLabel': '按系统',
+  'templates.filterAria': '按操作系统分类筛选',
+  'templates.filterAll': '全部',
+  'templates.groupToggleAria': '{name}：{count} 个模板，点击折叠或展开',
+  'templates.colOs': '系统',
   'templates.loadFailed': '无法加载模板列表',
   'templates.emptySearch': '没有匹配的模板',
   'templates.emptyVm': '暂无虚拟机模板',

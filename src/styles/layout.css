@@ -2793,6 +2793,416 @@
 }
 
 /* ---------------------------------------------------------------------------
+   模板页：按操作系统分类（筛选条 / 分组头 / 卡片 / 系统标识）
+
+   一处定义、四处复用：同一个 --os-color 喂给筛选条圆点、分组头圆点、卡片左上
+   的头像块与列表里的系统单元格，颜色天然对得上，不会出现「卡片是橙的、列表
+   却说这是 Debian」那种自相矛盾。
+
+   取色刻意压低饱和度：头像块只有 38px，鲜亮色会变成噪点，把整版拉回花花绿绿。
+   家族用色也不追求和官方品牌色一模一样 —— 面板的主色只有一个蓝，
+   这里要的是「一眼能把几类分开」，不是复刻各家 logo。
+   --------------------------------------------------------------------------- */
+
+[data-os] {
+  --os-color:var(--text-muted);
+  --os-tint:var(--bg-hover);
+}
+
+[data-os='windows'] { --os-color:#2b6cb0; --os-tint:rgba(43,108,176,.10); }
+[data-os='ubuntu']  { --os-color:#c2441b; --os-tint:rgba(194,68,27,.10); }
+[data-os='debian']  { --os-color:#b02a5b; --os-tint:rgba(176,42,91,.10); }
+[data-os='centos']  { --os-color:#8a3d84; --os-tint:rgba(138,61,132,.10); }
+[data-os='rocky']   { --os-color:#0f766e; --os-tint:rgba(15,118,110,.10); }
+[data-os='alma']    { --os-color:#0e7490; --os-tint:rgba(14,116,144,.10); }
+[data-os='fedora']  { --os-color:#34558f; --os-tint:rgba(52,85,143,.10); }
+[data-os='suse']    { --os-color:#2f855a; --os-tint:rgba(47,133,90,.10); }
+[data-os='alpine']  { --os-color:#0d6e8c; --os-tint:rgba(13,110,140,.10); }
+[data-os='arch']    { --os-color:#0f7fb8; --os-tint:rgba(15,127,184,.10); }
+[data-os='linux']   { --os-color:#4b5a74; --os-tint:rgba(75,90,116,.10); }
+[data-os='other']   { --os-color:#8c8c8c; --os-tint:rgba(140,140,140,.10); }
+
+/* 工具栏后面接的是筛选条 / 卡片，而不是紧贴的表格：把专为「贴表格」省掉的
+   下边框与上圆角补回来，否则它看起来像个没封口的盒子。 */
+.toolbar.is-standalone {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* 分类筛选条。做成一条独立白条（而不是塞进上面的工具栏）：
+   工具栏管「看哪一类模板（VM / 容器）」，这里管「看哪个系统」，
+   两件事拆开摆，用户不会把筛选当成第二个页签。 */
+.os-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+
+.os-filter-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 2px;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.os-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  /* 原生 button 不继承正文字体：不写这一行，分类名会掉进浏览器的 Arial */
+  font: inherit;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.os-chip:hover {
+  background: var(--bg-hover);
+  border-color: var(--border);
+  color: var(--text-primary);
+}
+
+.os-chip.is-on {
+  background: var(--accent-dim);
+  border-color: var(--accent-border);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.os-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.os-chip-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--os-color);
+}
+
+.os-chip-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+}
+
+.os-chip.is-on .os-chip-count {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* 分组容器与分组头 */
+.os-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+}
+
+.os-group {
+  min-width: 0;
+}
+
+.os-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 0 0 8px;
+  background: none;
+  border: none;
+  text-align: left;
+  /* 同 .os-chip：原生按钮要显式继承字体，否则分组名会换一种字体 */
+  font: inherit;
+  cursor: pointer;
+}
+
+.os-group-head:focus-visible {
+  outline: none;
+  border-radius: var(--radius-sm);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.os-chevron {
+  flex: none;
+  color: var(--text-muted);
+  transition: transform var(--transition);
+}
+
+.os-chevron.is-folded {
+  transform: rotate(-90deg);
+}
+
+.os-group-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--os-color);
+  box-shadow: 0 0 0 3px var(--os-tint);
+}
+
+.os-group-name {
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  color: var(--text-primary);
+  transition: color var(--transition-fast);
+}
+
+.os-group-head:hover .os-group-name {
+  color: var(--accent);
+}
+
+.os-group-count {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+}
+
+/* 标题右侧那条渐隐细线：把「分类头」和「内容」分开，又不用画一整条边框 */
+.os-group-rule {
+  flex: 1 1 auto;
+  min-width: 24px;
+  height: 1px;
+  background: var(--grad-hairline);
+  opacity: 0.7;
+}
+
+/* 卡片网格：min(100%, 300px) 让窗口比 300px 还窄时按 100% 走 ——
+   否则 auto-fill 会照着最小值把卡片撑开，整页跟着横向滚动。 */
+.tpl-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+}
+
+.tpl-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  /* 圆角与阴影跟全局 .card 同一口径 —— 这一页的卡片不该比别的页「更圆、更飘」 */
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  transition: border-color var(--transition), transform var(--transition),
+    box-shadow var(--transition);
+}
+
+/* 顶部一条家族色细线：默认不可见，悬停时淡入 —— 比给整张卡描彩边安静得多 */
+.tpl-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: linear-gradient(90deg, var(--os-color), transparent 72%);
+  opacity: 0;
+  transition: opacity var(--transition);
+  pointer-events: none;
+}
+
+.tpl-card:hover {
+  border-color: var(--accent-border);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+
+.tpl-card:hover::before {
+  opacity: 1;
+}
+
+.tpl-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+/* 标题右侧的徽章不参与收缩：名字再长，也应该由名字去省略号 */
+.tpl-card-head > .badge {
+  flex: none;
+}
+
+.tpl-os-mark {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: var(--radius);
+  background: var(--os-tint);
+  color: var(--os-color);
+  border: 1px solid color-mix(in srgb, var(--os-color) 18%, transparent);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.tpl-card-id {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tpl-card-name {
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tpl-card-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 规格三格：用浅底小块把数值托起来，比「大号数字平铺」在小卡片里更抗挤 */
+.tpl-card-specs {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+}
+
+.tpl-spec {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 7px 9px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius);
+}
+
+.tpl-spec-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
+
+.tpl-spec-value {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tpl-card-meta-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.tpl-dot {
+  opacity: 0.6;
+}
+
+/* 系统模板的卷 ID：一行等宽小字，超长省略（完整值在 title 里） */
+.tpl-card-path {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* margin-top:auto：同一行里内容少的卡片把按钮压到底，按钮永远对齐 */
+.tpl-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-muted);
+}
+
+.tpl-card-foot-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 列表视图里的「系统」单元格：与卡片头像同色，切换视图时不必重新认一遍 */
+.os-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.os-tag-mark {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 18px;
+  border-radius: var(--radius-sm);
+  background: var(--os-tint);
+  color: var(--os-color);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.os-tag-name {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
    节点卡里的指标：CPU / 内存 / 磁盘 三格
    --------------------------------------------------------------------------- */
 

@@ -1151,6 +1151,12 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'templates.viewCards': 'Cards',
   'templates.viewList': 'List',
   'templates.totalShown': '{count} total',
+  /* Category bar: narrows the list by OS family; cards and list share one result */
+  'templates.filterLabel': 'OS',
+  'templates.filterAria': 'Filter templates by operating system',
+  'templates.filterAll': 'All',
+  'templates.groupToggleAria': '{name}: {count} templates — click to fold or expand',
+  'templates.colOs': 'OS',
   'templates.loadFailed': 'Cannot load the template list',
   'templates.emptySearch': 'No matching templates',
   'templates.emptyVm': 'No VM templates yet',

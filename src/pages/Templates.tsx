@@ -51,10 +51,22 @@ import {
   IconVm,
   IconDisk,
   IconDownload,
+  IconChevronDown,
+  IconFilter,
 } from '../components/Icons';
 import { LxcCreateWizard } from '../components/LxcCreateWizard';
 import { formatBytes, formatUptime, formatUptimeShort, parseTags } from '../utils/format';
 import { isTaskSuccess, ostypeLabel } from '../utils/status'
+import {
+  groupTagged,
+  osFamilyLabel,
+  osFamilyMark,
+  tagFamilies,
+  templateFamily,
+  type FamilyTagged,
+  type OsFamily,
+  type OsFamilyKey,
+} from '../utils/osFamily';
 import { useT } from '../i18n';
 import { ostypeOptions, cpuTypeOptions } from '../utils/status';
 import { useTaskRunner } from '../hooks/useTaskRunner';
@@ -74,6 +86,14 @@ type TemplateTab = 'qemu' | 'lxc';
 
 /** 展示方式（与节点页保持一致的叫法） */
 type ViewMode = 'cards' | 'list';
+
+/** 按家族收窄：'all' 时原样返回（同一个函数给卡片与列表用，两边结果必然一致） */
+function scopeByFamily<T>(
+  entries: Array<FamilyTagged<T>>,
+  key: OsFamilyKey | 'all',
+): Array<FamilyTagged<T>> {
+  return key === 'all' ? entries : entries.filter((entry) => entry.family.key === key);
+}
 
 export function Templates() {
   const t = useT();
@@ -101,6 +121,12 @@ export function Templates() {
   const [busy, setBusy] = useState(false);
   const [tab, setTab] = useState<TemplateTab>('qemu');
   const [view, setView] = useState<ViewMode>('cards');
+  /* 分类筛选：'all' 或某个操作系统家族。卡片与列表**共用这一份** ——
+     两个视图各记一份状态，切一次视图筛选条件就丢，看着像自己跳回去了。 */
+  const [familyFilter, setFamilyFilter] = useState<OsFamilyKey | 'all'>('all');
+  /* 操作系统分类的折叠状态：机器模板与容器系统模板各一份，互不联动 */
+  const vmGroups = useCollapsedOs();
+  const ctGroups = useCollapsedOs();
 
   /* 模板列表走专用接口 /api/templates：模板是共享资源，普通用户也必须能看到
      并用于部署。原先前端是用 /api/vms 自己筛 template，而该接口对普通用户按
@@ -191,6 +217,58 @@ export function Templates() {
      `tab === 'lxc'`，漏掉任何一处都会重演这个 bug。 */
   const ctSystemShown = activeTab === 'lxc' ? ctSystem : [];
 
+  /* 分类：先打标（名称 → 家族）再筛选、分组。分组只收实际存在的系统，
+     搜索过滤后空组自然消失；表格视图保持平铺（分组表头会打断列对齐），
+     但行序按家族排，同类自然连在一起，另有一列「系统」直接标明类别。 */
+  const taggedVm = useMemo(() => tagFamilies(shown), [shown]);
+  const taggedCt = useMemo(() => tagFamilies(ctSystemShown), [ctSystemShown]);
+
+  /* 筛选条上的分类：按家族聚合数量，只列**当前真的有模板**的系统。
+     容器系统模板与已转模板的容器同属一个标签页，两者一起计数 ——
+     分开数会让筛选条的总数跟下面的列表对不上。 */
+  const familyChips = useMemo(() => {
+    const counts = new Map<OsFamilyKey, { family: OsFamily; count: number }>();
+    for (const { family } of [...taggedVm, ...taggedCt]) {
+      const hit = counts.get(family.key);
+      if (hit) hit.count += 1;
+      else counts.set(family.key, { family, count: 1 });
+    }
+    return [...counts.values()].sort((a, b) => a.family.rank - b.family.rank);
+  }, [taggedVm, taggedCt]);
+
+  /* 切页签 / 搜索后，选中的系统可能一个都不剩：这时按「全部」渲染，
+     而不是让人对着一屏空白以为模板没了。选择本身保留，切回来还在。 */
+  const activeFamily: OsFamilyKey | 'all' =
+    familyFilter === 'all' ||
+    familyChips.some((chip) => chip.family.key === familyFilter)
+      ? familyFilter
+      : 'all';
+
+  /* 只有一个系统时不摆筛选条：点它不会让列表有任何变化，纯噪音 */
+  const showChips = familyChips.length > 1;
+
+  const visibleVm = useMemo(
+    () => scopeByFamily(taggedVm, activeFamily),
+    [taggedVm, activeFamily],
+  );
+  const visibleCt = useMemo(
+    () => scopeByFamily(taggedCt, activeFamily),
+    [taggedCt, activeFamily],
+  );
+
+  const groupedTemplates = useMemo(() => groupTagged(visibleVm), [visibleVm]);
+  const groupedCtSystem = useMemo(() => groupTagged(visibleCt), [visibleCt]);
+
+  /* 列表视图的行序与卡片分组一致：同一系统连着排，跨类扫读不跳 */
+  const listRows = useMemo(
+    () => groupedTemplates.flatMap((group) => group.items),
+    [groupedTemplates],
+  );
+  const ctListRows = useMemo(
+    () => groupedCtSystem.flatMap((group) => group.items),
+    [groupedCtSystem],
+  );
+
   /* 「从现有虚拟机转换为模板」需要虚拟机列表，且只在要用到时才拉取 ——
      转换弹窗和创建向导里都有这一个页签，两个开关都要算进去。
      普通用户在这里只会看到自己名下的虚拟机（这正是期望的范围）。 */
@@ -274,6 +352,12 @@ export function Templates() {
         ),
       },
       {
+        key: 'os',
+        header: t('templates.colOs'),
+        width: 130,
+        render: (tpl) => <OsTag family={templateFamily({ name: tpl.name })} />,
+      },
+      {
         key: 'storage',
         header: t('templates.colStorage'),
         width: 140,
@@ -345,6 +429,14 @@ export function Templates() {
           <span className="fw-600" title={tpl.name}>
             {tpl.name || `${activeTab === 'lxc' ? 'CT' : 'VM'} ${tpl.vmid}`}
           </span>
+        ),
+      },
+      {
+        key: 'os',
+        header: t('templates.colOs'),
+        width: 130,
+        render: (tpl) => (
+          <OsTag family={templateFamily({ name: tpl.name, ostype: tpl.type })} />
         ),
       },
       {
@@ -546,7 +638,9 @@ export function Templates() {
       </CollapsibleCard>
 
       {/* ---- 工具栏：类型标签页 + 搜索 + 展示方式 ---- */}
-      <div className="toolbar">
+      <div
+        className={`toolbar${view === 'cards' || showChips ? ' is-standalone' : ''}`}
+      >
         <div className="toolbar-left">
           <SegmentedControl<TemplateTab>
             value={activeTab}
@@ -658,11 +752,51 @@ export function Templates() {
         </Card>
       ) : (
         <>
+          {/* 分类筛选条：卡片与列表**共用**。只在真的有两类以上系统时才占一行 ——
+              全是一个系统时点它不会让列表有任何变化，纯属噪音。 */}
+          {showChips ? (
+            <div
+              className="os-filter"
+              role="group"
+              aria-label={t('templates.filterAria')}
+            >
+              <span className="os-filter-label">
+                <IconFilter size={13} aria-hidden="true" />
+                {t('templates.filterLabel')}
+              </span>
+              <button
+                type="button"
+                className={`os-chip${activeFamily === 'all' ? ' is-on' : ''}`}
+                aria-pressed={activeFamily === 'all'}
+                onClick={() => setFamilyFilter('all')}
+              >
+                {t('templates.filterAll')}
+                <span className="os-chip-count">
+                  {familyChips.reduce((sum, chip) => sum + chip.count, 0)}
+                </span>
+              </button>
+              {familyChips.map((chip) => (
+                <button
+                  type="button"
+                  key={chip.family.key}
+                  className={`os-chip${activeFamily === chip.family.key ? ' is-on' : ''}`}
+                  data-os={chip.family.key}
+                  aria-pressed={activeFamily === chip.family.key}
+                  onClick={() => setFamilyFilter(chip.family.key)}
+                >
+                  <span className="os-chip-dot" aria-hidden="true" />
+                  {osFamilyLabel(chip.family, t)}
+                  <span className="os-chip-count">{chip.count}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
+
           {/* 容器系统模板（vztmpl 文件）：用来**新建**容器，不是拿来克隆的机器。
               两类在 PVE 里都叫「模板」，这里分开列并各自标名 —— 混成一个列表
               会让人以为点「克隆」就能用这些文件建出机器来。
               只在「容器模板」标签页出现（见 ctSystemShown）。 */}
-          {ctSystemShown.length > 0 ? (
+          {visibleCt.length > 0 ? (
             <section className="mb-20">
               <div className="flex items-center gap-8 flex-wrap mb-10">
                 <h3 className="card-title">{t('templates.ctSystemTitle')}</h3>
@@ -671,20 +805,38 @@ export function Templates() {
                 </span>
               </div>
               {view === 'cards' ? (
-                <div className="grid grid-auto-320">
-                  {ctSystemShown.map((tpl) => (
-                    <CtSystemTemplateCard
-                      key={`${tpl.connection_id}/${tpl.node}/${tpl.volid}`}
-                      template={tpl}
-                      canCreate={canCreateCt}
-                      onCreate={() => setCtPreset(tpl)}
-                    />
-                  ))}
+                <div className="os-groups">
+                  {groupedCtSystem.map((group) => {
+                    const folded = ctGroups.collapsed.has(group.family.key);
+                    return (
+                      <section className="os-group" key={group.family.key}>
+                        <OsGroupHead
+                          family={group.family}
+                          count={group.items.length}
+                          folded={folded}
+                          onToggle={() => ctGroups.toggle(group.family.key)}
+                        />
+                        {folded ? null : (
+                          <div className="tpl-grid">
+                            {group.items.map((tpl) => (
+                              <CtSystemTemplateCard
+                                key={`${tpl.connection_id}/${tpl.node}/${tpl.volid}`}
+                                template={tpl}
+                                family={group.family}
+                                canCreate={canCreateCt}
+                                onCreate={() => setCtPreset(tpl)}
+                              />
+                            ))}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
                 </div>
               ) : (
                 <Table<CtSystemTemplate>
                   columns={ctSystemColumns}
-                  rows={ctSystemShown}
+                  rows={ctListRows}
                   rowKey={(tpl) => `${tpl.connection_id}/${tpl.node}/${tpl.volid}`}
                   caption={t('templates.ctSystemCaption')}
                 />
@@ -692,41 +844,59 @@ export function Templates() {
             </section>
           ) : null}
 
-          {shown.length > 0 ? (
+          {visibleVm.length > 0 ? (
             <section>
               {/* 只有「容器模板」页上两类同时在列时才要这个小标题：只有一类时
                   不加，免得凭空多一层。用 ctSystemShown 而不是 ctSystem ——
                   否则在虚拟机模板页上，这一页的虚拟机模板会被打上
                   「已转为模板的容器」的标题。 */}
-              {ctSystemShown.length > 0 ? (
+              {visibleCt.length > 0 ? (
                 <h3 className="card-title mb-10">
                   {t('templates.ctConvertedTitle')}
                 </h3>
               ) : null}
               {view === 'cards' ? (
-                <div className="grid grid-auto-320">
-                  {shown.map((t) => (
-                    <TemplateCard
-                      key={`${t.connection_id}/${t.node}/${t.vmid}`}
-                      template={t}
-                      canClone={canClone}
-                      canManage={canManage}
-                      onClone={() => setCloneTarget(t)}
-                      onDelete={() => setDeleteTarget(t)}
-                      onOpen={() =>
-                        navigate(
-                          t.guest_type === 'lxc'
-                            ? `/lxc/${t.node}/${t.vmid}`
-                            : `/vms/${t.node}/${t.vmid}`,
-                        )
-                      }
-                    />
-                  ))}
+                <div className="os-groups">
+                  {groupedTemplates.map((group) => {
+                    const folded = vmGroups.collapsed.has(group.family.key);
+                    return (
+                      <section className="os-group" key={group.family.key}>
+                        <OsGroupHead
+                          family={group.family}
+                          count={group.items.length}
+                          folded={folded}
+                          onToggle={() => vmGroups.toggle(group.family.key)}
+                        />
+                        {folded ? null : (
+                          <div className="tpl-grid">
+                            {group.items.map((tpl) => (
+                              <TemplateCard
+                                key={`${tpl.connection_id}/${tpl.node}/${tpl.vmid}`}
+                                template={tpl}
+                                family={group.family}
+                                canClone={canClone}
+                                canManage={canManage}
+                                onClone={() => setCloneTarget(tpl)}
+                                onDelete={() => setDeleteTarget(tpl)}
+                                onOpen={() =>
+                                  navigate(
+                                    tpl.guest_type === 'lxc'
+                                      ? `/lxc/${tpl.node}/${tpl.vmid}`
+                                      : `/vms/${tpl.node}/${tpl.vmid}`,
+                                  )
+                                }
+                              />
+                            ))}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
                 </div>
               ) : (
                 <Table<TemplateItem>
                   columns={templateColumns}
-                  rows={shown}
+                  rows={listRows}
                   rowKey={(tpl) => `${tpl.connection_id}/${tpl.node}/${tpl.vmid}`}
                   caption={t('templates.tableCaption', {
                     kind:
@@ -861,6 +1031,60 @@ export function Templates() {
    --------------------------------------------------------------------------- */
 
 /**
+ * 分类分组头：家族色点 + 名称 + 数量，右侧一条渐隐细线把标题与内容隔开。
+ *
+ * 卡片与列表两种视图共用同一个头 —— 折叠状态由调用方各自持有（虚拟机模板与
+ * 容器系统模板互不联动，见 useCollapsedOs）。
+ */
+function OsGroupHead({
+  family,
+  count,
+  folded,
+  onToggle,
+}: {
+  family: OsFamily;
+  count: number;
+  folded: boolean;
+  onToggle: () => void;
+}) {
+  const t = useT();
+  const name = osFamilyLabel(family, t);
+  return (
+    <button
+      type="button"
+      className="os-group-head"
+      data-os={family.key}
+      onClick={onToggle}
+      aria-expanded={!folded}
+      aria-label={t('templates.groupToggleAria', { name, count })}
+    >
+      <IconChevronDown
+        size={14}
+        className={`os-chevron${folded ? ' is-folded' : ''}`}
+        aria-hidden="true"
+      />
+      <span className="os-group-dot" aria-hidden="true" />
+      <span className="os-group-name">{name}</span>
+      <span className="os-group-count">{count}</span>
+      <span className="os-group-rule" aria-hidden="true" />
+    </button>
+  );
+}
+
+/** 列表里的「系统」单元格：与卡片头像同一套家族色，扫读时两处颜色对得上 */
+function OsTag({ family }: { family: OsFamily }) {
+  const t = useT();
+  return (
+    <span className="os-tag" data-os={family.key}>
+      <span className="os-tag-mark" aria-hidden="true">
+        {osFamilyMark(family)}
+      </span>
+      <span className="os-tag-name">{osFamilyLabel(family, t)}</span>
+    </span>
+  );
+}
+
+/**
  * 一个容器**系统模板**（vztmpl 文件）。与 :func:`TemplateCard` 并列但不同源：
  * 那边是「被转成模板的机器」（有 VMID、能克隆），这边是存储里的一个文件，
  * 只能拿来**新建**容器。所以这里不摆 CPU / 内存 / 运行时长 —— 文件没有这些，
@@ -868,24 +1092,30 @@ export function Templates() {
  */
 function CtSystemTemplateCard({
   template,
+  family,
   canCreate,
   onCreate,
 }: {
   template: CtSystemTemplate;
+  /** 分组时算好的家族：卡片头像、左侧色条都用它，不再自己判一遍 */
+  family: OsFamily;
   canCreate: boolean;
   onCreate: () => void;
 }) {
   const t = useT();
   return (
-    <article className="entity-card">
-      <div className="entity-card-head">
-        <div className="entity-card-title">
-          <span className="entity-card-name" title={template.volid}>
+    <article className="tpl-card" data-os={family.key}>
+      <div className="tpl-card-head">
+        <span className="tpl-os-mark" aria-hidden="true">
+          {osFamilyMark(family)}
+        </span>
+        <div className="tpl-card-id">
+          <span className="tpl-card-name" title={template.volid}>
             {template.name}
           </span>
           {/* 共享存储上的模板集群内任意节点都能用，写一个节点名会暗示「它属于
               那一台」（cephfs 上的模板因此看着像绑在 node02 上）。 */}
-          <span className="entity-card-sub">
+          <span className="tpl-card-meta">
             {template.storage} ·{' '}
             {template.shared ? t('templates.ctShared') : template.node}
             {template.connection_name ? ` · ${template.connection_name}` : ''}
@@ -896,32 +1126,28 @@ function CtSystemTemplateCard({
         </Badge>
       </div>
 
-      <div className="entity-card-stats">
-        <div className="entity-stat">
-          <span className="entity-stat-label">{t('templates.colSize')}</span>
-          <span className="entity-stat-value">{formatBytes(template.size, 0)}</span>
+      <div className="tpl-card-specs">
+        <div className="tpl-spec">
+          <span className="tpl-spec-label">{t('templates.colSize')}</span>
+          <span className="tpl-spec-value">{formatBytes(template.size, 0)}</span>
         </div>
       </div>
 
-      <div className="fs-xs text-muted mono truncate" title={template.volid}>
+      <div className="tpl-card-path" title={template.volid}>
         {template.volid}
       </div>
 
-      <div className="entity-card-footer">
-        <div className="flex items-center gap-4">
-          <Button
-            size="sm"
-            variant="primary"
-            icon={<IconPlus size={14} />}
-            disabled={!canCreate}
-            title={
-              canCreate ? undefined : t('templates.ctCreateNeedsPermission')
-            }
-            onClick={onCreate}
-          >
-            {t('templates.ctCreate')}
-          </Button>
-        </div>
+      <div className="tpl-card-foot">
+        <Button
+          size="sm"
+          variant="primary"
+          icon={<IconPlus size={14} />}
+          disabled={!canCreate}
+          title={canCreate ? undefined : t('templates.ctCreateNeedsPermission')}
+          onClick={onCreate}
+        >
+          {t('templates.ctCreate')}
+        </Button>
       </div>
     </article>
   );
@@ -929,6 +1155,7 @@ function CtSystemTemplateCard({
 
 function TemplateCard({
   template,
+  family,
   canClone,
   canManage,
   onClone,
@@ -936,6 +1163,8 @@ function TemplateCard({
   onOpen,
 }: {
   template: TemplateItem;
+  /** 分组时算好的家族：卡片头像、家族色条都用它 */
+  family: OsFamily;
   canClone: boolean;
   canManage: boolean;
   onClone: () => void;
@@ -943,14 +1172,18 @@ function TemplateCard({
   onOpen: () => void;
 }) {
   const t = useT();
+  const tags = parseTags(template.tags);
   return (
-    <article className="entity-card">
-      <div className="entity-card-head">
-        <div className="entity-card-title">
-          <span className="entity-card-name" title={template.name}>
+    <article className="tpl-card" data-os={family.key}>
+      <div className="tpl-card-head">
+        <span className="tpl-os-mark" aria-hidden="true">
+          {osFamilyMark(family)}
+        </span>
+        <div className="tpl-card-id">
+          <span className="tpl-card-name" title={template.name}>
             {template.name || `VM ${template.vmid}`}
           </span>
-          <span className="entity-card-sub">
+          <span className="tpl-card-meta">
             VMID {template.vmid} · {template.node}
             {template.connection_name ? ` · ${template.connection_name}` : ''}
           </span>
@@ -961,68 +1194,64 @@ function TemplateCard({
         </Badge>
       </div>
 
-      <div className="entity-card-stats">
-        <div className="entity-stat">
-          <span className="entity-stat-label">CPU</span>
-          <span className="entity-stat-value">
+      <div className="tpl-card-specs">
+        <div className="tpl-spec">
+          <span className="tpl-spec-label">CPU</span>
+          <span className="tpl-spec-value">
             {t('templates.coresValue', { count: template.maxcpu ?? '—' })}
           </span>
         </div>
-        <div className="entity-stat">
-          <span className="entity-stat-label">{t('templates.colMem')}</span>
-          <span className="entity-stat-value">
+        <div className="tpl-spec">
+          <span className="tpl-spec-label">{t('templates.colMem')}</span>
+          <span className="tpl-spec-value">
             {formatBytes(template.maxmem, 0)}
           </span>
         </div>
-        <div className="entity-stat">
-          <span className="entity-stat-label">{t('templates.colDisk')}</span>
-          <span className="entity-stat-value">
+        <div className="tpl-spec">
+          <span className="tpl-spec-label">{t('templates.colDisk')}</span>
+          <span className="tpl-spec-value">
             {formatBytes(template.maxdisk, 0)}
           </span>
         </div>
       </div>
 
-      <div className="flex items-center gap-8 flex-wrap">
-        <span className="fs-xs text-muted">
-          {t('templates.osValue', {
-            value: ostypeLabel(template.type, t),
-          })}
+      <div className="tpl-card-meta-line">
+        <span>{t('templates.osValue', { value: ostypeLabel(template.type, t) })}</span>
+        <span className="tpl-dot" aria-hidden="true">
+          ·
         </span>
-        <span className="fs-xs text-muted">·</span>
-        <span className="fs-xs text-muted">
+        <span>
           {t('templates.uptime', {
             uptime: formatUptimeShort(template.uptime),
           })}
         </span>
       </div>
 
-      {parseTags(template.tags).length > 0 ? (
-        <TagList tags={parseTags(template.tags)} max={4} />
-      ) : null}
+      {tags.length > 0 ? <TagList tags={tags} max={4} /> : null}
 
-      <div className="entity-card-footer">
-        <div className="flex items-center gap-4">
-          <Button
-            variant="primary"
-            size="sm"
-            icon={<IconCopy size={14} />}
-            onClick={onClone}
-            disabled={!canClone}
-          >
-            {t('templates.clone')}
-          </Button>
+      <div className="tpl-card-foot">
+        <Button
+          variant="primary"
+          size="sm"
+          icon={<IconCopy size={14} />}
+          onClick={onClone}
+          disabled={!canClone}
+        >
+          {t('templates.clone')}
+        </Button>
+        <span className="tpl-card-foot-actions">
           <IconButton label={t('templates.viewDetail')} onClick={onOpen}>
             <IconEye size={15} />
           </IconButton>
-        </div>
-        <IconButton
-          label={t('templates.deleteAria', { name: template.name })}
-          variant="danger"
-          onClick={onDelete}
-          disabled={!canManage}
-        >
-          <IconTrash size={15} />
-        </IconButton>
+          <IconButton
+            label={t('templates.deleteAria', { name: template.name })}
+            variant="danger"
+            onClick={onDelete}
+            disabled={!canManage}
+          >
+            <IconTrash size={15} />
+          </IconButton>
+        </span>
       </div>
     </article>
   );
@@ -2165,4 +2394,22 @@ function TemplateCreateWizard({
       )}
     </Modal>
   );
+}
+
+/**
+ * 分类折叠状态：Set 里存的是**被折叠起来**的系统。
+ *
+ * 用「折叠集合」而不是「展开集合」：默认全展开是更常见的第一步（分类刚出来时
+ * 用户想先看到全貌），存折叠项意味着默认值就是一个空 Set，不必预先塞进所有 key。
+ */
+function useCollapsedOs() {
+  const [collapsed, setCollapsed] = useState<Set<OsFamilyKey>>(new Set());
+  const toggle = (key: OsFamilyKey) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  return { collapsed, toggle };
 }
