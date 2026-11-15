@@ -51,6 +51,7 @@ import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../hooks/useToast';
 import { useUiPrefs } from '../hooks/useUiPrefs';
 import { useNodeStorages } from '../hooks/useNodeStorages';
+import { useNodeBridges } from '../hooks/useNodeBridges';
 import {
   biosOptions,
   cpuTypeOptions,
@@ -193,6 +194,11 @@ interface FormState {
   cloneFrom: string;
   cloneFull: boolean;
   cloneStorage: string;
+  /**
+   * 克隆体接到哪个网桥（空串 = 沿用模板）。只替换网卡的 bridge 一段，
+   * MAC / VLAN / 速率保持模板里的值；静态地址与 DHCP 都适用。
+   */
+  cloneBridge: string;
   /** 克隆完成后是否自动开机 */
   cloneStart: boolean;
   disks: DiskRow[];
@@ -255,6 +261,8 @@ const initialState: FormState = {
   /** 默认链接克隆 */
   cloneFull: false,
   cloneStorage: '',
+  /** 空串 = 沿用模板网卡所在的网桥 */
+  cloneBridge: '',
   /** 默认克隆后自动开机 */
   cloneStart: true,
   disks: [
@@ -809,28 +817,19 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
     connectionOptions.find((o) => o.value === targetConn)?.label ??
     t('vmCreate.connCurrent');
 
-  /* 可用作网桥的网卡 */
-  const bridgesQuery = useQuery({
-    queryKey: ['nodes', targetConn, form.node, 'network'],
-    queryFn: () => nodesApi.network(form.node, targetConn),
-    enabled: open && Boolean(form.node),
-    staleTime: 60_000,
-  });
+  /* 可用作网桥的网卡：与快速部署 / 新建容器 / 重装用同一套筛选（含 OVS 桥）。
+     静态地址与 DHCP 都走这块网卡，候选范围不随地址模式变化。 */
+  const bridges = useNodeBridges(form.node, targetConn, open && Boolean(form.node));
 
-  const bridgeOptions = useMemo(() => {
-    const ifaces = bridgesQuery.data ?? [];
-    const bridges = ifaces.filter(
-      (i) => i.type === 'bridge' || i.type === 'OVSBridge',
-    );
-    const list = bridges.length > 0 ? bridges : ifaces;
-    return [
+  const bridgeOptions = useMemo(
+    () => [
       { label: t('vmDetail.addNicBridgePlaceholder'), value: '' },
-      ...list.map((i) => ({
-        label: `${i.iface}${i.active ? '' : t('vmDetail.addNicInactive')}`,
-        value: i.iface,
-      })),
-    ];
-  }, [bridgesQuery.data, t]);
+      ...(bridges.options.length
+        ? bridges.options
+        : [{ label: 'vmbr0', value: 'vmbr0' }]),
+    ],
+    [bridges.options, t],
+  );
 
   /* ---- 克隆源：只给模板 ----
      后端 /api/templates 已经筛过「type = qemu 且 template = 1」，拿到的就是
@@ -1068,7 +1067,9 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
         balloon: balloonOption,
         ...numaOptions,
         disks: [],
+        /* 空 = 继承模板网卡；选了桥就只改 bridge 那一段（见后端 bridge_override） */
         networks: [],
+        bridge_override: form.cloneBridge || undefined,
         tags: form.tags || undefined,
         description: form.description || undefined,
         start_on_boot: form.startOnBoot,
@@ -1137,8 +1138,15 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
         t('vmCreate.toastCreated'),
         t('vmCreate.toastCreatedHint', { vmid: result.vmid ?? form.vmid }),
       );
-      /* 这个组件**不走 runner**（创建是直连调用），所以额度读数要自己作废：
-         刚多出来一台机器，不刷的话「我的额度」还挂着创建前的已用数。 */
+      /* 这个组件**不走 runner**（创建是直连调用），所以列表与派生数据都得自己
+         作废：向导是盖在列表页上的，只刷额度的话，关掉向导后新机器那一行要等
+         「数据刷新间隔」（默认 30 秒）才出现 —— 用户会以为没建成，转头再点一次。
+         ['storages'] 一并刷：新磁盘 / cloud-init 盘会改变存储用量。 */
+      void queryClient.invalidateQueries({ queryKey: ['vms'] });
+      void queryClient.invalidateQueries({ queryKey: ['lxc'] });
+      void queryClient.invalidateQueries({ queryKey: ['cluster'] });
+      void queryClient.invalidateQueries({ queryKey: ['guests'] });
+      void queryClient.invalidateQueries({ queryKey: ['storages'] });
       invalidateQuota(queryClient);
       onCreated?.(result.vmid ?? Number(form.vmid));
       onClose();
@@ -1700,6 +1708,26 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                   }
                 />
 
+                {/* 接入网桥：克隆体默认沿用模板的网卡。要换网络（模板在 A 网、
+                    新机器要进 B 网）时在这里选 —— 只替换 bridge 一段，MAC 与
+                    VLAN 不变。地址是静态还是 DHCP 都能选，二者共用同一块网卡。 */}
+                <Select
+                  label={t('vmCreate.cloneBridge')}
+                  value={form.cloneBridge}
+                  onChange={(e) => update('cloneBridge', e.target.value)}
+                  options={[
+                    { label: t('vmCreate.cloneBridgeKeep'), value: '' },
+                    ...(bridges.options.length
+                      ? bridges.options
+                      : [{ label: 'vmbr0', value: 'vmbr0' }]),
+                  ]}
+                  hint={
+                    bridges.isError
+                      ? t('vmCreate.nicBridgeLoadFailed')
+                      : t('vmCreate.cloneBridgeHint')
+                  }
+                />
+
                 <Field label={t('vmCreate.cloneMethod')}>
                   <div className="clone-methods">
                     <button
@@ -2221,7 +2249,7 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                             options={bridgeOptions}
                             error={errors[`net-bridge-${i}`]}
                             hint={
-                              bridgesQuery.isError
+                              bridges.isError
                                 ? t('vmCreate.nicBridgeLoadFailed')
                                 : undefined
                             }

@@ -15,9 +15,17 @@
      结果不是装失败，而是装完机器换了个 IP，用户按记忆里的地址连不上。
    ========================================================================== */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { storagesApi, vmMetaApi, vmMetaKey, vmReinstallApi } from '../api/endpoints';
+import { useNodeBridges } from '../hooks/useNodeBridges';
+import {
+  ipPoolsApi,
+  storagesApi,
+  vmMetaApi,
+  vmMetaKey,
+  vmReinstallApi,
+} from '../api/endpoints';
+import { fitsPools } from '../utils/ippool';
 import { errorMessage } from '../api/client';
 import { useToast } from '../hooks/useToast';
 import { useT } from '../i18n';
@@ -48,9 +56,15 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
   const [ciPassword, setCiPassword] = useState('');
   const [sshKeys, setSshKeys] = useState('');
   const [ipMode, setIpMode] = useState<'dhcp' | 'static'>('dhcp');
+  /* 静态地址时可选「网段」（IP 地址池）：选中后从该池取一个空闲地址填进 IP/网关。
+     与新建 / 快速部署 / 导入共用同一套池筛选，不新增接口。 */
+  const [poolId, setPoolId] = useState('');
   const [ip, setIp] = useState('');
   const [gateway, setGateway] = useState('');
   const [dns, setDns] = useState('');
+  /* 网卡接到哪个网桥：空串 = 沿用原机器所在的那个。
+     静态与 DHCP 是**同一块网卡**的两种地址来源，所以这一项不随 ipMode 出现/消失。 */
+  const [bridge, setBridge] = useState('');
   const [startAfter, setStartAfter] = useState(true);
   /* 数据盘默认一起删：重装的语义是「这台机器回到干净状态」。要留数据的用户
      取消勾选即可 —— 所以默认开着，而不是默认关着让人自己去发现。 */
@@ -96,6 +110,36 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     retry: false,
   });
 
+  /* 可选网桥：与新建 / 快速部署 / 容器用同一套筛选（含 OVS 桥） */
+  const bridges = useNodeBridges(node, vm?.connection_id, open && Boolean(node));
+
+  /* 静态地址时可选的网段（IP 地址池）：只列「网桥 + 节点 + PVE 连接」都对得上的，
+     与新建 / 快速部署 / 导入共用同一套判定（utils/ippool），没有新增接口。 */
+  const poolsQuery = useQuery({
+    queryKey: ['ip-pools'],
+    queryFn: ipPoolsApi.get,
+    enabled: open && ipMode === 'static',
+    staleTime: 30_000,
+  });
+  const usablePools = useMemo(() => {
+    /* 网桥可能是空的（沿用原网桥）：这时用原机器所在的那个桥来过筛，
+       否则会把属于另一张网的池也列出来，选中后地址根本不通。 */
+    const targetBridge = bridge || netQuery.data?.bridge || '';
+    return fitsPools(poolsQuery.data?.pools ?? [], {
+      bridge: targetBridge,
+      node,
+      connection: vm?.connection_id ?? '',
+    });
+  }, [poolsQuery.data, bridge, netQuery.data?.bridge, node, vm?.connection_id]);
+
+  /* 换了网桥 / 节点后，之前选中的池可能不再适用：清掉选择，别让下拉停在一个
+     已经不存在的选项上（IP 保留，用户可以继续手改）。 */
+  useEffect(() => {
+    if (!poolId || !poolsQuery.isSuccess) return;
+    if (usablePools.some((item) => item.id === poolId)) return;
+    setPoolId('');
+  }, [poolId, poolsQuery.isSuccess, usablePools]);
+
   const templates = templatesQuery.data?.templates ?? [];
   const targets = (storagesQuery.data ?? []).filter((item) =>
     String(item.content ?? '')
@@ -115,9 +159,11 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     setCiPassword('');
     setSshKeys('');
     setIpMode('dhcp');
+    setPoolId('');
     setIp('');
     setGateway('');
     setDns('');
+    setBridge('');
     setStartAfter(true);
     setWipeDisks(true);
     setBusy(false);
@@ -145,6 +191,8 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     if (!metaQuery.isSuccess && !metaQuery.isError) return;
     networkAuto.current = true;
     const net = netQuery.data;
+    /* 网桥跟着原机器走：不填就是「沿用原来的桥」，与下面选静态还是 DHCP 无关 */
+    if (net.bridge) setBridge(net.bridge);
     if (net.mode === 'static' && net.ip) {
       setIpMode('static');
       setIp(net.ip);
@@ -200,6 +248,8 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
         ip: ipMode === 'static' ? ip.trim() : '',
         gateway: ipMode === 'static' ? gateway.trim() : '',
         dns: dns.trim(),
+        /* 空串 = 沿用原网桥；静态与 DHCP 都会带上它 */
+        bridge: bridge.trim(),
         start: startAfter,
         wipe_data_disks: wipeDisks,
       });
@@ -331,6 +381,26 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
           </Field>
 
           <div className="section-label">{t('vmReinstall.network')}</div>
+          {/* 网桥与地址模式并列，不随 ipMode 显隐：DHCP 也要能指定请求从哪个桥出去 */}
+          <Select
+            label={t('vmReinstall.bridge')}
+            value={bridge}
+            onChange={(e) => {
+              networkTouched.current = true;
+              setBridge(e.target.value);
+            }}
+            options={[
+              { label: t('vmReinstall.bridgeKeep'), value: '' },
+              ...(bridges.options.length
+                ? bridges.options
+                : [{ label: 'vmbr0', value: 'vmbr0' }]),
+            ]}
+            hint={
+              bridges.isError
+                ? t('vmReinstall.bridgeLoadFailed')
+                : t('vmReinstall.bridgeHint')
+            }
+          />
           <SegmentedControl<'dhcp' | 'static'>
             value={ipMode}
             onChange={(value) => {
@@ -354,43 +424,99 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
             ]}
           />
           {ipMode === 'static' ? (
-            <div className="field-row">
-              <Field label={t('vmReinstall.ip')} required>
-                <Input
-                  value={ip}
-                  onChange={(e) => {
-                    networkTouched.current = true;
-                    setIp(e.target.value);
-                  }}
-                  placeholder="10.0.0.10/24"
-                  mono
-                />
-              </Field>
-              <Field label={t('vmReinstall.gateway')}>
-                <Input
-                  value={gateway}
-                  onChange={(e) => {
-                    networkTouched.current = true;
-                    setGateway(e.target.value);
-                  }}
-                  placeholder="10.0.0.1"
-                  mono
-                />
-              </Field>
-              <Field label={t('vmReinstall.dns')}>
-                <Input
-                  value={dns}
-                  onChange={(e) => {
-                    networkTouched.current = true;
-                    setDns(e.target.value);
-                  }}
-                  placeholder="223.5.5.5"
-                  mono
-                />
-              </Field>
-            </div>
+            <>
+              <Select
+                label={t('vmCreate.nicPool')}
+                hint={t('vmCreate.poolHint')}
+                value={poolId}
+                onChange={(e) => {
+                  networkTouched.current = true;
+                  const id = e.target.value;
+                  setPoolId(id);
+                  const pool = usablePools.find((item) => item.id === id);
+                  if (!pool) return;
+                  /* 选中网段 = 换一个网段：从池里取一个空闲地址填进去。
+                     池的掩码藏在 subnet 的前缀里（free[] 是裸 IP），不补上
+                     会被 PVE 当成 /32，机器拿不到网络。 */
+                  const next = pool.free?.[0];
+                  if (next) {
+                    const prefix = (pool.subnet || '').split('/')[1] || '24';
+                    setIp(`${next}/${prefix}`);
+                  }
+                  if (pool.gateway) setGateway(pool.gateway);
+                  if (pool.dns) setDns(pool.dns);
+                }}
+                options={[
+                  { label: t('vmCreate.poolManual'), value: '' },
+                  ...usablePools.map((item) => ({
+                    /* 与快速部署 / 导入同一口径：池标了 VLAN 就一起显示，
+                       否则同网桥下的多个网段看起来像重复的池 */
+                    label: `${item.name || item.subnet} · ${item.subnet}（${t(
+                      'ippool.freeCount',
+                      { n: item.free_count },
+                    )}）${
+                      item.vlan != null
+                        ? ` · ${t('ippool.colVlan')} ${item.vlan}`
+                        : ''
+                    }`,
+                    value: item.id,
+                  })),
+                ]}
+                disabled={busy || poolsQuery.isLoading}
+              />
+              {!poolsQuery.isLoading && !usablePools.length ? (
+                <Notice tone="warning">{t('vmCreate.poolHintEmpty')}</Notice>
+              ) : null}
+              {poolId &&
+              !(usablePools.find((item) => item.id === poolId)?.free?.length ?? 0) ? (
+                <Notice tone="warning">{t('vmCreate.poolEmpty')}</Notice>
+              ) : null}
+              <div className="field-row">
+                <Field label={t('vmReinstall.ip')} required>
+                  <Input
+                    value={ip}
+                    onChange={(e) => {
+                      networkTouched.current = true;
+                      setIp(e.target.value);
+                    }}
+                    placeholder="10.0.0.10/24"
+                    mono
+                  />
+                </Field>
+                <Field label={t('vmReinstall.gateway')}>
+                  <Input
+                    value={gateway}
+                    onChange={(e) => {
+                      networkTouched.current = true;
+                      setGateway(e.target.value);
+                    }}
+                    placeholder="10.0.0.1"
+                    mono
+                  />
+                </Field>
+                <Field label={t('vmReinstall.dns')}>
+                  <Input
+                    value={dns}
+                    onChange={(e) => {
+                      networkTouched.current = true;
+                      setDns(e.target.value);
+                    }}
+                    placeholder="223.5.5.5"
+                    mono
+                  />
+                </Field>
+              </div>
+            </>
           ) : null}
           {netHint ? <div className="fs-xs text-muted">{netHint}</div> : null}
+
+          {/* 系统盘容量：模板通常只有 20G，而重装是整块换盘 —— 不说清楚的话，
+              用户会以为「重装」把机器缩回了模板尺寸（那确实曾是它的行为）。 */}
+          {vm?.maxdisk ? (
+            <div className="fs-xs text-muted">
+              {t('vmReinstall.diskKept', { size: formatBytes(vm.maxdisk) })}
+            </div>
+          ) : null}
 
           <div className="section-label">{t('vmReinstall.options')}</div>
           <Switch

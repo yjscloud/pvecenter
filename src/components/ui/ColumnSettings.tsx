@@ -43,6 +43,9 @@ interface ColumnSettingsState {
   order: string[];
   /** 被隐藏的列 */
   hidden: string[];
+  /** 列布局版本。声明顺序调整后调用方递增 orderVersion，
+      老用户保存的旧顺序会自动作废、回到新的默认顺序（隐藏偏好保留）。 */
+  version?: number;
 }
 
 function storageKeyOf(username: string | undefined, tableKey: string): string {
@@ -63,6 +66,7 @@ function readStored(key: string): ColumnSettingsState | null {
       hidden: Array.isArray(parsed.hidden)
         ? parsed.hidden.filter((k): k is string => typeof k === 'string')
         : [],
+      version: typeof parsed.version === 'number' ? parsed.version : 0,
     };
   } catch {
     /* 隐私模式 / 脏数据：静默回到默认列，不影响使用 */
@@ -71,10 +75,33 @@ function readStored(key: string): ColumnSettingsState | null {
 }
 
 /** 首次进入（或恢复默认）时的列配置：只把声明为 defaultHidden 的列藏起来 */
-function defaultState<T>(columns: Array<Column<T>>): ColumnSettingsState {
+function defaultState<T>(
+  columns: Array<Column<T>>,
+  orderVersion: number,
+): ColumnSettingsState {
   return {
     order: [],
     hidden: columns.filter((c) => c.defaultHidden).map((c) => c.key),
+    version: orderVersion,
+  };
+}
+
+/** 读到的偏好要经过「布局版本」校验：版本对不上说明列的默认顺序调整过，
+    旧顺序会让人看不到新的默认布局，此时丢弃 order、回到声明顺序，
+    但保留用户的隐藏偏好（那与顺序无关）。 */
+function normalizeState<T>(
+  stored: ColumnSettingsState | null,
+  columns: Array<Column<T>>,
+  orderVersion: number,
+): ColumnSettingsState {
+  const base = stored ?? defaultState(columns, orderVersion);
+  if ((base.version ?? 0) === orderVersion) {
+    return { ...base, version: orderVersion };
+  }
+  return {
+    order: [],
+    hidden: base.hidden,
+    version: orderVersion,
   };
 }
 
@@ -116,17 +143,18 @@ export interface ColumnSettingsApi<T> {
 export function useColumnSettings<T>(
   columns: Array<Column<T>>,
   tableKey: string,
+  orderVersion: number = 0,
 ): ColumnSettingsApi<T> {
   const { user } = useAuth();
   const storageKey = storageKeyOf(user?.username, tableKey);
 
   const [state, setState] = useState<ColumnSettingsState>(
-    () => readStored(storageKey) ?? defaultState(columns),
+    () => normalizeState(readStored(storageKey), columns, orderVersion),
   );
 
   /* 同一浏览器换账号登录时，读回新账号自己的那份偏好 */
   useEffect(() => {
-    setState(readStored(storageKey) ?? defaultState(columns));
+    setState(normalizeState(readStored(storageKey), columns, orderVersion));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storageKey]);
 
@@ -140,12 +168,19 @@ export function useColumnSettings<T>(
   );
 
   /* 对账：存下来的顺序里剔掉已经不复存在的列，再按声明顺序补上新出现的列。
-     老用户读到旧配置后，新加的列能自动出现在末尾（而不是永远看不见）。 */
+     补的位置也有讲究 —— 一律 push 到末尾的话，新加的「网络」列在老用户（存过
+     列序）那里会跑到表格最后，而不是声明里指定的「IP 地址」前面。所以插到
+     「它后面第一个已经存在的列」之前。 */
   const order = useMemo(() => {
     const known = new Set(declaredKeys);
     const result = state.order.filter((k) => known.has(k));
     for (const key of declaredKeys) {
-      if (!result.includes(key)) result.push(key);
+      if (result.includes(key)) continue;
+      const next = declaredKeys
+        .slice(declaredKeys.indexOf(key) + 1)
+        .find((candidate) => result.includes(candidate));
+      if (next) result.splice(result.indexOf(next), 0, key);
+      else result.push(key);
     }
     return result;
   }, [state.order, declaredKeys]);
@@ -200,8 +235,9 @@ export function useColumnSettings<T>(
     commit({
       order: [],
       hidden: declaredKeys.filter((key) => byKey.get(key)?.defaultHidden),
+      version: orderVersion,
     });
-  }, [commit, declaredKeys, byKey]);
+  }, [commit, declaredKeys, byKey, orderVersion]);
 
   /* 可见列：先按用户顺序取可见的非锁定列，再按声明顺序把锁定列钉回原位
      （选择框必须始终在第一列、操作列必须在最后一列，不能跟着拖动跑）。 */

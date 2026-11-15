@@ -263,6 +263,11 @@ class Settings(BaseSettings):
     # --- Behaviour ---------------------------------------------------------
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     task_poll_interval: float = 2.0
+    # 批量下发的并发度：每台都要阻塞等 PVE 任务（克隆 / 导入），串行执行时总耗时
+    # 是各台的**和**。2–4 路并发能把链接克隆的批量耗时压到原来的 1/3 左右；设 1
+    # 回到串行（机械盘或带宽紧张、宁慢勿抖的环境）。仅 ``stop_on_error=false``
+    # 时生效 —— 「前序失败就跳过后面」只有在顺序执行下才有确定语义。
+    batch_concurrency: int = 3
     http_timeout: float = 30.0
     # 「全量快照汇总」（/api/snapshots）的 fan-out 并发上限：每台客户机一次 PVE
     # 请求，200 台时 6 并发要跑 34 轮。小规格 PVE 或 API 限流严格的环境可下调。

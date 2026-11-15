@@ -80,6 +80,47 @@ export function isStopped(status?: VmStatus | null): boolean {
 }
 
 /* ---------------------------------------------------------------------------
+   客户机操作锁（PVE 的 ``lock``）
+   ---------------------------------------------------------------------------
+   PVE 在任务进行中会往客户机配置写 ``lock``（备份 / 迁移 / 关机 / 克隆…），
+   而 ``status`` 往往还是 ``running``（关机要等 QEMU 真正退出才变 stopped）。
+   只渲染 status 的话，用户点了关机后 60 秒内界面上什么都没变 —— 锁是这段
+   空窗期里唯一准确、实时的信号。 */
+
+const LOCK_KEYS: Record<string, MessageKey> = {
+  backup: 'status.lock.backup',
+  clone: 'status.lock.clone',
+  create: 'status.lock.create',
+  migrate: 'status.lock.migrate',
+  mounted: 'status.lock.mounted',
+  rollback: 'status.lock.rollback',
+  shutdown: 'status.lock.shutdown',
+  snapshot: 'status.lock.snapshot',
+  'snapshot-delete': 'status.lock.snapshotDelete',
+  suspend: 'status.lock.suspend',
+  suspended: 'status.lock.suspend',
+  template: 'status.lock.template',
+  'disk-resize': 'status.lock.diskResize',
+  'move-disk': 'status.lock.moveDisk',
+};
+
+/**
+ * 操作锁的展示文案；空锁返回 ``null``（调用方据此决定要不要渲染徽章）。
+ *
+ * 认不出来的锁值原样返回（小写化后），不编造文案 —— PVE 新加的锁类型至少
+ * 还能让用户知道「有别的事在跑」，而不是显示成正常的运行中。
+ */
+export function lockLabel(
+  lock: string | null | undefined,
+  t: TFunc,
+): string | null {
+  const text = String(lock ?? '').trim().toLowerCase();
+  if (!text) return null;
+  const key = LOCK_KEYS[text];
+  return key ? t(key) : text;
+}
+
+/* ---------------------------------------------------------------------------
    节点状态
    --------------------------------------------------------------------------- */
 

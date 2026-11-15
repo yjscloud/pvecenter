@@ -30,7 +30,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
-from . import alerting, i18n, notifications, security, vmconfig
+from . import alerting, guestip, i18n, ippool, notifications, security, vmconfig
 from .pve import ProxmoxError, client_for_connection
 
 logger = logging.getLogger(__name__)
@@ -163,6 +163,97 @@ async def _wait(client: Any, result: Any, timeout: float = IMPORT_TIMEOUT) -> No
     upid = result if isinstance(result, str) else (result or {}).get("task", "")
     if isinstance(upid, str) and upid.startswith("UPID:"):
         await client.wait_for_task(upid, timeout=timeout)
+
+
+async def _disk_gb(
+    client: Any, node: str, vmid: int, disk_key: str
+) -> Optional[float]:
+    """读某块盘现在的容量（GB）。
+
+    两个来源，按可靠性排序：
+
+    1. 配置里的 ``size=``（PVE 自己记的卷大小，与 ``qm resize`` 用的是同一份）；
+    2. ``status/current`` 的 ``maxdisk`` —— 老配置 / 某些存储上 config 不带
+       ``size=``，这时只有运行态接口能给出字节数。
+
+    都拿不到返回 ``None``：调用方**不要**猜一个数字，那会让「校验容量」变成
+    「按猜测的值去扩容」。
+    """
+    try:
+        config = await client.get(f"/nodes/{node}/qemu/{vmid}/config") or {}
+    except ProxmoxError:
+        config = {}
+    raw = str(config.get(disk_key) or "")
+    if "size=" in raw:
+        size = vmconfig.disk_size_to_gb(raw.split("size=", 1)[1].split(",", 1)[0])
+        if size:
+            return float(size)
+    try:
+        status = await client.get(f"/nodes/{node}/qemu/{vmid}/status/current") or {}
+        total = int(status.get("maxdisk") or 0)
+    except (ProxmoxError, TypeError, ValueError):
+        return None
+    return round(total / (1024 ** 3), 2) if total > 0 else None
+
+
+async def _restore_disk_size(
+    client: Any,
+    *,
+    node: str,
+    vmid: int,
+    disk_key: str,
+    target_gb: Optional[float],
+    record: Callable[[str, bool, str], None],
+) -> Optional[float]:
+    """把重装后的系统盘恢复到**重装前**的容量，并校验。
+
+    为什么必须做：重装的默认路线是用模板的系统盘整块换掉旧盘，而模板盘的通用的
+    尺寸（常见 20G）。不恢复的话，一台 100G 的机器重装完就只剩 20G —— 用户丢的
+    不是「一个数字」，是 80G 已经装好的数据能落脚的空间。旧盘同时被删除，等于
+    容量在用户不知情的情况下被重置成了模板的默认值。
+
+    PVE 的卷**只能增不能减**：目标比模板还小（用户当年就是从更小的模板扩上去的，
+    或者模板后来变大了）时保持模板尺寸，只记一条说明，不报错。
+    """
+    if not target_gb or target_gb <= 0:
+        return None
+    current = await _disk_gb(client, node, vmid, disk_key)
+    if current is None:
+        record(
+            "校验系统盘容量",
+            False,
+            f"读不到新系统盘容量（应为 {target_gb:g}G），请人工确认",
+        )
+        return None
+    if current + 0.01 >= target_gb:
+        record("校验系统盘容量", True, f"{current:g}G，与原规格一致")
+        return current
+
+    try:
+        await _wait(
+            client,
+            await client.qemu_resize(node, vmid, disk_key, f"{target_gb:g}G"),
+            timeout=600,
+        )
+    except ProxmoxError as exc:
+        record(
+            "恢复系统盘容量",
+            False,
+            f"{current:g}G → {target_gb:g}G 失败：{exc.message}（请手工扩容）",
+        )
+        return current
+
+    after = await _disk_gb(client, node, vmid, disk_key)
+    if after is not None and after + 0.01 >= target_gb:
+        record("恢复系统盘容量", True, f"{current:g}G → {after:g}G（与原规格一致）")
+    else:
+        record(
+            "恢复系统盘容量",
+            False,
+            f"{current:g}G → {after if after is not None else '未知'}G，"
+            f"与原始规格 {target_gb:g}G 不一致，请人工确认",
+        )
+    return after
 
 
 async def _delete_volume(client: Any, node: str, volid: str) -> Tuple[bool, str]:
@@ -352,6 +443,28 @@ def firmware_overrides(old_config: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+async def _check_bridge(client: Any, node: str, bridge: str) -> None:
+    """确认节点上确实有这个网桥。
+
+    写一个不存在的网桥名，PVE 会照单全收，客户机重启后就再也没有网络 —— 而这时
+    系统盘已经换好，用户只能进控制台手工救。读不到接口列表（权限 / 网络抖动）
+    时放行：不能因为校验本身失败而让重装卡死。
+    """
+    try:
+        interfaces = await client.get(f"/nodes/{node}/network")
+    except ProxmoxError:
+        return
+    if not isinstance(interfaces, list):
+        return
+    names = {
+        str(item.get("iface") or "")
+        for item in interfaces
+        if isinstance(item, dict)
+    }
+    if bridge and bridge not in names:
+        raise ReinstallError(f"节点 {node} 上没有名为 {bridge} 的网络接口")
+
+
 async def _apply_cloudinit(
     client: Any,
     *,
@@ -365,6 +478,8 @@ async def _apply_cloudinit(
     ip: Optional[str],
     gateway: Optional[str],
     dns: Optional[str],
+    bridge: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
     record: Callable[[str, bool, str], None],
 ) -> None:
     """把账号 / 网络 / 主机名写进 cloud-init。两条重装路线都要走这一步。"""
@@ -372,6 +487,9 @@ async def _apply_cloudinit(
     if hostname:
         # PVE 的 cloud-init 用虚拟机名做客户机 hostname，没有独立的 hostname 参数
         ci["name"] = hostname
+    if bridge:
+        # 网桥与地址模式无关：选 DHCP 也要能指定「DHCP 请求走哪个桥」
+        ci.update(vmconfig.override_bridge(config or {}, bridge))
     if ci_user:
         ci["ciuser"] = ci_user
     if ci_password:
@@ -439,11 +557,13 @@ async def _reclone(
     *,
     node: str,
     vmid: int,
+    connection: str,
     old_config: Dict[str, Any],
     old_name: str,
     template_node: str,
     template_vmid: int,
     target_storage: str,
+    disk_gb: Optional[float],
     hostname: Optional[str],
     ci_user: Optional[str],
     ci_password: Optional[str],
@@ -452,6 +572,7 @@ async def _reclone(
     ip: Optional[str],
     gateway: Optional[str],
     dns: Optional[str],
+    bridge: Optional[str] = None,
     start: bool,
     record: Callable[[str, bool, str], None],
 ) -> Dict[str, Any]:
@@ -479,6 +600,11 @@ async def _reclone(
             f"删除旧机器失败：{exc.message}。这台机器还没有被动过。"
         ) from exc
     record("删除旧机器", True, f"{node}/{vmid}（旧磁盘一并清除）")
+
+    # IP 缓存必须立刻清掉：落库表按「连接 + 节点 + VMID」索引，而重装的 VMID
+    # 不变 —— 不清的话，页面会在最长 15 分钟里继续显示**旧系统的地址**，与重装后
+    # 客户机真实拿到的地址对不上。内存缓存（60 秒）同理。
+    await guestip.forget(connection, node, vmid, "qemu")
 
     # 等配置文件真的消失再克隆：DELETE 只是「已受理」，收尾还要一会儿，
     # 而这期间克隆会直接失败 —— 那一刻机器已经没了，绝不能卡在这儿
@@ -557,6 +683,21 @@ async def _reclone(
                     f"以下项需要更高权限，没能恢复：{'、'.join(bad_keys)}（{detail}）",
                 )
 
+    # ---- 3b. 系统盘容量：克隆体只有模板的尺寸，恢复成重装前的规格 ------
+    #
+    # 这一步必须在**启动之前**：客户机带着一块 20G 的系统盘起来，分区表与
+    # cloud-init 的 growpart 都会按 20G 落定，事后再扩就是另一套麻烦。
+    new_config = await client.get(f"/nodes/{node}/qemu/{vmid}/config") or {}
+    new_key, new_volid = boot_disk(new_config)
+    disk_after = await _restore_disk_size(
+        client,
+        node=node,
+        vmid=vmid,
+        disk_key=new_key or old_key,
+        target_gb=disk_gb,
+        record=record,
+    )
+
     # ---- 4. cloud-init 与启动 -----------------------------------------
     await _apply_cloudinit(
         client,
@@ -570,13 +711,13 @@ async def _reclone(
         ip=ip,
         gateway=gateway,
         dns=dns,
+        bridge=bridge,
+        config=old_config,
         record=record,
     )
     if start:
         await _start_guest(client, node=node, vmid=vmid, record=record)
 
-    new_config = await client.get(f"/nodes/{node}/qemu/{vmid}/config") or {}
-    new_key, new_volid = boot_disk(new_config)
     return {
         "node": node,
         "vmid": vmid,
@@ -584,6 +725,7 @@ async def _reclone(
         "old_volume": old_volid,
         "new_volume": new_volid,
         "system_disk": new_key or old_key,
+        "disk_gb": disk_after,
         "steps": [],
     }
 
@@ -722,6 +864,120 @@ async def _linked_clone_disk(
                 )
 
 
+def _pool_scope(config: Dict[str, Any]) -> "ippool.PoolScope":
+    """从原机器的网卡配置推出「这张网卡落在哪个二层网络」。
+
+    重装要沿用 / 重新分配地址时，池的匹配条件（网桥 / VLAN）必须来自机器本身 ——
+    拿不到就按「不限」处理，与创建路径同一套规则。
+    """
+    try:
+        networks = vmconfig.parse_config_networks(config)
+    except Exception:  # noqa: BLE001 - 解析不了就按不限处理，不阻断重装
+        networks = []
+    if not networks:
+        return ippool.PoolScope()
+    first = networks[0]
+    try:
+        vlan = int(str(first.get("tag")).strip())
+        if not 1 <= vlan <= 4094:
+            vlan = None
+    except (TypeError, ValueError):
+        vlan = None
+    return ippool.PoolScope(bridge=str(first.get("bridge") or ""), vlan=vlan)
+
+
+async def _plan_network(
+    client: Any,
+    *,
+    vmid: int,
+    node: str,
+    connection: str,
+    owner_scope: Optional[str],
+    config: Dict[str, Any],
+    ip_mode: str,
+    ip: Optional[str],
+    gateway: Optional[str],
+    record: Callable[[str, bool, str], None],
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """决定重装后这张网卡用什么地址，并保证它**来自地址池**。
+
+    重装原来是「向导里选 DHCP 就下发 DHCP」，与创建路径的处理完全不同：创建时
+    ``ip=dhcp`` 会被换成池里的一个静态地址，重装却真的让客户机去问外部 DHCP ——
+    拿到的地址既不在池里、面板也不知道，于是「平台显示的 IP 和机器里实际用的 IP」
+    从重装那一刻起就分叉了。这里把重装拉回与创建同一套语义：
+
+    1. 用户明确填了静态地址：必须属于某个**可见且适用**的池，否则拒绝 —— 允许填
+       池外地址等于允许制造一条池永远对不上的记录；
+    2. 否则优先**沿用原机器在用的池内地址**（重装换的是系统盘，不是网络身份）；
+    3. 原地址不在池里 / 已被别人登记：从池里重新分配一个；
+    4. 环境里根本没有池：维持调用方给的参数（存量兼容，外部 DHCP 仍是唯一选择）。
+
+    返回 ``(ip_mode, ip, gateway)``，供 :func:`_ip_config` 直接使用。
+    """
+    pools = await ippool.load_pools()
+    if not pools:
+        return ip_mode, ip, gateway
+
+    if ip_mode == "static" and ip:
+        pool = ippool.find_pool_for_ip(
+            pools,
+            ip,
+            node=node,
+            connection_id=connection,
+            owner_scope=owner_scope,
+        )
+        if pool is None:
+            raise ReinstallError(
+                f"地址 {ip} 不在任何可用的 IP 地址池里。重装后它不会出现在池的占用表里，"
+                "下一次分配可能把同一个地址发给别的机器 —— 请从地址池里选一个地址，"
+                "或把网络方式改成「自动分配」。"
+            )
+        allocation = ippool.allocation_for(pool, ip)
+        if not await ippool.claim(
+            allocation, connection_id=connection, node=node, vmid=vmid
+        ):
+            raise ReinstallError(
+                f"地址 {allocation.ip} 已经被另一台机器登记占用，请换一个地址或改用自动分配。"
+            )
+        record("确认静态地址", True, f"{allocation.ip}（地址池 {allocation.pool_name or allocation.pool_id}）")
+        return "static", allocation.cidr, gateway or allocation.gateway
+
+    old_ip = guestip.static_ip_from_config(config)
+    if old_ip:
+        pool = ippool.find_pool_for_ip(
+            pools,
+            old_ip,
+            node=node,
+            connection_id=connection,
+            owner_scope=owner_scope,
+        )
+        if pool is not None:
+            allocation = ippool.allocation_for(pool, old_ip)
+            if await ippool.claim(
+                allocation, connection_id=connection, node=node, vmid=vmid
+            ):
+                record("沿用原地址", True, f"{allocation.ip}（地址池 {allocation.pool_name or allocation.pool_id}）")
+                return "static", allocation.cidr, gateway or allocation.gateway
+            record("沿用原地址", False, f"{allocation.ip} 已被其它机器登记，改从池里重新分配")
+
+    try:
+        picks = await ippool.allocate(
+            [_pool_scope(config)],
+            owner_scope=owner_scope,
+            node=node,
+            connection_id=connection,
+            vmid=vmid,
+            guest_type="qemu",
+        )
+    except ippool.PoolExhausted as exc:
+        raise ReinstallError(str(exc)) from exc
+    pick = picks[0] if picks else None
+    if pick is not None:
+        record("分配地址", True, f"{pick.ip}（地址池 {pick.pool_name or pick.pool_id}）")
+        return "static", pick.cidr, gateway or pick.gateway
+    return ip_mode, ip, gateway
+
+
 def _ip_config(
     ip_mode: str,
     ip: Optional[str],
@@ -747,6 +1003,8 @@ async def reinstall(
     template_node: str,
     template_vmid: int,
     target_storage: str,
+    connection: str = "",
+    owner_scope: Optional[str] = None,
     hostname: Optional[str] = None,
     ci_user: Optional[str] = None,
     ci_password: Optional[str] = None,
@@ -755,6 +1013,7 @@ async def reinstall(
     ip: Optional[str] = None,
     gateway: Optional[str] = None,
     dns: Optional[str] = None,
+    bridge: Optional[str] = None,
     start: bool = False,
     wipe_data_disks: bool = True,
     on_step: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -807,6 +1066,39 @@ async def reinstall(
     if not old_key:
         raise ReinstallError("这台虚拟机当前没有系统盘，请改用「新建」或「导入」")
 
+    # ---- 2b. 网桥：静态与 DHCP 都允许改，改之前先确认它真的存在 --------
+    if bridge:
+        await _check_bridge(client, node, bridge)
+        record("确认网桥", True, bridge)
+
+    # ---- 3a. 锁定原系统盘容量 -----------------------------------------
+    # 重装默认用模板的系统盘整块替换（模板常见 20G），而旧盘可能是 100G。这个
+    # 数字必须在**删除任何东西之前**读出来：机器一删，旧盘的 size 就无处可查，
+    # 之后只能任由模板的默认值把用户的机器缩回去。
+    original_disk_gb = await _disk_gb(client, node, vmid, old_key)
+    if original_disk_gb is not None:
+        record("记录系统盘容量", True, f"{original_disk_gb:g}G（重装后按此校验）")
+    else:
+        record("记录系统盘容量", False, "读不到原系统盘容量，重装后无法核对（将按模板尺寸）")
+
+    # ---- 3b. 网络：锁定重装后要用的地址 -------------------------------
+    # 先把本机旧的分配登记摘掉：登记表以「地址」为主键，留着它会挡住下面
+    # 「沿用原地址」的登记（INSERT 撞主键），旧地址也会白占一个保鲜期。
+    # 扫描仍然能从配置里看到它，所以这一瞬间不会有别的机器抢走它。
+    await ippool.release_guest(connection, node, vmid)
+    ip_mode, ip, gateway = await _plan_network(
+        client,
+        vmid=vmid,
+        node=node,
+        connection=connection,
+        owner_scope=owner_scope,
+        config=config,
+        ip_mode=ip_mode,
+        ip=ip,
+        gateway=gateway,
+        record=record,
+    )
+
     # ---- 4a. 默认路线：删掉这台机器，用同一个 VMID 链接克隆回来 --------
     #
     # 链接克隆要求卷「生来就属于这台机器」，而 PVE 只在自己克隆新机器时才这么干，
@@ -820,11 +1112,13 @@ async def reinstall(
             client,
             node=node,
             vmid=vmid,
+            connection=connection,
             old_config=config,
             old_name=str(config.get("name") or f"VM {vmid}"),
             template_node=template_node,
             template_vmid=template_vmid,
             target_storage=target_storage,
+            disk_gb=original_disk_gb,
             hostname=hostname,
             ci_user=ci_user,
             ci_password=ci_password,
@@ -833,6 +1127,7 @@ async def reinstall(
             ip=ip,
             gateway=gateway,
             dns=dns,
+            bridge=bridge,
             start=start,
             record=record,
         )
@@ -910,6 +1205,16 @@ async def reinstall(
         ) from exc
     record("切换系统盘", True, f"{old_key} → {new_volid}")
 
+    # ---- 5b. 系统盘容量：复制过来的是模板尺寸，恢复到重装前 -----------
+    disk_after = await _restore_disk_size(
+        client,
+        node=node,
+        vmid=vmid,
+        disk_key=old_key,
+        target_gb=original_disk_gb,
+        record=record,
+    )
+
     # ---- 6. 旧盘：连卷一起删除 ---------------------------------------
     # 刻意不给「保留旧盘以便回滚」这个选项：用户真正想回滚的场景只有「刚装完
     # 发现参数填错了」，而那再做一次重装就够了；反过来说，留一块几十 GB 的
@@ -944,12 +1249,19 @@ async def reinstall(
         ip=ip,
         gateway=gateway,
         dns=dns,
+        bridge=bridge,
+        config=config,
         record=record,
     )
 
     # ---- 8. 可选启动 --------------------------------------------------
     if start:
         await _start_guest(client, node=node, vmid=vmid, record=record)
+
+    # 系统盘换了，客户机的地址也可能跟着变（新的 cloud-init 配置要等它起来才
+    # 生效）。把 IP 缓存清掉，让列表在它启动后重新解析**实际**地址，而不是继续
+    # 挂着旧系统那一份。
+    await guestip.forget(connection, node, vmid, "qemu")
 
     return {
         "node": node,
@@ -958,6 +1270,8 @@ async def reinstall(
         "old_volume": old_volid,
         "new_volume": new_volid,
         "system_disk": old_key,
+        "disk_gb": disk_after,
+        "ip": ip or "",
         "steps": steps,
     }
 
@@ -1004,6 +1318,9 @@ class ReinstallJob:
         self.steps: List[Dict[str, Any]] = []
         self.old_volume = ""
         self.new_volume = ""
+        #: 重装后的系统盘容量（GB）与重装后的地址 —— 界面据此核对「规格没被重置」
+        self.disk_gb: Optional[float] = None
+        self.ip = ""
         self.created = time.time()
         self.finished = 0.0
         self.task: Optional[asyncio.Task[Any]] = None
@@ -1029,6 +1346,8 @@ class ReinstallJob:
             "steps": self.steps,
             "old_volume": self.old_volume,
             "new_volume": self.new_volume,
+            "disk_gb": self.disk_gb,
+            "ip": self.ip,
             "created": self.created,
             "finished": self.finished,
         }
@@ -1069,6 +1388,7 @@ async def start_reinstall(
     template_node: str,
     template_vmid: int,
     target_storage: str,
+    owner_scope: Optional[str] = None,
     hostname: Optional[str] = None,
     ci_user: Optional[str] = None,
     ci_password: Optional[str] = None,
@@ -1077,6 +1397,7 @@ async def start_reinstall(
     ip: Optional[str] = None,
     gateway: Optional[str] = None,
     dns: Optional[str] = None,
+    bridge: Optional[str] = None,
     start: bool = False,
     wipe_data_disks: bool = True,
 ) -> ReinstallJob:
@@ -1126,6 +1447,10 @@ async def start_reinstall(
         "template_node": template_node,
         "template_vmid": template_vmid,
         "target_storage": target_storage,
+        # 后台协程里没有请求上下文，连接 id 必须在这里就定下来（同 job.connection）
+        "connection": connection,
+        # 地址池的可见范围：普通用户只能用分配给自己的池，管理员不受限（None）
+        "owner_scope": owner_scope,
         "hostname": hostname,
         "ci_user": ci_user,
         "ci_password": ci_password,
@@ -1134,6 +1459,8 @@ async def start_reinstall(
         "ip": ip,
         "gateway": gateway,
         "dns": dns,
+        # 空 = 沿用原网卡所在的桥（静态 / DHCP 都不影响这个选择）
+        "bridge": bridge or None,
         "start": start,
         "wipe_data_disks": wipe_data_disks,
     }
@@ -1168,10 +1495,21 @@ async def _run_reinstall(job: ReinstallJob, kwargs: Dict[str, Any]) -> None:
         job.status = "success"
         job.old_volume = str(result.get("old_volume") or "")
         job.new_volume = str(result.get("new_volume") or "")
+        disk_gb = result.get("disk_gb")
+        job.disk_gb = float(disk_gb) if isinstance(disk_gb, (int, float)) else None
+        job.ip = str(result.get("ip") or "")
         job.detail = job.new_volume
     finally:
         job.finished = time.time()
         job.stage = ""
+        # 旧机器已经删掉、重装又失败了：这台机器不存在了，池里那条分配登记不能
+        # 继续占着地址 —— 否则要等 15 分钟保鲜期才回池，用户立刻重试时会被分到
+        # 另一个地址，看起来像「重装把 IP 弄丢了」。
+        if job.status != "success" and any(
+            str(item.get("step")) == "删除旧机器" and item.get("ok")
+            for item in job.steps
+        ):
+            await ippool.release_guest(job.connection, job.node, job.vmid)
         # 结束的审计只能在这里写：提交那一条记的是「提交了」，而用户最关心的
         # 「到底换成功没有」发生在请求之外。没有 request 就没有客户端地址。
         await security.audit(

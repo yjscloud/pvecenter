@@ -799,6 +799,10 @@ class PoolScope:
 
     bridge: str = ""
     vlan: Optional[int] = None
+    #: 用户选定的池 id。非空时**只从这个池**分配（仍需满足 bridge / VLAN /
+    #: 节点 / 连接适用性）：多个池共享同一网桥与 VLAN 时，按网桥匹配会永远取
+    #: 配置顺序里的第一个，用户的「选测试网」就失效了。
+    pool_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -846,6 +850,205 @@ def pool_free(pool: Dict[str, Any], used: Dict[str, str]) -> List[str]:
             free.append(s)
         cur += 1
     return free
+
+
+def pool_contains(pool: Dict[str, Any], ip: str) -> bool:
+    """这个地址是不是**落在池的范围内**（subnet 内、且在 start~end 之间）。
+
+    只判范围，不看占用 —— 「这个地址归不归这个池管」与「现在有没有人用」是两件事。
+    重装要沿用原地址时必须先过这一关：原地址可能是当年手工填的、早就不在任何池里，
+    那样沿用下去，面板上「池内地址」与机器实际地址就永远对不上。
+    """
+    value = _ip_only(str(ip or ""))
+    if not value:
+        return False
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    try:
+        net = ipaddress.ip_network(str(pool.get("subnet") or "").strip(), strict=False)
+    except ValueError:
+        return False
+    if addr.version != net.version or addr not in net:
+        return False
+    gateway = _ip_only(str(pool.get("gateway") or ""))
+    if gateway and value == gateway:
+        return False
+    try:
+        lo = ipaddress.ip_address(str(pool.get("start") or "").strip()) if pool.get("start") else None
+        hi = ipaddress.ip_address(str(pool.get("end") or "").strip()) if pool.get("end") else None
+    except ValueError:
+        return False
+    if lo is not None and int(addr) < int(lo):
+        return False
+    if hi is not None and int(addr) > int(hi):
+        return False
+    return True
+
+
+def pool_covers(pool: Dict[str, Any], ip: str) -> bool:
+    """这个地址是不是**属于这个池管的那张网**（展示用，比 :func:`pool_contains` 宽松）。
+
+    两者回答的是不同问题，不能混用：
+
+    * :func:`pool_contains` —— 「这个地址能不能登记成池的占用」。要求落在
+      ``start~end`` 这段**可分配**区间里，且不是网关；重装沿用原地址靠它把关。
+    * :func:`pool_covers` —— 「这台机器用的地址是不是池这张网里的」。只看子网。
+
+    区别在列表上就是一次误报：用户手工在池的子网里挑了一个区间外的固定地址
+    （网关旁边、留给打印机 / 存储的号段，都是常见做法），严格判断会把它标成
+    「池外」，而它明明就在池管的这张网里 —— 面板看起来像判断错了。
+    没有 subnet 的池退回用 start~end 兜底，总比一律判「池外」强。
+    """
+    value = _ip_only(str(ip or ""))
+    if not value:
+        return False
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+
+    subnet = str(pool.get("subnet") or "").strip()
+    if subnet:
+        try:
+            net = ipaddress.ip_network(subnet, strict=False)
+        except ValueError:
+            net = None
+        if net is not None:
+            return addr.version == net.version and addr in net
+
+    try:
+        lo = (
+            ipaddress.ip_address(str(pool.get("start") or "").strip())
+            if pool.get("start")
+            else None
+        )
+        hi = (
+            ipaddress.ip_address(str(pool.get("end") or "").strip())
+            if pool.get("end")
+            else None
+        )
+    except ValueError:
+        return False
+    if lo is None and hi is None:
+        return False
+    if lo is not None and int(addr) < int(lo):
+        return False
+    if hi is not None and int(addr) > int(hi):
+        return False
+    return True
+
+
+def pool_name_for_ip(
+    pools: Sequence[Dict[str, Any]], ip: str
+) -> Optional[str]:
+    """这个地址属于哪张网 —— 返回地址池名，供列表的「网络」一列展示。
+
+    刻意与 :func:`find_pool_for_ip` 分开：那边是「能不能把这个地址登记成占用」，
+    用严格的 ``pool_contains`` 且按用户过滤；这里是只读展示，最终兜底用宽松的
+    :func:`pool_covers`（只看子网），保证与列表里的 ``ip_in_pool`` 口径一致 ——
+    标着「池内」的行网络列一定有名字，不会自相矛盾。
+
+    不做 owner / 节点 / 连接过滤：``GET /ip-pools`` 会按用户裁剪可见池，普通用户
+    看不到公共池，但这里后端拿的是全量池，只读展示不该因为权限漏掉网络名。
+
+    匹配分两步：
+
+    1. **地址落在某个池的显式区间里**（声明了 ``start``/``end`` 且命中
+       ``pool_contains``）就显示那个池 —— 多个池共享同一子网、各管一段区间
+       （业务网 / 测试网挂同一个 vmbr0）是常见配置，只看子网永远分不出归属，
+       列表会整列标成配置顺序第一个池的名字。只认**显式区间**：没写 start/end
+       的池视作「整个子网」，放进第一步会把重叠子网里本属于区间更具体那个池
+       的地址抢走。
+    2. **区间都对不上再退回子网** —— 用户手工挑的区间外地址（网关旁边留给
+       打印机 / 存储的号段）也该显示它所在那张网的名字，这正是 ``ip_in_pool``
+       的口径；此时多个池仍可能同时覆盖，按 :func:`_rank` 取最具体的。
+    """
+    value = _ip_only(str(ip or ""))
+    if not value:
+        return None
+
+    def _name(pool: Dict[str, Any]) -> Optional[str]:
+        return str(pool.get("name") or pool.get("id") or "").strip() or None
+
+    exact = [
+        pool
+        for pool in (pools or [])
+        if (pool.get("start") or pool.get("end"))
+        and pool_contains(pool, value)
+    ]
+    if exact:
+        exact.sort(key=_rank)
+        return _name(exact[0])
+
+    matches = [pool for pool in (pools or []) if pool_covers(pool, value)]
+    if not matches:
+        return None
+    matches.sort(key=_rank)
+    return _name(matches[0])
+
+
+def find_pool_for_ip(
+    pools: Sequence[Dict[str, Any]],
+    ip: str,
+    *,
+    node: str = "",
+    connection_id: str = "",
+    owner_scope: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """地址所属、且对当前用户可见、并且适用于这台机器的那个池。
+
+    找不到就是 ``None`` —— 调用方据此决定「沿用不了，得重新分配」或「明确拒绝」。
+    多个池都包含它时按 :func:`_rank` 取最具体的那个（与自动分配同一套优先级）。
+    """
+    value = _ip_only(str(ip or ""))
+    if not value:
+        return None
+    matches: List[Dict[str, Any]] = []
+    for pool in pools or []:
+        if owner_scope is not None and not visible_to(pool, owner_scope):
+            continue
+        if not pool_contains(pool, value):
+            continue
+        # 节点 / 连接是「这个池能不能用在这里」，不是「地址归不归这个池」。
+        # 这里放宽：地址确实在范围内就算，避免因为池上没写 nodes 而误判。
+        pool_nodes = pool.get("nodes") or []
+        if node and isinstance(pool_nodes, list) and pool_nodes and node not in pool_nodes:
+            continue
+        pool_conns = pool.get("connections") or []
+        if (
+            connection_id
+            and isinstance(pool_conns, list)
+            and pool_conns
+            and connection_id not in pool_conns
+        ):
+            continue
+        matches.append(pool)
+    if not matches:
+        return None
+    matches.sort(key=_rank)
+    return matches[0]
+
+
+def allocation_for(
+    pool: Dict[str, Any], ip: str
+) -> Allocation:
+    """把一个池内的既有地址包成 :class:`Allocation`（重装沿用原地址时用）。"""
+    value = _ip_only(ip)
+    try:
+        prefix = str(
+            ipaddress.ip_network(str(pool.get("subnet") or ""), strict=False).prefixlen
+        )
+    except ValueError:
+        prefix = "24"
+    return Allocation(
+        ip=value,
+        cidr=f"{value}/{prefix}",
+        gateway=_ip_only(str(pool.get("gateway") or "")),
+        pool_id=str(pool.get("id") or ""),
+        pool_name=str(pool.get("name") or ""),
+    )
 
 
 def pool_fits(
@@ -911,6 +1114,11 @@ def _candidates(
     out = []
     for pool in pools:
         if owner_scope is not None and not visible_to(pool, owner_scope):
+            continue
+        # 用户指定了池：只认这一个。它仍得能装进这张网卡（bridge / VLAN 匹配），
+        # 匹配不上宁可返回空、保持 DHCP，也不要静默回退到别的池 —— 那正是
+        # 「选了测试网、却下发成业务网」的来源。
+        if scope.pool_id and str(pool.get("id") or "") != scope.pool_id:
             continue
         if pool_fits(pool, scope, node=node, connection_id=connection_id):
             out.append(pool)
@@ -1007,3 +1215,22 @@ async def allocate(
                 )
             reserved.append(pick)
         return picks
+
+
+async def claim(
+    allocation: Allocation,
+    *,
+    connection_id: str,
+    node: str,
+    vmid: int,
+) -> bool:
+    """把一个**已确定**的地址登记为占用（重装沿用原池地址时用）。
+
+    与 :func:`allocate` 的区别：地址不是挑出来的，而是调用方指定的。返回 ``False``
+    表示这个地址正被**别的**登记占着 —— 调用方必须重新分配，绝不能让两台机器写
+    同一个地址。调用前应先 :func:`release_guest` 摘掉本机旧登记，否则本机上一次
+    的登记会把自己挡住（``INSERT`` 撞主键）。
+    """
+    return await _reserve(
+        allocation, connection_id=connection_id, node=node, vmid=vmid
+    )

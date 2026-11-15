@@ -17,7 +17,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .. import guestguard, ownership, reinstall, security, store
+from .. import guestguard, ownership, reinstall, security, store, vmconfig
 from ..vm_scope import bind_node_connection
 from ..pve import ProxmoxError, get_client, requested_connection
 from ..schemas import VmReinstallRequest
@@ -80,6 +80,11 @@ async def reinstall_network(
     dns = str(cfg.get("nameserver") or "").strip()
     if dns:
         result["dns"] = dns
+    # 网卡当前接在哪个桥：向导把这一项作为默认值，用户不动它就是「沿用原网桥」。
+    # 静态与 DHCP 都用同一张网卡，所以这个默认值与 ip_mode 无关。
+    networks = vmconfig.parse_config_networks(cfg)
+    if networks:
+        result["bridge"] = str(networks[0].get("bridge") or "")
     return result
 
 
@@ -119,6 +124,9 @@ async def reinstall_vm(
             template_node=payload.template_node,
             template_vmid=payload.template_vmid,
             target_storage=payload.target_storage,
+            # 地址池的可见范围：重装要沿用 / 重新分配池内地址，普通用户只能用
+            # 分给自己的池；管理员传 None（不限）。
+            owner_scope=security.visible_owner(user),
             hostname=payload.hostname or None,
             ci_user=payload.ci_user or None,
             ci_password=payload.ci_password or None,
@@ -127,6 +135,7 @@ async def reinstall_vm(
             ip=payload.ip or None,
             gateway=payload.gateway or None,
             dns=payload.dns or None,
+            bridge=payload.bridge or None,
             start=payload.start,
             wipe_data_disks=payload.wipe_data_disks,
         )

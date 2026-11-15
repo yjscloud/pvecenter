@@ -3821,6 +3821,16 @@ body.is-col-resizing * {
   justify-content: flex-end;
 }
 
+/* 状态单元格：状态徽章 +（任务进行中时）操作锁徽章。
+   允许换行而不是把锁裁掉 —— 列宽固定时「运行中 + 关机中」两个徽章放不下，
+   宁可多占一行，也不能让用户看不到「它正在关机」。 */
+.row-status {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
 /* 破坏性动作（删除）与普通动作拉开距离：图标按钮一个挨一个时，
    鼠标/手指很容易落错一格，而删除是不可撤销的 */
 .row-actions-split {

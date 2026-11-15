@@ -38,6 +38,7 @@ from ..formatters import (
     pve_flag,
 )
 from ..vm_scope import bind_vm_connection
+from .vm_meta import manual_ip_index
 from ..pve import (
     ProxmoxError,
     client_for_connection,
@@ -52,6 +53,7 @@ from ..pve import (
 from ..schemas import (
     BulkRequest,
     CloneRequest,
+    CloudInitSpec,
     GuestPasswordRequest,
     IpConfigRequest,
     MigrateRequest,
@@ -154,14 +156,34 @@ def _raise(exc: ProxmoxError) -> None:
     )
 
 
+#: 存储清单（名 → 类型）的缓存时长。建机只是拿它决定 ``format=`` 怎么拼，
+#: 存储的增删是低频操作，30 秒的陈旧度无害；而每建一台机器都打一次
+#: ``/nodes/{node}/storage``，批量下发 N 台就是 N 次多余的往返。
+STORAGE_TYPES_TTL = 30.0
+
+
 async def _storage_type_map(node: str) -> Dict[str, str]:
     """Map storage name -> PVE type, used to normalise disk formats."""
-    client = get_client()
+
+    async def _load() -> Dict[str, str]:
+        storages = await get_client().storages(node)
+        return {
+            s.get("storage", ""): s.get("type", "")
+            for s in storages
+            if s.get("storage")
+        }
+
+    # 连接也要进 key：不同 PVE 上同名节点的存储类型可以完全不同。
     try:
-        storages = await client.storages(node)
+        return await pvecache.cached(
+            f"vms:storage-types:{_op_connection()}:{node}",
+            STORAGE_TYPES_TTL,
+            _load,
+        )
     except ProxmoxError:
+        # 读不到就按「不认识这些存储」处理（与原实现的空表语义一致），且**不写
+        # 缓存** —— 否则 PVE 抖一下，接下来 30 秒内的建机都会把 qcow2 拼成 raw。
         return {}
-    return {s.get("storage", ""): s.get("type", "") for s in storages if s.get("storage")}
 
 
 # =============================================================== read paths
@@ -219,6 +241,13 @@ async def collect_vms(
         (client.cluster_resources("vm") for _profile, client in targets),
         limit=max(1, len(targets)),
     )
+
+    # 地址池范围只读一次：下面每行都要判断「这个 IP 是不是来自平台地址池」。
+    pools = await ippool.load_pools()
+    # 手动备注的 IP（面板侧补充）：自动解析不到地址时用它算「网络」归属。
+    # 可见性与 GET /vm-meta 一致 —— 普通用户只看自己填的，不会拿别人的手动
+    # 地址当自己的数据去推池名。
+    manual_ips = await manual_ip_index(user) if with_ip else {}
 
     for (profile, client), resources in zip(targets, resources_list):
         if isinstance(resources, BaseException):
@@ -292,6 +321,34 @@ async def collect_vms(
             resolved = await guestip.resolve_batch(client, items, limit=12)
             for item, ip in zip(items, resolved):
                 item["ip"] = ip
+                # 这个地址归不归平台地址池管：页面据此把「不在池里的地址」标出来。
+                # 它同时覆盖两种偏离 —— 客户机没吃到 cloud-init、自己从外部 DHCP
+                # 拿了地址；以及有人在客户机里手工改过 IP。页面照实显示实际地址，
+                # 但不加区分地显示会让人以为「这台机器用的是池里的地址」。
+                # 判定用 pool_covers（只看子网）：手工在池的子网里挑一个区间外的
+                # 固定地址是正常运维做法，按可分配区间判会把它误标成「池外」。
+                # 环境里一个池都没配、或这台机器没解析到地址，都给 None（不适用）——
+                # False 的含义是「有一个地址，但它不在池里」，别让空值冒充它。
+                item["ip_in_pool"] = (
+                    None
+                    if not pools or not ip
+                    else any(ippool.pool_covers(pool, ip) for pool in pools)
+                )
+                # 「网络」列：把「池内」细化成具体池名。同一个 pool_covers 口径，
+                # 所以上面为 true 时这里一定有值，不会出现互相打架的两列。
+                # 自动地址解析不到时，退而用手动备注的地址判网络归属 —— 用户手动
+                # 填的那份也想知道它在哪张网里。但 ip_in_pool（池外徽标）仍只描述
+                # 自动识别到的地址，两者别混。
+                manual_ip = manual_ips.get(
+                    (
+                        str(item.get("connection_id") or ""),
+                        str(item.get("node") or ""),
+                        int(item.get("vmid") or 0),
+                    ),
+                    "",
+                )
+                effective = ip or manual_ip
+                item["ip_pool_name"] = ippool.pool_name_for_ip(pools, effective)
 
         # 创建时间：缓存里没有的逐台读一次 config（每台一次请求 + 进程内缓存，
         # 一轮有预算上限），取不到就留空 —— 它不比 IP 重要，不值得拖慢列表。
@@ -1087,9 +1144,37 @@ async def _assign_dhcp_ips(
 
     返回本次真正分配出去的地址，供调用方在创建失败时释放。
     """
-    ci = payload.cloudinit
-    if not ci or not ci.enabled or payload.template_mode:
+    if payload.template_mode:
         return []
+
+    # 克隆体会**整体继承**模板的 ``ipconfigN``。模板里若写的是静态地址，每一个
+    # 克隆体都会拿到同一个 IP —— 下发出来立刻撞地址，而列表上还显示得好好的
+    # （配置里确实是这个地址）。所以哪怕调用方没启用 cloud-init 覆盖，只要源机器
+    # 带静态地址，也必须重新分配。
+    source_cfg: Dict[str, Any] = {}
+    if payload.clone_from:
+        try:
+            source_cfg = await client.qemu_config(
+                payload.clone_from.node, int(payload.clone_from.vmid)
+            ) or {}
+        except Exception:  # noqa: BLE001 - 读不到就按「没有继承地址」处理
+            source_cfg = {}
+
+    ci = payload.cloudinit
+    if ci is None or not ci.enabled:
+        inherited = ippool.config_ips(source_cfg)
+        if not inherited:
+            return []
+        logger.info(
+            "克隆源 %s/%s 带静态地址 %s：为 %s/%s 重新分配，避免克隆体撞地址",
+            payload.clone_from.node,
+            payload.clone_from.vmid,
+            ",".join(inherited),
+            payload.node,
+            vmid,
+        )
+        ci = CloudInitSpec(enabled=True)
+        payload.cloudinit = ci
 
     networks = list(payload.networks or [])
     entries = list(ci.ip_configs or [])
@@ -1100,7 +1185,11 @@ async def _assign_dhcp_ips(
         if index < len(networks):
             net = networks[index]
             scopes.append(
-                ippool.PoolScope(bridge=str(net.bridge or ""), vlan=net.vlan_tag)
+                ippool.PoolScope(
+                    bridge=str(net.bridge or ""),
+                    vlan=net.vlan_tag,
+                    pool_id=net.pool_id,
+                )
             )
         else:
             # 克隆模式下请求体里没有 networks：克隆体会继承模板的网卡，按源机
@@ -1108,12 +1197,6 @@ async def _assign_dhcp_ips(
             scopes.append(ippool.PoolScope())
 
     if not networks and payload.clone_from:
-        try:
-            source_cfg = await client.qemu_config(
-                payload.clone_from.node, int(payload.clone_from.vmid)
-            ) or {}
-        except Exception:  # noqa: BLE001 - 读不到就按「不限」处理
-            source_cfg = {}
         parsed = vmconfig.parse_config_networks(source_cfg)
         for index in range(min(count, len(parsed))):
             item = parsed[index]
@@ -1161,6 +1244,26 @@ async def _assign_dhcp_ips(
             ", ".join(item.cidr for item in assigned),
         )
     return assigned
+
+
+#: 后台通知任务的强引用集合。``asyncio`` 只持弱引用，未完成的 task 在事件循环
+#: 里有 GC 机会时可能被回收（官方文档明确要求调用方保存引用）。
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_deploy_notice(user: Dict[str, Any], info: Any) -> None:
+    """把「建好了，这是连接信息」的通知丢到后台执行。
+
+    为什么不在请求里等：``notify_deployed`` 除了写站内信，还会走**同步 SMTP**
+    发邮件（用户开了邮箱提醒时），最慢能到几秒 —— 那是创建响应里最不该出现的
+    阻塞点。通知是「尽力而为」：投递失败不影响机器本身，也不该让创建变慢。
+    """
+    try:
+        task = asyncio.create_task(guestnotify.notify_deployed(user, info))
+    except RuntimeError:  # pragma: no cover - 没有运行中的事件循环（如单测直接调用）
+        return
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
 async def _create_vm_core(
@@ -1224,6 +1327,16 @@ async def _create_vm_core(
         # 记下来。少了这一步，勾了「接入安全管控」的快速部署会静默失效。
         if payload.manage:
             await _enqueue_managed_registration(payload, vmid, user)
+        # 克隆体同样可能落在回收的 VMID 上：旧的 IP 记录若还留着（面板外删除、
+        # 面板重启之类会留下），列表会把上一台机器的地址贴到这台新机器上。
+        # 非克隆分支在建机末尾已经清过一次，这条路一直漏着 —— 而快速部署走的
+        # 正是克隆。克隆可以落到 target_node，缓存键带节点，必须按实际落点清。
+        await guestip.forget(
+            _op_connection(),
+            payload.clone_from.target_node or payload.clone_from.node,
+            vmid,
+            "qemu",
+        )
         return result
 
     # --- build config -------------------------------------------------
@@ -1252,21 +1365,24 @@ async def _create_vm_core(
 
     upid = result if isinstance(result, str) else (result or {}).get("task", "")
 
-    await security.audit(
-        request, user, "vm.create", target=f"{payload.node}/{vmid}",
-        detail=_audit_detail(config),
-    )
-
-    # 创建时间：面板自己记一份。PVE 的 meta.ctime 在建机瞬间可能还没写好（列表
+    # 审计与「创建时间」互不依赖，并发写掉：串行时是两次数据库往返，批量下发
+    # N 台就是 2N 次，而这段本来就在建机请求的关键路径上。
+    # 创建时间这份记录是必需的：PVE 的 meta.ctime 在建机瞬间可能还没写好（列表
     # 轮询先读到就会显示「没有创建时间」），克隆 / 恢复时又会被继承 —— 见
     # app/guest_created.py。这里记的是准确的建机时刻。
-    await guest_created.record(
-        _op_connection(),
-        payload.node,
-        vmid,
-        "qemu",
-        source="import" if import_disk else "create",
-        username=str(user.get("username") or ""),
+    await asyncio.gather(
+        security.audit(
+            request, user, "vm.create", target=f"{payload.node}/{vmid}",
+            detail=_audit_detail(config),
+        ),
+        guest_created.record(
+            _op_connection(),
+            payload.node,
+            vmid,
+            "qemu",
+            source="import" if import_disk else "create",
+            username=str(user.get("username") or ""),
+        ),
     )
 
     # --- post-create steps that must finish before the VM is usable ----
@@ -1298,22 +1414,30 @@ async def _create_vm_core(
                 detail=f"虚拟机 {vmid} 已创建，但转换为模板失败：{exc.message}",
             ) from exc
 
-    # 记录归属：普通用户只能看到自己创建的虚拟机
-    await ownership.set_owner(
-        ownership.KIND_VM,
-        ownership.vm_ref(_op_connection(), payload.node, vmid),
-        str(user.get("username") or ""),
-    )
-
-    # 勾了「接入安全管控」：登记成受管主机。此刻只写一条记录、指纹留空 ——
+    # 记录归属（普通用户只能看到自己创建的虚拟机）+ 勾了「接入安全管控」时的
+    # 受管主机登记：两者互不依赖，并发写。后者此刻只写一条记录、指纹留空 ——
     # 机器还在 cloud-init 阶段，等后台巡检连上后自动采纳（见 adopt_panel_hosts）。
+    tail: List[Any] = [
+        ownership.set_owner(
+            ownership.KIND_VM,
+            ownership.vm_ref(_op_connection(), payload.node, vmid),
+            str(user.get("username") or ""),
+        )
+    ]
     if payload.manage:
-        await _enqueue_managed_registration(payload, vmid, user)
+        tail.append(_enqueue_managed_registration(payload, vmid, user))
+    await asyncio.gather(*tail)
+
+    # 新机器可能复用了回收的 VMID：旧的 IP 记录若还留着（面板外删除、面板重启
+    # 之类会留下），会贴到这台新机器上。清一次，让列表从这台机器自己的配置 /
+    # Agent 重新解析 —— 否则「刚建出来的机器显示着别人的地址」。
+    await guestip.forget(_op_connection(), payload.node, vmid, "qemu")
 
     # 下发通知：把「怎么连上它」告诉创建者（站内消息 + 他开了邮箱提醒就发邮件）。
-    # 放在**创建请求里**而不是等 PVE 任务跑完：用户要的就是「建完立刻拿到连接
-    # 信息」，等他去任务队列翻到成功、再回来找 IP 与口令，黄花菜都凉了。
-    await guestnotify.notify_deployed(
+    # **丢到后台**：邮件走同步 SMTP，最慢能拖上几秒，而它原来串在创建响应里 ——
+    # 用户点完「创建」要等邮件发完才看到结果。站内信仍然立刻可见（同一事件循环
+    # 里几十毫秒就写完），投递失败也不影响这次创建（notify_deployed 自己吞异常）。
+    _spawn_deploy_notice(
         user,
         guestnotify.from_vm_request(
             payload,
@@ -1548,6 +1672,13 @@ async def _create_from_clone(
             overrides[str(nic["interface"])] = ""
         for index, net in enumerate(payload.networks):
             overrides[f"net{index}"] = vmconfig.format_network_spec(net)
+    elif payload.bridge_override:
+        # 只换「接入哪个二层网络」：克隆体继承模板的 MAC / VLAN / 速率，仅替换
+        # bridge= 那一段。经典场景是把模板克隆到另一套网络里，DHCP 与静态地址
+        # 都要选桥，而整行重写会把 MAC 换掉（租约、端口安全全跟着失效）。
+        overrides.update(
+            vmconfig.override_bridge(current_config, payload.bridge_override)
+        )
     # NUMA 绑定与 CPU 亲和性是纯配置项，克隆出来的实例落在哪台宿主机上并不确定，
     # 必须能按实例重新指定。efidisk0 / tpmstate0 不在这里下发：它们会在目标存储上
     # 真的开卷，而 Win11 模板本身就该自带这两件套，克隆时已随模板继承。
@@ -1597,32 +1728,33 @@ async def _create_from_clone(
         except ProxmoxError:
             started = False
 
-    await security.audit(
-        request, user, "vm.clone",
-        target=f"{clone.node}/{clone.vmid} -> {target_node}/{vmid}",
-        detail=_audit_detail({**overrides, "started": started}),
-    )
-
+    # 审计 / 创建时间 / 归属三者互不依赖，并发写（串行时是三次数据库往返）。
     # 创建时间：**必须记面板这一份** —— PVE 克隆是整体复制模板的 config，
     # meta.ctime 也带过来了（实测克隆出来的机器显示的是模板的时间）。
-    await guest_created.record(
-        _op_connection(),
-        target_node,
-        vmid,
-        "qemu",
-        source="clone",
-        username=str(user.get("username") or ""),
+    await asyncio.gather(
+        security.audit(
+            request, user, "vm.clone",
+            target=f"{clone.node}/{clone.vmid} -> {target_node}/{vmid}",
+            detail=_audit_detail({**overrides, "started": started}),
+        ),
+        guest_created.record(
+            _op_connection(),
+            target_node,
+            vmid,
+            "qemu",
+            source="clone",
+            username=str(user.get("username") or ""),
+        ),
+        ownership.set_owner(
+            ownership.KIND_VM,
+            ownership.vm_ref(_op_connection(), target_node, vmid),
+            str(user.get("username") or ""),
+        ),
     )
 
-    # 记录归属：克隆出来的虚拟机同样归创建者所有
-    await ownership.set_owner(
-        ownership.KIND_VM,
-        ownership.vm_ref(_op_connection(), target_node, vmid),
-        str(user.get("username") or ""),
-    )
-
-    # 下发通知：快速部署走的正是这条路（链接克隆），通知里必须带上连接信息
-    await guestnotify.notify_deployed(
+    # 下发通知：快速部署走的正是这条路（链接克隆），通知里必须带上连接信息。
+    # 与全新创建那条路径一致，丢到后台（同步 SMTP 不该挡住创建响应）。
+    _spawn_deploy_notice(
         user,
         guestnotify.from_vm_request(
             payload,
@@ -2138,6 +2270,11 @@ async def set_ipconfig(
         result = await client.qemu_set_config(node, vmid, data)
     except ProxmoxError as exc:
         _raise(exc)
+
+    # 改了地址就把这台机器解析出来的 IP 作废：内存缓存 60 秒、落库 15 分钟，
+    # 不清的话列表会继续显示改之前的地址，用户会以为「改了没生效」。
+    if any(str(key).startswith("ipconfig") for key in data):
+        await guestip.forget(_op_connection(), node, vmid, "qemu")
 
     task = result if isinstance(result, str) else (result or {}).get("task", "")
     return {"task": task}

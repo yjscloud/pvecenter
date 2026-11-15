@@ -533,7 +533,8 @@ PVE 里把 PBS 注册成存储之后，存储页就会显示 PBS 徽标、最近
 | `PVE_TRUST_ENV` | `false` | 是否让请求走环境变量里的 `HTTP_PROXY` / `HTTPS_PROXY` |
 | `PVE_CONSOLE_USER` / `PVE_CONSOLE_PASSWORD` | 空 | 控制台用的 PVE 账号密码，留空则控制台不可用 |
 | `CORS_ORIGINS` | `http://localhost:5173` | 允许的前端来源，逗号分隔 |
-| `HTTP_TIMEOUT` / `TASK_POLL_INTERVAL` | `30` / `2` | PVE 请求超时（秒）与任务状态轮询间隔（秒） |
+| `HTTP_TIMEOUT` / `TASK_POLL_INTERVAL` | `30` / `2` | PVE 请求超时（秒）与任务状态轮询间隔（秒）。轮询是自适应的：从 0.2 秒起逐步翻倍，最长到这个值 |
+| `BATCH_CONCURRENCY` | `3` | 批量下发的并发台数（仅 `stop_on_error=0` 时生效，设 `1` 回到串行）。每台都要等 PVE 任务结束，并发能把总耗时压到接近「最慢一台 × 轮数」 |
 | `DEBUG` | `false` | 响应里带 `X-PVE-Calls` / `X-DB-Queries` 计数头，便于排性能问题；生产别开 |
 | `METRICS_HISTORY_ENABLED` / `METRICS_SAMPLE_INTERVAL` / `METRICS_RETENTION_DAYS` | `true` / `60` / `30` | 指标采样进 `metrics_history` 的开关、周期（秒）与保留天数（`0` = 永久保留）。PVE 自带的 RRD 会被滚动覆盖，面板重启或主机重装就丢 |
 | `PC_UPDATE_MIRROR` | 空 | 一键更新拉源码包的镜像前缀（直连 GitHub 失败后才用）。不在 `.env.example` 里，用 `systemctl edit pvecenter` 写 `Environment=` |

@@ -75,7 +75,7 @@ import {
   usageColor,
   usageTone,
 } from '../utils/format';
-import { isRunning, isTransient, vmStatusMeta } from '../utils/status'
+import { isRunning, isTransient, lockLabel, vmStatusMeta } from '../utils/status'
 import { isDestructivePower, powerConfirmOptions } from '../utils/powerConfirm';
 import { useT, type MessageKey } from '../i18n';
 import { useTaskRunner } from '../hooks/useTaskRunner';
@@ -175,6 +175,8 @@ export function LxcDetail() {
     queryFn: () => lxcApi.detail(node, ctId),
     enabled: pveReady && Boolean(node) && Number.isFinite(ctId),
     refetchInterval: pveReady ? refresh : false,
+    /* 与虚拟机详情同一口径：切回标签页先对一次账，别让人对着旧状态点按钮 */
+    refetchOnWindowFocus: 'always',
   });
 
   /* 曲线数据由「监控」页签自己查（见文件末尾的 LxcMonitorTab）：概览不再画图，
@@ -535,6 +537,8 @@ export function LxcDetail() {
   }
 
   const status = vmStatusMeta(ct.status, t);
+  /* 同虚拟机详情：把 PVE 的 lock 翻成「关机中 / 迁移中」，任务期间才有东西可看 */
+  const lockText = lockLabel(ct.lock, t);
   const running = isRunning(ct.status);
   /* 挂起中的容器要单独给一个「恢复」按钮 —— 它既不算运行也不算停止，
      少了这个出口就只能去列表页操作。取值与虚拟机详情页同一口径。 */
@@ -739,9 +743,9 @@ export function LxcDetail() {
           <Badge variant="neutral" size="sm">
             {t('lxcDetail.lxcBadge')}
           </Badge>
-          {ct.lock ? (
+          {lockText ? (
             <Badge variant="warning" size="sm">
-              {t('lxcDetail.locked', { lock: ct.lock })}
+              {lockText}
             </Badge>
           ) : null}
         </div>

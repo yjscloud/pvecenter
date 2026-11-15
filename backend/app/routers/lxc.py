@@ -64,6 +64,7 @@ from ..schemas import (
     SnapshotCreate,
 )
 from ..vm_scope import bind_vm_connection
+from .vm_meta import manual_ip_index
 from .vms import (
     _filter_snapshots,
     _op_connection,
@@ -152,6 +153,8 @@ async def list_containers(
 
     result: List[Dict[str, Any]] = []
     failure: Optional[ProxmoxError] = None
+    # 手动备注 IP（与 /vms 同口径）：自动解析不到时用它算「网络」归属。
+    manual_ips = await manual_ip_index(user) if with_ip else {}
 
     for (profile, client), resources in zip(targets, resources_list):
         if isinstance(resources, BaseException):
@@ -205,8 +208,26 @@ async def list_containers(
             resolved = await parallel(
                 (_resolve_ct_ip(client, ct) for ct in items), limit=12
             )
+            # 与 /vms 同一口径：标出「这个地址不在任何池里」（客户机自己 DHCP
+            # 拿了一个 / 被手工改过），避免页面把实际地址误当成池内分配。
+            pools = await ippool.load_pools()
             for item, ip in zip(items, resolved):
-                item["ip"] = ip if isinstance(ip, str) else ""
+                value = ip if isinstance(ip, str) else ""
+                item["ip"] = value
+                # 同 /vms：只看子网（pool_covers），没地址就是「不适用」而不是「池外」
+                item["ip_in_pool"] = (
+                    None
+                    if not pools or not value
+                    else any(ippool.pool_covers(pool, value) for pool in pools)
+                )
+                # 「网络」列：与 /vms 同一口径，池名由后端回填（不额外调
+                # GET /ip-pools —— 那个接口按用户裁剪池，普通用户会漏显）。
+                # 自动地址解析不到时退而用手动备注地址判网络归属。
+                manual_ip = manual_ips.get(
+                    (str(cid), str(item.get("node") or ""), int(item.get("vmid") or 0)),
+                    "",
+                )
+                item["ip_pool_name"] = ippool.pool_name_for_ip(pools, value or manual_ip)
 
         # 创建时间：同 /vms，缓存未命中时逐台读一次 config。
         if items:
@@ -524,6 +545,7 @@ async def _assign_dhcp_ips(
             ippool.PoolScope(
                 bridge=str(payload.networks[i].bridge or ""),
                 vlan=payload.networks[i].vlan_tag,
+                pool_id=payload.networks[i].pool_id,
             )
             for i in targets
         ],
@@ -627,6 +649,11 @@ async def _create_lxc_core(
         source="create",
         username=str(user.get("username") or ""),
     )
+
+    # 新容器可能复用了回收的 VMID：旧的 IP 记录若还留着（面板外删除、面板重启
+    # 之类会留下），会贴到这台新容器上。清一次，让列表从它自己的 netN 重新解析
+    # —— 否则「刚建出来的容器显示着别人的地址」。
+    await guestip.forget(_op_connection(), payload.node, vmid, "lxc")
 
     # 下发通知：容器没有 cloud-init，root 口令只在这次创建时存在 ——
     # 这条消息（以及它触发的邮件）往往就是用户拿到它的唯一机会。
@@ -1292,6 +1319,8 @@ async def clone_container(
         source="clone",
         username=str(user.get("username") or ""),
     )
+    # IP 记录同理：clone 可能落到回收的 VMID，也不能沿用旧机器的地址
+    await guestip.forget(_op_connection(), target_node, payload.newid, "lxc")
     return {"task": task, "vmid": payload.newid, "node": target_node}
 
 

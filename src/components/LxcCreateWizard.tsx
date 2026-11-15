@@ -44,6 +44,7 @@ import { QuickDeployForm } from './QuickDeployForm';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../hooks/useToast';
 import { useNodeStorages } from '../hooks/useNodeStorages';
+import { useNodeBridges } from '../hooks/useNodeBridges';
 import { useTaskRunner } from '../hooks/useTaskRunner';
 import { useT, type TFunc } from '../i18n';
 import type { LxcCreateNetwork, LxcCreateRequest } from '../api/types';
@@ -342,12 +343,13 @@ export function LxcCreateWizard({
   /* 存储：只列**所选节点上**的存储池（含显式带连接，见 useNodeStorages） */
   const storagesQuery = useNodeStorages(form.node, targetConn, open && Boolean(targetConn));
 
-  const bridgesQuery = useQuery({
-    queryKey: ['nodes', targetConn, form.node, 'network'],
-    queryFn: () => nodesApi.network(form.node, targetConn),
-    enabled: open && Boolean(targetConn) && Boolean(form.node),
-    staleTime: 60_000,
-  });
+  /* 网桥候选：与虚拟机新建 / 快速部署 / 重装共用一套筛选（含 OVS 桥）。
+     静态地址与 DHCP 都用这块网卡，候选范围不随地址模式变化。 */
+  const bridges = useNodeBridges(
+    form.node,
+    targetConn,
+    open && Boolean(targetConn),
+  );
 
   /** 下发额度：容器有**自己的一份**（与虚拟机额度互相独立），填了才显示 */
   const quotaQuery = useQuery({
@@ -413,18 +415,16 @@ export function LxcCreateWizard({
     [templatesQuery.data],
   );
 
-  const bridgeOptions = useMemo(() => {
-    const ifaces = bridgesQuery.data ?? [];
-    const bridges = ifaces.filter((i) => i.type === 'bridge' || i.type === 'OVSBridge');
-    const list = bridges.length > 0 ? bridges : ifaces;
-    return [
+  /* 节点上读不到网桥时保留一个 vmbr0 兜底：不该让「读列表失败」把新建流程卡死 */
+  const bridgeOptions = useMemo(
+    () => [
       { label: t('lxcWizard.selectBridge'), value: '' },
-      ...list.map((i) => ({
-        label: `${i.iface}${i.active ? '' : t('lxcWizard.inactive')}`,
-        value: i.iface,
-      })),
-    ];
-  }, [bridgesQuery.data, t]);
+      ...(bridges.options.length
+        ? bridges.options
+        : [{ label: 'vmbr0', value: 'vmbr0' }]),
+    ],
+    [bridges.options, t],
+  );
 
   /* ---- 步骤导航 ---- */
   const goNext = () => {

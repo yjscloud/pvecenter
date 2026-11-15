@@ -465,14 +465,26 @@ class ProxmoxClient:
         self, upid: str, node: Optional[str] = None, timeout: float = 300.0
     ) -> Dict[str, Any]:
         """Block until a task reaches a terminal state. Used by the template
-        build pipeline, which must finish one step before starting the next."""
+        build pipeline, which must finish one step before starting the next.
+
+        轮询间隔是**自适应**的：PVE 上绝大多数建机 / 克隆 / 改配置任务在 1–5 秒内
+        结束，固定 ``task_poll_interval``（默认 2 秒）会让每一个等待点多睡 0–2 秒；
+        一条模板流水线有 3–4 个等待点、一次克隆有 1–2 个，凭空多出好几秒。这里首轮
+        0.2 秒、之后翻倍到 ``task_poll_interval`` 封顶 —— 短任务的等待延迟降到
+        0.2–0.6 秒，长任务（镜像导入）的请求数仍与原来一致。
+        """
         node = node or node_from_upid(upid)
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        ceiling = max(float(settings.task_poll_interval), 0.2)
+        delay = min(0.2, ceiling)
+        while True:
             status = await self.task_status(upid, node)
             if status.get("status") == "stopped":
                 return status
-            await asyncio.sleep(settings.task_poll_interval)
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, ceiling)
         raise ProxmoxError(
             f"Task {upid} did not finish within {timeout:.0f}s", 504
         )
@@ -952,7 +964,19 @@ class ProxmoxClient:
     async def lxc_set_config(
         self, node: str, vmid: int, config: Dict[str, Any]
     ) -> Any:
-        return await self.post(f"/nodes/{node}/lxc/{vmid}/config", data=config)
+        """改容器配置（改名 / 改规格 / 加网卡都走这里）。
+
+        **只能用 PUT**：PVE 的 ``PVE::API2::LXC::Config`` 这一层只注册了
+        ``GET`` 与 ``PUT``，没有 qemu 那边用来返回任务的 ``POST`` 别名
+        （见 ``PVE::API2::Qemu`` 的 ``update_vm_async``）。用 POST 会被 PVE
+        以 501 "method not implemented" 拒掉，前端把 501 统一显示成
+        「该功能未实现」—— 容器改名报的就是这个。
+
+        PUT 是同步语义、返回 null：改动当场写盘生效（运行中的容器由 PVE
+        热更新），没有 UPID 可等。调用方（routers/lxc.py、bulk.py）本来就按
+        「task 可能为空」处理，所以不需要补一个假任务。
+        """
+        return await self.put(f"/nodes/{node}/lxc/{vmid}/config", data=config)
 
     async def lxc_create(self, node: str, config: Dict[str, Any]) -> Any:
         return await self.post(f"/nodes/{node}/lxc", data=config)

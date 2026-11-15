@@ -13,12 +13,15 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import HTTPException
+
+from .config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +142,16 @@ def _error_text(exc: Exception) -> str:
     return str(exc)[:500] or exc.__class__.__name__
 
 
+def _row_base(index: int, item: Any, kind: str) -> Dict[str, Any]:
+    return {
+        "index": index,
+        "node": str(getattr(item, "node", "") or ""),
+        "vmid": int(getattr(item, "vmid", 0) or 0),
+        "name": _item_name(item),
+        "type": "qemu" if kind == "vm" else "lxc",
+    }
+
+
 async def run_batch(
     *,
     batch_id: str,
@@ -146,6 +159,7 @@ async def run_batch(
     items: List[Any],
     create_one: Callable[[Any], Any],
     stop_on_error: bool = True,
+    concurrency: Optional[int] = None,
 ) -> Dict[str, Any]:
     """逐台执行 ``create_one``，返回与 ``BulkResponse`` 兼容的逐台清单。
 
@@ -155,7 +169,91 @@ async def run_batch(
     建机是异步任务，真正的终态由前端按每台的 ``task`` 轮询得出（``stopped``
     之后的 ``exitstatus`` 才是结果，``WARNINGS: n`` 属于「完成但有警告」）。
     ``skipped`` 单独计数并写进逐台明细，避免把「前序失败后没执行」混进失败数。
+
+    **并发**：``create_one`` 在克隆 / 导入路径里会阻塞等 PVE 任务结束，串行执行时
+    整批耗时是各台的**和**（10 台 × 8 秒 = 80 秒）。``concurrency``（默认
+    ``settings.batch_concurrency``，3）路并发把等待重叠起来，总耗时接近「最慢的
+    那一台 × ceil(N/并发度)」。``stop_on_error=true`` 时**强制串行** —— 「前序失败
+    就跳过后面」只有在顺序执行下才有确定语义。结果始终按提交顺序返回。
     """
+    limit = settings.batch_concurrency if concurrency is None else int(concurrency)
+    limit = max(1, min(int(limit or 1), len(items)))
+
+    async def _run_one(index: int, item: Any) -> Dict[str, Any]:
+        base = _row_base(index, item, kind)
+        try:
+            created = await create_one(item)
+        except HTTPException as exc:
+            logger.warning(
+                "批量下发 %s 第 %d 台失败：%s", batch_id, index, exc.detail
+            )
+            return {
+                **base,
+                "ok": False,
+                "skipped": False,
+                "task": None,
+                "error": _error_text(exc),
+            }
+        except Exception as exc:  # noqa: BLE001 - 单台失败不能拖垮整批
+            logger.warning(
+                "批量下发 %s 第 %d 台异常", batch_id, index, exc_info=True
+            )
+            return {
+                **base,
+                "ok": False,
+                "skipped": False,
+                "task": None,
+                "error": _error_text(exc),
+            }
+
+        created = created or {}
+        return {
+            **base,
+            "node": str(created.get("node") or base["node"]),
+            "vmid": int(created.get("vmid") or base["vmid"] or 0),
+            "ok": True,
+            "skipped": False,
+            "task": created.get("task") or None,
+            "error": None,
+            "post_steps": created.get("post_steps") or [],
+            "disk_note": created.get("disk_note") or "",
+            "template": bool(created.get("template")),
+        }
+
+    def _skipped(index: int, item: Any) -> Dict[str, Any]:
+        return {
+            **_row_base(index, item, kind),
+            "ok": False,
+            "skipped": True,
+            "task": None,
+            "error": "已跳过：前序任务失败（stop_on_error=true）",
+        }
+
+    rows: List[Dict[str, Any]] = []
+    if stop_on_error or limit <= 1:
+        stopped = False
+        for index, item in enumerate(items):
+            if stopped:
+                rows.append(_skipped(index, item))
+                continue
+            row = await _run_one(index, item)
+            if not row["ok"]:
+                stopped = bool(stop_on_error)
+            rows.append(row)
+    else:
+        sem = asyncio.Semaphore(limit)
+
+        async def _guarded(index: int, item: Any) -> Dict[str, Any]:
+            async with sem:
+                return await _run_one(index, item)
+
+        # gather 保序：结果的下标与 items 一一对应，前端不需要重新排序
+        rows = list(
+            await asyncio.gather(
+                *(_guarded(index, item) for index, item in enumerate(items))
+            )
+        )
+
     result: Dict[str, Any] = {
         "action": "create",
         "batch_id": batch_id,
@@ -164,80 +262,14 @@ async def run_batch(
         "ok": 0,
         "failed": 0,
         "skipped": 0,
-        "results": [],
+        "results": rows,
     }
-    stopped = False
-    for index, item in enumerate(items):
-        base = {
-            "index": index,
-            "node": str(getattr(item, "node", "") or ""),
-            "vmid": int(getattr(item, "vmid", 0) or 0),
-            "name": _item_name(item),
-            "type": "qemu" if kind == "vm" else "lxc",
-        }
-        if stopped:
+    for row in rows:
+        if row.get("skipped"):
             result["failed"] += 1
             result["skipped"] += 1
-            result["results"].append(
-                {
-                    **base,
-                    "ok": False,
-                    "skipped": True,
-                    "task": None,
-                    "error": "已跳过：前序任务失败（stop_on_error=true）",
-                }
-            )
-            continue
-
-        try:
-            created = await create_one(item)
-        except HTTPException as exc:
-            logger.warning(
-                "批量下发 %s 第 %d 台失败：%s", batch_id, index, exc.detail
-            )
+        elif row.get("ok"):
+            result["ok"] += 1
+        else:
             result["failed"] += 1
-            result["results"].append(
-                {
-                    **base,
-                    "ok": False,
-                    "skipped": False,
-                    "task": None,
-                    "error": _error_text(exc),
-                }
-            )
-            stopped = bool(stop_on_error)
-            continue
-        except Exception as exc:  # noqa: BLE001 - 单台失败不能拖垮整批
-            logger.warning(
-                "批量下发 %s 第 %d 台异常", batch_id, index, exc_info=True
-            )
-            result["failed"] += 1
-            result["results"].append(
-                {
-                    **base,
-                    "ok": False,
-                    "skipped": False,
-                    "task": None,
-                    "error": _error_text(exc),
-                }
-            )
-            stopped = bool(stop_on_error)
-            continue
-
-        created = created or {}
-        result["ok"] += 1
-        result["results"].append(
-            {
-                **base,
-                "node": str(created.get("node") or base["node"]),
-                "vmid": int(created.get("vmid") or base["vmid"] or 0),
-                "ok": True,
-                "skipped": False,
-                "task": created.get("task") or None,
-                "error": None,
-                "post_steps": created.get("post_steps") or [],
-                "disk_note": created.get("disk_note") or "",
-                "template": bool(created.get("template")),
-            }
-        )
     return result

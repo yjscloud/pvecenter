@@ -150,6 +150,11 @@ export const zhCore = {
   'vmReinstall.sshKeys': 'SSH 公钥',
   'vmReinstall.sshKeysHint': '一行一个；填了它就可以只用密钥登录',
   'vmReinstall.network': '网络',
+  'vmReinstall.bridge': '网桥',
+  'vmReinstall.bridgeKeep': '沿用原网桥（不修改）',
+  'vmReinstall.bridgeHint':
+    '与地址方式无关：选 DHCP 时，DHCP 请求也从这块网桥出去。留空表示沿用重装前网卡所在的桥。',
+  'vmReinstall.bridgeLoadFailed': '无法读取节点网卡列表，已回退到 vmbr0',
   'vmReinstall.ipModeDhcp': 'DHCP（自动获取）',
   'vmReinstall.ipModeStatic': '静态地址',
   'vmReinstall.ip': 'IP 地址（CIDR）',
@@ -165,6 +170,8 @@ export const zhCore = {
   'vmReinstall.irreversibleTitle': '数据不可恢复',
   'vmReinstall.irreversibleBody':
     '重装会删掉这台机器、再用模板重建：原系统盘与数据盘连卷一起清除，上面的系统与数据都无法找回。VMID、网卡（含 MAC）、CPU/内存等身份信息会保留。还有要用的东西，请先做备份。',
+  'vmReinstall.diskKept':
+    '系统盘容量会保留：重装前锁定当前规格（{size}），重装后自动扩回并校验，不会被模板的默认尺寸覆盖。',
   'vmReinstall.wipeDisks': '同时删除数据盘',
   'vmReinstall.wipeDisksHint':
     '勾选 = 连同数据盘一起清除，用链接克隆重建（秒级，磁盘依赖模板）；取消勾选则保留数据盘，但要改成完整复制系统盘（几十 GB，慢几分钟）。',
@@ -379,6 +386,8 @@ export const zhCore = {
   /* ------------------------------------------------- 跨页面复用的表格词 */
   'common.actions': '操作',
   'common.yes': '是',
+  /* 网桥下拉里标出「存在但未激活」的接口（PVE 里新建的桥不点应用就是这种状态） */
+  'common.inactiveSuffix': '（未激活）',
   'common.no': '否',
   'common.description': '描述',
   'common.createdAt': '创建时间',
@@ -449,6 +458,20 @@ export const zhCore = {
   'status.vm.suspended': '已挂起',
   'status.vm.stopping': '正在停止',
   'status.vm.starting': '正在启动',
+  /* PVE 的操作锁：任务进行中时 status 仍是 running，锁是唯一实时的信号 */
+  'status.lock.backup': '备份中',
+  'status.lock.clone': '克隆中',
+  'status.lock.create': '创建中',
+  'status.lock.migrate': '迁移中',
+  'status.lock.mounted': '已挂载',
+  'status.lock.rollback': '回滚中',
+  'status.lock.shutdown': '关机中',
+  'status.lock.snapshot': '快照中',
+  'status.lock.snapshotDelete': '删快照中',
+  'status.lock.suspend': '挂起中',
+  'status.lock.template': '转模板中',
+  'status.lock.diskResize': '扩容中',
+  'status.lock.moveDisk': '移盘中',
   'status.node.online': '在线',
   'status.node.offline': '离线',
   'status.task.running': '执行中',

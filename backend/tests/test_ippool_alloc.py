@@ -178,3 +178,113 @@ def test_delete_style_release_returns_the_address_to_the_pool(api) -> None:
     # 用 TestClient 自己的事件循环执行：数据库连接池绑定在它上面
     api.portal.call(ippool.release_guest, "", "pve1", 105)
     assert "192.168.50.100" in _free_ips(api, headers)
+
+
+# -------------------------------------------------------------- 指定池分配
+def test_vm_dhcp_honors_selected_pool(api) -> None:
+    """多个池共享同一网桥 / VLAN：用户指定 pool_id 时只从那个池分配。
+
+    旧逻辑只按 bridge + vlan 匹配，会永远取配置顺序第一个 —— 选了「测试网」
+    却下发成「业务网」。指定 pool_id 后必须取用户选中的那个。
+    """
+    headers = auth_headers(api)
+    resp = api.put(
+        "/api/ip-pools",
+        headers=headers,
+        json=[
+            {
+                **POOL,
+                "id": "pool-a",
+                "name": "业务网",
+            },
+            {
+                **POOL,
+                "id": "pool-b",
+                "name": "测试网",
+                "subnet": "10.0.0.0/24",
+                "gateway": "10.0.0.1",
+                "start": "10.0.0.100",
+                "end": "10.0.0.105",
+            },
+        ],
+    )
+    assert resp.status_code == 200, resp.text
+    mock_mod.REQUESTS.clear()
+
+    payload = _vm_payload()
+    payload["networks"][0]["pool_id"] = "pool-b"
+    resp = api.post("/api/vms", json=payload, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    body = _requests("/api2/json/nodes/pve1/qemu")
+    assert body is not None
+    assert body["ipconfig0"] == "ip=10.0.0.100/24,gw=10.0.0.1"
+
+
+def test_vm_dhcp_keeps_dhcp_when_selected_pool_does_not_fit(api) -> None:
+    """指定了池但该池装不进这张网卡：宁可保持 DHCP，也不静默回退到别的池。
+
+    pool-b 属于 vmbr1，而网卡接在 vmbr0 上 —— 匹配不上就返回空、保持 dhcp，
+    绝不能因为「还有别的池能匹配」就悄悄下发成那个池的地址。
+    """
+    headers = auth_headers(api)
+    resp = api.put(
+        "/api/ip-pools",
+        headers=headers,
+        json=[
+            {**POOL, "id": "pool-a", "name": "业务网"},
+            {
+                **POOL,
+                "id": "pool-b",
+                "name": "另一张网",
+                "bridge": "vmbr1",
+                "subnet": "10.0.0.0/24",
+                "gateway": "10.0.0.1",
+                "start": "10.0.0.100",
+                "end": "10.0.0.105",
+            },
+        ],
+    )
+    assert resp.status_code == 200, resp.text
+    mock_mod.REQUESTS.clear()
+
+    payload = _vm_payload()  # 网卡 bridge=vmbr0
+    payload["networks"][0]["pool_id"] = "pool-b"  # 指定 vmbr1 的池，装不进 vmbr0
+    resp = api.post("/api/vms", json=payload, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    body = _requests("/api2/json/nodes/pve1/qemu")
+    assert body is not None
+    assert body["ipconfig0"] == "ip=dhcp"
+
+
+def test_container_dhcp_honors_selected_pool(api) -> None:
+    """容器同样走 pool_id：验证 lxc.py 的传递路径没有漏掉这个字段。"""
+    headers = auth_headers(api)
+    resp = api.put(
+        "/api/ip-pools",
+        headers=headers,
+        json=[
+            {**POOL, "id": "pool-a", "name": "业务网"},
+            {
+                **POOL,
+                "id": "pool-b",
+                "name": "测试网",
+                "subnet": "10.0.0.0/24",
+                "gateway": "10.0.0.1",
+                "start": "10.0.0.100",
+                "end": "10.0.0.105",
+            },
+        ],
+    )
+    assert resp.status_code == 200, resp.text
+    mock_mod.REQUESTS.clear()
+
+    payload = _ct_payload()
+    payload["networks"][0]["pool_id"] = "pool-b"
+    resp = api.post("/api/lxc", json=payload, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    body = _requests("/api2/json/nodes/pve1/lxc")
+    assert body is not None
+    assert "ip=10.0.0.100/24,gw=10.0.0.1" in body["net0"]

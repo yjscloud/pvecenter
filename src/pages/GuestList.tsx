@@ -71,6 +71,8 @@ import { LxcCreateWizard } from '../components/LxcCreateWizard';
 /* VMware 互操作：OVF/OVA 导入与镜像导出（只有虚拟机有这两件事，容器不参与） */
 import { VmImportWizard } from '../components/VmImportWizard';
 import { VmExportDialog } from '../components/VmExportDialog';
+/* 重装系统：用 Cloud-Init 模板重建系统盘（机器身份不变），只有虚拟机有 */
+import { VmReinstallWizard } from '../components/VmReinstallWizard';
 import { ResetGuestPasswordDialog } from '../components/ResetGuestPasswordDialog';
 import {
   IconBox,
@@ -87,6 +89,7 @@ import {
   IconTemplate,
   IconSnapshot,
   IconLayers,
+  IconDisk,
   IconUser,
   IconMore,
   IconPlus,
@@ -104,7 +107,13 @@ import {
   formatUptimeShort,
   toPercent,
 } from '../utils/format';
-import { isRunning, isStopped, isTransient, vmStatusMeta } from '../utils/status';
+import {
+  isRunning,
+  isStopped,
+  isTransient,
+  lockLabel,
+  vmStatusMeta,
+} from '../utils/status';
 import {
   bulkPowerConfirmOptions,
   isDestructivePower,
@@ -195,6 +204,8 @@ interface RowMenuProps {
   onTemplate: () => void;
   onSnapshot: () => void;
   onMigrate: () => void;
+  /* 重装系统：只有虚拟机有（容器换系统盘就是换模板，没有对应端点） */
+  onReinstall: () => void;
   onAssign: () => void;
   onResetPassword: () => void;
   onExport: () => void;
@@ -225,6 +236,7 @@ function RowMenu({
   onTemplate,
   onSnapshot,
   onMigrate,
+  onReinstall,
   onAssign,
   onResetPassword,
   onExport,
@@ -255,6 +267,8 @@ function RowMenu({
      （原先与「修改配置」共用 config，矩阵上却写着迁移仅管理员）。 */
   const canMigrateRow = hasPermission(`${permPrefix}.migrate`);
   const canDeleteRow = hasPermission(`${permPrefix}.delete`);
+  /* 重装只有虚拟机有，权限点与详情页 VmMoreMenu 同一把钥匙（vm.reinstall） */
+  const canReinstallRow = !isLxc && hasPermission('vm.reinstall');
   /* 「问 AI」能不能出现：与详情页那个按钮同一套判定（权限 + 面板级开关），
      见 AskAiButton.useAiAssistantEntry */
   const aiAvailable = useAiAssistantEntry();
@@ -277,17 +291,30 @@ function RowMenu({
     right: number;
   } | null>(null);
 
-  /* 打开期间：点击外部、任意滚动（含容器内滚动）、窗口尺寸变化都关闭 ——
-     fixed 菜单不随内容滚动移动，留着只会错位。 */
+  /* 打开期间：点击外部、页面 / 表格滚动、窗口尺寸变化都关闭 ——
+     fixed 菜单不随内容滚动移动，留着只会错位。
+     **菜单内部的滚动与点击除外**：下拉有 max-height，选项多时要能拖它自己的
+     滚动条；把内部滚动也算成「外部活动」会让菜单一滚就关，滚动条看着就像
+     拖不动。 */
   useEffect(() => {
     if (!open) return;
     const close = () => setOpen(false);
-    document.addEventListener('click', close);
-    window.addEventListener('scroll', close, { capture: true, passive: true });
+    const inside = (target: EventTarget | null) =>
+      target instanceof Node && Boolean(menuRef.current?.contains(target));
+    const onScroll = (event: Event) => {
+      if (inside(event.target)) return;
+      close();
+    };
+    const onClick = (event: MouseEvent) => {
+      if (inside(event.target)) return;
+      close();
+    };
+    document.addEventListener('click', onClick);
+    window.addEventListener('scroll', onScroll, { capture: true, passive: true });
     window.addEventListener('resize', close);
     return () => {
-      document.removeEventListener('click', close);
-      window.removeEventListener('scroll', close, true);
+      document.removeEventListener('click', onClick);
+      window.removeEventListener('scroll', onScroll, true);
       window.removeEventListener('resize', close);
     };
   }, [open]);
@@ -425,6 +452,11 @@ function RowMenu({
             : null}
           {canMigrateRow
             ? item(t('guestList.migrate'), <IconLayers size={15} />, onMigrate)
+            : null}
+          {/* 重装系统：换掉系统盘，VMID / 网卡与 MAC / CPU 内存都不变。
+              容器不摆这一项 —— 它没有重装的概念（换系统盘就是换模板）。 */}
+          {canReinstallRow
+            ? item(t('vmReinstall.menu'), <IconDisk size={15} />, onReinstall)
             : null}
           {canAssign
             ? item(t('guestList.assign'), <IconUser size={15} />, onAssign)
@@ -584,6 +616,8 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   const [cloneTarget, setCloneTarget] = useState<VmSummary | null>(null);
   const [templateTarget, setTemplateTarget] = useState<VmSummary | null>(null);
   const [migrateTarget, setMigrateTarget] = useState<VmSummary | null>(null);
+  /* 重装系统（仅虚拟机）：用 Cloud-Init 模板重建系统盘，机器身份保持不变 */
+  const [reinstallTarget, setReinstallTarget] = useState<VmSummary | null>(null);
   const [snapshotTarget, setSnapshotTarget] = useState<VmSummary | null>(null);
   const [assignTarget, setAssignTarget] = useState<VmSummary | null>(null);
   /* 重置客户机内用户口令（虚拟机走 Guest Agent / cloud-init，容器走宿主机 SSH） */
@@ -640,6 +674,10 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
        已经很便宜；间隔由「数据刷新间隔」定，列表要的是「状态大致是新的」。 */
     enabled: pveReady,
     refetchInterval: pveReady ? refresh : false,
+    /* 切回标签页时立刻对一次账。全局默认是关的（见 main.tsx），而这里的轮询
+       可能被「数据刷新间隔」拉到 30 秒、甚至被用户关掉 —— 用户切回来第一眼
+       看到的必须是真实状态，而不是几分钟前那一份。 */
+    refetchOnWindowFocus: 'always',
   });
 
   /* 连接点列表：节点选择器的选项要靠它圈定范围（而非从已过滤的节点里反推，
@@ -821,6 +859,9 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         vm.ip,
         // 手动填的地址也要能搜到：它往往是用户手上唯一记得的标识
         manualIpOf(vm),
+        // 网络列也要能搜：按池名（业务网 / 测试网）筛出整段网段下的机器
+        vm.ip_pool_name ?? '',
+        vm.tags,
         vm.tags,
         // 列里显示的是来源模板名，搜索也要能按它命中
         vm.source_template?.name,
@@ -933,6 +974,32 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
     void queryClient.invalidateQueries({ queryKey: ['ssh'] });
   }, [queryClient]);
 
+  /* ---- 批量操作后的短时高频刷新 ----
+     批量启停一次打十几台，PVE 侧是每台一个任务、关机可能跑上一分钟；列表本身
+     按「数据刷新间隔」轮询（默认 30 秒），这期间界面几乎不动，用户不知道做到
+     第几台了。操作后开一个 45 秒的小窗口，每 3 秒对一次账，到点自动停 ——
+     比全局调快轮询省得多，也不会影响其他页面。 */
+  const burstTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (burstTimer.current) window.clearInterval(burstTimer.current);
+    },
+    [],
+  );
+  const startBurst = useCallback(() => {
+    if (burstTimer.current) window.clearInterval(burstTimer.current);
+    const stopAt = Date.now() + 45_000;
+    burstTimer.current = window.setInterval(() => {
+      if (Date.now() > stopAt) {
+        if (burstTimer.current) window.clearInterval(burstTimer.current);
+        burstTimer.current = null;
+        return;
+      }
+      void queryClient.invalidateQueries({ queryKey: [isLxc ? 'lxc' : 'vms'] });
+      void queryClient.invalidateQueries({ queryKey: ['cluster'] });
+    }, 3_000);
+  }, [queryClient, isLxc]);
+
   const doPower = useCallback(
     async (vm: VmSummary, action: 'start' | 'stop' | 'shutdown' | 'reboot') => {
       /* 按**具体权限**判，不按角色粗判：自定义角色（角色名不是 operator）完全
@@ -1032,6 +1099,8 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
           );
         }
         invalidateGuests();
+        /* 逐台任务是异步的：让列表在这几十秒里跟着进度动（见 startBurst） */
+        startBurst();
       } catch (err) {
         toast.error(
           t('guestList.bulkFailed', { action: t(bulkActionKey(action)) }),
@@ -1041,7 +1110,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         setPendingAction(false);
       }
     },
-    [selectedGuests, invalidateGuests, toast, t, L.unit],
+    [selectedGuests, invalidateGuests, startBurst, toast, t, L.unit],
   );
 
   /* 批量电源操作前的确认：一次点击打的是勾选里的每一台，代价比单台大得多，
@@ -1213,33 +1282,10 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       ),
     },
     {
-      key: 'status',
-      header: t('guestList.colStatus'),
-      width: 108,
-      render: (vm) => {
-        const status = vmStatusMeta(vm.status, t);
-        return (
-          <Badge variant={status.variant} dot pulse={status.pulse} size="sm">
-            {status.label}
-          </Badge>
-        );
-      },
-      sortable: true,
-      sortValue: (vm) => vm.status,
-    },
-    {
-      key: 'vmid',
-      header: 'VMID',
-      width: 76,
-      mono: true,
-      render: (vm) => <span className="text-secondary">{vm.vmid}</span>,
-      sortable: true,
-      sortValue: (vm) => vm.vmid,
-    },
-    {
       key: 'name',
       header: t('guestList.name'),
-      /* 其余列都写死了宽度，名称列不写就会独占全部剩余空间，
+      /* 名称列放在最前（紧跟全选框）：它是每一行的身份标识，读列表先认名字。
+         其余列都写死了宽度，名称列不写就会独占全部剩余空间，
          宽屏下被撑得很长；给一个上限后超出部分由 truncate 省略。
          178 = 原来的 160 + 改名按钮所占的宽度：按钮是 flex-shrink:0 的，
          不补回来的话名字会比加按钮之前更早被省略。 */
@@ -1320,6 +1366,41 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       sortValue: (vm) => vm.name ?? '',
     },
     {
+      key: 'status',
+      header: t('guestList.colStatus'),
+      width: 128,
+      render: (vm) => {
+        const status = vmStatusMeta(vm.status, t);
+        /* PVE 在任务进行中只挂 ``lock``，``status`` 往往还是 running（关机要等
+           QEMU 真正退出）。不把锁画出来，用户点完关机就是几十秒的「毫无反应」：
+           按钮是灰的，状态还是「运行中」，看不出到底有没有在执行。 */
+        const lock = lockLabel(vm.lock, t);
+        return (
+          <span className="row-status">
+            <Badge variant={status.variant} dot pulse={status.pulse} size="sm">
+              {status.label}
+            </Badge>
+            {lock ? (
+              <Badge variant="info" size="sm">
+                {lock}
+              </Badge>
+            ) : null}
+          </span>
+        );
+      },
+      sortable: true,
+      sortValue: (vm) => vm.status,
+    },
+    {
+      key: 'vmid',
+      header: 'VMID',
+      width: 76,
+      mono: true,
+      render: (vm) => <span className="text-secondary">{vm.vmid}</span>,
+      sortable: true,
+      sortValue: (vm) => vm.vmid,
+    },
+    {
       key: 'node',
       header: t('common.node'),
       width: 110,
@@ -1333,6 +1414,31 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       ),
       sortable: true,
       sortValue: (vm) => vm.node,
+    },
+    {
+      key: 'network',
+      header: t('guestList.networkLabel'),
+      width: 140,
+      render: (vm) => {
+        /* 池名由后端回填：自动地址优先，解析不到时退而用手动备注的地址判网络
+           归属（同一个 pool_covers 口径）。所以这里不再要求 vm.ip 非空 —— 手动
+           地址的网络名也由后端算好了。池外地址没有归属，IP 列已有「池外」徽标，
+           这里留空即可。 */
+        const name = vm.ip_pool_name;
+        return name ? (
+          <span title={t('guestList.networkHint')}>
+            <Badge variant="neutral" size="sm">
+              {name}
+            </Badge>
+          </span>
+        ) : (
+          <span className="fs-sm text-muted" title={t('guestList.networkNone')}>
+            —
+          </span>
+        );
+      },
+      sortable: true,
+      sortValue: (vm) => vm.ip_pool_name ?? '',
     },
     {
       key: 'ip',
@@ -1377,6 +1483,18 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
                 —
               </span>
             )}
+            {/* 地址不在任何池里：实际用的是别的地址，池的占用表也看不到它 ——
+                不标出来，用户会以为这台机器用的是池里分配的那一个。
+                **只对自动识别到的地址判断**：`ip_in_pool` 是后端按自动解析结果算的，
+                手动填的那份只是面板备注，拿它来标手动值必然误报（自动值为空时后端
+                根本不知道这台机器写着手动地址）。手动地址是运维自己确认过的。 */}
+            {!fromManual && vm.ip_in_pool === false && shown ? (
+              <span title={t('guestList.ipOutOfPool')}>
+                <Badge variant="warning" size="sm">
+                  {t('guestList.ipOutOfPoolTag')}
+                </Badge>
+              </span>
+            ) : null}
             {/* 只在平台拿不到地址时给编辑入口：自动值更准，
                 让它旁边常驻一个「改」按钮只会诱导用户改错 */}
             {!auto && canConfig ? (
@@ -1627,6 +1745,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
               onTemplate={() => setTemplateTarget(vm)}
               onSnapshot={() => setSnapshotTarget(vm)}
               onMigrate={() => setMigrateTarget(vm)}
+              onReinstall={() => setReinstallTarget(vm)}
               onAssign={() => setAssignTarget(vm)}
               canAssign={canAssign}
               onResetPassword={() => setPasswordTarget(vm)}
@@ -1648,7 +1767,9 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
 
   /* 列显隐与顺序：按账号存在 localStorage，虚拟机与容器各记一份
      （两边的列不完全一样，共用一份配置会互相打架）。 */
-  const cols = useColumnSettings(columns, isLxc ? 'lxc' : 'vms');
+  /* orderVersion=1：这一版把「名称」列提到了最前 —— 老账号之前保存的列顺序
+     （状态在前）作废，回到新的默认顺序；隐藏偏好保留。 */
+  const cols = useColumnSettings(columns, isLxc ? 'lxc' : 'vms', 1);
 
   /* ---- 排序 + 分页 ----
      这两步的**顺序不能反**：先按整份 filtered 排好，再交给 usePaged 切页。
@@ -2196,6 +2317,14 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             open={Boolean(exportTarget)}
             vm={exportTarget}
             onClose={() => setExportTarget(null)}
+          />
+          {/* 重装系统：与详情页 VmMoreMenu 共用同一个弹窗。成功后**不自动关窗** ——
+              结果里带着每一步以及新旧盘的去向，那正是用户要确认的东西。 */}
+          <VmReinstallWizard
+            open={Boolean(reinstallTarget)}
+            vm={reinstallTarget}
+            onClose={() => setReinstallTarget(null)}
+            onDone={() => invalidateGuests(reinstallTarget ?? undefined)}
           />
         </>
       ) : null}

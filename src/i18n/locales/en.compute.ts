@@ -381,6 +381,9 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'guestList.ipNoticeVm': 'A VM needs the guest agent enabled before the panel can read the address inside it.',
   'guestList.ipNoticeTail': 'What you type here only affects display and search in the panel; the network config in Proxmox is left alone.',
   'guestList.ipLabel': 'IP address',
+  'guestList.networkLabel': 'Network',
+  'guestList.networkHint': 'Address pool this IP belongs to (name defined in Network settings)',
+  'guestList.networkNone': 'No matching address pool',
   'guestList.ipPlaceholder': 'e.g. 192.168.1.10',
   'guestList.ipHint': 'Save it empty to clear the record and fall back to automatic detection',
   'guestList.deleteTail': ' (VMID {vmid} on node {node}). Its disk data goes with it, and this cannot be undone.',
@@ -912,6 +915,10 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'vmCreate.cloneStorage': 'Target storage (optional)',
   'vmCreate.cloneStorageHintFull': 'Holds the independent disk copy',
   'vmCreate.cloneStorageHintLinked': 'A linked clone reuses the template disk, so no storage is needed',
+  'vmCreate.cloneBridge': 'Access bridge',
+  'vmCreate.cloneBridgeKeep': 'Keep the template bridge',
+  'vmCreate.cloneBridgeHint':
+    'Only the bridge is replaced; MAC, VLAN and rate stay as in the template. Works for static and DHCP alike — with DHCP the request goes out through this bridge.',
   'vmCreate.cloneMethod': 'Clone method',
   'vmCreate.cloneLinked': 'Linked clone',
   'vmCreate.cloneDefault': 'default',
@@ -1928,8 +1935,10 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'quickDeploy.linkedCloneNote':
     'Linked clone: disks stay on the template’s storage (instant, no extra space) and the system disk grows to the plan’s {n}G; these machines break if the template is deleted.',
   'quickDeploy.sectionNetwork': 'Network',
-  'quickDeploy.networkSubtitleVm': 'Add as many NICs as you need; static addresses are auto-picked from “Network → IP pools”',
-  'quickDeploy.networkSubtitleLxc': 'Add as many NICs as you need; IPs are written on netN',
+  'quickDeploy.networkSubtitleVm':
+    'Add as many NICs as you need; static addresses are auto-picked from “Network → IP pools”, and DHCP can target a subnet too',
+  'quickDeploy.networkSubtitleLxc':
+    'Add as many NICs as you need; IPs are written on netN, and DHCP can target a subnet too',
   'quickDeploy.networkSubtitleBatch':
     'Add as many NICs as you need; in batch mode the primary NIC gets one pool address per guest, extra NICs use DHCP (auto-assigned per guest when a matching pool exists)',
   'quickDeploy.labelBridge': 'Bridge',
@@ -1956,6 +1965,10 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'quickDeploy.errBatchIpDup': 'Two guests in this batch share the same address',
   'quickDeploy.labelPool': 'Subnet',
   'quickDeploy.poolHint': 'Selected based on the bridge',
+  'quickDeploy.labelSegment': 'DHCP subnet',
+  'quickDeploy.segmentOption': '{name} · {subnet}',
+  'quickDeploy.segmentHint':
+    'Picking one aligns the bridge and VLAN to it: the DHCP request leaves on that L2 network and its address comes from that subnet’s DHCP server (the panel reserves nothing).',
   'quickDeploy.labelIp': 'IP address',
   'quickDeploy.ipPlaceholder': 'e.g. 172.16.149.50',
   'quickDeploy.labelGateway': 'Gateway',
@@ -2180,6 +2193,9 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'guestList.ipManualBy': ' (recorded by {name})',
   'guestList.ipCopyTitle': 'Click to copy the IP',
   'guestList.ipManualTag': 'manual',
+  'guestList.ipOutOfPoolTag': 'off-pool',
+  'guestList.ipOutOfPool':
+    'This address is outside every IP pool: the guest may not have applied the cloud-init address (it took one from an external DHCP server), or someone changed it inside the system.',
   'guestList.ipEditAria': 'Enter the IP for {name} manually',
   'guestList.ipEditTitle': 'The panel could not detect an IP; you can enter one manually',
   'guestList.ipSaved': 'Manual IP saved',

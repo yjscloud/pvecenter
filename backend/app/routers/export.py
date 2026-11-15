@@ -291,6 +291,8 @@ async def export_vms(
                 vm.get("tags") or "",
                 owners.get(ref, ""),
                 vm.get("ip", "") if with_ip else "",
+                # 「网络」列与列表一致：地址所属的 IP 地址池名，with_ip 才解析得到
+                vm.get("ip_pool_name", "") if with_ip else "",
             ]
 
     header = [
@@ -309,6 +311,7 @@ async def export_vms(
     ]
     if with_ip:
         header.append("IP 地址")
+        header.append("网络")
 
     return exporting.csv_attachment(
         filename=f"资产清单-{_stamp()}.csv",

@@ -153,6 +153,11 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'vmReinstall.sshKeys': 'SSH public keys',
   'vmReinstall.sshKeysHint': 'One per line; with keys installed you can log in by key only',
   'vmReinstall.network': 'Network',
+  'vmReinstall.bridge': 'Bridge',
+  'vmReinstall.bridgeKeep': 'Keep the current bridge',
+  'vmReinstall.bridgeHint':
+    'Independent of the address mode: with DHCP the request goes out through this bridge too. Empty keeps the NIC on its current bridge.',
+  'vmReinstall.bridgeLoadFailed': 'Could not read the node interfaces — falling back to vmbr0',
   'vmReinstall.ipModeDhcp': 'DHCP (automatic)',
   'vmReinstall.ipModeStatic': 'Static address',
   'vmReinstall.ip': 'IP address (CIDR)',
@@ -171,6 +176,8 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'vmReinstall.irreversibleTitle': 'The data cannot be recovered',
   'vmReinstall.irreversibleBody':
     'The reinstall deletes this machine and rebuilds it from the template: the old system disk and any data disks are removed together with their volumes, and nothing on them can be recovered. The VMID, network cards (including their MACs), CPU and memory are kept. Back up whatever you still need first.',
+  'vmReinstall.diskKept':
+    'The system disk size is preserved: the current size ({size}) is captured before the reinstall, then restored and verified afterwards, so the template default cannot shrink it.',
   'vmReinstall.wipeDisks': 'Delete the data disks as well',
   'vmReinstall.wipeDisksHint':
     'Ticked: the data disks are cleared as well and the machine is rebuilt as a linked clone (seconds, and the disk depends on the template). Untick to keep the data disks \u2014 that falls back to a full disk copy, which takes minutes.',
@@ -389,6 +396,8 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   /* -------------------------------------------------- Shared table wording */
   'common.actions': 'Actions',
   'common.yes': 'Yes',
+  /* Bridges that exist in the node config but are not applied yet */
+  'common.inactiveSuffix': ' (inactive)',
   'common.no': 'No',
   'common.description': 'Description',
   'common.createdAt': 'Created',
@@ -459,6 +468,20 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'status.vm.suspended': 'Suspended',
   'status.vm.stopping': 'Stopping',
   'status.vm.starting': 'Starting',
+  /* PVE task locks: while a task runs, ``status`` may still be ``running`` */
+  'status.lock.backup': 'Backing up',
+  'status.lock.clone': 'Cloning',
+  'status.lock.create': 'Creating',
+  'status.lock.migrate': 'Migrating',
+  'status.lock.mounted': 'Mounted',
+  'status.lock.rollback': 'Rolling back',
+  'status.lock.shutdown': 'Shutting down',
+  'status.lock.snapshot': 'Snapshotting',
+  'status.lock.snapshotDelete': 'Deleting snapshot',
+  'status.lock.suspend': 'Suspending',
+  'status.lock.template': 'Converting to template',
+  'status.lock.diskResize': 'Resizing disk',
+  'status.lock.moveDisk': 'Moving disk',
   'status.node.online': 'Online',
   'status.node.offline': 'Offline',
   'status.task.running': 'Running',

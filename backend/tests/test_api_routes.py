@@ -841,6 +841,35 @@ class TestWriteRoutes:
         assert body["node"] == "pve1"
         assert body["task"].startswith("UPID:pve1:")
 
+    def test_clone_create_clears_stale_ip_cache(self, api, monkeypatch) -> None:
+        """克隆建机（快速部署走这条）必须清掉新 VMID 的旧 IP 记录。
+
+        回归：VMID 是从空闲池里回收的，克隆分支一直没清 ``guest_ip`` 缓存，
+        批量下发出来的机器会在列表里显示上一台机器的地址，而 PVE 里的实际
+        地址是对的。
+        """
+        from app.routers import vms as vms_router
+
+        calls = []
+
+        async def fake_forget(connection_id, node, vmid, kind):
+            calls.append((connection_id, node, vmid, kind))
+
+        monkeypatch.setattr(vms_router.guestip, "forget", fake_forget)
+
+        payload = {
+            "node": "pve1",
+            "name": "clone-new",
+            "clone_from": {"node": "pve1", "vmid": 9000, "full": False},
+            "networks": [{"bridge": "vmbr0", "model": "virtio"}],
+        }
+        resp = api.post("/api/vms", json=payload, headers=auth_headers(api))
+        assert resp.status_code == 200, resp.text
+        vmid = resp.json()["vmid"]
+        assert calls[-1][1] == "pve1"
+        assert calls[-1][2] == vmid
+        assert calls[-1][3] == "qemu"
+
     def test_batch_create_vms_returns_per_item_results(self, api) -> None:
         """一次下发 3 台：逐台结果、VMID 不重复、每台都有 PVE 任务。"""
         base = {
@@ -916,6 +945,33 @@ class TestWriteRoutes:
         assert [item["vmid"] for item in body["results"]] == [105, 106]
         assert all(item["type"] == "lxc" for item in body["results"])
         assert all(item["task"].startswith("UPID:pve1:") for item in body["results"])
+
+    def test_container_create_clears_stale_ip_cache(self, api, monkeypatch) -> None:
+        """容器新建同样要清旧 IP 记录：VMID 会回收，旧地址会贴到新容器上。"""
+        from app.routers import lxc as lxc_router
+
+        calls = []
+
+        async def fake_forget(connection_id, node, vmid, kind):
+            calls.append((connection_id, node, vmid, kind))
+
+        monkeypatch.setattr(lxc_router.guestip, "forget", fake_forget)
+
+        payload = {
+            "node": "pve1",
+            "ostemplate": "local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst",
+            "storage": "local-lvm",
+            "rootfs": 8,
+            "memory": 512,
+            "cores": 1,
+            "hostname": "ct-new",
+        }
+        resp = api.post("/api/lxc", json=payload, headers=auth_headers(api))
+        assert resp.status_code == 200, resp.text
+        vmid = resp.json()["vmid"]
+        assert calls[-1][1] == "pve1"
+        assert calls[-1][2] == vmid
+        assert calls[-1][3] == "lxc"
 
     def test_create_vm_validates_name(self, api) -> None:
         resp = api.post(

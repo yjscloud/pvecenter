@@ -726,6 +726,11 @@ ROUTES = {
     ("GET", "/api2/json/cluster/nextid"): lambda: 105,
     ("GET", "/api2/json/cluster/resources"): lambda: [VM_RUNNING, VM_TEMPLATE],
     ("GET", "/api2/json/nodes/pve1/qemu/100/config"): lambda: VM_CONFIG,
+    # 克隆目标机的配置读写（POST /config 是 qemu 侧的配置更新别名）
+    ("GET", "/api2/json/nodes/pve1/qemu/105/config"): lambda: {},
+    ("POST", "/api2/json/nodes/pve1/qemu/105/config"): lambda: (
+        "UPID:pve1:0000A1B7:00C3D4EA:65F00006:qmset:105:root@pam:"
+    ),
     ("GET", "/api2/json/nodes/pve1/storage"): lambda: STORAGES,
     # Cluster-wide storage list. PVE exposes this alongside the per-node view,
     # and /api/storages calls it when no node is given.
@@ -744,6 +749,9 @@ ROUTES = {
     ("POST", "/api2/json/nodes/pve1/qemu/9000/template"): lambda: (
         "UPID:pve1:0000A1B5:00C3D4E8:65F00004:qmtemplate:9000:root@pam:"
     ),
+    # 容器配置：PVE 只注册了 PUT（见 PVE::API2::LXC::Config），这里刻意不提供
+    # POST —— 未注册的方法由 mock 统一回 501，与真实 PVE 的行为一致。
+    ("PUT", "/api2/json/nodes/pve1/lxc/101/config"): lambda: None,
 }
 
 
@@ -955,6 +963,28 @@ class TestVmOperations:
         assert nets[0]["macaddr"] == "AA:BB:CC:DD:EE:FF"
         assert nets[0]["bridge"] == "vmbr0"
         assert nets[0]["tag"] == "10"
+
+
+class TestLxcConfig:
+    def test_set_config_uses_put_and_returns_no_task(self, mock_pve) -> None:
+        """容器配置只能走 PUT —— PVE 的 ``LXC::Config`` 没有 POST 别名。
+
+        回归：早先这里发的是 POST，真实 PVE 回 501 "method not implemented"，
+        前端把所有 501 统一显示成「该功能未实现」，于是容器改名 / 改规格 /
+        加网卡全部报这一句。mock 对未注册方法同样回 501，所以用 POST 时这个
+        用例会直接抛 ProxmoxError。
+        """
+        client = make_client(mock_pve)
+        result = run(client.lxc_set_config("pve1", 101, {"hostname": "ct-101"}))
+        # PUT 是同步语义：没有 UPID 可等，调用方按「task 为空」处理
+        assert result is None
+
+        method, path, body, _headers = next(
+            r for r in REQUESTS if r[1].endswith("/lxc/101/config")
+        )
+        assert method == "PUT"
+        assert path == "/api2/json/nodes/pve1/lxc/101/config"
+        assert body["hostname"] == "ct-101"
 
 
 class TestTaskHandling:

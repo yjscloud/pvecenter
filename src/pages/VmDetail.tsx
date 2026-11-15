@@ -15,7 +15,6 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   backupsApi,
   clusterApi,
-  nodesApi,
   sshFleetApi,
   storagesApi,
   vmsApi,
@@ -24,6 +23,7 @@ import { setPageConnection, isNotImplemented } from '../api/client';
 import { PveQueryError } from '../components/SetupRequired';
 import { usePveReady } from '../hooks/usePveStatus';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
+import { useNodeBridges } from '../hooks/useNodeBridges';
 import { useAnimatedNumber } from '../hooks/useAnimatedNumber';
 import { AskAiButton } from '../components/AskAiButton';
 import { NicSpecTags } from '../components/NicSpecTags';
@@ -99,6 +99,7 @@ import {
   isRunning,
   isStopped,
   isTransient,
+  lockLabel,
   ostypeLabel,
   taskStatusMeta,
   vmStatusMeta,
@@ -279,6 +280,9 @@ export function VmDetail() {
     queryFn: () => vmsApi.detail(node, vmid),
     enabled: pveReady && validParams,
     refetchInterval: pveReady ? refresh : false,
+    /* 切回标签页时立刻重取一次：详情页的状态与按钮可用性都靠这份数据，
+       而轮询可能被「数据刷新间隔」拉长甚至关掉（全局默认 focus 不刷新）。 */
+    refetchOnWindowFocus: 'always',
     retry: false,
   });
 
@@ -506,6 +510,9 @@ export function VmDetail() {
   }
 
   const statusMeta = vmStatusMeta(vm.status, tStatic);
+  /* 任务进行中时 PVE 只挂 lock、status 仍是 running：把锁翻成人话（「关机中」
+     「迁移中」），用户才知道底下确实在忙，而不是面板没反应。 */
+  const lockText = lockLabel(vm.lock, t);
   const running = isRunning(vm.status);
   const stopped = isStopped(vm.status);
   const frozen = vm.status === 'paused' || vm.status === 'suspended';
@@ -570,9 +577,9 @@ export function VmDetail() {
                 {t('vmDetail.badgeTemplate')}
               </Badge>
             ) : null}
-            {vm.lock ? (
+            {lockText ? (
               <Badge variant="warning" size="sm">
-                {t('vmDetail.badgeLocked', { lock: vm.lock })}
+                {lockText}
               </Badge>
             ) : null}
           </div>
@@ -2240,26 +2247,10 @@ function AddNetworkModal({
   const [firewall, setFirewall] = useState(true);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
-  /* 节点上可用作网桥的网卡，与创建向导取的是同一份数据 */
-  const bridgesQuery = useQuery({
-    queryKey: ['nodes', node, 'network'],
-    queryFn: () => nodesApi.network(node),
-    enabled: open,
-    staleTime: 60_000,
-    retry: false,
-  });
-
-  const bridgeOptions = useMemo(() => {
-    const ifaces = bridgesQuery.data ?? [];
-    const bridges = ifaces.filter(
-      (i) => i.type === 'bridge' || i.type === 'OVSBridge',
-    );
-    const list = bridges.length > 0 ? bridges : ifaces;
-    return list.map((i) => ({
-      label: `${i.iface}${i.active ? '' : t('vmDetail.addNicInactive')}`,
-      value: i.iface,
-    }));
-  }, [bridgesQuery.data, t]);
+  /* 节点上可用作网桥的网卡：与创建向导用同一套筛选（含 OVS 桥、标出未激活）。
+     连接走页面级默认（见主组件的 setPageConnection），这里不重复指定。 */
+  const bridges = useNodeBridges(node, undefined, open);
+  const bridgeOptions = bridges.options;
 
   useEffect(() => {
     if (!open) return;
@@ -2326,9 +2317,7 @@ function AddNetworkModal({
           required
           error={errors.bridge}
           hint={
-            bridgesQuery.isError
-              ? t('vmDetail.addNicBridgeLoadFailed')
-              : undefined
+            bridges.isError ? t('vmDetail.addNicBridgeLoadFailed') : undefined
           }
         >
           <Select

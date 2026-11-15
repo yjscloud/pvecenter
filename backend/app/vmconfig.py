@@ -706,6 +706,30 @@ def parse_config_networks(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     return networks
 
 
+def override_bridge(config: Dict[str, Any], bridge: str) -> Dict[str, Any]:
+    """把第一张网卡接到指定网桥上，**其余字段原样保留**。
+
+    只替换 ``bridge=`` 那一段，而不是整行重写：整行重建会把 MAC 换成新的（客户机
+    的 DHCP 静态租约、上游交换机的端口安全随之失效），VLAN、速率、防火墙标记也会
+    一起丢掉。克隆与重装都只要换「接入哪个二层网络」，别的都不该动。
+
+    返回可直接并入 PVE 配置的片段；配置里没有网卡时返回空 —— 不凭空加一张网。
+    """
+    networks = parse_config_networks(config)
+    if not networks or not bridge:
+        return {}
+    first = networks[0]
+    key = str(first["interface"])
+    raw = str(first.get("raw") or "")
+    parts = [
+        segment
+        for segment in raw.split(",")
+        if segment.strip() and not segment.strip().startswith("bridge=")
+    ]
+    parts.append(f"bridge={bridge}")
+    return {key: ",".join(parts)}
+
+
 def _parse_disk_value(key: str, value: str) -> Optional[Dict[str, Any]]:
     """Parse ``local-lvm:vm-100-disk-0,size=32G`` into a dict."""
     segments = value.split(",")

@@ -513,13 +513,15 @@ async def build_template_from_image(
             f"请先转成裸盘再导入：qemu-img convert -O raw 源文件 目标.raw 。",
         )
 
-    # --- 1. create the shell VM ---------------------------------------
+    # --- 1. create the VM: import + boot order + cloud-init in one shot ----
     # 固件与机型要配套算一遍：OVMF 在 i440fx 上不可用（那样建出来的模板直接引导
     # 失败），而默认机型**不写进配置** —— PVE 8 的 API 认 pc、PVE 9 只认 i440fx，
     # 写死哪个都会在另一个版本上被驳回；模板的值还会被每个克隆体继承下去。
     bios, machine = vmconfig.resolve_firmware(
         payload.bios, payload.machine, needs_efi=payload.bios == "ovmf"
     )
+    # DNS 先算出来：cloud-init 参数下面随建机请求一起下发，不再单独发一次 config。
+    dns = await defaults.effective_dns(payload.nameserver)
     create_config: Dict[str, Any] = {
         "vmid": vmid,
         "name": payload.name,
@@ -545,7 +547,24 @@ async def build_template_from_image(
         # 不再走「先建壳机 → qm importdisk」—— 那个端点已被 PVE 9.2 移除
         # （实测 501），继续用它这条流水线会在第二步直接失败。
         "scsi0": f"{payload.storage}:0,import-from={payload.image},discard=on",
+        # ---- 启动顺序与 cloud-init：与建机合并成一次请求 ----
+        # 早先这几项是建完机再发一次 ``PUT .../config`` 补的：多一次往返、多一个
+        # PVE 任务要等（固定 2 秒轮询时最多白等 2 秒），而它们本来就是
+        # ``POST /nodes/{node}/qemu`` 接受的参数。合并后模板流水线少一整步。
+        "boot": "order=scsi0",
+        # cloud-init 盘要带存储前缀（``<存储>:cloudinit``）：它是一块小 qcow2，
+        # 只写 ``cloudinit`` 会被 PVE 判为非法卷 ID 而拒绝。落在系统盘同一个存储上。
+        "ide2": f"{payload.storage}:cloudinit",
+        "ciuser": payload.ci_user or "ubuntu",
+        "ipconfig0": "ip=dhcp",
     }
+    if payload.ci_password:
+        create_config["cipassword"] = payload.ci_password
+    if payload.ssh_keys:
+        create_config["sshkeys"] = vmconfig._encode_ssh_keys(payload.ssh_keys)
+    # 未单独填写时套用面板默认 DNS，避免新模板的虚拟机只剩 RA 下发的 DNS
+    if dns:
+        create_config["nameserver"] = dns
     # 只在显式要 q35 时才写机型（默认机型由 PVE 自己决定，见上面的说明）
     if machine:
         create_config["machine"] = machine
@@ -559,6 +578,8 @@ async def build_template_from_image(
             timeout=1800,
         )
         record("创建虚拟机并导入镜像", True, f"VMID {vmid} ← {payload.image}")
+        # 保留这一条：cloud-init 与启动顺序确实配置过了，只是随建机一并下发。
+        record("配置 cloud-init", True, "随建机请求一并下发")
     except ProxmoxError as exc:
         await security.audit(
             request, user, "template.build", target=f"{payload.node}/{vmid}",
@@ -566,39 +587,10 @@ async def build_template_from_image(
         )
         raise HTTPException(
             status_code=exc.status_code if exc.status_code < 600 else 500,
-            detail=f"步骤 1/4 创建虚拟机失败：{exc.message}",
+            detail=f"步骤 1/3 创建虚拟机失败：{exc.message}",
         ) from exc
 
-    # --- 2. attach boot order + cloud-init ----------------------------
-    # 系统盘已经在创建时由 import-from 建好，这里只补启动顺序与 cloud-init
-    attach: Dict[str, Any] = {
-        "boot": "order=scsi0",
-        # cloud-init 盘要带存储前缀（``<存储>:cloudinit``）：它是一块小 qcow2，
-        # 只写 ``cloudinit`` 会被 PVE 判为非法卷 ID 而拒绝。落在系统盘同一个存储上。
-        "ide2": f"{payload.storage}:cloudinit",
-        "ciuser": payload.ci_user or "ubuntu",
-        "ipconfig0": "ip=dhcp",
-    }
-    if payload.ci_password:
-        attach["cipassword"] = payload.ci_password
-    if payload.ssh_keys:
-        attach["sshkeys"] = vmconfig._encode_ssh_keys(payload.ssh_keys)
-    # 未单独填写时套用面板默认 DNS，避免新模板的虚拟机只剩 RA 下发的 DNS
-    dns = await defaults.effective_dns(payload.nameserver)
-    if dns:
-        attach["nameserver"] = dns
-
-    try:
-        await _await(client, await client.qemu_set_config(payload.node, vmid, attach))
-        record("配置 cloud-init", True, payload.image)
-    except ProxmoxError as exc:
-        await _cleanup_failed_build(client, payload.node, vmid)
-        raise HTTPException(
-            status_code=500,
-            detail=f"步骤 2/4 配置 cloud-init 失败：{exc.message}。已回滚临时虚拟机。",
-        ) from exc
-
-    # --- 3. grow the disk if requested --------------------------------
+    # --- 2. grow the disk if requested --------------------------------
     if payload.disk_size:
         try:
             await _await(
@@ -613,7 +605,7 @@ async def build_template_from_image(
             # that is not fatal for the template.
             record("扩容磁盘", False, exc.message)
 
-    # --- 4. freeze as a template --------------------------------------
+    # --- 3. freeze as a template --------------------------------------
     try:
         await _await(client, await client.qemu_to_template(payload.node, vmid))
         record("转换为模板", True)
@@ -624,7 +616,7 @@ async def build_template_from_image(
         )
         raise HTTPException(
             status_code=500,
-            detail=f"步骤 4/4 转换为模板失败：{exc.message}（虚拟机 {vmid} 已保留，可手动处理）",
+            detail=f"步骤 3/3 转换为模板失败：{exc.message}（虚拟机 {vmid} 已保留，可手动处理）",
         ) from exc
 
     await security.audit(
@@ -639,17 +631,6 @@ async def build_template_from_image(
         "success": True,
         "steps": steps,
     }
-
-
-async def _cleanup_failed_build(client: Any, node: str, vmid: int) -> None:
-    """Destroy a half-built VM so a failed build leaves nothing behind."""
-    try:
-        result = await client.qemu_destroy(node, vmid, purge=True)
-        upid = result if isinstance(result, str) else (result or {}).get("task", "")
-        if isinstance(upid, str) and upid.startswith("UPID:"):
-            await client.wait_for_task(upid, timeout=120)
-    except Exception:  # noqa: BLE001 - best effort
-        pass
 
 
 # --------------------------------------------------------- convert existing

@@ -22,10 +22,21 @@ export interface RunTaskOptions {
   node?: string;
   /** 完成后需要刷新的 query key */
   invalidate?: QueryKey[];
-  /** 轮询间隔，默认 1500ms */
+  /** 轮询间隔，默认 1500ms（首轮不等待，之后从 250ms 起退避到这个值） */
   interval?: number;
   /** 超时时间，默认 10 分钟 */
   timeout?: number;
+  /**
+   * 任务运行期间是否周期性刷新 ``invalidate`` 里的数据，默认**开**。
+   *
+   * 关机（PVE 侧最多等 60 秒）、迁移、备份这类任务跑起来后，列表上那份数据
+   * 仍按「数据刷新间隔」（默认 30 秒）在转，用户看到的就是「点了没反应」。
+   * 开着它时每 :data:`LIVE_REFRESH_MS` 刷一次，PVE 挂上的 lock 与状态变化
+   * 能及时出现在界面上。
+   */
+  live?: boolean;
+  /** 运行期刷新间隔，默认 3 秒 */
+  liveInterval?: number;
   /** 成功回调 */
   onSuccess?: (task: TaskInfo) => void;
   /** 失败回调 */
@@ -54,6 +65,25 @@ export interface TaskRunner {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** 首轮之后的最小轮询间隔。``qm start`` / ``stop`` / ``resume`` 常在几百毫秒内结束 */
+const MIN_POLL_DELAY = 250;
+
+/** 任务运行期间的刷新节奏（毫秒） */
+const LIVE_REFRESH_MS = 3_000;
+
+/**
+ * 任何写操作都会牵动的「派生数据」。
+ *
+ * ``['cluster']`` 是**无条件**作废的，理由与 :func:`useTaskRunner` 里那段额度的
+ * 说明相同：一台机器的启停 / 增删会改变集群资源分布与仪表盘的统计，而这个查询
+ * 本身很轻。漏刷的代价（仪表盘与列表对不上）远高于多刷一次。
+ *
+ * 额度那几份由 ``invalidateQuota`` 负责（它覆盖 ``['guests','quota']`` 等）；
+ * 虚拟机/容器列表（``['vms']`` / ``['lxc']``）**不**放进来 —— 它们是逐台带 IP 的
+ * 重查询，只能由知道「这次动了哪种资源」的调用点显式给出。
+ */
+const DERIVED_KEYS: QueryKey[] = [['cluster']];
 
 /**
  * 从任务日志里读进度百分比。
@@ -106,7 +136,13 @@ export function useTaskRunner(): TaskRunner {
    */
   const flush = useCallback(
     (keys: QueryKey[]) => {
-      for (const key of keys) {
+      /* 去重：调用点自己给了 ['cluster'] 时不要再作废一次 —— 每次 invalidate
+         都会真的触发一次 refetch，重复 key 等于把请求数翻倍。 */
+      const seen = new Set<string>();
+      for (const key of [...keys, ...DERIVED_KEYS]) {
+        const id = JSON.stringify(key);
+        if (seen.has(id)) continue;
+        seen.add(id);
         void queryClient.invalidateQueries({ queryKey: key });
       }
       invalidateQuota(queryClient);
@@ -122,6 +158,8 @@ export function useTaskRunner(): TaskRunner {
         invalidate = [],
         interval = 1_500,
         timeout = 600_000,
+        live = true,
+        liveInterval = LIVE_REFRESH_MS,
         onSuccess,
         onError,
         destructive = false,
@@ -173,9 +211,18 @@ export function useTaskRunner(): TaskRunner {
       let failures = 0;
       const MAX_FAILURES = 5;
 
+      /* 任务已受理就先刷一次：``qm start/stop/shutdown`` 会立刻在虚拟机上挂
+         lock（``shutdown`` / ``migrate`` / ``backup`` …），列表里那颗按钮据此
+         置灰。让用户点完马上看到「它已经在动了」，而不是等整个任务结束才变。 */
+      flush(invalidate);
+      let lastLive = Date.now();
+      /** 轮询退避：首轮不等待，之后 250 → 500 → 1000 → interval 封顶 */
+      let delay = MIN_POLL_DELAY;
+
       try {
-        for (;;) {
-          await sleep(interval);
+        for (let first = true; ; first = false) {
+          if (!first) await sleep(delay);
+          delay = Math.min(Math.max(delay * 2, MIN_POLL_DELAY), interval);
 
           if (Date.now() - started > timeout) {
             toast.update(toastId, {
@@ -237,6 +284,14 @@ export function useTaskRunner(): TaskRunner {
             });
           }
 
+          /* 运行期刷新：任务还在跑时，列表/详情本来要等「数据刷新间隔」（默认
+             30 秒）才更新，而关机最多要等 60 秒 —— 这段时间界面上什么都看不出来。
+             按 liveInterval 刷一次，PVE 挂上的 lock 与中间状态就能跟着出现。 */
+          if (live && Date.now() - lastLive >= liveInterval) {
+            flush(invalidate);
+            lastLive = Date.now();
+          }
+
           if (task.status !== 'running') {
             const exit = task.exitstatus ?? '';
             /* WARNINGS 也是完成：PVE 在 LXC 创建等场景会返回 ``WARNINGS: 1``，
@@ -294,7 +349,7 @@ export function useTaskRunner(): TaskRunner {
         }
       }
     },
-    [toast, queryClient, t],
+    [toast, queryClient, t, flush],
   );
 
   return { run };

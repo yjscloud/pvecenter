@@ -63,6 +63,7 @@ import { Spinner } from './ui/Spinner';
 import { NodePicker } from './NodePicker';
 import { isPathDisabled, SSH_SECURITY_NAV_PATH } from './Sidebar';
 import { IconCloud, IconPlus, IconTrash } from './Icons';
+import { useNodeBridges } from '../hooks/useNodeBridges';
 import { useToast } from '../hooks/useToast';
 import { useUiPrefs } from '../hooks/useUiPrefs';
 import { useAuth } from '../hooks/useAuth';
@@ -330,13 +331,9 @@ export function QuickDeployForm({
     open && (!isVm || fullClone),
   );
 
-  const bridgesQuery = useQuery({
-    queryKey: ['nodes', targetConn, node, 'network'],
-    queryFn: () => nodesApi.network(node, targetConn),
-    enabled: open && Boolean(node),
-    staleTime: 60_000,
-    retry: false,
-  });
+  /* 网桥候选：与新建虚拟机 / 新建容器 / 重装共用同一套筛选（见 useNodeBridges）。
+     静态地址与 DHCP 都用这块网卡，所以两种模式下候选完全相同。 */
+  const bridges = useNodeBridges(node, targetConn, open && Boolean(node));
 
   /* 只列虚拟机模板：快速部署固定「从模板克隆」（容器走系统模板） */
   const templatesQuery = useQuery({
@@ -357,7 +354,11 @@ export function QuickDeployForm({
   const poolsQuery = useQuery({
     queryKey: ['ip-pools'],
     queryFn: ipPoolsApi.get,
-    enabled: open && primaryNic?.ipMode === 'static',
+    /* 静态与 DHCP 都要读：静态按池分配地址；DHCP 用池来确定「接入哪个网段」
+       （池记着它的网桥与 VLAN），选完把网卡对齐过去，DHCP 请求就从那条二层
+       网络出去。之前这里卡了 ipMode === 'static'，DHCP 模式下连池都不拉，
+       界面上自然没有任何网段可选。 */
+    enabled: open,
     staleTime: 30_000,
     retry: false,
   });
@@ -419,18 +420,19 @@ export function QuickDeployForm({
     setOsTemplate('');
   }, [node]);
 
-  /* 网桥默认取节点上的第一个（通常是 vmbr0），所有还没选网桥的网卡一起填上 */
+  /* 网桥默认取节点上的第一个（通常是 vmbr0），所有还没选网桥的网卡一起填上。
+     与地址模式无关：先选 DHCP 再切静态、或反过来，这个默认值都留在原地。 */
   useEffect(() => {
-    const bridgesOnly = (bridgesQuery.data ?? []).filter((i) => i.type === 'bridge');
-    const first = bridgesOnly.find((b) => b.iface?.startsWith('vmbr')) ?? bridgesOnly[0];
-    const iface = first?.iface;
+    const first =
+      bridges.options.find((o) => o.value.startsWith('vmbr')) ?? bridges.options[0];
+    const iface = first?.value;
     if (!iface) return;
     setNics((prev) =>
       prev.some((n) => !n.bridge)
         ? prev.map((n) => (n.bridge ? n : { ...n, bridge: iface }))
         : prev,
     );
-  }, [bridgesQuery.data]);
+  }, [bridges.options]);
 
   /* 存储默认：容器建 rootfs 要 rootdir 存储 */
   useEffect(() => {
@@ -457,6 +459,118 @@ export function QuickDeployForm({
       }),
     [poolsQuery.data, primaryNic?.bridge, primaryNic?.vlan, node, targetConn],
   );
+
+  /* DHCP 可选的「网段」：**不按当前网桥/VLAN 过滤** —— 用户正是要先选网段，再把
+     网桥与 VLAN 对齐过去；按当前网桥过滤的话，挂在另一块桥上的网段根本选不到。
+     节点与连接仍然要看：同一个 vmbr0 在不同节点上常常是不同网段。 */
+  const segmentPools = useMemo(
+    () =>
+      fitsPools(poolsQuery.data?.pools ?? [], {
+        node,
+        connection: targetConn,
+      }),
+    [poolsQuery.data, node, targetConn],
+  );
+
+  /* 网段下拉只列真实网段：DHCP 的目的是「从某个网段拿地址」，摆一个
+     「跟随网桥（不指定）」的默认项，等于允许一个语义上说不清的选择 ——
+     用户既然选了 DHCP，就该说清请求从哪条二层网络出去。 */
+  const segmentOptions = useMemo(
+    () =>
+      segmentPools.map((p) => ({
+        label: `${t('quickDeploy.segmentOption', {
+          name: p.name,
+          subnet: p.subnet,
+        })}${p.vlan != null ? ` · ${t('ippool.colVlan')} ${p.vlan}` : ''}`,
+        value: p.id,
+      })),
+    [segmentPools, t],
+  );
+
+  /**
+   * 手改网桥 / VLAN。
+   *
+   * DHCP 的网段下拉没有「不指定」这一档，不能把选择清空：改为换到一个与新的
+   * 二层网络匹配的网段（已选的那个仍匹配就保持不动）。一个都不匹配时保留原
+   * 选择 —— 那是用户明确覆盖的，提交时用的仍是网桥 / VLAN 本身。
+   * 静态模式不用管：usablePools 会按新网桥重筛，下面的 effect 会重挑。
+   */
+  const editNicLink = (index: number, patch: Partial<QuickNic>) => {
+    const nic = nics[index];
+    if (!nic || nic.ipMode !== 'dhcp') {
+      updateNic(index, patch);
+      return;
+    }
+    const nextBridge = patch.bridge ?? nic.bridge;
+    const nextVlan =
+      patch.vlan !== undefined ? parseVlan(patch.vlan) : parseVlan(nic.vlan);
+    const candidates = fitsPools(segmentPools, {
+      bridge: nextBridge,
+      vlan: nextVlan ?? null,
+      node,
+      connection: targetConn,
+    });
+    const fit = candidates.find((p) => p.id === nic.poolId) ?? candidates[0];
+    if (!fit || fit.id === nic.poolId) {
+      updateNic(index, patch);
+      return;
+    }
+    updateNic(index, {
+      ...patch,
+      poolId: fit.id,
+      /* 换了网段就把 VLAN 跟上（与下拉里选网段同一口径）；这次改的正是 VLAN
+         时以用户输入为准 */
+      vlan: patch.vlan ?? (fit.vlan != null ? String(fit.vlan) : nic.vlan),
+    });
+  };
+
+  /* 换节点 / 换 PVE 连接后，原来那个网段可能已经不适用于这台主机：下拉里没有
+     对应选项时值会变成空白，但状态里还留着一个旧 id —— 提交时它不会生效，却
+     让人以为选好了。这里统一清掉（静态模式随后由下面的 effect 重挑）。 */
+  useEffect(() => {
+    if (!open || !poolsQuery.data) return;
+    const ids = new Set(segmentPools.map((p) => p.id));
+    setNics((prev) => {
+      const next = prev.map((n) =>
+        /* 地址也一起清：它属于刚被丢掉的那个网段，留着会被当成「已填好」提交 */
+        n.poolId && !ids.has(n.poolId)
+          ? { ...n, poolId: '', ip: '', gateway: '' }
+          : n,
+      );
+      return next.some((n, i) => n !== prev[i]) ? next : prev;
+    });
+  }, [open, poolsQuery.data, segmentPools]);
+
+  /* DHCP 网段没有「不指定」这一档：切到 DHCP、或刚换过节点（上面的 effect 把
+     旧选择清掉了）时，自动挑一个网段 —— 优先与当前网桥 / VLAN 匹配的那个，
+     否则列表里的第一个，并把网卡的网桥与 VLAN 对齐过去。 */
+  useEffect(() => {
+    if (!open || segmentPools.length === 0) return;
+    setNics((prev) => {
+      let changed = false;
+      const next = prev.map((n) => {
+        if (n.ipMode !== 'dhcp') return n;
+        if (n.poolId && segmentPools.some((p) => p.id === n.poolId)) return n;
+        const fits = fitsPools(segmentPools, {
+          bridge: n.bridge,
+          vlan: parseVlan(n.vlan) ?? null,
+          node,
+          connection: targetConn,
+        });
+        const pick = fits[0] ?? segmentPools[0];
+        changed = true;
+        return {
+          ...n,
+          poolId: pick.id,
+          bridge: pick.bridge || n.bridge,
+          vlan: pick.vlan != null ? String(pick.vlan) : n.vlan,
+        };
+      });
+      return changed ? next : prev;
+    });
+    /* nics 也要跟着看：从「静态」切到「DHCP」时 poolId 可能还是空的，
+       光靠节点 / 网段变化触发不到 */
+  }, [open, nics, segmentPools, node, targetConn]);
 
   const poolOptions = useMemo(
     () => [
@@ -655,13 +769,7 @@ export function QuickDeployForm({
     ];
   }, [storagesQuery.data, isVm, t]);
 
-  const bridgeOptions = useMemo(
-    () =>
-      (bridgesQuery.data ?? [])
-        .filter((i) => i.type === 'bridge' && i.iface)
-        .map((i) => ({ label: i.iface, value: i.iface })),
-    [bridgesQuery.data],
-  );
+  const bridgeOptions = bridges.options;
 
   /* 什么时候要选存储：容器建 rootfs，或**虚拟机开了完整克隆**（磁盘要复制到
      某个存储上）。链接克隆不往任何存储写数据（磁盘留在模板所在存储），
@@ -802,6 +910,9 @@ export function QuickDeployForm({
              bridge=…,tag=…,rate=…（见 vmconfig.format_network_spec） */
           vlan_tag: parseVlan(nic.vlan) ?? null,
           rate: nicRate(nic),
+          /* DHCP 模式下用户选的网段（池）：后端据此只从这个池分配，而不是按
+             bridge + VLAN 自然排序取第一个（多个池共享同一网段时靠它区分）。 */
+          pool_id: nic.poolId || null,
         })),
         tags: tags || undefined,
         cloudinit: {
@@ -853,6 +964,8 @@ export function QuickDeployForm({
             /* 容器同样支持 VLAN 标签（后端 LxcNetworkSpec.vlan_tag → tag=） */
             vlan_tag: parseVlan(nic.vlan) ?? null,
             rate: nicRate(nic),
+            /* DHCP 模式下用户选的网段（池）：后端只从这个池分配 */
+            pool_id: nic.poolId || null,
           };
         }),
         setup: {
@@ -1274,15 +1387,15 @@ export function QuickDeployForm({
                     <Select
                       label={t('quickDeploy.labelBridge')}
                       value={nic.bridge}
-                      onChange={(e) => updateNic(index, { bridge: e.target.value })}
+                      onChange={(e) => editNicLink(index, { bridge: e.target.value })}
                       options={
                         bridgeOptions.length
                           ? bridgeOptions
                           : [{ label: nic.bridge || 'vmbr0', value: nic.bridge || 'vmbr0' }]
                       }
                       hint={
-                        index === 0 && bridgesQuery.isError
-                          ? errorMessage(bridgesQuery.error)
+                        index === 0 && bridges.isError
+                          ? errorMessage(bridges.error)
                           : undefined
                       }
                     />
@@ -1292,7 +1405,7 @@ export function QuickDeployForm({
                       min={1}
                       max={4094}
                       value={nic.vlan}
-                      onChange={(e) => updateNic(index, { vlan: e.target.value })}
+                      onChange={(e) => editNicLink(index, { vlan: e.target.value })}
                       placeholder={t('quickDeploy.vlanPlaceholder')}
                     />
                     <Input
@@ -1397,6 +1510,41 @@ export function QuickDeployForm({
                           />
                         </>
                       )}
+                    </div>
+                  ) : segmentPools.length > 0 ? (
+                    /* DHCP：同样要能指定「从哪个网段拿地址」。选中后把网桥与 VLAN
+                       对齐到该网段 —— DHCP 服务器按二层网络分地址，选网段就是选出
+                       哪个 VLAN / 网桥，这也是唯一能控制「拿到哪个网段」的手段。
+                       下拉里不设「不指定」：池都没配时干脆不摆这个框，避免出现
+                       一个点不出任何东西的空壳。 */
+                    <div
+                      className={`dyn-row mt-12${
+                        batchMode && index === 0 ? ' qd-nic-batch-pool' : ''
+                      }`}
+                    >
+                      <Select
+                        label={t('quickDeploy.labelSegment')}
+                        value={nic.poolId}
+                        onChange={(e) => {
+                          const picked = segmentPools.find(
+                            (p) => p.id === e.target.value,
+                          );
+                          updateNic(index, {
+                            poolId: e.target.value,
+                            ...(picked
+                              ? {
+                                  bridge: picked.bridge || nic.bridge,
+                                  vlan:
+                                    picked.vlan != null
+                                      ? String(picked.vlan)
+                                      : nic.vlan,
+                                }
+                              : {}),
+                          });
+                        }}
+                        options={segmentOptions}
+                        hint={t('quickDeploy.segmentHint')}
+                      />
                     </div>
                   ) : null}
 

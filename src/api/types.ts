@@ -1590,6 +1590,27 @@ export interface VmSummary {
   status: VmStatus;
   /** 主 IP（列表接口 with_ip=true 时返回，Guest Agent 优先、回退静态配置） */
   ip?: string;
+  /**
+   * 这个地址归不归平台 IP 地址池管。
+   *
+   * - `true`：落在某个池的子网里；
+   * - `false`：**不在任何池的子网里** —— 客户机可能没吃到 cloud-init 下发的静态
+   *   地址（自己从外部 DHCP 拿了一个），或者有人在系统内部改过 IP；
+   * - `null` / 缺省：环境里一个池都没配，或这台机器没解析到地址，判断不适用。
+   *
+   * 注意它描述的是**自动识别到的地址**（`ip`），不是面板里手动备注的那份 ——
+   * 手动值由界面单独展示，不参与这个判断。
+   */
+  ip_in_pool?: boolean | null;
+  /**
+   * 这个地址所属 IP 地址池的名字 —— 列表「网络」一列展示它。
+   *
+   * 由后端按自动识别到的 `ip` 与 `pool_covers` 回填，与 `ip_in_pool` 同一口径
+   * （`true` 时一定有值）。不用前端拉 `/ip-pools` 自行判断：那个接口会按用户
+   * 裁剪可见池，普通用户会漏掉公共池的名字，还会触发一次全集群扫描。
+   * 手动备注的地址后端看不到，所以它不参与判定。
+   */
+  ip_pool_name?: string | null;
   cpu?: number;
   maxcpu?: number;
   mem?: number;
@@ -1910,6 +1931,9 @@ export interface VmCreateNetwork {
   macaddr?: string;
   /** 速率上限（MB/s）。留空 = 不限速；PVE 的 net 行里就是 `rate=`。 */
   rate?: number | null;
+  /** 用户选定的 IP 地址池 id。只用于「DHCP → 地址池」时从哪个池分配，
+   *  不写入 PVE 配置。多个池共享同一网桥 / VLAN 时，靠它区分业务网 / 测试网。 */
+  pool_id?: string | null;
 }
 
 /* ---- 高级硬件（NUMA 绑定 / EFI 盘 / 虚拟 TPM）----
@@ -2165,6 +2189,9 @@ export interface LxcCreateNetwork {
   hwaddr?: string;
   rate?: number | null;
   mtu?: number | null;
+  /** 同 VmCreateNetwork.pool_id：用户选定的地址池，只用于 DHCP → 地址池分配，
+   *  不写进 PVE 的 netN 行。 */
+  pool_id?: string | null;
 }
 
 /** 创建容器时的挂载点 */
@@ -2828,6 +2855,11 @@ export interface VmCreateRequest {
   ostype?: string;
   disks: VmCreateDisk[];
   networks: VmCreateNetwork[];
+  /**
+   * 克隆时**只**换第一张网卡的接入网桥（MAC / VLAN / 速率保留）。
+   * 与 `networks` 互斥；留空 = 沿用模板网卡。DHCP 与静态地址都适用。
+   */
+  bridge_override?: string;
   iso?: string;
   scsi_hw?: string;
   bios?: string;
@@ -4329,6 +4361,8 @@ export interface ReinstallNetwork {
   ip: string;
   gateway: string;
   dns: string;
+  /** 网卡当前接在哪个网桥（重装向导的默认值；与静态/DHCP 无关） */
+  bridge?: string;
 }
 
 export interface ReinstallStep {
@@ -4378,6 +4412,11 @@ export interface VmReinstallBody {
   ip?: string;
   gateway?: string;
   dns?: string;
+  /**
+   * 网卡接到哪个网桥；留空 = 沿用原机器的网桥。
+   * 与 `ip_mode` 无关：DHCP 也要能指定「DHCP 请求从哪个桥出去」。
+   */
+  bridge?: string;
   start?: boolean;
   /** 连数据盘一起删（默认 true：重装 = 回到干净状态） */
   wipe_data_disks?: boolean;

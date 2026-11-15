@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
@@ -67,6 +67,30 @@ async def _load() -> Dict[str, Dict[str, Any]]:
             "at": int(value.get("at") or 0),
         }
     return result
+
+
+async def manual_ip_index(user: Dict[str, Any]) -> Dict[Tuple[str, str, int], str]:
+    """手动备注 IP 的索引 ``(连接, 节点, vmid) -> ip``，供列表 / 导出算「网络」。
+
+    可见性与 :func:`get_vm_meta` 一致：管理员全量，普通用户只看自己填的 ——
+    否则别人的虚拟机手动地址会顺着「网络归属」这个侧信道漏出来（虽然只漏池名，
+    但推池名的输入是别人填的 IP，不能拿它当自己的数据用）。
+
+    键用三元组而非原串：调用方（``collect_vms`` / ``list_containers``）拿到的
+    就是这三个字段，不必再和这里的串格式耦合。
+    """
+    items = await _load()
+    if user.get("role") != "admin":
+        username = str(user.get("username") or "")
+        items = {k: v for k, v in items.items() if v.get("by") == username}
+    out: Dict[Tuple[str, str, int], str] = {}
+    for key, value in items.items():
+        try:
+            conn, node, vmid_s = str(key).rsplit("|", 2)
+            out[(conn, node, int(vmid_s))] = str(value.get("ip") or "")
+        except ValueError:
+            continue
+    return out
 
 
 class VmMetaInput(BaseModel):

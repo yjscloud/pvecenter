@@ -689,6 +689,10 @@ export const zhCompute = {
   'vmCreate.cloneStorage': '目标存储（可选）',
   'vmCreate.cloneStorageHintFull': '用于存放独立磁盘副本',
   'vmCreate.cloneStorageHintLinked': '链接克隆复用模板磁盘，无需指定存储',
+  'vmCreate.cloneBridge': '接入网桥',
+  'vmCreate.cloneBridgeKeep': '沿用模板网桥（不修改）',
+  'vmCreate.cloneBridgeHint':
+    '只替换网卡的网桥，MAC / VLAN / 速率保持模板里的值。静态地址与 DHCP 都适用：选 DHCP 时，DHCP 请求也从这块网桥出去。',
   'vmCreate.cloneMethod': '克隆方式',
   'vmCreate.cloneLinked': '链接克隆',
   'vmCreate.cloneDefault': '默认',
@@ -1695,8 +1699,10 @@ export const zhCompute = {
   'quickDeploy.linkedCloneNote':
     '链接克隆：磁盘留在模板所在存储（秒级、不额外占空间），系统盘扩到规格的 {n}G；模板被删则这些机器起不来。',
   'quickDeploy.sectionNetwork': '网络',
-  'quickDeploy.networkSubtitleVm': '可加多张网卡；静态地址从「网络 → IP 地址池」自动挑，可改',
-  'quickDeploy.networkSubtitleLxc': '可加多张网卡，IP 直接写在 netN 上',
+  'quickDeploy.networkSubtitleVm':
+    '可加多张网卡；静态地址从「网络 → IP 地址池」自动挑，可改；DHCP 也能指定网段',
+  'quickDeploy.networkSubtitleLxc':
+    '可加多张网卡，IP 直接写在 netN 上；DHCP 也能指定网段',
   'quickDeploy.networkSubtitleBatch':
     '可加多张网卡；批量时主网卡从 IP 池按台分配地址，附加网卡用 DHCP（有匹配地址池时同样按台自动分配）',
   'quickDeploy.labelBridge': '网桥',
@@ -1721,6 +1727,10 @@ export const zhCompute = {
   'quickDeploy.errBatchIpDup': '同一批里有两台填了相同的地址',
   'quickDeploy.labelPool': '网段',
   'quickDeploy.poolHint': '已按网桥自动选中',
+  'quickDeploy.labelSegment': 'DHCP 网段',
+  'quickDeploy.segmentOption': '{name} · {subnet}',
+  'quickDeploy.segmentHint':
+    '选中后网桥与 VLAN 会按该网段对齐：DHCP 请求从这条二层网络发出，地址由该网段的 DHCP 服务器分配（面板不预留）。',
   'quickDeploy.labelIp': 'IP 地址',
   'quickDeploy.ipPlaceholder': '如 172.16.149.50',
   'quickDeploy.labelGateway': '网关',
@@ -2115,6 +2125,10 @@ export const zhCompute = {
   'guestList.ipNoticeVm': '虚拟机需要开启 Guest Agent 面板才能读到客户机内的地址。',
   'guestList.ipNoticeTail': '手动填写只影响面板上的展示与搜索，Proxmox 里的网络配置保持不变。',
   'guestList.ipLabel': 'IP 地址',
+  /* 「网络」一列：显示这个 IP 落在「网络配置」里哪个地址池（业务网 / 测试网…） */
+  'guestList.networkLabel': '网络',
+  'guestList.networkHint': '该地址所属的 IP 地址池（在「网络配置」里定义的名称）',
+  'guestList.networkNone': '未匹配到地址池',
   'guestList.ipPlaceholder': '例如 192.168.1.10',
   'guestList.ipHint': '留空并保存 = 清除这条记录，回落到平台自动识别',
   'guestList.deleteTail': '（VMID {vmid}，位于节点 {node}）。该操作会同时清除其磁盘数据，且无法恢复。',
@@ -2149,6 +2163,9 @@ export const zhCompute = {
   'guestList.ipManualBy': '（由 {name} 记录）',
   'guestList.ipCopyTitle': '点击复制 IP',
   'guestList.ipManualTag': '手动',
+  'guestList.ipOutOfPoolTag': '池外',
+  'guestList.ipOutOfPool':
+    '这个地址不属于任何 IP 地址池：客户机可能没吃到 cloud-init 下发的地址（自己从外部 DHCP 取了一个），或者在系统内部被手工改过。',
   'guestList.ipEditAria': '手动填写 {name} 的 IP',
   'guestList.ipEditTitle': '平台未识别到 IP，可手动填写',
   'guestList.ipSaved': '已保存手动 IP',

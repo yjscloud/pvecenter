@@ -851,7 +851,8 @@ plus step-up confirmation. Expired tokens are cleaned up by a background job.
 | `PVE_TRUST_ENV` | `false` | Whether requests honour `HTTP_PROXY` / `HTTPS_PROXY` from the environment |
 | `PVE_CONSOLE_USER` / `PVE_CONSOLE_PASSWORD` | empty | PVE account for the console; the console is unavailable when empty |
 | `CORS_ORIGINS` | `http://localhost:5173` | Allowed frontend origins, comma separated |
-| `HTTP_TIMEOUT` / `TASK_POLL_INTERVAL` | `30` / `2` | PVE request timeout (seconds) and task polling interval (seconds) |
+| `HTTP_TIMEOUT` / `TASK_POLL_INTERVAL` | `30` / `2` | PVE request timeout (seconds) and task polling interval (seconds). Polling is adaptive: it starts at 0.2s and doubles up to this ceiling |
+| `BATCH_CONCURRENCY` | `3` | Parallel creations in a batch (only when `stop_on_error=0`; `1` = serial). Each item blocks on a PVE task, so parallelism collapses total time to roughly "slowest item × rounds" |
 | `DEBUG` | `false` | Adds `X-PVE-Calls` / `X-DB-Queries` counters to every response for performance work; keep off in production |
 | `METRICS_HISTORY_ENABLED` / `METRICS_SAMPLE_INTERVAL` / `METRICS_RETENTION_DAYS` | `true` / `60` / `30` | Sampling into `metrics_history`: switch, interval (seconds) and retention (days, `0` = keep forever). PVE's own RRD rolls over and is lost when the panel restarts or a host is reinstalled |
 | `PC_UPDATE_MIRROR` | empty | Mirror prefix for the one-click update (only after a direct GitHub attempt fails). Not in `.env.example`; add it with `Environment=` under `systemctl edit pvecenter` |

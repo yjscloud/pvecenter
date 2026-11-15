@@ -343,6 +343,10 @@ class NetworkSpec(BaseModel):
     firewall: bool = False
     macaddr: Optional[str] = None
     rate: Optional[float] = None
+    #: 用户选定的 IP 地址池 id。只用于「DHCP → 地址池」时**从哪个池**分配；
+    #: 不写入 PVE 配置（format_network_spec 不读它）。多个池共享同一网桥 / VLAN
+    #: 时，不靠它无法区分「业务网还是测试网」——按网桥匹配会永远取配置顺序第一个。
+    pool_id: Optional[str] = None
 
 
 class VmAddDisk(DiskSpec):
@@ -475,6 +479,11 @@ class VmCreateRequest(BaseModel):
     scsihw: str = Field(default="virtio-scsi-single", alias="scsi_hw")
     disks: List[DiskSpec] = Field(default_factory=list)
     networks: List[NetworkSpec] = Field(default_factory=list)
+    #: 克隆时**只**换第一张网卡的接入网桥，其余（MAC / VLAN / 速率 / 防火墙）保留。
+    #: 与 ``networks`` 互斥：给了 ``networks`` 就按整行覆盖（新建 / 快速部署）。
+    #: 留空 = 沿用模板网卡。静态地址与 DHCP 都走同一块网卡，所以这一项与地址
+    #: 模式无关 —— 选 DHCP 时同样可以指定「DHCP 请求从哪个桥出去」。
+    bridge_override: str = ""
     iso: Optional[str] = None
     boot_order: Optional[str] = None
     start_on_boot: bool = False
@@ -686,6 +695,9 @@ class LxcNetworkSpec(BaseModel):
     hwaddr: Optional[str] = None
     rate: Optional[float] = None
     mtu: Optional[int] = None
+    #: 同 NetworkSpec.pool_id：用户选定的地址池，只用于 DHCP → 地址池分配时
+    #: 定位池；format_lxc_network_spec 不读它，不会写进 PVE 的 net0 行。
+    pool_id: Optional[str] = None
 
 
 class LxcMountSpec(BaseModel):
@@ -1533,6 +1545,9 @@ class VmReinstallRequest(BaseModel):
     ip: str = ""
     gateway: str = ""
     dns: str = ""
+    # 网卡接到哪个网桥；留空 = 沿用原机器所在的网桥。
+    # 与 ip_mode 无关：DHCP 同样要能指定「DHCP 请求从哪个桥出去」。
+    bridge: str = ""
     start: bool = False               # 重装完成后是否启动
     # 连数据盘一起删（默认开：重装的语义就是让这台机器回到干净状态）。
     # 要保留数据盘的用户在向导里取消勾选即可。
