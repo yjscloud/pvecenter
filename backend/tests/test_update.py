@@ -332,7 +332,8 @@ class TestUpdateScript:
         log = Path("/srv/pvecenter/logs/update-20261006-120000.log")
         text = update._script_text(_dep(), "v0.1.5", log)
         assert f'exec >>"{log}" 2>&1' in text
-        assert "git fetch --tags --prune origin" in text
+        # 拉代码走带退路的 fetch_once（见 TestGitFetchFallbacks），不是光秃秃一句 fetch
+        assert "fetch --tags --prune origin" in text
         assert "git rev-parse --verify --quiet" in text
         assert 'git checkout "v0.1.5"' in text
         assert './deploy.sh --service "pvecenter"' in text
@@ -405,6 +406,139 @@ class TestUpdateScript:
         assert not update._TAG_RE.match("v0.1.5; rm -rf /")
         assert not update._TAG_RE.match("$(id)")
         assert not update._TAG_RE.match("")
+
+
+class TestGitFetchFallbacks:
+    """git fetch 不能在第一次失败时就把整次更新判死。
+
+    实测最常见的两类都是网络层的：
+
+    * 老版本 git / 中间代理把 HTTP/2 走成半死状态（``RPC failed; curl 92 HTTP/2
+      stream``），换成 ``-c http.version=HTTP/1.1`` 往往一次就过；
+    * 弱网 / 代理抖动，等十几秒自愈。
+
+    所以顺序是「按现状 → HTTP/1.1 → 退避重试 2 次 → 镜像 → 放弃」；放弃时才写诊断
+    （git 版本 / 脱敏后的 remote / curl trace 末尾）—— 早先日志里只有一句
+    「git fetch 失败」，用户和客服都无从下手。
+    """
+
+    def test_order_before_giving_up(self) -> None:
+        text = update._script_text(_dep(), "v0.1.5", Path("/tmp/x.log"))
+        assert 'fetch_once "第 1 次，按现状"' in text
+        assert "for delay in 5 15" in text  # 退避两档
+        first = text.index('fetch_once "第 1 次')
+        marks = [
+            first,
+            # 注释里也出现过这个参数，从第一次尝试往后找才是真的那次调用
+            text.index("-c http.version=HTTP/1.1", first),
+            text.index("for delay in 5 15", first),
+            text.index('MIRROR/https://github.com/', first),
+            text.index("  dump_git_failure\n", first),
+        ]
+        assert marks == sorted(marks)
+
+    def test_failure_keeps_git_version_remote_and_trace(self) -> None:
+        text = update._script_text(_dep(), "v0.1.5", Path("/tmp/x.log"))
+        assert "git --version" in text
+        assert "GIT_TRACE_CURL" in text
+        assert 'tail -n 20 "$f"' in text  # 只贴末尾，不把整份 curl 日志灌进更新日志
+        assert "redact" in text  # remote 里可能带 token，落盘前要抹掉
+        assert "[Aa]uthorization" in text
+
+    def test_mirror_is_a_fallback_for_git_too(self) -> None:
+        """``PC_UPDATE_MIRROR`` 原来只对源码包安装生效，git 部署没有任何退路。
+
+        这里直接拿镜像前缀当远端拉目标 tag（绕开 origin）：SSH 远端、一次性 unit
+        里没有 ssh-agent 的场景也走得通。
+        """
+        text = update._script_text(
+            _dep(), "v0.1.5", Path("/tmp/x.log"), None, "yjscloud/pvecenter"
+        )
+        assert "git -c http.version=HTTP/1.1 fetch --no-tags" in text
+        assert '"$MIRROR/https://github.com/yjscloud/pvecenter"' in text
+        assert '"+refs/tags/v0.1.5:refs/tags/v0.1.5"' in text
+        # 只有直连全部失败才碰镜像
+        assert text.index('FETCHED" = 0 ] && [ -n "$MIRROR"') > text.index("for delay in 5 15")
+
+    def test_mirror_reaches_the_script_environment(self, monkeypatch) -> None:
+        """systemd-run 的一次性单元不继承面板进程的环境：不显式带过去就等于没设。"""
+        monkeypatch.setenv("PC_UPDATE_MIRROR", "https://ghfast.top/")
+        assert update._launch_env()["PC_UPDATE_MIRROR"] == "https://ghfast.top/"
+        monkeypatch.delenv("PC_UPDATE_MIRROR", raising=False)
+        assert "PC_UPDATE_MIRROR" not in update._launch_env()
+
+
+def _fetch_section(tmp_path: Path) -> str:
+    """截出生成脚本里「拉代码」那一段：整份脚本会真去跑 deploy.sh，不能直接执行。"""
+    text = update._script_text(_dep(), "v0.1.5", tmp_path / "u.log")
+    return text[text.index('echo "PROGRESS 12 fetch"') : text.index("if ! git rev-parse")]
+
+
+def _stub_bin(tmp_path: Path, *, succeed_on_http11: bool) -> Path:
+    """假 git：把每次调用的参数记到 ``$CALLS``，按需只在带 http.version 的那次「通」。
+
+    退避用的 sleep 也换掉 —— 用例验证的是顺序，不是真等 20 秒。
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    body = (
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  config) echo 'https://user:tok@example.com/o/r.git'; exit 0 ;;\n"
+        "  --version) echo 'git version 9.9.9'; exit 0 ;;\n"
+        "esac\n"
+        'printf \'%s\\n\' "$*" >> "$CALLS"\n'
+    )
+    if succeed_on_http11:
+        body += 'grep -q http.version <<<"$*" && exit 0\n'
+    body += "exit 1\n"
+    git = bin_dir / "git"
+    git.write_text(body, encoding="utf-8")
+    git.chmod(0o755)
+    sleep = bin_dir / "sleep"
+    sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    sleep.chmod(0o755)
+    return bin_dir
+
+
+def _run_fetch(tmp_path: Path, bin_dir: Path) -> subprocess.CompletedProcess:
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ.get('PATH') or '/usr/bin:/bin'}",
+        "CALLS": str(tmp_path / "calls.log"),
+        "HOME": str(tmp_path),
+    }
+    env.pop("PC_UPDATE_MIRROR", None)
+    return subprocess.run(
+        ["bash", "-c", 'TMP="$(mktemp -d)"\n' + _fetch_section(tmp_path)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+class TestGitFetchRuntime:
+    """把生成出来的那一段真的跑一遍：重试顺序与诊断输出不能只靠读代码确认。"""
+
+    def test_second_attempt_switches_to_http11(self, tmp_path: Path) -> None:
+        proc = _run_fetch(tmp_path, _stub_bin(tmp_path, succeed_on_http11=True))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        calls = (tmp_path / "calls.log").read_text(encoding="utf-8").splitlines()
+        assert calls[0] == "fetch --tags --prune origin"
+        assert calls[1] == "-c http.version=HTTP/1.1 fetch --tags --prune origin"
+        assert len(calls) == 2  # 通了就不再折腾
+
+    def test_all_attempts_fail_then_diagnostics(self, tmp_path: Path) -> None:
+        proc = _run_fetch(tmp_path, _stub_bin(tmp_path, succeed_on_http11=False))
+        assert proc.returncode == 1
+        calls = (tmp_path / "calls.log").read_text(encoding="utf-8").splitlines()
+        # 1 次按现状 + 1 次 HTTP/1.1 + 2 次退避 = 4 次
+        assert len(calls) == 4
+        assert proc.stdout.count("git fetch（") == 4
+        assert "git version 9.9.9" in proc.stdout
+        # remote 里的凭据不能落进更新日志
+        assert "tok@example.com" not in proc.stdout
+        assert "https://***@example.com/o/r.git" in proc.stdout
 
 
 class TestApplyingState:

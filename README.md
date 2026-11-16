@@ -151,7 +151,7 @@ sudo ./deploy.sh --port 9000 --mysql-root-password '<root 口令>' \
 
 > 本机构建前端要 Node.js **22.22+**（`react-router 8` 的下限，vite 8 自己也要 22.12+）。版本不够时 `deploy.sh` 会自己补：先用发行版仓库装（RHEL 9 会切 `nodejs:22` 模块流），还不行就从 npmmirror / nodejs.org 下官方二进制，解压到仓库下的 `.node/` 再构建 —— 不改系统源、不动系统里已有的 node，删目录即卸载，重复执行直接复用。想钉版本：`NODE_BOOTSTRAP_VERSION=22.22.1 sudo ./deploy.sh`。三条都走不通（Alpine、完全离线、架构不在支持列表）时脚本才会停下给手工方案：NodeSource / nvm、在别的机器 `npm run build` 后拷 `dist/` 过来加 `--skip-frontend`、或改用 Docker。宿主机一个 Node 都不装也能跑，只要 `dist/` 是新的。
 
-> 「立即更新」要联网拉源码包，国内连 `github.com` 经常卡。0.3.2 起加了连接超时和总时长，失败直接报错而不是一直挂着。连不上就在 `systemctl edit pvecenter` 里写 `Environment=PC_UPDATE_MIRROR=https://ghfast.top/` 后重试，或者下源码包手工升级 / 改用 Docker。
+> 「立即更新」要联网拉代码（源码包安装下 tar.gz，git 安装下 `git fetch`），国内连 `github.com` 经常卡。0.3.2 起加了连接超时和总时长，失败直接报错而不是一直挂着；git 安装还会按「原样 → HTTP/1.1 → 退避重试 2 次 → 镜像」逐级重试，全失败才放弃，并把 `git --version`、脱敏后的 remote、`GIT_TRACE_CURL` 末尾写进更新日志。连不上就在 `systemctl edit pvecenter` 里写 `Environment=PC_UPDATE_MIRROR=https://ghfast.top/` 后重试，或者下源码包手工升级 / 改用 Docker。
 
 > `SECRET_KEY` 生成之后别再改，换了它，库里已存的 PVE Token、SMTP 口令全都解不开。`.env` 已存在时，脚本只覆盖命令行上显式给出的键。
 
@@ -493,7 +493,7 @@ PVE 里把 PBS 注册成存储之后，存储页就会显示 PBS 徽标、最近
 
 ### 面板自身维护（更新 / 作业 / 品牌 / 入口开关）
 
-- **更新**：设置页检查新版本，可以跳过某个版本，也可以改发布仓库。「立即更新」下载源码包后 `rsync` 覆盖（排除 `.git`、`backend/.env`、`data`、`dist` 等）再重启，接口立刻返回，进度看日志文件。国内拉不到 GitHub 时设 `PC_UPDATE_MIRROR` 镜像前缀。
+- **更新**：设置页检查新版本，可以跳过某个版本，也可以改发布仓库。「立即更新」按安装形态换代码：源码包安装下载 tar.gz 后 `rsync` 覆盖（排除 `.git`、`backend/.env`、`data`、`dist` 等），git 安装则 `git fetch` + `checkout`，两者最后都跑 `deploy.sh` 重启，接口立刻返回，进度看日志文件。国内拉不到 GitHub 时设 `PC_UPDATE_MIRROR` 镜像前缀 —— 源码包与 git 两种形态都会回退到它。
 - **后台作业**：面板自己的定时任务都列在这一页（各种巡检、告警、证书续期、归属对账、数据清理、frp 看护、版本检查等），间隔 10 秒到 30 天可调，能单独启停、立即执行并看这次的结果，也能恢复默认值。
 - **站点品牌**：站点名、副标题、备案号，自定义 Logo 与登录页背景图（上传即生效，可移除回落到内置图标）。`/api/config/site` 保持匿名，登录页读它渲染。
 - **入口开关**：可以逐个关闭侧边栏入口。关掉之后侧边栏、顶栏菜单、`Ctrl + K` 和直达 URL 一起失效，但**接口不因此拒绝**（入口不等于授权）；只有「系统设置」永远保留，否则就没地方恢复了。
@@ -537,7 +537,7 @@ PVE 里把 PBS 注册成存储之后，存储页就会显示 PBS 徽标、最近
 | `BATCH_CONCURRENCY` | `3` | 批量下发的并发台数（仅 `stop_on_error=0` 时生效，设 `1` 回到串行）。每台都要等 PVE 任务结束，并发能把总耗时压到接近「最慢一台 × 轮数」 |
 | `DEBUG` | `false` | 响应里带 `X-PVE-Calls` / `X-DB-Queries` 计数头，便于排性能问题；生产别开 |
 | `METRICS_HISTORY_ENABLED` / `METRICS_SAMPLE_INTERVAL` / `METRICS_RETENTION_DAYS` | `true` / `60` / `30` | 指标采样进 `metrics_history` 的开关、周期（秒）与保留天数（`0` = 永久保留）。PVE 自带的 RRD 会被滚动覆盖，面板重启或主机重装就丢 |
-| `PC_UPDATE_MIRROR` | 空 | 一键更新拉源码包的镜像前缀（直连 GitHub 失败后才用）。不在 `.env.example` 里，用 `systemctl edit pvecenter` 写 `Environment=` |
+| `PC_UPDATE_MIRROR` | 空 | 一键更新的镜像前缀（直连 GitHub 失败后才用）：源码包安装拿它拼下载地址，git 安装拿它当远端拉目标 tag。不在 `.env.example` 里，用 `systemctl edit pvecenter` 写 `Environment=` |
 | `SSH_FORWARD_LOG_HOST` / `SSH_FORWARD_PROXIES` / `SSH_FORWARD_ROUTES` / `SSH_FORWARD_HAPROXY_CFG` | 空 | 入口机（haproxy + PROXY protocol）的来源 IP 还原：读哪台入口机的日志、可选覆盖与显式路由、haproxy 配置路径。详见 [frp 真实 IP 接入指南](docs/frp-real-ip.md) |
 | `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | `127.0.0.1` / `3306` / 空 | MySQL 连接，库名必填 |
 | `DB_POOL_SIZE` | `8` | 连接池上限 |

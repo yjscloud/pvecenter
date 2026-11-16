@@ -414,6 +414,12 @@ def manual_commands(
         lines = [f"cd {dep.get('root')}"]
         if git.get("dirty"):
             lines.append("# 工作区有未提交改动，先备份/提交：git stash")
+        # 网络不通时给人留两条可照抄的退路：HTTP/1.1（老 git / 代理走 HTTP/2 会半死）
+        # 与镜像前缀（与面板内一键更新的重试顺序一致）
+        lines.append(
+            "# 拉不下来时：git -c http.version=HTTP/1.1 fetch --tags --prune origin，"
+            "或设 PC_UPDATE_MIRROR 用镜像"
+        )
         lines.append("sudo git fetch --tags --prune origin")
         lines.append(f"sudo git checkout {spec}")
         # deploy.sh 是幂等的：装依赖 + 构建前端 + 重启服务，官方升级路径就是它
@@ -811,19 +817,28 @@ def _launch_env() -> Dict[str, str]:
     那一步直接退出 —— 依赖没装、服务没重启，而界面还停在「正在更新中」。一次性
     systemd 单元的环境是干净的，**不会**继承面板进程的 ``HOME``，所以这里显式给。
     ``PATH`` 也给全，免得 ``git`` / ``node`` / ``npm`` 找不到。
+
+    ``PC_UPDATE_MIRROR`` 要显式带过去：它一般写在 ``systemctl edit`` 的
+    ``Environment=`` 里，而 ``systemd-run`` 起的一次性单元**同样**不继承 —— 不带的话
+    脚本里 ``${PC_UPDATE_MIRROR:-}`` 永远是空，镜像退路等于没接上（源码包与 git 两条
+    路都靠它兜底）。
     """
     try:
         record = pwd.getpwuid(os.geteuid())
         home, user = record.pw_dir, record.pw_name
     except (KeyError, OSError):
         home, user = os.environ.get("HOME", "/root"), os.environ.get("USER", "root")
-    return {
+    env = {
         "HOME": home,
         "USER": user,
         "LOGNAME": user,
         "PATH": os.environ.get("PATH")
         or "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     }
+    mirror = str(os.environ.get("PC_UPDATE_MIRROR") or "").strip()
+    if mirror:
+        env["PC_UPDATE_MIRROR"] = mirror
+    return env
 
 
 def _script_text(
@@ -902,8 +917,86 @@ if ! rsync -a --delete \\
   echo "同步代码失败，放弃更新"; exit 1
 fi'''
     else:
+        # 拉代码这一段以前是「一句 git fetch，失败即退出」：国内网络下这是整个一键
+        # 更新最容易死的地方，而日志里只留一句「git fetch 失败」，既看不出是 DNS、
+        # 443 被挡、HTTP/2 半死还是凭据问题，也没有第二条路可走。现在按
+        # 「按现状 → HTTP/1.1 → 退避重试 2 次 → 镜像（PC_UPDATE_MIRROR）」逐级退让，
+        # 全失败才放弃，并把 git 版本、脱敏后的 remote、curl trace 末尾写进日志。
         code_section = f'''echo "PROGRESS 12 fetch"
-if ! git fetch --tags --prune origin; then echo "git fetch 失败（网络或凭据问题），放弃更新"; exit 1; fi
+MIRROR="${{PC_UPDATE_MIRROR:-}}"
+MIRROR="${{MIRROR%/}}"
+TRACE_DIR="$TMP/git-trace"
+mkdir -p "$TRACE_DIR"
+TRACE_N=0
+# remote 里可能带凭据（https://user:token@github.com/...）：写进日志前统一抹掉
+redact() {{
+  sed -E -e 's#(://)[^/@[:space:]]*@#\\1***@#g' \\
+         -e 's#([Aa]uthorization:).*#\\1 ***#' 2>/dev/null || cat
+}}
+SAFE_URL="$(printf '%s' "$(git config --get remote.origin.url 2>/dev/null || true)" | redact)"
+fetch_once() {{
+  # $1 是这次尝试的说明，其余参数原样交给 git（形如 -c http.version=HTTP/1.1）
+  local note="$1"
+  shift
+  TRACE_N=$((TRACE_N + 1))
+  echo "[$(date -Is)] git fetch（$note）"
+  # GIT_TRACE_CURL 指向文件：只留 info 与 header（NO_DATA），失败时贴末尾几十行足够定位
+  GIT_TERMINAL_PROMPT=0 GIT_TRACE_CURL_NO_DATA=1 \\
+    GIT_TRACE_CURL="$TRACE_DIR/$TRACE_N.log" \\
+    git "$@" fetch --tags --prune origin
+}}
+dump_git_failure() {{
+  echo "[$(date -Is)] git fetch 全部尝试都失败，下面是定位用的信息："
+  echo "  git --version ：$(git --version 2>&1)"
+  echo "  remote        ：$SAFE_URL"
+  if [ -n "$MIRROR" ]; then echo "  试过的镜像    ：$MIRROR"; fi
+  echo "  ---- GIT_TRACE_CURL 末尾（每次尝试 20 行）----"
+  for f in "$TRACE_DIR"/*.log; do
+    [ -f "$f" ] || continue
+    echo "  · 第 $(basename "$f" .log) 次尝试"
+    tail -n 20 "$f" | redact
+  done
+  echo "  ---- 结束（以上内容已脱敏）----"
+}}
+FETCHED=0
+if fetch_once "第 1 次，按现状"; then
+  FETCHED=1
+elif fetch_once "第 2 次，HTTP/1.1" -c http.version=HTTP/1.1; then
+  FETCHED=1
+else
+  # 指数退避再试 2 次：弱网 / 中间代理抖动，等十几秒多半就恢复了
+  for delay in 5 15; do
+    echo "[$(date -Is)] 等待 ${{delay}}s 后重试"
+    sleep "$delay"
+    if fetch_once "退避重试（${{delay}}s 后，HTTP/1.1）" -c http.version=HTTP/1.1; then
+      FETCHED=1
+      break
+    fi
+  done
+fi
+if [ "$FETCHED" = 0 ] && [ -n "$MIRROR" ]; then
+  # git 部署原来完全不吃 PC_UPDATE_MIRROR：GitHub 到不了时只剩手工一条路。
+  # 镜像（ghfast / ghproxy 那一类）是把 https 地址贴在最前面的前缀，这里直接拿它
+  # 当远端拉目标 tag —— 绕开 origin，SSH 远端、一次性 unit 里没有 ssh-agent 也不影响。
+  echo "[$(date -Is)] 直连 GitHub 不通，改用镜像 $MIRROR 拉取 {tag}"
+  TRACE_N=$((TRACE_N + 1))
+  if GIT_TERMINAL_PROMPT=0 GIT_TRACE_CURL_NO_DATA=1 \\
+       GIT_TRACE_CURL="$TRACE_DIR/$TRACE_N.log" \\
+       git -c http.version=HTTP/1.1 fetch --no-tags \\
+       "$MIRROR/https://github.com/{repo or DEFAULT_REPO}" \\
+       "+refs/tags/{tag}:refs/tags/{tag}"; then
+    FETCHED=1
+  else
+    echo "[$(date -Is)] 经镜像也拉不下来（镜像需支持 git over HTTP，只代理下载文件的镜像不行）"
+  fi
+fi
+if [ "$FETCHED" = 0 ]; then
+  dump_git_failure
+  echo "下一步：设置 PC_UPDATE_MIRROR（形如 https://ghfast.top/）后重试，或手工下载源码包覆盖："
+  echo "        https://github.com/{repo or DEFAULT_REPO}/archive/refs/tags/{tag}.tar.gz"
+  echo "git fetch 失败（网络或凭据问题），放弃更新"
+  exit 1
+fi
 if ! git rev-parse --verify --quiet "{tag}^{{commit}}" >/dev/null; then echo "远端找不到 {tag}，放弃更新"; exit 1; fi
 echo "PROGRESS 30 switch"
 # 先记下当前所在的分支：更新完要回到它。detached（正停在某个 tag 上）时为空，
