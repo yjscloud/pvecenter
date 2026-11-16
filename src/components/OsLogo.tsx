@@ -37,11 +37,17 @@ import archLinuxLogo from '../assets/os-logos/arch.svg';
 import alpineLogo from '../assets/os-logos/alpine.svg';
 import almaLinuxLogo from '../assets/os-logos/alma.svg';
 import centosLogo from '../assets/os-logos/centos.svg';
+import coreosLogo from '../assets/os-logos/coreos.svg';
 import debianLogo from '../assets/os-logos/debian.svg';
 import fedoraLogo from '../assets/os-logos/fedora.svg';
+import fnosLogo from '../assets/os-logos/fnos.svg';
 import linuxLogo from '../assets/os-logos/linux.svg';
+import opencloudosLogo from '../assets/os-logos/opencloudos.svg';
+import openwrtLogo from '../assets/os-logos/openwrt.svg';
+import redhatLogo from '../assets/os-logos/redhat.svg';
 import rockyLogo from '../assets/os-logos/rocky.svg';
 import suseLogo from '../assets/os-logos/suse.svg';
+import tencentLogo from '../assets/os-logos/tencent.svg';
 import ubuntuLogo from '../assets/os-logos/ubuntu.svg';
 import windowsLogo from '../assets/os-logos/windows.svg';
 import { osFamilyMark, type OsFamily, type OsFamilyKey } from '../utils/osFamily';
@@ -57,11 +63,20 @@ const OS_LOGOS: Partial<Record<OsFamilyKey, string>> = {
   windows: windowsLogo,
   ubuntu: ubuntuLogo,
   debian: debianLogo,
+  redhat: redhatLogo,
   centos: centosLogo,
   rocky: rockyLogo,
   alma: almaLinuxLogo,
   fedora: fedoraLogo,
+  /* TencentOS：官方标识只有位图（蓝底 #0052d9 的斜方形 + 白色 t）。这里按轮廓
+     重绘成矢量（外框 4 个顶点、内圈 11 个），斜边才不会像放大位图那样出现台阶 ——
+     列表里它只有 16px。**是重绘不是原图**：拿到官方 SVG 直接替换这个文件即可。 */
+  tencent: tencentLogo,
+  opencloudos: opencloudosLogo,
   suse: suseLogo,
+  coreos: coreosLogo,
+  openwrt: openwrtLogo,
+  fnos: fnosLogo,
   alpine: alpineLogo,
   arch: archLinuxLogo,
   linux: linuxLogo,

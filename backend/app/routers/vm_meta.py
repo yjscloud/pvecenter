@@ -8,9 +8,14 @@
 这时让运维手工填一个地址，列表与详情照常展示（并标出「手动」），
 不必为了看一眼 IP 去开控制台。
 
+同一份记录里还带一个 ``os``（操作系统家族 key）：列表那一列只能从**来源模板**
+认出系统，手工建、ISO 装、导入进来的机器没有来源，就没法显示。这个字段由面板
+侧直接写入（没有编辑接口），列表优先用它，取不到再回落到来源模板推断。
+
 存储沿用 settings KV（与 node-notes 同一套机制），
 键为 ``<connection_id 或 ''>|<node>|<vmid>``，值为
-``{"ip": ..., "by": <填写人>, "at": <时间戳>}``。
+``{"ip": ..., "os": <家族 key>, "by": <填写人>, "at": <时间戳>}``。
+两个字段各自独立：只填其中一个也算一条记录。
 
 **这份数据只用于展示**：面板绝不会把它写回 PVE 的 ipconfig / net0 ——
 「改了个显示值却动了机器网络」是这类功能最容易出的事故。
@@ -58,11 +63,13 @@ async def _load() -> Dict[str, Dict[str, Any]]:
         if not isinstance(value, dict):
             continue
         ip = str(value.get("ip") or "").strip()
-        if not ip:
-            # 空 IP 视为没有条目，避免脏数据把「未填写」显示成空白
+        os_key = str(value.get("os") or "").strip().lower()
+        # 两个字段都空才算没有条目：只标了系统的机器不该因为「没填 IP」被丢掉
+        if not ip and not os_key:
             continue
         result[str(key)] = {
             "ip": ip,
+            "os": os_key,
             "by": str(value.get("by") or ""),
             "at": int(value.get("at") or 0),
         }
@@ -132,9 +139,12 @@ async def save_vm_meta(
     items = await _load()
     key = _entry_key(node, payload.vmid, payload.connection_id)
 
-    if ip:
+    # 保留记录里已有的 ``os``：这个接口只管 IP，删地址不该把系统标注一起抹掉
+    os_key = str((items.get(key) or {}).get("os") or "")
+    if ip or os_key:
         items[key] = {
             "ip": ip,
+            "os": os_key,
             "by": str(user.get("username") or ""),
             "at": int(time.time()),
         }
@@ -147,6 +157,10 @@ async def save_vm_meta(
         user,
         "vm_meta.save" if ip else "vm_meta.clear",
         target=f"{node}/{payload.vmid}",
-        detail={"ip": ip, "connection_id": payload.connection_id or ""},
+        detail={
+            "ip": ip,
+            "os": os_key,
+            "connection_id": payload.connection_id or "",
+        },
     )
     return {"key": key, "item": items.get(key)}

@@ -79,7 +79,7 @@ import {
 } from '../components/VmReinstallWizard';
 import { ResetGuestPasswordDialog } from '../components/ResetGuestPasswordDialog';
 import { OsLogo } from '../components/OsLogo';
-import { osFamilyLabel, templateFamily } from '../utils/osFamily';
+import { familyByKey, osFamilyLabel, templateFamily } from '../utils/osFamily';
 import {
   IconBox,
   IconVm,
@@ -795,6 +795,13 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   const manualIpOf = useCallback(
     (vm: VmSummary) =>
       metaItems[vmMetaKey(vm.connection_id, vm.node, vm.vmid)]?.ip ?? '',
+    [metaItems],
+  );
+  /* 面板侧记录的操作系统（家族 key）。优先级高于「来源模板名推断」：
+     来源只说「从谁克隆的」，而这个字段说的是「它是什么系统」。 */
+  const metaOsOf = useCallback(
+    (vm: VmSummary) =>
+      familyByKey(metaItems[vmMetaKey(vm.connection_id, vm.node, vm.vmid)]?.os),
     [metaItems],
   );
 
@@ -1606,22 +1613,27 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
     },
     {
       key: 'sourceTemplate',
-      /* 列里只剩一个系统图标，「来源模板」四个字仍然成立：显示的是**来源**的
-         操作系统。表头挂一句说明，免得用户以为这一列在讲机器自己的系统。 */
+      /* 表头叫「操作系统」：列里只剩一个系统图标，用户扫这一眼要认的是系统，
+         不是「哪张模板」。取值的优先级见下面的 render。 */
       header: t('guestList.colSourceTemplate'),
       title: t('guestList.colSourceTemplateTitle'),
-      /* 140px 是给模板名的宽度；22px 的图标只占一小格，省下的还回去。
-         但别压到极限：英文表头 "Template" 比中文「来源模板」宽，76px 会把它
-         截成 "Templ…"，96px 才两头都够。 */
+      /* 只放 22px 图标，宽度按中文表头「操作系统」+ 排序箭头给：96px 刚好，
+         再窄中文会被截成「操作…」（英文表头只有 "OS"，宽度由中文这头决定）。 */
       width: 96,
       className: 'col-source-template',
       render: (vm) => {
         const source = vm.source_template;
         const name = source?.name?.trim() ?? '';
+        /* 两级来源：
+           1. 面板侧记录的系统家族（`vm_meta` 的 `os`）—— 人工确认过，最可信；
+           2. 来源模板名推断（克隆 / 重装的出处）—— 没有记录时的回落。
+           两者都没有才是「真不知道」，退回 `#VMID` / 「—」。 */
+        const family = metaOsOf(vm) ?? (name ? templateFamily({ name }) : null);
+
         /* 名字取不到（来源模板被改名 / 被删，或不在当前这一页的清单里）时退回
            `#VMID` —— VMID 是来源里唯一不会变的部分，比「—」有用得多。
            容器用系统模板新建时 vmid 是 0，只有文件名，所以两样都空才算没有。 */
-        if (!name) {
+        if (!family) {
           if (!source?.vmid) return <span className="fs-sm text-muted">—</span>;
           return (
             <span className="fs-sm text-muted" title={`#${source.vmid}`}>
@@ -1630,21 +1642,20 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
           );
         }
 
-        /* 容器模板名就是文件名（`debian-12-standard_12.7-1_amd64.tar.zst`），
-           虚拟机则是克隆来源的名字；两种都由 templateFamily 从名字里认发行版。
-           认不出时 family.key === 'other'，OsLogo 会渲染统一的「···」占位块 ——
-           宁可给一个中性标记，也不要随便挑一个发行版 logo 误导人。 */
-        const family = templateFamily({ name });
-        /* 悬停给**模板名**：图标已经说明是哪套系统了，而「具体是这张模板的哪一份」
-           （发行版同版本可能有多张）只有名字说得清 —— 那正是这一列改成图标后
-           丢掉的信息。读屏再把系统名一起念出来（图标对读屏不可见）。 */
+        /* 认不出的系统（`other`）不在这一步特判：OsLogo 会退成统一的「···」
+           字母块，比随便挑一个发行版 logo 诚实。 */
+        const label = osFamilyLabel(family, t);
+        /* 列里只留图标，悬停给**模板名**：图标已经说明是哪套系统，而「具体是
+           这张模板的哪一份」（同版本可能有多张）只有名字说得清 —— 那正是这一
+           列改成图标后丢掉的信息。没有来源模板时退回系统名，别悬停出空白。
+           读屏走 aria-label，把系统名与模板名一起念出来（图标对读屏不可见）。 */
         return (
           <span
             className="os-tag source-os"
             data-os={family.key}
             role="img"
-            aria-label={`${osFamilyLabel(family, t)} · ${name}`}
-            title={name}
+            aria-label={name ? `${label} · ${name}` : label}
+            title={name || label}
           >
             <span className="os-tag-mark">
               <OsLogo family={family} size="table" />

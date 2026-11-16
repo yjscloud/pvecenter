@@ -2536,6 +2536,13 @@ export interface RoleQuotaReport {
  */
 export interface VmMetaEntry {
   ip: string;
+  /**
+   * 面板侧记录的操作系统家族 key（如 `tencent` / `openwrt`，见 utils/osFamily）。
+   *
+   * 列表的「操作系统」列先读它，读不到再从来源模板名推断。
+   * 这一项目前只由后端直接写入（没有编辑入口），空串等价于没记录。
+   */
+  os?: string;
   /** 填写人；普通用户只拿得到自己填的条目 */
   by?: string;
   /** 填写时间（秒） */

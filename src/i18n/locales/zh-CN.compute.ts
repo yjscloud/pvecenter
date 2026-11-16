@@ -2214,9 +2214,9 @@ export const zhCompute = {
   'guestList.colUptime': '运行时长',
   'guestList.colCreatedTitle': '面板发起的新建 / 克隆 / 恢复按实际时刻记录；其余机器取 PVE config 里的 meta.ctime。注意 PVE 克隆 / 恢复会继承来源机器的时间（面板自身发起的克隆已按实际时刻纠正），PVE 8 之前创建的机器与容器没有这个记录，显示为 —',
   'guestList.colTags': '标签',
-  'guestList.colSourceTemplate': '来源模板',
+  'guestList.colSourceTemplate': '操作系统',
   'guestList.colSourceTemplateTitle':
-    '显示来源模板的操作系统；鼠标悬停图标可看模板名称',
+    '系统图标：优先用面板记录的系统，没有记录时从来源模板推断；鼠标悬停图标可看来源模板名',
   'guestList.consoleAria': '打开 {name} 控制台',
   'guestList.resumeTask': '恢复「{name}」',
   'guestList.migrate.title': '迁移{noun}',

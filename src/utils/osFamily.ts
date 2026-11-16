@@ -17,11 +17,17 @@ export type OsFamilyKey =
   | 'windows'
   | 'ubuntu'
   | 'debian'
+  | 'redhat'
   | 'centos'
   | 'rocky'
   | 'alma'
   | 'fedora'
+  | 'tencent'
+  | 'opencloudos'
   | 'suse'
+  | 'coreos'
+  | 'openwrt'
+  | 'fnos'
   | 'alpine'
   | 'arch'
   | 'linux'
@@ -45,15 +51,26 @@ const FAMILIES: Record<OsFamilyKey, OsFamily> = {
   windows: { key: 'windows', label: 'Windows', rank: 0 },
   ubuntu: { key: 'ubuntu', label: 'Ubuntu', rank: 1 },
   debian: { key: 'debian', label: 'Debian', rank: 2 },
-  centos: { key: 'centos', label: 'CentOS', rank: 3 },
-  rocky: { key: 'rocky', label: 'Rocky Linux', rank: 4 },
-  alma: { key: 'alma', label: 'AlmaLinux', rank: 5 },
-  fedora: { key: 'fedora', label: 'Fedora', rank: 6 },
-  suse: { key: 'suse', label: 'openSUSE', rank: 7 },
-  alpine: { key: 'alpine', label: 'Alpine', rank: 8 },
-  arch: { key: 'arch', label: 'Arch Linux', rank: 9 },
-  linux: { key: 'linux', label: 'Linux', rank: 10 },
-  other: { key: 'other', label: 'Other', rank: 11 },
+  /* RHEL 排在 CentOS 族群之前：它是 Rocky / Alma / CentOS 的上游，运维心里
+     那张谱系表就是这个顺序。 */
+  redhat: { key: 'redhat', label: 'Red Hat', rank: 3 },
+  centos: { key: 'centos', label: 'CentOS', rank: 4 },
+  rocky: { key: 'rocky', label: 'Rocky Linux', rank: 5 },
+  alma: { key: 'alma', label: 'AlmaLinux', rank: 6 },
+  fedora: { key: 'fedora', label: 'Fedora', rank: 7 },
+  /* 腾讯的 TencentOS Server（原 tlinux）单独成组：它有自己的官方标识，与
+     「认得出是 Linux 但没有单独 logo」的那批（openEuler / 麒麟）不同，
+     混进通用 Linux 组会让一排 Tux 里分不出哪台是它。 */
+  tencent: { key: 'tencent', label: 'TencentOS', rank: 8 },
+  opencloudos: { key: 'opencloudos', label: 'openCloudOS', rank: 9 },
+  suse: { key: 'suse', label: 'openSUSE', rank: 10 },
+  coreos: { key: 'coreos', label: 'CoreOS', rank: 11 },
+  openwrt: { key: 'openwrt', label: 'OpenWrt', rank: 12 },
+  fnos: { key: 'fnos', label: 'fnOS', rank: 13 },
+  alpine: { key: 'alpine', label: 'Alpine', rank: 14 },
+  arch: { key: 'arch', label: 'Arch Linux', rank: 15 },
+  linux: { key: 'linux', label: 'Linux', rank: 16 },
+  other: { key: 'other', label: 'Other', rank: 17 },
 };
 
 /** 名称 → 家族。顺序有意义：更具体的词排在更宽泛的前面。 */
@@ -64,18 +81,37 @@ const NAME_RULES: Array<[RegExp, OsFamilyKey]> = [
   [/\bwindows|w2k|wxp|win(?:7|8|10|11|20\d\d|vista)/i, 'windows'],
   [/ubuntu/i, 'ubuntu'],
   [/debian/i, 'debian'],
+  /* Fedora CoreOS 名字里带 Fedora，必须排在 /fedora/ 之前，否则会被分进 Fedora 组；
+     `Container Linux`（CoreOS 的旧名）同样归到这一族。 */
+  [/core\s*os|container\s*linux/i, 'coreos'],
+  /* `red hat` 中间可能有空格 / 连字符（`red-hat-8` / `Red Hat Enterprise Linux`），
+     `rhel` 是最常见的缩写，而且版本号会直接粘在后面（`rhel9`）—— 所以只卡词首边界。
+     排在下面通用的 Tux 兜底之前。 */
+  [/red\s*[-]?\s*hat|\brhel/i, 'redhat'],
   [/rocky/i, 'rocky'],
   [/alma(?:linux)?/i, 'alma'],
+  /* TencentOS Server（原 tlinux）：模板名常见写法是 `TencentOS4` / `tencentos-4` /
+     `tlinux4.0`。**必须排在 /centos/ 之前**：`TencentOS` 拼出来就是
+     tenc-**entos**，按 centos 先匹配会把这张模板整个分进 CentOS 组（实测过）。
+     它有自己的官方标识，也不该落进下面那条通用的 Tux 兜底。 */
+  [/tencent\s*os|\btlinux/i, 'tencent'],
   [/centos/i, 'centos'],
   [/fedora/i, 'fedora'],
+  /* 腾讯参与的国产服务器发行版，名字里没有能误伤别人的词，但同样要有自己的组。 */
+  [/open\s*cloud\s*os/i, 'opencloudos'],
   [/open\s*suse|suse|sles/i, 'suse'],
+  /* `lede` 是 OpenWrt 的前身；路由器固件在模板列表里常直接写 `openwrt-23.05` */
+  [/open\s*wrt|\blede\b/i, 'openwrt'],
+  /* fnOS（飞牛）：名字很短，用词边界避免误伤 `xxxfnosyyy` 这类机器名；
+     但版本号会直接粘在后面（`fnos4` / `fnOS-1.0`），所以只卡**词首**边界。 */
+  [/\bfnos|\bfn\s*os\b/i, 'fnos'],
   [/alpine/i, 'alpine'],
   [/\barch(?:linux)?\b/i, 'arch'],
-  /* 认得出是 Linux、但没有（也不需要）单独 logo 的发行版：RHEL / Oracle /
+  /* 认得出是 Linux、但没有（也不需要）单独 logo 的发行版：Oracle Linux /
      Amazon Linux 与国产发行版。落到通用的 Tux，比扔进「认不出」诚实 ——
      列表里一排「···」会让人以为面板坏了。 */
   [
-    /rhel|red\s*hat|oracle\s*linux|\bol\d|amazon\s*linux|\bamzn\b|euler|kylin|deepin|\buos\b|gentoo|slackware|nixos|void\s*linux/i,
+    /oracle\s*linux|\bol\d|amazon\s*linux|\bamzn\b|euler|kylin|deepin|\buos\b|gentoo|slackware|nixos|void\s*linux/i,
     'linux',
   ],
 ];
@@ -131,6 +167,18 @@ export function osFamilyLabel(family: OsFamily, t: TFunc): string {
   if (family.key === 'linux') return t('osFamily.linux');
   if (family.key === 'other') return t('osFamily.other');
   return family.label;
+}
+
+/**
+ * 家族 key → 家族。
+ *
+ * 列表「操作系统」列会先读面板侧记录的 key（``vm_meta`` 里的 ``os``），
+ * 认不出的 key（旧版本删掉的家族、手改脏数据）一律当没记录，交给来源模板推断。
+ */
+export function familyByKey(key: string | null | undefined): OsFamily | null {
+  const name = String(key ?? '').trim().toLowerCase();
+  if (!name) return null;
+  return (FAMILIES as Record<string, OsFamily | undefined>)[name] ?? null;
 }
 
 /**
@@ -247,11 +295,17 @@ const MARKS: Record<OsFamilyKey, string> = {
   windows: 'WIN',
   ubuntu: 'UBT',
   debian: 'DEB',
+  redhat: 'RHT',
   centos: 'CEN',
   rocky: 'RCK',
   alma: 'ALM',
   fedora: 'FED',
+  tencent: 'TOS',
+  opencloudos: 'OCO',
   suse: 'SUS',
+  coreos: 'COS',
+  openwrt: 'WRT',
+  fnos: 'FNS',
   alpine: 'ALP',
   arch: 'ARC',
   linux: 'LNX',

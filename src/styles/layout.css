@@ -2812,11 +2812,18 @@
 [data-os='windows'] { --os-color:#2b6cb0; --os-tint:rgba(43,108,176,.10); }
 [data-os='ubuntu']  { --os-color:#c2441b; --os-tint:rgba(194,68,27,.10); }
 [data-os='debian']  { --os-color:#b02a5b; --os-tint:rgba(176,42,91,.10); }
+[data-os='redhat']  { --os-color:#ee0000; --os-tint:rgba(238,0,0,.10); }
 [data-os='centos']  { --os-color:#8a3d84; --os-tint:rgba(138,61,132,.10); }
 [data-os='rocky']   { --os-color:#0f766e; --os-tint:rgba(15,118,110,.10); }
 [data-os='alma']    { --os-color:#0e7490; --os-tint:rgba(14,116,144,.10); }
 [data-os='fedora']  { --os-color:#34558f; --os-tint:rgba(52,85,143,.10); }
+/* 腾讯品牌蓝，取自官方标识本身（#0052d9） */
+[data-os='tencent'] { --os-color:#0052d9; --os-tint:rgba(0,82,217,.10); }
+[data-os='opencloudos'] { --os-color:#52d67f; --os-tint:rgba(82,214,127,.12); }
 [data-os='suse']    { --os-color:#2f855a; --os-tint:rgba(47,133,90,.10); }
+[data-os='coreos']  { --os-color:#53a3da; --os-tint:rgba(83,163,218,.12); }
+[data-os='openwrt'] { --os-color:#00ace2; --os-tint:rgba(0,172,226,.12); }
+[data-os='fnos']    { --os-color:#3374db; --os-tint:rgba(51,116,219,.10); }
 [data-os='alpine']  { --os-color:#0d6e8c; --os-tint:rgba(13,110,140,.10); }
 [data-os='arch']    { --os-color:#0f7fb8; --os-tint:rgba(15,127,184,.10); }
 [data-os='linux']   { --os-color:#4b5a74; --os-tint:rgba(75,90,116,.10); }

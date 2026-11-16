@@ -2245,9 +2245,9 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'guestList.colUptime': 'Uptime',
   'guestList.colCreatedTitle': 'Machines created, cloned or restored from the panel record the actual moment; others use meta.ctime from the PVE config. Note that a PVE-side clone or restore inherits the source machine’s timestamp (clones started from the panel are corrected), and machines made before PVE 8 have no such record, shown as —',
   'guestList.colTags': 'Tags',
-  'guestList.colSourceTemplate': 'Template',
+  'guestList.colSourceTemplate': 'OS',
   'guestList.colSourceTemplateTitle':
-    'OS of the source template; hover the icon to see the template name',
+    'System icon: recorded OS first, otherwise inferred from the source template; hover the icon to see the template name',
 
   'guestList.consoleAria': 'Open the console for {name}',
   'guestList.resumeTask': 'Resume “{name}”',
