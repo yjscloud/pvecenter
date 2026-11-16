@@ -197,3 +197,23 @@ if (drift.length) {
   process.exit(1);
 }
 console.log('✓ package-lock.json 与 package.json 一致（版本号 + 依赖表）');
+
+/* ---------------------------------------------------------------------------
+   额外检查：后端 __version__ 必须与 package.json 一致
+
+   面板版本在运行时的唯一来源是 backend/app/__init__.py 的 __version__，
+   前端构建产物里记的是 package.json 的版本（scripts/write-build-info.mjs）。
+   发版时只改 package.json、忘了改后端，服务重启后就会在界面上报「前端产物与
+   后端版本不一致」—— 代码其实是新的，纯粹是自报版本号落后（v0.2.9、v0.5.7
+   各踩过一次）。这里提前拦住，别等用户更新完才看到告警。
+   --------------------------------------------------------------------------- */
+const backendInit = readFileSync('backend/app/__init__.py', 'utf8');
+const backendVersion = (backendInit.match(/^__version__\s*=\s*["']([^"']+)["']/m) || [])[1];
+if (backendVersion !== pkg.version) {
+  console.error(
+    `✗ 后端版本号与 package.json 不一致：backend/app/__init__.py ${backendVersion ?? '(没有)'} ≠ package.json ${pkg.version}`,
+  );
+  console.error('   修：把 backend/app/__init__.py 的 __version__ 改成与 package.json 相同的版本号');
+  process.exit(1);
+}
+console.log(`✓ 后端 __version__ 与 package.json 一致（${pkg.version}）`);
