@@ -414,20 +414,23 @@ def manual_commands(
         lines = [f"cd {dep.get('root')}"]
         if git.get("dirty"):
             lines.append("# 工作区有未提交改动，先备份/提交：git stash")
-        # 网络不通时给人留两条可照抄的退路：HTTP/1.1（老 git / 代理走 HTTP/2 会半死）
-        # 与镜像前缀（与面板内一键更新的重试顺序一致）
+        # --force 必须带：上游重打过同名 tag 时，`--tags` 会因为
+        # `! [rejected] v0.5.5 -> v0.5.5 (would clobber existing tag)` 整条命令返回 1，
+        # 本地那个 tag 也停在旧提交上 —— 用户照着抄，第一句就报错（0.5.5 → v0.5.6 实测）。
+        # 网络不通时另外留两条退路：HTTP/1.1（老 git / 代理走 HTTP/2 会半死）与镜像前缀
+        # （与面板内一键更新的重试顺序一致）。
         lines.append(
-            "# 拉不下来时：git -c http.version=HTTP/1.1 fetch --tags --prune origin，"
+            "# 拉不下来时：sudo git -c http.version=HTTP/1.1 fetch --tags --prune --force origin，"
             "或设 PC_UPDATE_MIRROR 用镜像"
         )
-        lines.append("sudo git fetch --tags --prune origin")
+        lines.append("sudo git fetch --tags --prune --force origin")
         lines.append(f"sudo git checkout {spec}")
         # deploy.sh 是幂等的：装依赖 + 构建前端 + 重启服务，官方升级路径就是它
         lines.append("sudo ./deploy.sh")
         return lines
     return [
         "# 源码安装：按 README 的升级步骤重新获取新版本并重跑安装脚本",
-        "cd <面板目录> && git fetch --tags && git checkout <新版本 tag> && sudo ./deploy.sh",
+        "cd <面板目录> && git fetch --tags --force && git checkout <新版本 tag> && sudo ./deploy.sh",
         "# 只部署了 dist/ 的安装：下载新版产物覆盖 dist/ 后重启服务",
     ]
 
@@ -940,10 +943,17 @@ fetch_once() {{
   shift
   TRACE_N=$((TRACE_N + 1))
   echo "[$(date -Is)] git fetch（$note）"
+  # --force 不能省：上游一旦**挪过 tag**（本项目的发布流程就会重打同名 tag），
+  # `--tags` 里那一条会以 `! [rejected] v0.5.5 -> v0.5.5 (would clobber existing
+  # tag)` 失败，整条 fetch 的退出码变成 1 —— 而代码和要用的 tag 其实都已拉下来了。
+  # 0.5.5 → v0.5.6 实测踩到：日志里明明有 `* [new tag] v0.5.6`，脚本却当场判「网络
+  # 或凭据问题」放弃。加上 --force 让本地 tag 跟着远端走，这次更新才走得下去；
+  # 反过来（不加）更危险：本地留着旧位置的同名 tag，checkout 出来的是旧代码，
+  # 版本号却可能已经变了。
   # GIT_TRACE_CURL 指向文件：只留 info 与 header（NO_DATA），失败时贴末尾几十行足够定位
   GIT_TERMINAL_PROMPT=0 GIT_TRACE_CURL_NO_DATA=1 \\
     GIT_TRACE_CURL="$TRACE_DIR/$TRACE_N.log" \\
-    git "$@" fetch --tags --prune origin
+    git "$@" fetch --tags --prune --force origin
 }}
 dump_git_failure() {{
   echo "[$(date -Is)] git fetch 全部尝试都失败，下面是定位用的信息："

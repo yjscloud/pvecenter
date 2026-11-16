@@ -285,6 +285,15 @@ class TestManualCommands:
         assert lines[-1] == "sudo ./deploy.sh"
         assert any("git checkout v0.1.5" in line for line in lines)
 
+    def test_git_fetch_carries_force(self) -> None:
+        """手工命令是「一键更新不可用时给人照抄的」，抄一句就报错等于没有。
+
+        上游重打过同名 tag 时，`git fetch --tags` 会以「would clobber existing tag」
+        返回 1（0.5.5 → v0.5.6 实测），所以这里必须带 --force。
+        """
+        lines = update.manual_commands(_dep(), "v0.1.5")
+        assert "sudo git fetch --tags --prune --force origin" in lines
+
     def test_git_without_node_still_uses_deploy_sh(self) -> None:
         """没 Node 也给 `./deploy.sh`：它会自己下载（不再教用户 `--skip-frontend`）。"""
         lines = update.manual_commands(_dep(node=False), "v0.1.5")
@@ -327,13 +336,20 @@ def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
+def _git_out(cwd: Path, *args: str) -> str:
+    """跑一条 git 命令并取回输出：「本地 tag 指向哪个提交」得看得见。"""
+    out = subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
 class TestUpdateScript:
     def test_every_step_is_checked_and_the_log_is_kept(self) -> None:
         log = Path("/srv/pvecenter/logs/update-20261006-120000.log")
         text = update._script_text(_dep(), "v0.1.5", log)
         assert f'exec >>"{log}" 2>&1' in text
-        # 拉代码走带退路的 fetch_once（见 TestGitFetchFallbacks），不是光秃秃一句 fetch
-        assert "fetch --tags --prune origin" in text
+        # 拉代码走带退路的 fetch_once（见 TestGitFetchFallbacks），不是光秃秃一句 fetch；
+        # --force 也不是可选项：上游重打 tag 时没有它整条 fetch 会以 1 退出
+        assert "fetch --tags --prune --force origin" in text
         assert "git rev-parse --verify --quiet" in text
         assert 'git checkout "v0.1.5"' in text
         assert './deploy.sh --service "pvecenter"' in text
@@ -524,9 +540,52 @@ class TestGitFetchRuntime:
         proc = _run_fetch(tmp_path, _stub_bin(tmp_path, succeed_on_http11=True))
         assert proc.returncode == 0, proc.stdout + proc.stderr
         calls = (tmp_path / "calls.log").read_text(encoding="utf-8").splitlines()
-        assert calls[0] == "fetch --tags --prune origin"
-        assert calls[1] == "-c http.version=HTTP/1.1 fetch --tags --prune origin"
+        assert calls[0] == "fetch --tags --prune --force origin"
+        assert calls[1] == "-c http.version=HTTP/1.1 fetch --tags --prune --force origin"
         assert len(calls) == 2  # 通了就不再折腾
+
+    def test_moved_tag_does_not_abort_the_update(self, tmp_path: Path) -> None:
+        """上游重打过同名 tag 时，`--tags` 会因为「would clobber existing tag」整条失败。
+
+        0.5.5 → v0.5.6 实测踩到：日志里 ``* [new tag] v0.5.6`` 都打出来了，脚本却
+        当场判「网络或凭据问题」放弃，用户卡在旧版本。这里用真仓库复现：本地那个
+        旧 tag 停在原处、远端已经重打，那一段必须返回 0，且本地 tag 跟到新提交 ——
+        否则 checkout 出来的是旧代码，版本号却可能已经变了。
+        """
+        origin = tmp_path / "origin.git"
+        _git(tmp_path, "init", "-q", "--bare", str(origin))
+        _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+        work = tmp_path / "work"
+        _git(tmp_path, "clone", "-q", str(origin), str(work))
+        _git(work, "config", "user.email", "t@example.com")
+        _git(work, "config", "user.name", "t")
+        (work / "f").write_text("a", encoding="utf-8")
+        _git(work, "add", ".")
+        _git(work, "commit", "-qm", "A")
+        _git(work, "tag", "-a", "v0.1.5", "-m", "v0.1.5")
+        _git(work, "push", "-q", "origin", "HEAD:refs/heads/main", "--tags")
+
+        install = tmp_path / "install"
+        _git(tmp_path, "clone", "-q", str(origin), str(install))
+        old = _git_out(install, "rev-parse", "v0.1.5^{commit}")
+
+        # 上游：新提交 + 把同名 tag 重打到它上面（发布时重打 tag 就是这个形状）
+        (work / "f").write_text("b", encoding="utf-8")
+        _git(work, "commit", "-qam", "B")
+        _git(work, "tag", "-f", "-a", "v0.1.5", "-m", "v0.1.5")
+        _git(work, "push", "-q", "--force", "origin", "HEAD:refs/heads/main", "--tags")
+        new = _git_out(work, "rev-parse", "HEAD")
+        assert new != old
+
+        proc = subprocess.run(
+            ["bash", "-c", 'TMP="$(mktemp -d)"\n' + _fetch_section(tmp_path)],
+            cwd=str(install),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HOME": str(tmp_path), "PC_UPDATE_MIRROR": ""},
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert _git_out(install, "rev-parse", "v0.1.5^{commit}") == new
 
     def test_all_attempts_fail_then_diagnostics(self, tmp_path: Path) -> None:
         proc = _run_fetch(tmp_path, _stub_bin(tmp_path, succeed_on_http11=False))
