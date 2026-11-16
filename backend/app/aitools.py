@@ -440,6 +440,14 @@ TOOL_PERMISSIONS: Dict[str, str] = {
     "host_propose_command": "ai.exec",
     # 面板本机的 SSH 登录分析（全局数据，不分归属）
     "get_ssh_failures": "ssh.view",
+    # 虚拟机内动作：与宿主机那套刻意分成两个权限位 —— 「能看日志」和「能改客户机
+    # 配置」是两件严重程度差着量级的事，共用一个 ai.exec 会逼管理员二选一。
+    "vm_list_dir": "ai.vm.read",
+    "vm_read_file": "ai.vm.read",
+    "vm_run_command": "ai.vm.read",
+    "vm_collect_diagnostics": "ai.vm.read",
+    "vm_write_file": "ai.vm.write",
+    "vm_restart_unit": "ai.vm.write",
 }
 
 
@@ -853,9 +861,81 @@ def validate_write_command(command: Any) -> str:
 
 
 # ------------------------------------------------------------------ 执行
-def _run_local(argv: List[str], timeout: float) -> Tuple[bool, str]:
+def _run_local_stream(
+    argv: List[str],
+    timeout: float,
+    on_output: Callable[[str], None],
+    *,
+    shell: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """本机执行并**实时**交出输出（目标就是面板宿主机时才走这里）。
+
+    stderr 合并进 stdout：分开读的话，一条狂写 stderr 的命令在管道写满时会和
+    只读 stdout 的我们互相等死（经典死锁）；而终端镜像本来也只需要一条连续的
+    文本流。
+    """
+    import os
+    import select
+    import subprocess
+
+    cmd: Any = ["sh", "-c", shell] if shell is not None else argv
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+    parts: List[str] = []
+    deadline = time.monotonic() + timeout
+    fd = proc.stdout.fileno() if proc.stdout is not None else -1
+    timed_out = False
+    try:
+        while fd >= 0:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                timed_out = True
+                proc.kill()
+                break
+            ready, _, _ = select.select([fd], [], [], min(0.2, left))
+            if not ready:
+                continue
+            data = os.read(fd, 32768)
+            if not data:
+                break
+            text = data.decode("utf-8", "replace")
+            parts.append(text)
+            try:
+                on_output(text)
+            except Exception:  # noqa: BLE001 - 镜像失败不能影响命令本身
+                logger.debug("本机命令输出回调失败", exc_info=True)
+    finally:
+        try:
+            proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+    output = "".join(parts)
+    if timed_out and not output:
+        return False, "命令执行超时"
+    return (proc.returncode == 0 and not timed_out), output
+
+
+def _run_local(
+    argv: List[str],
+    timeout: float,
+    on_output: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
     """本机执行：argv 数组直接交给 subprocess，不过 shell。"""
     import subprocess
+
+    if on_output is not None:
+        return _run_local_stream(argv, timeout, on_output)
 
     try:
         proc = subprocess.run(
@@ -869,7 +949,12 @@ def _run_local(argv: List[str], timeout: float) -> Tuple[bool, str]:
     return proc.returncode == 0, out
 
 
-async def _run_remote(row: Dict[str, Any], argv: List[str], timeout: float) -> Tuple[bool, str]:
+async def _run_remote(
+    row: Dict[str, Any],
+    argv: List[str],
+    timeout: float,
+    on_output: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
     """远程执行：ssh 的 exec_command 会过远端 shell，所以逐个 quote。
 
     这一句是整个模块最要紧的地方 —— 少了 quote，模型给出的参数就能在目标机上
@@ -878,7 +963,7 @@ async def _run_remote(row: Dict[str, Any], argv: List[str], timeout: float) -> T
     from . import sshremote
 
     command = " ".join(shlex.quote(part) for part in argv)
-    return await sshremote.run_command(row, command, timeout=timeout)
+    return await sshremote.run_command(row, command, timeout=timeout, on_output=on_output)
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -888,13 +973,20 @@ def _truncate(text: str, limit: int) -> str:
     return body[:limit] + "\n…（已截断，完整输出共 " + str(len(body)) + " 字符）"
 
 
-def _run_local_shell(command: str, timeout: float) -> Tuple[bool, str]:
+def _run_local_shell(
+    command: str,
+    timeout: float,
+    on_output: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
     """本机执行一条**已通过白名单校验**的只读命令管道。
 
     这里必须过 shell —— 管道（``|``）只有 shell 能串起来。安全性由
     :func:`validate_command` 在**进入本函数之前**兜住：结构检查 + 逐段白名单。
     """
     import subprocess
+
+    if on_output is not None:
+        return _run_local_stream([], timeout, on_output, shell=command)
 
     try:
         proc = subprocess.run(
@@ -912,12 +1004,19 @@ def _run_local_shell(command: str, timeout: float) -> Tuple[bool, str]:
 
 
 async def _run_remote_shell(
-    row: Dict[str, Any], command: str, timeout: float
+    row: Dict[str, Any],
+    command: str,
+    timeout: float,
+    on_output: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, str]:
-    """远程执行（远端本来就走 shell，命令已经校验过）。"""
+    """远程执行（远端本来就走 shell，命令已经校验过）。
+
+    ``on_output`` 透传到 SSH 读取层：给了就在命令跑的时候把输出块交出去
+    （AI 终端据此实时显示），不给就一次性拿完整结果。
+    """
     from . import sshremote
 
-    return await sshremote.run_command(row, command, timeout=timeout)
+    return await sshremote.run_command(row, command, timeout=timeout, on_output=on_output)
 
 
 async def _run_command_tool(
@@ -926,6 +1025,8 @@ async def _run_command_tool(
     *,
     row: Optional[Dict[str, Any]],
     local: bool,
+    on_output: Optional[Callable[[str], None]] = None,
+    on_command: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """执行 ``host_run_command``：模型自己拼的只读命令，先过白名单再落地。"""
     raw = (args or {}).get("command") if isinstance(args, dict) else ""
@@ -939,11 +1040,18 @@ async def _run_command_tool(
         " ".join(shlex.quote(part) for part in argv) for argv in segments
     )
     started = time.time()
+    # 命令已经定下来：先把它写进终端，后面的输出才有地方接（见 app.ai 的镜像）
+    if on_command is not None:
+        on_command(command)
     try:
         if local:
-            ok, output = await asyncio.to_thread(_run_local_shell, command, RUN_TIMEOUT)
+            ok, output = await asyncio.to_thread(
+                _run_local_shell, command, RUN_TIMEOUT, on_output
+            )
         elif row is not None:
-            ok, output = await _run_remote_shell(row, command, RUN_TIMEOUT)
+            ok, output = await _run_remote_shell(
+                row, command, RUN_TIMEOUT, on_output=on_output
+            )
         else:
             return {"ok": False, "output": i18n.pick("目标主机不可达", "Target host unreachable")}
     except Exception as exc:  # noqa: BLE001 - 单条命令失败不该中断整次排查
@@ -965,6 +1073,8 @@ async def _run_propose_tool(
     row: Optional[Dict[str, Any]],
     local: bool,
     approval: Optional[Callable[[str, str], Awaitable[bool]]],
+    on_output: Optional[Callable[[str], None]] = None,
+    on_command: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """执行 ``host_propose_command``：**先请用户批准，批准后才真正落地**。
 
@@ -1002,11 +1112,17 @@ async def _run_propose_tool(
         }
 
     started = time.time()
+    if on_command is not None:
+        on_command(command)
     try:
         if local:
-            ok, output = await asyncio.to_thread(_run_local_shell, command, RUN_TIMEOUT)
+            ok, output = await asyncio.to_thread(
+                _run_local_shell, command, RUN_TIMEOUT, on_output
+            )
         elif row is not None:
-            ok, output = await _run_remote_shell(row, command, RUN_TIMEOUT)
+            ok, output = await _run_remote_shell(
+                row, command, RUN_TIMEOUT, on_output=on_output
+            )
         else:
             return {"ok": False, "output": i18n.pick("目标主机不可达", "Target host unreachable")}
     except Exception as exc:  # noqa: BLE001 - 单条命令失败不该中断整次排查
@@ -1028,8 +1144,14 @@ async def run_host_tool(
     row: Optional[Dict[str, Any]],
     local: bool,
     approval: Optional[Callable[[str, str], Awaitable[bool]]] = None,
+    on_output: Optional[Callable[[str], None]] = None,
+    on_command: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """执行一个主机工具。返回 ``{ok, output}``，不抛异常给上层。"""
+    """执行一个主机工具。返回 ``{ok, output}``，不抛异常给上层。
+
+    ``on_command`` / ``on_output`` 是给「AI 终端实时实况」用的：前者在命令确定
+    后立刻回调一次，后者把执行中的输出块边产边交出去（见 ``app.ai`` 的镜像）。
+    """
     tool = HOST_TOOL_MAP.get(name)
     if tool is None:
         return {"ok": False, "output": i18n.pick("没有这个工具", "No such tool")}
@@ -1037,11 +1159,19 @@ async def run_host_tool(
     # 写命令：先过用户审批再落地
     if tool.get("writes"):
         return await _run_propose_tool(
-            tool, args, row=row, local=local, approval=approval
+            tool,
+            args,
+            row=row,
+            local=local,
+            approval=approval,
+            on_output=on_output,
+            on_command=on_command,
         )
     # 授权执行的自由只读命令：参数不是模板，而是模型拼好的整条命令
     if tool.get("exec"):
-        return await _run_command_tool(tool, args, row=row, local=local)
+        return await _run_command_tool(
+            tool, args, row=row, local=local, on_output=on_output, on_command=on_command
+        )
 
     try:
         argv = validate_args(tool, args)
@@ -1050,11 +1180,15 @@ async def run_host_tool(
         return {"ok": False, "output": str(exc)}
 
     started = time.time()
+    if on_command is not None:
+        on_command(" ".join(argv))
     try:
         if local:
-            ok, output = await asyncio.to_thread(_run_local, argv, RUN_TIMEOUT)
+            ok, output = await asyncio.to_thread(
+                _run_local, argv, RUN_TIMEOUT, on_output
+            )
         elif row is not None:
-            ok, output = await _run_remote(row, argv, RUN_TIMEOUT)
+            ok, output = await _run_remote(row, argv, RUN_TIMEOUT, on_output=on_output)
         else:
             return {"ok": False, "output": i18n.pick("目标主机不可达", "Target host unreachable")}
     except Exception as exc:  # noqa: BLE001 - 单条命令失败不该中断整次排查

@@ -15,7 +15,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { aiApi, exportUrl, usersApi } from '../api/endpoints';
+import { aiApi, exportUrl, usersApi, type VmAiLease, type VmAiTarget } from '../api/endpoints';
 import { errorMessage } from '../api/client';
 import { PageShell } from '../components/Layout';
 import { RichText } from '../components/RichText';
@@ -30,6 +30,8 @@ import { Skeleton, Spinner } from '../components/ui/Spinner';
 import { Modal } from '../components/ui/Modal';
 import { RemediationDialog } from '../components/RemediationDialog';
 import { ApprovalCard, type ApprovalRequest } from '../components/AiApprovalCard';
+import { VmAiLeaseCard } from '../components/VmAiLeaseCard';
+import { VmAiPolicyCard } from '../components/VmAiPolicyCard';
 import { AiTerminal } from '../components/AiTerminal';
 import { AiUsageModal } from '../components/AiUsageModal';
 import {
@@ -229,6 +231,21 @@ export function AiAssistant() {
    * 或开了新对话，就是一次全新的授权，不沿用旧的值。
    */
   const [allowExec, setAllowExec] = useState(false);
+  /**
+   * 刚刚（本次操作里）才把「上机执行」打开。
+   *
+   * 只在这种时候给「继续执行」入口：一直开着开关的人每轮结束都看到它，
+   * 就成了一条常驻噪音。开关关掉或已经续跑一次就复位。
+   */
+  const [execJustGranted, setExecJustGranted] = useState(false);
+  /**
+   * 虚拟机内取证授权（一张限时票据）。
+   *
+   * 与 ``allowExec`` 是两件不同的事：那个是「在这台**受管主机**上跑命令」，
+   * 这个是「进这台**虚拟机**里看日志、改配置」。分开是因为它们的风险与撤销量级
+   * 不同 —— 混成一个开关，用户没法只给其中一种。
+   */
+  const [vmLease, setVmLease] = useState<VmAiLease | null>(null);
   /** 待用户批准的写命令：AI 提议后本轮挂起，等对话流里的审批卡拍板 */
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [busy, setBusy] = useState(false);
@@ -307,6 +324,8 @@ export function AiAssistant() {
   );
 
   const targetsQuery = useQuery({ queryKey: ['ai', 'targets'], queryFn: aiApi.targets });
+  /** 虚拟机授权候选：与「受管主机」是两套清单，前者是 SSH 目标，后者是 PVE 里的机器 */
+  const vmTargetsQuery = useQuery({ queryKey: ['ai', 'vm', 'targets'], queryFn: aiApi.vmTargets });
   const status = targetsQuery.data?.status;
   // 模型清单对所有用户可见（不含密钥），用来渲染顶部的「已接入」状态条与模型选择
   const modelsQuery = useQuery({ queryKey: ['ai', 'models'], queryFn: aiApi.models });
@@ -327,21 +346,68 @@ export function AiAssistant() {
   const activeModelId = modelsQuery.data?.active_id || '';
   const currentModelId = modelId || activeModelId;
 
+  /** 受管主机的原始记录：选择器要用它的 ``node`` / ``vmid`` 把主机与虚拟机对上 */
+  const hostCards = useMemo(() => targetsQuery.data?.hosts ?? [], [targetsQuery.data]);
+
   const hostOptions = useMemo(
-    () =>
-      (targetsQuery.data?.hosts ?? []).map((host) => ({
-        label: host.name || host.id,
-        value: host.id,
-      })),
-    [targetsQuery.data],
+    () => hostCards.map((host) => ({ label: host.name || host.id, value: host.id })),
+    [hostCards],
   );
 
-  /** 带占位项的选择项：``value=''`` 那一项必须存在 —— 原生 select 在没有
-      匹配项时会显示第一台主机，状态里其实还是空，那样等于骗用户已经选好了。 */
-  const hostSelectOptions = useMemo(
-    () => [{ label: t('ai.selectHostPlaceholder'), value: '' }, ...hostOptions],
-    [hostOptions, t],
+  /**
+   * 虚拟机授权目标只留**运行中**的：停着的机器连不进去，列出来只会让人签完
+   * 票才发现进不去，而票本身是有时限的。
+   */
+  const vmTargets = useMemo(
+    () => (vmTargetsQuery.data?.items ?? []).filter((item) => item.status === 'running'),
+    [vmTargetsQuery.data],
   );
+
+  /**
+   * 受管主机里的那台虚拟机（按「节点|vmid」对上）。
+   *
+   * 目标机器**只列受管主机**：没被纳管的虚拟机既跑不了主机命令，也不在
+   * 权限模型里，出现在候选里只会让人以为它也是可操作的对象。
+   */
+  const vmByHostId = useMemo(() => {
+    const byKey = new Map<string, VmAiTarget>();
+    for (const vm of vmTargets) byKey.set(`${vm.node}|${vm.vmid}`, vm);
+    const map = new Map<string, VmAiTarget>();
+    for (const host of hostCards) {
+      if (!host.node || host.vmid == null) continue;
+      const vm = byKey.get(`${host.node}|${host.vmid}`);
+      if (vm) map.set(host.id, vm);
+    }
+    return map;
+  }, [hostCards, vmTargets]);
+
+  /**
+   * 目标机器的候选 = 受管主机清单，一台一行。
+   *
+   * 之前按「虚拟机 + 主机」两份清单拼，结果没纳管的虚拟机会混进来 —— 那些机器
+   * 没有主机凭据，选它就只能进机取证，等于绕开了「AI 只对受管机器动手」这条边界。
+   * 现在一律以受管主机为准，选中后自动带出它对应的虚拟机（有才带）。
+   */
+  const targetOptions = useMemo(
+    () => [
+      // 占位项必须在：没有匹配项时原生 select 会显示第一台，等于骗用户已经选好了
+      { label: t('ai.selectTargetPlaceholder'), value: '' },
+      ...hostCards.map((host) => ({
+        label: `${host.name || host.id} · ${
+          vmByHostId.has(host.id) ? t('ai.targetBoth') : t('ai.targetHostOnly')
+        }`,
+        value: host.id,
+      })),
+    ],
+    [hostCards, vmByHostId, t],
+  );
+
+  const selectedHost = useMemo(
+    () => hostCards.find((item) => item.id === hostId) ?? null,
+    [hostCards, hostId],
+  );
+  /** 选中主机对应的虚拟机；没有就为空 —— 授权卡据此提示「这台不能进机取证」 */
+  const vmTarget: VmAiTarget | null = hostId ? vmByHostId.get(hostId) ?? null : null;
 
   /**
    * 目标主机**只由用户指定**，没有默认项。
@@ -667,6 +733,9 @@ export function AiAssistant() {
       allowExec,
       mode,
       preset,
+      // 授权只在**这一轮**随请求下发：没有租约 id，模型连进虚拟机的工具都拿不到，
+      // 也就谈不上「偷偷执行」。
+      vmLease?.id ?? '',
     );
   }
 
@@ -774,6 +843,7 @@ export function AiAssistant() {
     setErrorText('');
     // 新会话默认不授权上机执行：上一条会话开过不等于这条也要开。
     setAllowExec(false);
+    setExecJustGranted(false);
   }
 
   function stop() {
@@ -822,6 +892,35 @@ export function AiAssistant() {
   const canExec = hasPermission('ai.exec');
   // 远程终端是**另一道门**：能看 AI 的结论，不等于能亲手在这台机器上敲命令
   const canTerminal = hasPermission('ai.terminal');
+
+  /**
+   * 上一轮停在 AI 说完话的位置、而现在已经拿到上机执行授权：可以一键续跑。
+   *
+   * 开关只对**下一轮**生效，这是有意的（换一轮就是一次新授权）。但用户看到
+   * 「我先看一下磁盘」之后停住、再去打开开关时，界面上不该只剩一片安静 ——
+   * 他能明确知道「现在可以继续了」，并且不用重新描述一遍问题。
+   */
+  const lastSpeaker = [...transcript]
+    .reverse()
+    .find((item) => item.role === 'user' || item.role === 'assistant');
+  const canContinue =
+    canExec &&
+    allowExec &&
+    execJustGranted &&
+    !busy &&
+    Boolean(convId) &&
+    lastSpeaker?.role === 'assistant';
+
+  function continueTurn() {
+    if (!canContinue) return;
+    setExecJustGranted(false);
+    void execute(async (controller) => {
+      const target = await ensureConversation();
+      const text = t('ai.continuePrompt');
+      pushUserBubble(target, text);
+      await streamTurn(target, text, controller, 'chat');
+    });
+  }
 
   return (
     <PageShell
@@ -911,11 +1010,11 @@ export function AiAssistant() {
             </Notice>
           ) : null}
 
-          {/* 目标主机必须由用户自己选：AI 会登录到这台机器上执行命令，替他顶一台
-              上去等于擅自决定动哪台机器。没选之前入口全关着（按钮 disabled、
-              终端不开），这里把原因说清楚，而不是让人对着一排灰按钮猜。 */}
+          {/* 目标机器必须由用户自己选：AI 会登录上去执行命令，替他顶一台上去等于
+              擅自决定动哪台机器。没选之前入口全关着（按钮 disabled、终端不开），
+              这里把原因说清楚，而不是让人对着一排灰按钮猜。 */}
           {!hostId && !targetsQuery.isLoading ? (
-            hostOptions.length === 0 ? (
+            hostCards.length === 0 ? (
               <Notice tone="info" title={t('ai.noHostTitle')}>
                 {t('ai.noHostHint')}
               </Notice>
@@ -929,21 +1028,35 @@ export function AiAssistant() {
             )
           ) : null}
 
-          <Card>
-            {/* 左选择、右操作：主操作放最右（视线与操作的终点），次要操作降为
-                ghost 小按钮靠左 —— 两个实心按钮并排会让人分不清该点哪个。 */}
+          {/* 工作台：把「目标与模型」「授权范围」「控制台」收进同一张面板，
+              区块之间只用分隔线分节，而不是三张各自带边框阴影的卡片 ——
+              卡片套卡片会让整页看起来像几个互不相干的工具拼在一起。 */}
+          <div className="ai-studio">
+            <section className="ai-studio-section">
+              <div className="ai-section-head">
+                <span className="ai-section-num">01</span>
+                <div className="ai-section-text">
+                  <span className="ai-section-title">{t('ai.sectionTarget')}</span>
+                  <span className="ai-section-desc">{t('ai.sectionTargetHint')}</span>
+                </div>
+              </div>
+              {/* 左选择、右操作：主操作放最右（视线与操作的终点），次要操作降为
+                  ghost 小按钮靠左 —— 两个实心按钮并排会让人分不清该点哪个。 */}
             <div className="flex items-end justify-between gap-12 flex-wrap">
               <div
                 className="flex items-end gap-12 flex-wrap"
                 style={{ flex: '1 1 460px' }}
               >
                 <div style={{ flex: '1 1 190px', minWidth: 170 }}>
-                  <Field label={t('ai.selectHost')}>
+                  {/* 只选一次：候选全是**受管主机**（AI 只对纳管过的机器动手），
+                      选中后自动带出同一台机器上的虚拟机，两条通道一起确定。
+                      没纳管的虚拟机不在这里出现 —— 它跑不了主机命令。 */}
+                  <Field label={t('ai.selectTarget')} hint={t('ai.selectTargetHint')}>
                     <Select
                       value={hostId}
                       onChange={(e) => setHostId(e.target.value)}
-                      options={hostSelectOptions}
-                      disabled={busy || hostOptions.length === 0}
+                      options={targetOptions}
+                      disabled={busy || hostCards.length === 0}
                     />
                   </Field>
                 </div>
@@ -997,32 +1110,74 @@ export function AiAssistant() {
               </div>
             </div>
 
-            {/* 授权上机执行：一次排查一次授权、不记住 —— 让「允许它动我的机器」
-                始终是一个当场做出的决定，而不是某天顺手勾过就一直生效 */}
-            {canExec ? (
-              <div
-                style={{
-                  marginTop: 12,
-                  paddingTop: 12,
-                  borderTop: '1px solid var(--border-muted)',
-                }}
-              >
-                <Switch
-                  checked={allowExec}
-                  onChange={setAllowExec}
-                  label={t('ai.allowExec')}
-                  hint={t('ai.allowExecHint')}
-                  disabled={busy}
-                />
-                {/* 「写操作也要你点头」单独用警示色说一遍：它藏在上面那段灰字里
-                    很容易被略过，而这一条恰恰是用户勾选前最该确认的事。 */}
-                <div className="ai-warn-note">
-                  <IconAlert size={14} />
-                  <span>{t('ai.allowExecWarn')}</span>
+            </section>
+
+            {/* 授权范围紧接「在哪台机器上做」：它是这一轮的能力边界。
+                两条通道并列而不是各占一处 —— 主机命令（本次会话）与虚拟机内（限时
+                票据）本来就是同一件事的两个面，分开摆会让人以为哪个才是总开关。 */}
+            <section className="ai-studio-section">
+              <div className="ai-section-head">
+                <span className="ai-section-num">02</span>
+                <div className="ai-section-text">
+                  <span className="ai-section-title">{t('ai.sectionScope')}</span>
+                  <span className="ai-section-desc">{t('ai.sectionScopeHint')}</span>
                 </div>
               </div>
-            ) : null}
-          </Card>
+
+              <div className="ai-scope-list">
+                {canExec ? (
+                  <div className="ai-scope-block">
+                    <div className="ai-scope-row">
+                      <div className="ai-scope-text">
+                        <span className="ai-scope-name">
+                          {t('ai.execScopeName')}
+                          <Badge variant={allowExec ? 'success' : 'neutral'} size="sm" dot>
+                            {allowExec ? t('ai.execScopeOn') : t('ai.execScopeOff')}
+                          </Badge>
+                        </span>
+                        <span className="ai-scope-hint">{t('ai.allowExecHint')}</span>
+                      </div>
+                      <Switch
+                        checked={allowExec}
+                        onChange={(next) => {
+                          setAllowExec(next);
+                          // 打开的那一刻记下来：下面据此给「继续执行」入口
+                          setExecJustGranted(next);
+                        }}
+                        disabled={busy}
+                        ariaLabel={t('ai.execScopeToggle')}
+                      />
+                    </div>
+                    {/* 开关是**下一轮**的授权，不会把刚结束的那一轮重新拉起来。
+                        用户看到 AI 说「我先看一下磁盘」然后停住、再去打开开关时，
+                        最容易以为「我批准了，它怎么不动」—— 这里给一个显式入口，
+                        不必重新打字，也不用猜是不是要再发一遍。 */}
+                    {canContinue ? (
+                      <div className="ai-scope-row" style={{ marginTop: 8 }}>
+                        <span className="ai-scope-hint">{t('ai.continueHint')}</span>
+                        <Button size="sm" variant="ghost" onClick={continueTurn}>
+                          {t('ai.continue')}
+                        </Button>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                <div className="ai-scope-block">
+                  {/* 目标已在上面的 01 区块选定，这里不再重复选择：只把「这台机器
+                      能不能进机取证」说清楚，再给出发放入口。 */}
+                  {selectedHost && !vmTarget ? (
+                    <Notice tone="info">{t('ai.targetHostOnlyHint')}</Notice>
+                  ) : null}
+                  <VmAiLeaseCard
+                    lease={vmLease}
+                    onLeaseChange={setVmLease}
+                    target={vmTarget}
+                  />
+                </div>
+              </div>
+            </section>
+          </div>
 
           {/* 控制台：左「终端 / 执行过程」、右「对话与授权」。
               左栏默认是终端 —— 那台被纳管服务器的实况窗口：用户自己敲的命令，
@@ -1032,16 +1187,36 @@ export function AiAssistant() {
               就在同一屏里。 */}
           {/* 「连的是哪台机器」由终端卡片自己那行说明负责，不在这里重复一遍 ——
               同一个句子同时出现在工具栏和卡片里，读起来像出了两次错。 */}
-          <SegmentedControl
-            value={leftTab}
-            onChange={setLeftTab}
-            options={[
-              { label: t('ai.terminalTitle'), value: 'terminal' },
-              { label: t('ai.progressTitle'), value: 'activity' },
-            ]}
-            ariaLabel={t('ai.terminalTitle')}
-          />
-          <div className="grid grid-2 ai-console">
+          <div className="ai-console-shell">
+            <div className="ai-console-shell-head">
+              <div className="ai-section-head" style={{ marginBottom: 0 }}>
+                <span className="ai-section-num">03</span>
+                <div className="ai-section-text">
+                  <span className="ai-section-title">{t('ai.sectionConsole')}</span>
+                  <span className="ai-section-desc">{t('ai.sectionConsoleHint')}</span>
+                </div>
+              </div>
+              <div className="ai-console-shell-tools">
+                {/* 没有上机授权时，AI 只给建议不执行 —— 这个原因必须能在控制台
+                    旁边看到，否则用户只会以为「它今天不想动手」 */}
+                {canExec && !allowExec ? (
+                  <span className="ai-scope-warn">
+                    <IconAlert size={13} />
+                    {t('ai.execNotGranted')}
+                  </span>
+                ) : null}
+                <SegmentedControl
+                  value={leftTab}
+                  onChange={setLeftTab}
+                  options={[
+                    { label: t('ai.terminalTitle'), value: 'terminal' },
+                    { label: t('ai.progressTitle'), value: 'activity' },
+                  ]}
+                  ariaLabel={t('ai.terminalTitle')}
+                />
+              </div>
+            </div>
+            <div className="grid grid-2 ai-console">
             {/* 两个页签**都保持挂载**，只切换显隐：终端一旦卸载就等于断开 SSH，
                 切去看一眼「执行过程」再切回来会变成一条新连接 —— 当前目录、
                 环境变量、跑着的进程全丢，而且隐藏期间 AI 的镜像输出也收不到了。
@@ -1085,6 +1260,7 @@ export function AiAssistant() {
               playbooks={playbooks}
               onRunPlaybook={runPlaybook}
             />
+            </div>
           </div>
 
           {errorText ? (
@@ -2491,6 +2667,30 @@ function ConversationsPanel({
  * 命令白名单 / 参数黑名单这类判定规则只留在服务端 —— 页面展示它们对用户没有
  * 帮助，对探测者却是一份现成的绕过指南。
  */
+/** 一条「能做什么 + 什么场景用」。序号与工作台的分节编号是同一套视觉语言 */
+function CapFeature({
+  n,
+  title,
+  desc,
+  scene,
+}: {
+  n: string;
+  title: string;
+  desc: string;
+  scene: string;
+}) {
+  return (
+    <div className="ai-cap-card">
+      <div className="ai-cap-card-title">
+        <span className="ai-cap-card-num">{n}</span>
+        {title}
+      </div>
+      <div className="ai-cap-card-desc">{desc}</div>
+      <div className="ai-cap-card-scene">{scene}</div>
+    </div>
+  );
+}
+
 function CapabilitiesModal({
   open,
   onClose,
@@ -2508,6 +2708,9 @@ function CapabilitiesModal({
   const tools = query.data?.tools ?? [];
   const internal = tools.filter((item) => item.kind === 'internal');
   const host = tools.filter((item) => item.kind === 'host');
+  /* 虚拟机内动作：要签了授权才会真的下发，但说明页得列出来 ——
+     用户判断「要不要授权」靠的就是这份清单 */
+  const guest = tools.filter((item) => item.kind === 'guest');
 
   return (
     <Modal
@@ -2529,34 +2732,118 @@ function CapabilitiesModal({
           <Skeleton height={16} width="60%" />
         </div>
       ) : (
-        <div className="flex flex-col gap-16">
-          <Notice tone="info">{t('ai.capIntro')}</Notice>
+        <div className="ai-cap">
+          {/* 先说「能干什么、什么时候用」，再展开工具清单 ——
+              顺序反过来，用户看到的是一串函数名，反而不知道这东西能解决什么问题。 */}
+          <div className="ai-cap-hero">
+            <span className="ai-cap-kicker">{t('ai.capKicker')}</span>
+            <p>{t('ai.capIntro')}</p>
+          </div>
 
-          <section className="flex flex-col gap-6">
-            <strong className="fs-sm">
-              {t('ai.capInternalTitle')}（{internal.length}）
-            </strong>
-            <span className="fs-sm text-muted">{t('ai.capInternalBody')}</span>
-            {internal.map((item) => (
-              <div key={item.name} className="flex flex-col gap-4">
-                <span className="mono fs-sm">{item.name}</span>
-                <span className="fs-xs text-muted">{item.description}</span>
-              </div>
-            ))}
-          </section>
+          <div className="ai-cap-grid">
+            <CapFeature
+              n="01"
+              title={t('ai.capFeature1Title')}
+              desc={t('ai.capFeature1Desc')}
+              scene={t('ai.capFeature1Scene')}
+            />
+            <CapFeature
+              n="02"
+              title={t('ai.capFeature2Title')}
+              desc={t('ai.capFeature2Desc')}
+              scene={t('ai.capFeature2Scene')}
+            />
+            <CapFeature
+              n="03"
+              title={t('ai.capFeature3Title')}
+              desc={t('ai.capFeature3Desc')}
+              scene={t('ai.capFeature3Scene')}
+            />
+            <CapFeature
+              n="04"
+              title={t('ai.capFeature4Title')}
+              desc={t('ai.capFeature4Desc')}
+              scene={t('ai.capFeature4Scene')}
+            />
+            <CapFeature
+              n="05"
+              title={t('ai.capFeature5Title')}
+              desc={t('ai.capFeature5Desc')}
+              scene={t('ai.capFeature5Scene')}
+            />
+            <CapFeature
+              n="06"
+              title={t('ai.capFeature6Title')}
+              desc={t('ai.capFeature6Desc')}
+              scene={t('ai.capFeature6Scene')}
+            />
+          </div>
 
-          <section className="flex flex-col gap-6">
-            <strong className="fs-sm">
-              {t('ai.capHostTitle')}（{host.length}）
-            </strong>
-            <span className="fs-sm text-muted">{t('ai.capHostBody')}</span>
-            {host.map((item) => (
-              <div key={item.name} className="flex flex-col gap-4">
-                <span className="mono fs-sm">{item.name}</span>
-                <span className="fs-xs text-muted">{item.description}</span>
+          <div className="ai-cap-scenes">
+            <span className="ai-cap-scene-label">{t('ai.capSceneTitle')}</span>
+            <span className="ai-cap-chip">{t('ai.capSceneSlow')}</span>
+            <span className="ai-cap-chip">{t('ai.capSceneDisk')}</span>
+            <span className="ai-cap-chip">{t('ai.capSceneCpu')}</span>
+            <span className="ai-cap-chip">{t('ai.capSceneNetwork')}</span>
+            <span className="ai-cap-chip">{t('ai.capSceneInstall')}</span>
+            <span className="ai-cap-chip">{t('ai.capSceneConfig')}</span>
+          </div>
+
+          {/* 工具清单按权限实时生成；默认收起，避免一屏几十个函数名盖住上面的场景 */}
+          <details className="ai-cap-tools">
+            <summary>
+              {t('ai.capToolsTitle')} · {tools.length}
+            </summary>
+
+            {internal.length ? (
+              <div className="ai-cap-tool-group">
+                <span className="ai-cap-tool-group-title">
+                  {t('ai.capInternalTitle')}（{internal.length}）
+                </span>
+                <span className="ai-cap-tool-group-desc">
+                  {t('ai.capInternalBody')}
+                </span>
+                {internal.map((item) => (
+                  <div key={item.name} className="ai-cap-tool">
+                    <span className="ai-cap-tool-name">{item.name}</span>
+                    <span className="ai-cap-tool-desc">{item.description}</span>
+                  </div>
+                ))}
               </div>
-            ))}
-          </section>
+            ) : null}
+
+            {host.length ? (
+              <div className="ai-cap-tool-group">
+                <span className="ai-cap-tool-group-title">
+                  {t('ai.capHostTitle')}（{host.length}）
+                </span>
+                <span className="ai-cap-tool-group-desc">{t('ai.capHostBody')}</span>
+                {host.map((item) => (
+                  <div key={item.name} className="ai-cap-tool">
+                    <span className="ai-cap-tool-name">{item.name}</span>
+                    <span className="ai-cap-tool-desc">{item.description}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            {guest.length ? (
+              <div className="ai-cap-tool-group">
+                <span className="ai-cap-tool-group-title">
+                  {t('ai.capGuestTitle')}（{guest.length}）
+                </span>
+                <span className="ai-cap-tool-group-desc">
+                  {t('ai.capGuestBody')}
+                </span>
+                {guest.map((item) => (
+                  <div key={item.name} className="ai-cap-tool">
+                    <span className="ai-cap-tool-name">{item.name}</span>
+                    <span className="ai-cap-tool-desc">{item.description}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </details>
 
           {/* 命令白名单 / 参数黑名单 / 路径白名单**不再下发前端**：它们是服务端
               的判定依据，页面只需要「能做什么」。清单留在服务端也少一份可被
@@ -2972,6 +3259,11 @@ function SettingsModal({
             label={t('ai.enable')}
             hint={t('ai.enableHint')}
           />
+
+          {/* 虚拟机授权策略是平台级开关（生产标签禁写、双人审批、快照保留），
+              只有管理员能改。普通用户看不到这一段：他们需要知道的是「我这台
+              为什么写不了」，那写在授权卡上。 */}
+          {isAdmin ? <VmAiPolicyCard /> : null}
 
           {/* 这几项决定「一次排查跑多大、回答写多长」：分析窗口是往回看多少数据，
               token 上限是最多烧多少额度，两个字数档是回答的字数上限。放在模型列表

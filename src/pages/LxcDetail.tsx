@@ -82,7 +82,7 @@ import { useTaskRunner } from '../hooks/useTaskRunner';
 import { useToast } from '../hooks/useToast';
 import { useAuth } from '../hooks/useAuth';
 import { useSnapshotQuota } from '../hooks/useSnapshotQuota';
-import type { RrdPoint, RrdTimeframe } from '../api/types';
+import type { RrdPoint, RrdTimeframe, Snapshot } from '../api/types';
 import type {
   LxcMountConfig,
   LxcNetworkConfig,
@@ -525,28 +525,50 @@ export function LxcDetail() {
     kind: 'rollback' | 'delete';
     name: string;
   } | null>(null);
+  /**
+   * 正在删除的快照名：先从表格里摘掉，任务结束后再放开。
+   *
+   * PVE 的删除是异步任务，任务一提交就会先刷一次列表（那时快照还在），
+   * 不摘的话用户点完看到的是「没反应，得再点一次」。
+   */
+  const [deletingSnaps, setDeletingSnaps] = useState<string[]>([]);
 
   const confirmSnapAction = async () => {
     if (!snapAction) return;
+    const action = snapAction;
+    const isDelete = action.kind === 'delete';
+    if (isDelete) {
+      /* 删除：确认即收工。对话框、这一行、缓存里的记录同时撤掉，任务进度交给
+         任务提示条 —— 等任务跑完才关对话框的话，用户看不到列表变化，会以为
+         没删掉再点一次。 */
+      setSnapAction(null);
+      setDeletingSnaps((list) => [...list, action.name]);
+      queryClient.setQueryData<Snapshot[]>(['lxc', node, ctId, 'snapshots'], (rows) =>
+        rows ? rows.filter((s) => s.name !== action.name) : rows,
+      );
+    }
     setPending(true);
     try {
       const promise =
-        snapAction.kind === 'rollback'
-          ? lxcApi.rollbackSnapshot(node, ctId, snapAction.name)
-          : lxcApi.deleteSnapshot(node, ctId, snapAction.name);
+        action.kind === 'rollback'
+          ? lxcApi.rollbackSnapshot(node, ctId, action.name)
+          : lxcApi.deleteSnapshot(node, ctId, action.name);
       await runner.run(promise, {
         title:
-          snapAction.kind === 'rollback'
-            ? t('lxcDetail.rollbackTask', { name: snapAction.name })
-            : t('lxcDetail.deleteSnapshotTask', { name: snapAction.name }),
+          action.kind === 'rollback'
+            ? t('lxcDetail.rollbackTask', { name: action.name })
+            : t('lxcDetail.deleteSnapshotTask', { name: action.name }),
         node,
         invalidate: [['lxc', node, ctId, 'snapshots'], ['lxc', node, ctId]],
         /* 回滚会丢弃快照之后的全部改动，删除则不可撤销 —— 两者都算不可逆 */
         destructive: true,
       });
+      // 等真刷新落地再放开这个名字：先放开会让旧行闪回一下
+      if (isDelete) await snapshotsQuery.refetch();
     } catch {
       /* toast 已提示 */
     } finally {
+      if (isDelete) setDeletingSnaps((list) => list.filter((n) => n !== action.name));
       setPending(false);
       setSnapAction(null);
     }
@@ -1301,7 +1323,9 @@ export function LxcDetail() {
           </Notice>
           <Table
             columns={snapshotColumns}
-            rows={(snapshotsQuery.data ?? []) as unknown as Array<Record<string, unknown>>}
+            rows={(
+              (snapshotsQuery.data ?? []) as unknown as Array<Record<string, unknown>>
+            ).filter((r) => !deletingSnaps.includes(String(r.name)))}
             rowKey={(r) => String(r.name)}
             loading={snapshotsQuery.isLoading}
             caption={t('lxcDetail.snapshotCaption')}

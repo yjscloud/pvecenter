@@ -89,6 +89,7 @@ from .routers import (
 )
 from . import aichat
 from . import aiaudit
+from . import aivm
 # 远程终端：进程退出时要主动断开挂着的 SSH 交互会话（见 lifespan）
 from . import aiterm
 from . import alert_rootcause
@@ -157,6 +158,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await aiaudit.init_table()
     # AI 会话：把「一次性排查」升级成可追问的对话（对话线程 + 消息）
     await aichat.init_table()
+    # AI 虚拟机内取证：授权租约 + 动作流水（谁、对哪台、改了什么、能不能回滚）
+    await aivm.init_table()
     await alerting.init_table()
     await cert_manager.init_table()
     await ownership.init_table()
@@ -1207,7 +1210,12 @@ if (DIST_DIR / "index.html").is_file():
         if _looks_like_static_file(full_path):
             logger.info("静态资源不存在，拒绝回退到首页：/%s", full_path)
             raise HTTPException(status_code=404, detail=_api_404_detail())
-        return FileResponse(DIST_DIR / "index.html")
+        # 入口页**不能**被缓存：它引用的是一串带 hash 的 assets，index.html 一旦
+        # 被浏览器或代理存住，用户就一直跑旧版本 —— 前端明明重新构建过，页面上
+        # 还是旧行为，看起来就像「修复没生效」。
+        return FileResponse(
+            DIST_DIR / "index.html", headers={"Cache-Control": "no-store"}
+        )
 
 else:
 
@@ -1624,6 +1632,21 @@ scheduler.register(
         verifyguard.evaluate,
         BACKUP_CHECK_INTERVAL,
         summarize=_count("命中"),
+    )
+)
+# AI 虚拟机授权回收：每次首次写入都会在 PVE 侧打一个 pvecenter-ai-* 快照，
+# 客户机里还会留一份回滚备份。不回收的话，存储会被这些「没人记得的快照」慢慢吃掉，
+# 而用户在界面上看不到它们从哪来 —— 所以回收是授权机制的一部分，不是可选的收尾。
+scheduler.register(
+    _job(
+        "ai_vm_cleanup",
+        "AI 虚拟机授权回收",
+        "维护",
+        "回收过期授权留下的 PVE 快照与客户机回滚备份（保留时长见授权策略）",
+        aivm.cleanup_expired,
+        3600,
+        summarize=lambda data: f"回收 {int((data or {}).get('removed') or 0)} 个",
+        first_delay=600,
     )
 )
 # PBS 运行状态：GC 失败与磁盘健康。走 PBS 直连，没登记只读凭据时该作业安静返回，

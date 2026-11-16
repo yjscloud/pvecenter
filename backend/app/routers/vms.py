@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -2646,6 +2647,40 @@ async def rollback_snapshot(
     return {"task": task}
 
 
+def _invalidate_snapshots_after_task(task: str) -> None:
+    """等 PVE 的快照删除任务真正结束，再作废一次快照缓存。
+
+    只在提交时 ``invalidate`` 是不够的：任务受理的那一刻前端就会刷一次列表，
+    而 PVE 还没删完 —— 这次刷新会把「删除前」的列表重新写进 60 秒缓存。等任务
+    结束再刷新时命中的正是这份旧缓存，用户看到的就是「删了还在，得再点一次」，
+    要等缓存过期（最长一分钟）才自己消失。
+    """
+    if not task:
+        return
+
+    async def _wait() -> None:
+        client = get_client()
+        deadline = time.monotonic() + 300.0
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(1.0)
+                try:
+                    status = await client.task_status(task)
+                except Exception:  # noqa: BLE001 - 任务查不到就别再耗着
+                    return
+                if str(status.get("status") or "") != "running":
+                    return
+        finally:
+            # 无论任务成功、失败还是超时都清一次：真实状态该由 PVE 说了算，
+            # 而不是让我们替它记住一个可能已经过期的列表。
+            pvecache.invalidate("snapshots:")
+
+    try:
+        asyncio.create_task(_wait())
+    except RuntimeError:  # pragma: no cover - 没有事件循环时退回同步清理
+        pvecache.invalidate("snapshots:")
+
+
 @router.delete("/vms/{node}/{vmid}/snapshot/{name}")
 async def delete_snapshot(
     node: str,
@@ -2674,6 +2709,8 @@ async def delete_snapshot(
         request, user, "snapshot.delete", target=f"{node}/{vmid}/{name}"
     )
     pvecache.invalidate("snapshots:")
+    # 任务结束后再清一次：否则「任务受理时那次刷新」会把删除前的列表写回缓存
+    _invalidate_snapshots_after_task(str(task or ""))
     return {"task": task}
 
 

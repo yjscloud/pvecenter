@@ -2891,6 +2891,99 @@ async function streamSse<T>(
   }
 }
 
+/** 一张虚拟机授权（租约）：范围、时长、动作额度都写在票面上，过期或撤销即失效 */
+export interface VmAiLease {
+  id: string;
+  username: string;
+  connection_id: string;
+  node: string;
+  vmid: number;
+  vm_name: string;
+  guest_type: 'qemu' | 'lxc' | string;
+  /** 可读目录 */
+  fs_ro: string[];
+  /** 可写目录（空 = 只读授权） */
+  fs_rw: string[];
+  /** 允许重启的 systemd 单元 */
+  units: string[];
+  risk_max: number;
+  risk_label: string;
+  minutes: number;
+  expires_at: number;
+  /** 剩余秒数（后端按当前时间算好，前端不用本地时钟去推） */
+  remaining: number;
+  status: 'active' | 'revoked' | 'expired' | string;
+  reason: string;
+  /** 授权时自动打的快照名（存储不支持时为空） */
+  snapshot: string;
+  actions_used: number;
+  actions_max: number;
+  created: number;
+  revoke_reason: string;
+  writable: boolean;
+  /** 客户机系统：决定路径语义与命令白名单 */
+  os_type: 'linux' | 'windows' | string;
+  /** PVE 标签（策略按它生效，例如 prod 禁写） */
+  tags: string[];
+  /**
+   * standard = 客户机内装了 diagd（有 CPU/内存上限、可终止）；
+   * compat = 没装，隔离只靠服务端白名单
+   */
+  mode: 'standard' | 'compat' | string;
+  /** 高危动作是否要求两名用户分别批准 */
+  double_approve: boolean;
+  /** 策略命中说明（例如「标签命中禁止写入：prod」） */
+  policy_note: string;
+  /**
+   * 授权级别：read 只读 / write 受限变更（目录 + 服务清单）/
+   * ops 运维授权（整机 shell，可装软件，逐条审批 + 不可回滚黑名单）
+   */
+  access: 'read' | 'write' | 'ops' | string;
+  /** 后端给的级别中文名，前端未命中词条时兜底显示 */
+  access_label: string;
+}
+
+/** 虚拟机授权策略（管理员可改） */
+export interface VmAiPolicy {
+  max_minutes: number;
+  double_approve: boolean;
+  /** 带这些标签的机器不允许授予写权限 */
+  deny_write_tags: string[];
+  auto_snapshot: boolean;
+  keep_snapshot_hours: number;
+  /** 是否允许签发运维授权（整机 shell）。关掉后只能签只读/受限变更 */
+  allow_ops: boolean;
+}
+
+/** 可授权的虚拟机（当前连接） */
+export interface VmAiTarget {
+  node: string;
+  vmid: number;
+  name: string;
+  guest_type: 'qemu' | 'lxc';
+  status: string;
+}
+
+/** 一条虚拟机内动作的流水：做了啥、被判了什么风险、结果与可回滚点 */
+export interface VmAiAction {
+  id: string;
+  lease_id: string;
+  username: string;
+  seq: number;
+  tool: string;
+  target: string;
+  risk: number;
+  risk_label: string;
+  verdict: 'allow' | 'deny' | 'error' | string;
+  ok: boolean;
+  exitcode: number;
+  output: string;
+  diff: string;
+  backup: string;
+  elapsed_ms: number;
+  created: number;
+}
+
 export const aiApi = {
   /** 全局模型配置（仅管理员；密钥只回传「配没配」与打码值） */
   config: () => get<AiConfig>('/ai/config'),
@@ -2957,12 +3050,101 @@ export const aiApi = {
    * 批准 / 拒绝 AI 提议的写命令（逐条确认）。
    *
    * 与排查是两条连接：排查挂在流式响应上等，这里用一次普通 POST 把它唤醒。
+   *
+   * ``done`` 才是「这一票让等待结束了吗」：高危动作需要**两个人**分别批准，
+   * 第一票只记账（``ok: true, done: false``），后端还在等。界面必须据此保留
+   * 审批卡 —— 当成成功收掉的话，用户会以为批完了，而后端一直到超时按拒绝处理。
    */
   approve: (approvalId: string, approved: boolean) =>
-    post<{ ok: boolean }>('/ai/approval', {
+    post<{
+      ok: boolean;
+      done?: boolean;
+      approved?: boolean;
+      count?: number;
+      required?: number;
+    }>('/ai/approval', {
       approval_id: approvalId,
       approved,
     }),
+
+  /* ------------------------------------------------ 虚拟机内排查（限时授权） */
+
+  /** 可授权的虚拟机清单（后端已按归属过滤，且只含运行中的机器） */
+  vmTargets: () => get<{ items: VmAiTarget[] }>('/ai/vm/targets'),
+
+  /**
+   * 选中机器后确认 Guest Agent 是否应答。
+   * `ok: false` 表示这台机器没被纳管（未运行 / 未装 agent），不能签发授权。
+   */
+  vmAgent: (node: string, vmid: number) =>
+    get<{ ok: boolean }>('/ai/vm/agent', { params: { node, vmid } }),
+
+  /** 我的授权记录；管理员看全部 */
+  vmLeases: () => get<{ items: VmAiLease[] }>('/ai/vm/leases'),
+
+  /** 授权详情 + 完整动作流水（谁、改了什么、能不能回滚） */
+  vmLease: (id: string) =>
+    get<{ lease: VmAiLease; actions: VmAiAction[] }>(
+      `/ai/vm/leases/${encodeURIComponent(id)}`,
+    ),
+
+  /**
+   * 签发授权。写能力需要 ``ai.vm.write``，只读只需要 ``ai.vm.read``。
+   * 同一台机器已有生效授权时后端直接复用（``reused``）——
+   * 反复点授权不该刷出一堆票据，否则撤销时不知道撤哪张。
+   */
+  vmGrant: (payload: {
+    node: string;
+    vmid: number;
+    vm_name?: string;
+    guest_type?: string;
+    connection_id?: string;
+    fs_ro?: string[];
+    fs_rw?: string[];
+    units?: string[];
+    /**
+     * 授权级别。read 只看；write 只能改勾选目录 / 重启勾选服务；
+     * ops 是整机运维授权（装软件、改任意配置），每一步变更仍需批准。
+     */
+    access?: 'read' | 'write' | 'ops';
+    minutes?: number;
+    actions_max?: number;
+    reason?: string;
+  }) => post<{ lease: VmAiLease; reused: boolean }>('/ai/vm/leases', payload),
+
+  /** 撤销授权：下一次工具调用就会被拦下（执行前重读状态） */
+  vmRevoke: (id: string, reason = '') =>
+    post<{
+      lease: VmAiLease;
+      /** 是否成功终止了客户机内正在运行的命令（兼容模式下做不到） */
+      kill?: { ok: boolean; output: string };
+    }>(`/ai/vm/leases/${encodeURIComponent(id)}/revoke`, { reason }),
+
+  /** 立即终止该授权在客户机内仍在运行的命令（不撤销授权本身） */
+  vmKill: (id: string) =>
+    post<{ ok: boolean; output: string }>(
+      `/ai/vm/leases/${encodeURIComponent(id)}/kill`,
+      {},
+    ),
+
+  /** 授权策略：管理员可改；普通用户读来展示（知道为什么写被禁） */
+  vmPolicy: () => get<{ policy: VmAiPolicy; defaults: VmAiPolicy }>('/ai/vm/policy'),
+
+  saveVmPolicy: (payload: Partial<VmAiPolicy>) =>
+    put<{ policy: VmAiPolicy }>('/ai/vm/policy', payload),
+
+  /** 客户机内受限执行器（diagd）的安装脚本 */
+  vmDiagd: () => get<{ version: string; script: string; hint: string }>('/ai/vm/diagd'),
+
+  /** 回滚：按动作还原单个文件，或整机回到授权前打的快照 */
+  vmRollback: (
+    id: string,
+    payload: { action_id?: string; mode?: 'file' | 'snapshot' },
+  ) =>
+    post<{ ok: boolean; output: string }>(
+      `/ai/vm/leases/${encodeURIComponent(id)}/rollback`,
+      payload,
+    ),
 
   /** 排查记录（工具调用明细的入口）。普通用户只看得到自己的 */
   sessions: (params: { limit?: number; offset?: number; host_id?: string } = {}) => {
@@ -3068,6 +3250,8 @@ export const aiApi = {
     allowExec = false,
     mode: 'chat' | 'inspect' = 'chat',
     preset = '',
+    /** 生效中的虚拟机授权（租约 id）。不传则模型拿不到进虚拟机的工具 */
+    vmLease = '',
   ) =>
     streamSse<AiChatStreamEvent>(
       `/ai/conversations/${encodeURIComponent(conversationId)}/messages/stream`,
@@ -3078,6 +3262,7 @@ export const aiApi = {
         preset: preset || undefined,
         provider_id: providerId || undefined,
         allow_exec: allowExec || undefined,
+        vm_lease: vmLease || undefined,
       },
       onEvent,
       signal,

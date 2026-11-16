@@ -2,7 +2,7 @@
    pvecenter — 全局快照视图
    ========================================================================== */
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { lxcApi, vmsApi } from '../api/endpoints';
@@ -36,6 +36,14 @@ import type { Snapshot } from '../api/types';
    页面
    --------------------------------------------------------------------------- */
 
+/**
+ * 同一台机器上可能重名（容器与虚拟机各自一套命名空间），所以 key 里要带类型。
+ * 节点也要带：不同节点上的 vmid 会重号。
+ */
+function snapshotKey(s: Snapshot): string {
+  return `${s.node}|${s.vmid}|${s.vm_type}|${s.name}`;
+}
+
 export function Snapshots() {
   const t = useT();
   const navigate = useNavigate();
@@ -52,6 +60,15 @@ export function Snapshots() {
   const [rollbackTarget, setRollbackTarget] = useState<Snapshot | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Snapshot | null>(null);
   const [busy, setBusy] = useState(false);
+  /**
+   * 正在删除的快照（`节点|vmid|类型|名称`）。
+   *
+   * PVE 的删除是异步任务：任务一提交 ``useTaskRunner`` 就会先刷一次列表，而那一刻
+   * 快照还在 —— 用户确认删除后行仍留在原地，要再点一次才「生效」。这里先把这些
+   * 行从渲染数据里摘掉，任务运行期间无论刷新多少次都不会把它放回来；失败时再放开，
+   * 它会随真实数据回来（同时有失败 toast），界面始终与 PVE 一致。
+   */
+  const [deleting, setDeleting] = useState<string[]>([]);
 
   /* 未配置连接时后端对每个请求都回 428，轮询只会刷一屏没人看的报错
      （配好之后自动恢复） */
@@ -81,10 +98,21 @@ export function Snapshots() {
      服务端并发（上限可配）+ 归属过滤 + 60 秒缓存，且变更路径会主动作废。
      轮询间隔仍跟「设置 → 面板设置 → 数据刷新间隔」走。 */
   const refresh = useRefreshInterval();
+  /**
+   * 下一次取数是否要**绕过服务端缓存**。
+   *
+   * ``/api/snapshots`` 有 60 秒缓存，而删除快照是 PVE 的异步任务：任务刚受理时
+   * 那一刷会把「删除前」的列表写进缓存，任务结束后再刷就命中这份旧数据 ——
+   * 列表里那条已经删掉的快照会一直留到缓存过期，用户以为没删掉，只能再点一次。
+   * 所以删除完成后这一刷必须带 ``fresh=1``。
+   */
+  const freshRef = useRef(false);
   const snapshotsQuery = useQuery({
     queryKey: ['snapshots', 'all'],
     queryFn: async () => {
-      const rows = await vmsApi.allSnapshots();
+      const fresh = freshRef.current;
+      freshRef.current = false;
+      const rows = await vmsApi.allSnapshots({ fresh });
       // 后端字段叫 vm_name，页面与列定义里用的是 vmname，这里对齐一次
       return rows.map<Snapshot>((s) => ({ ...s, vmname: s.vmname ?? s.vm_name }));
     },
@@ -108,11 +136,15 @@ export function Snapshots() {
             String(s.vmid ?? '').includes(q),
         )
       : list;
+    // 已确认删除、任务还在跑的那几行：先不显示（见 deleting 的说明）
+    const visible = deleting.length
+      ? filtered.filter((s) => !deleting.includes(snapshotKey(s)))
+      : filtered;
 
-    return [...filtered].sort(
+    return [...visible].sort(
       (a, b) => (b.snaptime ?? 0) - (a.snaptime ?? 0),
     );
-  }, [snapshotsQuery.data, search, nodeFilter]);
+  }, [snapshotsQuery.data, search, nodeFilter, deleting]);
 
   /* 快照会越攒越多（每台机器若干条），和其它列表一样分页。
      切片放在上面那份「已过滤 + 已按时间排序」的列表之后，翻到哪一页都是
@@ -415,30 +447,44 @@ export function Snapshots() {
         open={Boolean(deleteTarget)}
         onCancel={() => setDeleteTarget(null)}
         onConfirm={async () => {
-          if (!deleteTarget?.node || !deleteTarget.vmid) return;
+          const target = deleteTarget;
+          if (!target?.node || !target.vmid) return;
+          const key = snapshotKey(target);
+          const isLxcRow = target.vm_type === 'lxc';
+          /* 确认即收工：对话框、这一行、缓存里的记录同时撤掉，任务进度交给任务
+             提示条。等 PVE 任务跑完才关对话框的话，用户盯着转圈的那几秒恰好看
+             不到列表变化，会以为没删掉，于是再点一次。
+             另外，任务一提交 runner 就会先刷一次列表（那时快照还在），所以这里
+             不只是「隐藏」——缓存里的那一行也一并删掉。 */
+          setDeleteTarget(null);
+          setDeleting((list) => [...list, key]);
+          queryClient.setQueryData<Snapshot[]>(['snapshots', 'all'], (rows) =>
+            rows ? rows.filter((s) => snapshotKey(s) !== key) : rows,
+          );
           setBusy(true);
           try {
-            const isLxcRow = deleteTarget.vm_type === 'lxc';
             const api = isLxcRow ? lxcApi : vmsApi;
             await runner.run(
-              api.deleteSnapshot(
-                deleteTarget.node,
-                deleteTarget.vmid,
-                deleteTarget.name,
-              ),
+              api.deleteSnapshot(target.node, target.vmid, target.name),
               {
-                title: t('snapshots.taskDelete', { name: deleteTarget.name }),
-                node: deleteTarget.node,
+                title: t('snapshots.taskDelete', { name: target.name }),
+                node: target.node,
                 invalidate: [
                   ['snapshots'],
-                  [isLxcRow ? 'lxc' : 'vm', deleteTarget.node, deleteTarget.vmid],
+                  [isLxcRow ? 'lxc' : 'vm', target.node, target.vmid],
                 ],
                 destructive: true,
               },
             );
-            setDeleteTarget(null);
+            /* 等这次真刷新落地再撤掉标记：先撤再刷新的话，中间那一瞬
+               会把刚删掉的行闪回列表（看起来还是「没删掉」）。
+               这一刷必须绕过服务端 60 秒缓存 —— 缓存里存的是「删除前」的列表，
+               命中它就等于把刚删掉的行原样拿回来。 */
+            freshRef.current = true;
+            await snapshotsQuery.refetch();
             invalidate();
           } finally {
+            setDeleting((list) => list.filter((item) => item !== key));
             setBusy(false);
           }
         }}

@@ -88,10 +88,25 @@ class TerminalSession:
         self.out: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue()
         self._closed = False
         self._thread: Optional[threading.Thread] = None
+        # 流式镜像里跨块残留的尾巴（见 feed_stream）：可能是半行，也可能是 \r
+        self._stream_tail = ""
 
     # ------------------------------------------------------------ 出方向
     def _put(self, event: Dict[str, Any]) -> None:
         if self._closed:
+            return
+        # AI 命令的输出是在 SSH 的**阻塞线程**里回调过来的，而 ``out`` 是
+        # asyncio.Queue —— 跨线程直接 put_nowait 不会唤醒等待方，输出就会积在
+        # 队列里直到下一次有别的写入。所以不在 loop 线程时交给 loop 入队。
+        try:
+            running: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not self.loop:
+            try:
+                self.loop.call_soon_threadsafe(self.out.put_nowait, event)
+            except RuntimeError:  # pragma: no cover - loop 已关闭
+                pass
             return
         try:
             self.out.put_nowait(event)
@@ -102,6 +117,46 @@ class TerminalSession:
         """把一段终端输出推给浏览器。"""
         if text:
             self._put({"type": _OUTPUT, "data": text})
+
+    def feed_stream(self, text: str) -> None:
+        r"""把命令的**实时**输出写进终端（可从阻塞线程调用）。
+
+        AI 的命令走 ``exec``，拿回来是裸 LF，必须补成 CRLF（见 :func:`crlf`）。
+        但流式分块会把 ``\r\n`` 从中间劈开：上一块以 ``\r`` 结尾、下一块以 ``\n``
+        开头，逐块补就会多出 ``\r\r\n`` —— 终端里凭空多一行空行。所以这里保留
+        一个跨块的小尾巴，等下一块到了再决定。
+        """
+        if not text:
+            return
+        buf = self._stream_tail + text
+        out: List[str] = []
+        i = 0
+        size = len(buf)
+        while i < size:
+            ch = buf[i]
+            if ch == "\r":
+                if i + 1 < size:
+                    if buf[i + 1] == "\n":
+                        out.append("\r\n")
+                        i += 2
+                        continue
+                    out.append("\r")
+                    i += 1
+                    continue
+                # 末尾的 \r 先留着：下一块可能正好是 \n
+                break
+            out.append("\r\n" if ch == "\n" else ch)
+            i += 1
+        self._stream_tail = buf[i:]
+        if out:
+            self.feed("".join(out))
+
+    def flush_stream(self) -> None:
+        """把流式输出最后的残余（比如孤零零的 ``\r``）补出来。"""
+        tail = self._stream_tail
+        self._stream_tail = ""
+        if tail:
+            self.feed(tail)
 
     def notice(self, text: str, *, color: str = _CYAN) -> None:
         """推一行带颜色的提示（AI 命令的起止、连接信息、错误归因）。"""
@@ -215,6 +270,15 @@ def _unregister(session: TerminalSession) -> None:
         bucket.discard(session.id)
         if not bucket:
             _index.pop(_key(session.username, session.host_id), None)
+
+
+def sessions_of_user(username: str) -> List[TerminalSession]:
+    """该用户当前打开的全部终端（用于「只有一台就镜像到它」的兜底）。"""
+    return [
+        session
+        for session in list(_sessions.values())
+        if session.username == str(username or "") and not session._closed
+    ]
 
 
 def mirror_sessions(username: str, host_id: str) -> List[TerminalSession]:
@@ -363,6 +427,55 @@ def mirror_command(
         for session in sessions:
             session.feed(text)
     except Exception:  # noqa: BLE001 - 镜像永远不该影响排查本身
+        logger.debug("AI 终端镜像失败", exc_info=True)
+
+
+def mirror_command_start(username: str, host_id: str, command: str) -> None:
+    """在终端里先写一行「AI 现在要执行什么」，输出随后实时追加在它后面。
+
+    与 :func:`mirror_command` 的区别：那个是命令**结束后**一次性写完整结果，
+    适合没有实时输出通道的场景；这条路径配合 :func:`mirror_output` 用，用户能
+    看着命令一行行跑出来，而不是等几十秒后突然刷屏。
+    """
+    try:
+        body = (command or "").strip()
+        if not body:
+            return
+        # 多行命令（heredoc、脚本片段）只显示第一行：把整段贴进终端会把后面
+        # 的实时输出挤到看不见的地方，真正的全文在审计与终端输出里都有。
+        lines = body.splitlines()
+        shown = lines[0] + (f" …（{len(lines)} 行）" if len(lines) > 1 else "")
+        header = f"\r\n{_CYAN}{_BOLD}AI{_RESET}{_CYAN} $ {shown}{_RESET}\r\n"
+        for session in mirror_sessions(username, host_id):
+            session.feed(header)
+    except Exception:  # noqa: BLE001 - 镜像永远不该影响排查本身
+        logger.debug("AI 终端镜像失败", exc_info=True)
+
+
+def mirror_output(username: str, host_id: str, chunk: str) -> None:
+    """命令执行过程中，把输出块**实时**写进终端。
+
+    会在 SSH 的阻塞线程里被高频调用（每块几十 KB），所以只做入队、不碰 IO，
+    也不抛异常 —— 慢一点、丢一点都不能反过来拖慢命令本身。
+    """
+    try:
+        if not chunk:
+            return
+        for session in mirror_sessions(username, host_id):
+            session.feed_stream(chunk)
+    except Exception:  # noqa: BLE001
+        logger.debug("AI 终端实时输出失败", exc_info=True)
+
+
+def mirror_command_end(username: str, host_id: str, ok: bool) -> None:
+    """命令收尾：把流式残留补出来，再写一行状态。"""
+    try:
+        status = f"{_GREEN}✓{_RESET}" if ok else f"{_RED}✕{_RESET}"
+        text = f"{status} {_CYAN}{i18n.pick('AI 命令结束', 'AI command finished')}{_RESET}\r\n"
+        for session in mirror_sessions(username, host_id):
+            session.flush_stream()
+            session.feed("\r\n" + text)
+    except Exception:  # noqa: BLE001
         logger.debug("AI 终端镜像失败", exc_info=True)
 
 

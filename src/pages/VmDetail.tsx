@@ -2892,6 +2892,8 @@ function SnapshotsTab({
   const [rollbackTarget, setRollbackTarget] = useState<Snapshot | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Snapshot | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 正在删除的快照名：先隐藏，任务结束后再放开（见 snapshots 的过滤说明） */
+  const [deleting, setDeleting] = useState<string[]>([]);
 
   const snapQuery = useQuery({
     queryKey: ['snapshots', node, vmid],
@@ -2899,10 +2901,16 @@ function SnapshotsTab({
     staleTime: 15_000,
   });
 
-  /* Proxmox 会返回一个名为 "current" 的特殊条目，需过滤 */
+  /* Proxmox 会返回一个名为 "current" 的特殊条目，需过滤。
+     正在删除的那几条也一并挡住：PVE 删除是异步任务，任务一提交就会先刷一次列表，
+     那一瞬快照还在 —— 不挡的话用户看到的是「点了删除没反应，要再点一次」。
+     任务结束后（见下面 onConfirm）才把这些名字放出来，届时数据里已经没有它们。 */
   const snapshots = useMemo(
-    () => (snapQuery.data ?? []).filter((s) => s.name !== 'current'),
-    [snapQuery.data],
+    () =>
+      (snapQuery.data ?? []).filter(
+        (s) => s.name !== 'current' && !deleting.includes(s.name),
+      ),
+    [snapQuery.data, deleting],
   );
 
   const invalidate = () => {
@@ -3157,17 +3165,27 @@ function SnapshotsTab({
         onCancel={() => setDeleteTarget(null)}
         onConfirm={async () => {
           if (!deleteTarget) return;
+          const name = deleteTarget.name;
+          // 确认删除的那一刻就关掉对话框并把这一行拿掉：等任务跑完才关的话，
+          // 用户盯着转圈的那几秒恰好看不到列表变化，会以为没删掉再点一次
+          setDeleteTarget(null);
+          setDeleting((list) => [...list, name]);
+          queryClient.setQueryData<Snapshot[]>(['snapshots', node, vmid], (rows) =>
+            rows ? rows.filter((s) => s.name !== name) : rows,
+          );
           setBusy(true);
           try {
-            await runner.run(vmsApi.deleteSnapshot(node, vmid, deleteTarget.name), {
-              title: t('vmDetail.snapDeleteTask', { name: deleteTarget.name }),
+            await runner.run(vmsApi.deleteSnapshot(node, vmid, name), {
+              title: t('vmDetail.snapDeleteTask', { name }),
               node,
               invalidate: [['snapshots', node, vmid], ['vm', node, vmid]],
               destructive: true,
             });
-            setDeleteTarget(null);
+            // 等真刷新落地再放开这个名字：先放开的话，中间那一下会闪回旧行
+            await snapQuery.refetch();
             invalidate();
           } finally {
+            setDeleting((list) => list.filter((item) => item !== name));
             setBusy(false);
           }
         }}

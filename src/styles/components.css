@@ -10020,3 +10020,569 @@ button.pbs-task-row:focus-visible {
     justify-content: flex-end;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   AI 审批卡里的变更预览（虚拟机内写文件）
+
+   按行着色而不是整块染色：一条配置改动里有效行只有两三行，整块红绿底反而
+   看不出改了什么。这里只给 + / - / @@ 上淡色，其余行保持中性。
+   --------------------------------------------------------------------------- */
+.ai-diff {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre;
+  color: var(--text-secondary);
+}
+
+.ai-diff-line {
+  display: block;
+}
+
+.ai-diff-add {
+  background: var(--success-dim);
+  color: var(--success);
+}
+
+.ai-diff-del {
+  background: var(--danger-dim);
+  color: var(--danger);
+}
+
+.ai-diff-hunk {
+  color: var(--accent);
+}
+
+.ai-diff-file {
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------------------
+   AI 虚拟机授权卡（授权范围 / 倒计时 / 撤销 / 回滚）
+   --------------------------------------------------------------------------- */
+.ai-lease {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-sm);
+  padding: 12px 14px;
+}
+
+.ai-lease-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ai-lease-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ai-lease-sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.ai-lease-grid {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+
+/* 目标虚拟机下方的纳管状态：运行中不代表进得去，agent 在不在线要单独说 */
+.ai-lease-agent {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.ai-lease-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ai-lease-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.ai-lease-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.ai-lease-scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.ai-lease-chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+}
+
+.ai-lease-actions-log {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-muted);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.ai-lease-action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  min-width: 0;
+}
+
+.ai-lease-action-row code {
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   AI 工作台：一块面板，而不是三张彼此分开的卡片
+
+   原来的排布是「主机卡 + 授权卡 + 终端卡 + 对话卡」四张独立卡片各自带边框和
+   阴影，页面上像四个互不相干的工具并排摆着。这里把前两段收进同一张
+   ``.ai-studio``，用分隔线分节；控制台则单独成一块带标题的工具条 ——
+   两层结构就够，再多又会回到「到处是框」。
+   --------------------------------------------------------------------------- */
+.ai-studio {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.ai-studio-section {
+  padding: 16px 18px;
+}
+
+.ai-studio-section + .ai-studio-section {
+  border-top: 1px solid var(--border-muted);
+}
+
+.ai-section-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 14px;
+  min-width: 0;
+}
+
+/* 序号块：给这一页一条可数的阅读路径（01 目标 → 02 授权 → 03 执行），
+   颜色只借品牌蓝一点，不做大色块 */
+.ai-section-num {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.ai-section-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ai-section-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 24px;
+}
+
+.ai-section-desc {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+/* ---- 授权范围：主机命令与虚拟机票据并排成两条同构的授权行 ---- */
+.ai-scope-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ai-scope-block {
+  padding: 12px 14px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+.ai-scope-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ai-scope-text {
+  display: flex;
+  flex: 1 1 380px;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ai-scope-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ai-scope-hint {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.ai-scope-row > .switch-field {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* 嵌套在授权块里的票据卡：外层已经有底色与边框，这里不能再描一次 */
+.ai-scope-block .ai-lease {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+}
+
+/* 授权清单在浅色块上要反过来用面板底色，否则两层同色叠在一起完全看不出来 */
+.ai-scope-block .ai-lease-actions-log {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+}
+
+/* 控制台标题条右侧：未授权提示 + 左栏页签 */
+.ai-console-shell-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ai-scope-warn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border: 1px solid var(--warning-dim);
+  border-radius: var(--radius-pill);
+  background: var(--warning-dim);
+  color: var(--warning);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* ---- 控制台：一整块，左终端右对话只靠一条竖线分隔 ---- */
+.ai-console-shell {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.ai-console-shell-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-muted);
+  background: linear-gradient(180deg, var(--bg-elevated), var(--bg-surface));
+}
+
+.ai-console-shell .ai-console {
+  /* 比原来少减一点：控制台标题条替代了页面级那个页签，占位大致相当 */
+  height: clamp(420px, calc(100vh - 470px), 800px);
+  padding: 14px 16px 16px;
+  gap: 0;
+  margin: 0;
+}
+
+/* 两栏不再各自是一张卡，而是同一块面板里的两个窗格 */
+.ai-console-shell .ai-console .card {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.ai-console-shell .ai-console .card::before {
+  display: none;
+}
+
+/* 分隔线不加额外内边距：两栏卡片本身各有 18px 内边距，再加一层会左右不对称 */
+.ai-console-shell .ai-console > * + * {
+  border-left: 1px solid var(--border-muted);
+}
+
+@media (max-width: 768px) {
+  .ai-studio-section {
+    padding: 14px;
+  }
+
+  .ai-console-shell .ai-console {
+    height: auto;
+    padding: 12px;
+  }
+
+  /* 单列堆叠时竖线要改成横线，否则会变成两条并排的栏 */
+  .ai-console-shell .ai-console > * + * {
+    border-left: 0;
+    border-top: 1px solid var(--border-muted);
+    margin-top: 12px;
+    padding-top: 12px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   AI 能力说明：功能卡 + 适用场景 + 可折叠工具清单
+   --------------------------------------------------------------------------- */
+.ai-cap {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ai-cap-hero {
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-dim);
+}
+
+.ai-cap-kicker {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.ai-cap-hero p {
+  margin: 6px 0 0;
+  font-size: var(--font-size-sm);
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+.ai-cap-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(236px, 1fr));
+  gap: 10px;
+}
+
+.ai-cap-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+.ai-cap-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ai-cap-card-num {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-border);
+  border-radius: 5px;
+  padding: 0 5px;
+  line-height: 18px;
+}
+
+.ai-cap-card-desc {
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text-secondary);
+}
+
+.ai-cap-card-scene {
+  margin-top: auto;
+  padding-top: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.ai-cap-scenes {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ai-cap-scene-label {
+  margin-right: 2px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.ai-cap-chip {
+  padding: 3px 9px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-muted);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.ai-cap-tools {
+  border-top: 1px solid var(--border-muted);
+  padding-top: 12px;
+}
+
+.ai-cap-tools > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ai-cap-tools > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* 手写展开箭头：原生 marker 在各浏览器里长得不一样，和面板的线条语言也不搭 */
+.ai-cap-tools > summary::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform var(--transition-fast);
+}
+
+.ai-cap-tools[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.ai-cap-tool-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 14px;
+}
+
+.ai-cap-tool-group-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ai-cap-tool-group-desc {
+  margin-bottom: 4px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.ai-cap-tool {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border-muted);
+}
+
+.ai-cap-tool:last-child {
+  border-bottom: 0;
+}
+
+.ai-cap-tool-name {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-primary);
+}
+
+.ai-cap-tool-desc {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}

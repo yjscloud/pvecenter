@@ -18,6 +18,7 @@ paramiko 是阻塞库，所有调用都用 ``asyncio.to_thread`` 丢到线程里
 from __future__ import annotations
 
 import asyncio
+import codecs
 import io
 import json
 import logging
@@ -27,7 +28,7 @@ import socket
 import threading
 import time
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import paramiko
 
@@ -1079,19 +1080,92 @@ def _open_channel(
     return client.exec_command(command, timeout=timeout)
 
 
-def _read_channel(stdout: Any, stderr: Any) -> Tuple[bool, str]:
-    out = stdout.read().decode("utf-8", "replace")
-    err = stderr.read().decode("utf-8", "replace")
-    code = stdout.channel.recv_exit_status()
+def _read_channel(
+    stdout: Any,
+    stderr: Any,
+    on_output: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
+    """读完一条命令的输出，返回 (成功?, 完整输出)。
+
+    给了 ``on_output`` 就**边读边交出去**：AI 终端靠它在命令跑的时候就能看到
+    输出，而不是等整条命令结束才一次性刷屏。回调在**阻塞线程**里被调用，实现方
+    必须自己保证线程安全（见 ``aiterm.TerminalSession.feed_stream``）。
+
+    不给回调时走 ``read()`` 一次读全：巡检、备份这类批量调用不需要实时性，
+    少一层循环。
+    """
+    channel = stdout.channel
+    if on_output is None:
+        out = stdout.read().decode("utf-8", "replace")
+        err = stderr.read().decode("utf-8", "replace")
+        code = channel.recv_exit_status()
+        try:
+            channel.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return code == 0, (out or "") + (err or "")
+
+    # 增量解码：一次 recv 完全可能把多字节 UTF-8 字符劈成两半，to-decode 会变成
+    # 一串替换符，中文输出就全废了。
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    parts: List[str] = []
+
+    def _push(data: bytes) -> None:
+        text = decoder.decode(data)
+        if not text:
+            return
+        parts.append(text)
+        try:
+            on_output(text)
+        except Exception:  # noqa: BLE001 - 镜像失败不能影响命令本身
+            logger.debug("命令输出回调失败", exc_info=True)
+
+    timed_out = False
     try:
-        stdout.channel.close()
+        while True:
+            moved = False
+            while channel.recv_ready():
+                _push(channel.recv(32768))
+                moved = True
+            while channel.recv_stderr_ready():
+                _push(channel.recv_stderr(32768))
+                moved = True
+            # eof_received 只说明对端不再写，缓冲区里可能还有尾巴要读干净
+            if (
+                getattr(channel, "eof_received", False)
+                and not channel.recv_ready()
+                and not channel.recv_stderr_ready()
+            ):
+                break
+            if not moved:
+                time.sleep(0.02)
+    except socket.timeout:
+        # 超时也要把已经拿到的输出留下：用户至少能看到命令停在哪一步
+        timed_out = True
+
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        parts.append(tail)
+        try:
+            on_output(tail)
+        except Exception:  # noqa: BLE001
+            logger.debug("命令输出回调失败", exc_info=True)
+    try:
+        code = channel.recv_exit_status()
+    except Exception:  # noqa: BLE001 - 通道已断时拿不到退出码
+        code = -1
+    try:
+        channel.close()
     except Exception:  # noqa: BLE001
         pass
-    return code == 0, (out or "") + (err or "")
+    return (code == 0 and not timed_out), "".join(parts)
 
 
 def run_command_sync(
-    row: Dict[str, Any], command: str, timeout: float = DEFAULT_TIMEOUT
+    row: Dict[str, Any],
+    command: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    on_output: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, str]:
     """在远程主机上跑一条命令（阻塞版本）。返回 (成功?, 输出)。
 
@@ -1115,14 +1189,24 @@ def run_command_sync(
     # 命令已发出 —— 之后的失败一律如实抛出，不重试
     _stdin, stdout, stderr = channel
     try:
-        return _read_channel(stdout, stderr)
+        return _read_channel(stdout, stderr, on_output)
     finally:
         entry.last_used = time.time()
 
 
-async def run_command(row: Dict[str, Any], command: str, timeout: float = DEFAULT_TIMEOUT) -> Tuple[bool, str]:
+async def run_command(
+    row: Dict[str, Any],
+    command: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    on_output: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
+    """在远程主机上跑一条命令。
+
+    ``on_output`` 给了就把输出**边产边交**（在阻塞线程里回调），用于把 AI 执行
+    过程实时镜像到终端；不给就照旧一次性返回。
+    """
     # 走巡检专用线程池：SSH 建立与读取全程阻塞，别占事件循环的默认 executor
-    return await taskpool.run_blocking(run_command_sync, row, command, timeout)
+    return await taskpool.run_blocking(run_command_sync, row, command, timeout, on_output)
 
 
 #: 可达性预探测的超时（秒）。比 DEFAULT_TIMEOUT（20 秒）短得多：目的只是快速

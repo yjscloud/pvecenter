@@ -31,7 +31,7 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
-from . import ai, aiplaybooks, aitools, database, hostscope, i18n
+from . import ai, aiplaybooks, aitools, aivm, database, hostscope, i18n
 
 logger = logging.getLogger(__name__)
 
@@ -696,17 +696,51 @@ async def _run_turn(
     if provider is None:
         raise ai.AIError(i18n.tr("还没有可用的模型，请先在设置里添加并启用一个"))
 
-    host_id = str(conv.get("host_id") or "local")
-    host = await ai.resolve_host(host_id, allowed)
+    # 目标有两种：受管主机（SSH）或**只有一台虚拟机**（Guest Agent）。
+    # 后者是为「只选一次目标」服务的：用户选一台虚拟机就够，不必再挑一台
+    # 它所在的主机；没有关联受管主机时，这一轮就只做虚拟机内排查。
+    host_id = str(conv.get("host_id") or "")
+    lease = aivm.current_lease()
+    if host_id:
+        host = await ai.resolve_host(host_id, allowed)
+        local, row = await ai._resolve_target(host_id)
+    else:
+        if lease is None:
+            raise ai.AIError(
+                i18n.pick(
+                    "这条会话没有目标主机，也没有生效的虚拟机授权。请先选择一台"
+                    "虚拟机并签发授权。",
+                    "This conversation has no target host and no active VM grant. "
+                    "Pick a VM and issue a grant first.",
+                )
+            )
+        # 展示用的「目标」取票面上的虚拟机；host_id 留空，主机类工具不会下发。
+        host = {
+            "id": "",
+            "name": str(lease.get("vm_name") or f"VM {lease.get('vmid')}"),
+            "host": "",
+            "address": "",
+            "local": False,
+        }
+        local, row = False, None
     hours = int(cfg.get("hours") or 24)
     started = time.time()
     notify = ai._make_notify(emit)
-    approve = ai._make_approver(notify)
-    local, row = await ai._resolve_target(host_id)
+    approve = ai._make_approver(notify, owner=username)
 
     history = await list_messages(conversation_id)
 
     if mode == MODE_INSPECT:
+        if not host_id:
+            # 体检 / 报告依赖主机的巡检数据；只有虚拟机目标时没有可采的证据。
+            raise ai.AIError(
+                i18n.pick(
+                    "虚拟机目标没有主机巡检数据，无法生成体检报告。请直接对话排查，"
+                    "或在上方切换到一个受管主机。",
+                    "A VM-only target has no host inspection data, so a report cannot "
+                    "be generated. Use the chat instead, or switch to a managed host.",
+                )
+            )
         # 体检模板：固定流程 —— 采集证据 → 强制 findings JSON → 报告落库。
         # 它可以是会话的第一轮，也可以中途再来一次（「重新体检」）。
         await notify({"type": "stage", "stage": "collect"})
@@ -778,6 +812,24 @@ async def _run_turn(
             # 「你只能读」，而工具表里明明摆着提议写命令的那把 —— 它会不敢用。
             allow_exec=allow_exec,
         )
+        if not host_id and lease is not None:
+            # 「只有虚拟机」的会话：基础提示词讲的仍是排查一台主机，不纠正的话
+            # 模型会假装自己登录了主机，甚至编出主机命令的输出。
+            system_prompt = (
+                i18n.pick(
+                    "【本轮目标】没有主机 SSH 目标，你只能通过 QEMU Guest Agent 在虚拟机"
+                    f"「{lease.get('vm_name') or lease.get('vmid')}」内部操作，并读取平台内部"
+                    "数据（告警 / 指标 / 变更 / 关联资源）。不要声称登录了宿主机；需要主机"
+                    "级命令或终端时，请让用户先在上方选择一个受管主机。\n\n",
+                    "[Scope] There is no host SSH target. You may only act inside the VM "
+                    f"“{lease.get('vm_name') or lease.get('vmid')}” through the QEMU Guest "
+                    "Agent, plus read platform data (alerts / metrics / changes / related "
+                    "resources). Never claim to have logged in to the host; if host-level "
+                    "commands or a terminal are needed, ask the user to pick a managed host "
+                    "above.\n\n",
+                )
+                + system_prompt
+            )
         if summary.strip():
             system_prompt += i18n.pick(
                 "\n（更早对话的摘要：\n" + summary.strip() + "\n）",
@@ -812,6 +864,11 @@ async def _run_turn(
         )
 
     specs = aitools.openai_tools(include_exec=allow_exec)
+    if not host_id:
+        # 没有主机目标就不下发主机工具（包括读主机体检报告的那一个）：
+        # 下发了却没有执行目标，模型只会反复调用、反复拿到失败。
+        blocked = set(aitools.HOST_TOOL_MAP) | {"get_baseline_report"}
+        specs = [item for item in specs if item["function"]["name"] not in blocked]
     loop = await ai.run_tool_loop(
         model_messages,
         cfg=cfg,

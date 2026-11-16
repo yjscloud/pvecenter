@@ -38,9 +38,13 @@ from .. import (
     aiaudit,
     aiplaybooks,
     aiterm,
+    aivm,
+    aivm_diagd,
     baseline,
+    guestguard,
     hostscope,
     i18n,
+    ownership,
     security,
     store,
 )
@@ -478,18 +482,53 @@ async def resolve_approval(
     与排查是两条连接：排查挂在 SSE 上等，这里用一次普通 POST 把它唤醒。
     权限与授权一致（``ai.exec``）—— 能授权上机执行的人才谈得上逐条批准。
     """
-    if not security.has_user_permission(user, "ai.exec"):
-        raise HTTPException(
-            status_code=403,
-            detail=i18n.tr("没有「授权 AI 上机执行」的权限"),
-        )
-
     approval_id = str(payload.get("approval_id") or "")
     approved = bool(payload.get("approved"))
     if not approval_id:
         raise HTTPException(status_code=400, detail=i18n.tr("缺少 approval_id"))
 
-    hit = ai_approval.resolve(approval_id, approved)
+    # 审批必须由**发起人**拍板。原实现只校验 ai.exec，于是任何持权者拿到
+    # （或猜到）别人的 approval_id 就能替别人批准一条写命令 —— 而 approval_id
+    # 是推送里明文下发的，这不是理论风险。
+    owner = ai_approval.owner_of(approval_id)
+    username = str(user.get("username") or "")
+    if owner and owner != username and not _is_admin(user):
+        raise HTTPException(
+            status_code=403, detail=i18n.tr("只能批准自己发起的操作")
+        )
+
+    # 宿主机命令的审批要 ai.exec；虚拟机内动作的审批要 ai.vm.write —— 两者不能
+    # 互相顶替，否则「只能进虚拟机改配置」的人也能替宿主机写命令拍板。
+    if not (
+        security.has_user_permission(user, "ai.exec")
+        or security.has_user_permission(user, "ai.vm.write")
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=i18n.tr("没有「授权 AI 上机执行」的权限"),
+        )
+
+    verdict = ai_approval.resolve(
+        approval_id, approved, by=str(user.get("username") or "")
+    )
+    hit = bool(verdict.get("hit"))
+    # 一次「点了批准却什么也没发生」最难查的地方就在这里：HTTP 一律 200，
+    # 真正决定成败的是 hit（这个 id 还在不在等待队列里）。留一行日志，
+    # 事后能区分「没批到」与「批到了但执行失败」。
+    logger.info(
+        "审批请求：id=%s approved=%s hit=%s by=%s",
+        approval_id,
+        approved,
+        hit,
+        username,
+    )
+    # 高危动作可能需要两个人：第一票只是记账，界面上要显示「1/2」，
+    # 审计里也要留下「谁在第几步批的」——不然事后看不出是谁放行的。
+    tally = (
+        f"（{verdict.get('count')}/{verdict.get('required')}）"
+        if hit and not verdict.get("done")
+        else ""
+    )
     await security.audit(
         request,
         user,
@@ -497,9 +536,440 @@ async def resolve_approval(
         target=approval_id,
         result="success" if hit else "failed",
         detail=("批准" if approved else "拒绝")
+        + tally
         + ("执行写命令" if hit else "（请求已失效或超时）"),
     )
-    return {"ok": hit}
+    return {"ok": hit, **verdict}
+
+
+# ------------------------------------------------------- 虚拟机内排查（租约）
+# 授权不是「打开一个开关」，而是「给某台虚拟机签发一张限时票据」：范围（目录 /
+# 可重启的服务）、时长、动作数上限都写在票面上，过期或撤销即失效。这样才谈得上
+# 「显式授权」，而不是给 AI 一把常开的钥匙。
+
+VM_READ = "ai.vm.read"
+VM_WRITE = "ai.vm.write"
+
+
+async def _require_own_lease(lease_id: str, user: Dict[str, Any]) -> Dict[str, Any]:
+    """取一张属于调用者的租约。越权按 404 处理，不确认它是否存在。"""
+    lease = await aivm.get_lease(lease_id)
+    username = str(user.get("username") or "")
+    if not lease or (lease.get("username") != username and not _is_admin(user)):
+        raise HTTPException(status_code=404, detail=i18n.tr("找不到这条授权"))
+    return lease
+
+
+@router.get("/vm/targets")
+async def vm_targets(user: Dict[str, Any] = Depends(VIEW)) -> Dict[str, Any]:
+    """可授权的虚拟机清单（当前连接，排除模板）。"""
+    if not security.has_user_permission(user, VM_READ):
+        raise HTTPException(
+            status_code=403, detail=i18n.tr("没有「虚拟机内取证」的权限")
+        )
+    items = await aivm.list_targets()
+    # 只列自己管得到的机器：普通用户看不到别人的机器名，否则授权面板成了资产清单
+    visible = []
+    for item in items:
+        try:
+            await guestguard.require_guest_object(
+                user,
+                item["node"],
+                item["vmid"],
+                ownership.KIND_CT if item["guest_type"] == "lxc" else ownership.KIND_VM,
+            )
+        except HTTPException:
+            continue
+        visible.append(item)
+    return {"items": visible}
+
+
+@router.get("/vm/agent")
+async def vm_agent(
+    node: str, vmid: int, user: Dict[str, Any] = Depends(VIEW)
+) -> Dict[str, Any]:
+    """选中机器后确认 Guest Agent 是否应答（= 能不能纳入安全管控）。
+
+    单独一个轻量接口：签发前探测、失败时给出原因，比「签完发现每条命令都
+    超时」有用得多。只 ping，不执行任何命令。
+    """
+    if not security.has_user_permission(user, VM_READ):
+        raise HTTPException(
+            status_code=403, detail=i18n.tr("没有「虚拟机内取证」的权限")
+        )
+    if not node or vmid <= 0:
+        raise HTTPException(status_code=400, detail=i18n.tr("缺少虚拟机标识"))
+    await guestguard.require_guest_object(user, node, vmid, ownership.KIND_VM)
+    return {"ok": await aivm.probe_agent(node, vmid)}
+
+
+@router.get("/vm/leases")
+async def vm_lease_list(user: Dict[str, Any] = Depends(VIEW)) -> Dict[str, Any]:
+    """最近的授权记录：管理员看全部，其他人只看自己的。"""
+    if not (
+        security.has_user_permission(user, VM_READ)
+        or security.has_user_permission(user, VM_WRITE)
+    ):
+        raise HTTPException(
+            status_code=403, detail=i18n.tr("没有「虚拟机内取证」的权限")
+        )
+    username = "" if _is_admin(user) else str(user.get("username") or "")
+    items = await aivm.list_leases(username)
+    return {"items": [aivm.public_lease(item) for item in items]}
+
+
+@router.post("/vm/leases")
+async def vm_lease_create(
+    payload: Dict[str, Any],
+    request: Request,
+    user: Dict[str, Any] = Depends(VIEW),
+) -> Dict[str, Any]:
+    """签发一张租约。写能力需要 ``ai.vm.write``，只读只需要 ``ai.vm.read``。"""
+    username = str(user.get("username") or "")
+    node = str(payload.get("node") or "")
+    try:
+        vmid = int(payload.get("vmid") or 0)
+    except (TypeError, ValueError):
+        vmid = 0
+    if not node or vmid <= 0:
+        raise HTTPException(status_code=400, detail=i18n.tr("缺少虚拟机标识"))
+
+    fs_rw = [str(item) for item in (payload.get("fs_rw") or [])]
+    units = [str(item) for item in (payload.get("units") or [])]
+    # 授权级别由调用方显式选择（read / write / ops）。旧客户端没传时按原来的语义
+    # 推断：给了目录或服务就是受限变更，否则只读 —— 不能默认成 ops。
+    access = str(payload.get("access") or "").lower()
+    if access not in (aivm.ACCESS_READ, aivm.ACCESS_WRITE, aivm.ACCESS_OPS):
+        access = aivm.ACCESS_WRITE if (fs_rw or units) else aivm.ACCESS_READ
+    wants_write = access != aivm.ACCESS_READ
+
+    if not security.has_user_permission(user, VM_READ):
+        raise HTTPException(
+            status_code=403, detail=i18n.tr("没有「虚拟机内取证」的权限")
+        )
+    if wants_write and not security.has_user_permission(user, VM_WRITE):
+        raise HTTPException(
+            status_code=403, detail=i18n.tr("没有「虚拟机内变更」的权限")
+        )
+
+    guest_type = "lxc" if str(payload.get("guest_type") or "") == "lxc" else "qemu"
+    if guest_type == "lxc":
+        # 容器的执行要走节点侧 pct，写入更没有 Guest Agent 的文件接口可用（回滚
+        # 也就无从谈起）。与其发一张注定执行失败的票据，不如当场说清楚。
+        raise HTTPException(
+            status_code=400,
+            detail=i18n.tr("容器暂不支持 AI 内联排查，请对虚拟机授权"),
+        )
+    kind = ownership.KIND_CT if guest_type == "lxc" else ownership.KIND_VM
+    connection_id = str(payload.get("connection_id") or "")
+    await guestguard.require_guest_object(
+        user, node, vmid, kind, connection=connection_id or None
+    )
+
+    # 同一台机器上已有生效租约就复用：反复点「授权」不该刷出一堆票据，
+    # 否则撤销时用户不知道该撤哪一张。
+    existing = await aivm.active_lease_for(username, connection_id, node, vmid)
+    if existing:
+        # 级别不同的票不能「复用」：用户点的是「运维授权」，拿回一张只读票，
+        # 表现就是「授权了还是什么都不能做」。让他显式撤销旧票再签新票。
+        if str(existing.get("access") or aivm.ACCESS_WRITE) != access:
+            current = str(existing.get("access") or aivm.ACCESS_WRITE)
+            raise HTTPException(
+                status_code=409,
+                detail=i18n.pick(
+                    f"这台机器已有一张「{aivm.ACCESS_LABELS.get(current, current)}」级别的授权，"
+                    "请先在「生效中的授权」列表里撤销它，再签发新授权",
+                    f"This VM already has a “{aivm.ACCESS_LABELS_EN.get(current, current)}” "
+                    "grant. Revoke it in the “Active grants” list first, then issue the new one.",
+                ),
+            )
+        return {"lease": aivm.public_lease(existing), "reused": True}
+
+    # 纳管的前提是 Guest Agent 在线：没有它连不上客户机，票签出来也是死票。
+    # 这一点在签发时再确认一次 —— 列表加载与点「签发」之间机器可能已经停了。
+    if not await aivm.probe_agent(node, vmid):
+        raise HTTPException(
+            status_code=400,
+            detail=i18n.pick(
+                "这台虚拟机未运行，或没有响应 Guest Agent。请确认客户机已安装并"
+                "启动 qemu-guest-agent、虚拟机配置中 agent 已启用；未经纳管的机器"
+                "不能签发授权。",
+                "This VM is not running or is not answering the QEMU Guest Agent. "
+                "Make sure qemu-guest-agent is installed and running inside the guest, "
+                "and agent is enabled in the VM config. Unmanaged VMs cannot be granted.",
+            ),
+        )
+
+    try:
+        minutes = int(payload.get("minutes") or aivm.DEFAULT_MINUTES)
+    except (TypeError, ValueError):
+        minutes = aivm.DEFAULT_MINUTES
+    try:
+        actions_max = int(payload.get("actions_max") or aivm.DEFAULT_ACTIONS)
+    except (TypeError, ValueError):
+        actions_max = aivm.DEFAULT_ACTIONS
+
+    # 客户机是 Linux 还是 Windows、带了什么标签 —— 这两项决定路径语义、命令白名单
+    # 与策略（prod 标签禁写）。取不到就按 Linux + 无标签处理（见 describe_guest）。
+    info = await aivm.describe_guest(node, vmid, guest_type)
+    # 沙箱模式在签发时探测一次并固化：中途装上/卸掉 diagd 不该让同一次排查的
+    # 隔离等级悄悄变化。
+    probe = {
+        "id": "",
+        "node": node,
+        "vmid": vmid,
+        "guest_type": guest_type,
+        "os_type": info["os_type"],
+        "mode": "compat",
+    }
+    mode = await aivm.detect_mode(probe)
+
+    try:
+        lease = await aivm.create_lease(
+            username=username,
+            node=node,
+            vmid=vmid,
+            vm_name=str(payload.get("vm_name") or "") or info["name"],
+            connection_id=connection_id,
+            guest_type=guest_type,
+            fs_ro=[str(item) for item in (payload.get("fs_ro") or [])] or None,
+            fs_rw=fs_rw,
+            units=units,
+            risk_max=aivm.RISK_CONFIG if wants_write else aivm.RISK_READ,
+            minutes=minutes,
+            actions_max=actions_max,
+            reason=str(payload.get("reason") or ""),
+            os_type=info["os_type"],
+            tags=info["tags"],
+            mode=mode,
+            access=access,
+        )
+    except aivm.ToolDenied as exc:
+        # 策略拒绝（例如 prod 标签禁写）：4xx 而不是 500 —— 这是规则，不是故障
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 可写/运维级别的票先打快照：运维授权下 AI 是跑包管理器的，文件级备份覆盖不到。
+    # 快照失败不阻挡授权（存储可能不支持），票面上如实留空。
+    if access != aivm.ACCESS_READ:
+        await aivm.prepare_snapshot(lease)
+
+    await security.audit(
+        request,
+        user,
+        "ai.vm.grant",
+        target=f"{node}/{vmid}",
+        result="success",
+        detail=(
+            f"授权 AI 进入虚拟机 {lease['vm_name'] or vmid}："
+            f"{minutes} 分钟，级别 {aivm.ACCESS_LABELS.get(access, access)}，"
+            + (
+                "整机（装包 / 改配置 / 重启服务，逐条审批）"
+                if access == aivm.ACCESS_OPS
+                else ("可写 " + "、".join(lease["fs_rw"]) if lease["fs_rw"] else "仅只读")
+                + ("；可重启 " + "、".join(lease["units"]) if lease["units"] else "")
+            )
+        ),
+    )
+    return {"lease": aivm.public_lease(lease), "reused": False}
+
+
+@router.get("/vm/leases/{lease_id}")
+async def vm_lease_detail(
+    lease_id: str, user: Dict[str, Any] = Depends(VIEW)
+) -> Dict[str, Any]:
+    """租约详情 + 完整动作流水（谁授权、做了什么、是否被审批、结果如何）。"""
+    lease = await _require_own_lease(lease_id, user)
+    return {
+        "lease": aivm.public_lease(lease),
+        "actions": await aivm.list_actions(lease_id),
+    }
+
+
+@router.post("/vm/leases/{lease_id}/revoke")
+async def vm_lease_revoke(
+    lease_id: str,
+    payload: Dict[str, Any],
+    request: Request,
+    user: Dict[str, Any] = Depends(VIEW),
+) -> Dict[str, Any]:
+    """撤销授权，并尝试终止客户机内仍在执行的命令。"""
+    lease = await _require_own_lease(lease_id, user)
+    outcome = await aivm.revoke_lease(
+        lease_id, reason=str(payload.get("reason") or "")
+    )
+    await security.audit(
+        request,
+        user,
+        "ai.vm.revoke",
+        target=f"{lease.get('node')}/{lease.get('vmid')}",
+        result="success",
+        detail=f"撤销 AI 虚拟机授权（{lease.get('vm_name') or lease.get('vmid')}）",
+    )
+    refreshed = await aivm.get_lease(lease_id)
+    return {
+        "lease": aivm.public_lease(refreshed or lease),
+        # 兼容模式下没有终止开关，前端要如实告诉用户「那条命令会自己跑完」
+        "kill": outcome.get("kill") or {},
+    }
+
+
+@router.post("/vm/leases/{lease_id}/kill")
+async def vm_lease_kill(
+    lease_id: str,
+    request: Request,
+    user: Dict[str, Any] = Depends(VIEW),
+) -> Dict[str, Any]:
+    """立即终止该授权在客户机内仍在运行的进程（不撤销授权）。
+
+    单独一个动作是有必要的：排查到一半发现某条 ``journalctl -f`` 还在刷，
+    用户想停掉的只是那一条，不是整张票。
+    """
+    lease = await _require_own_lease(lease_id, user)
+    result = await aivm.kill_lease(lease)
+    await security.audit(
+        request,
+        user,
+        "ai.vm.kill",
+        target=f"{lease.get('node')}/{lease.get('vmid')}",
+        result="success" if result.get("ok") else "failed",
+        detail="终止客户机内运行中的命令：" + str(result.get("output") or "")[:150],
+    )
+    return result
+
+
+@router.get("/vm/diagd")
+async def vm_diagd_script(user: Dict[str, Any] = Depends(VIEW)) -> Dict[str, Any]:
+    """客户机内受限执行器的安装脚本。
+
+    为什么把脚本源码交给前端而不是让用户去翻仓库：这东西必须和面板**同一版本**
+    才有意义（参数格式、kill 语义都在变），跟着面板一起下发最省事。
+    """
+    if not security.has_user_permission(user, VM_READ):
+        raise HTTPException(
+            status_code=403, detail=i18n.tr("没有「虚拟机内取证」的权限")
+        )
+    return {
+        "version": aivm_diagd.VERSION,
+        "script": aivm_diagd.SCRIPT,
+        "hint": aivm_diagd.INSTALL_HINT,
+    }
+
+
+@router.get("/vm/policy")
+async def vm_policy_get(user: Dict[str, Any] = Depends(VIEW)) -> Dict[str, Any]:
+    """虚拟机授权策略（谁能被写、要不要双人批、快照留多久）。"""
+    return {"policy": await aivm.policy(), "defaults": aivm.DEFAULT_POLICY}
+
+
+@router.put("/vm/policy")
+async def vm_policy_put(
+    payload: Dict[str, Any],
+    request: Request,
+    user: Dict[str, Any] = Depends(VIEW),
+) -> Dict[str, Any]:
+    """改策略（仅管理员）。**非法值一律拒掉**而不是夹到边界：
+
+    这几项直接决定「生产机器能不能被写」，静默纠正会让人以为配置生效了，
+    实际却是另一个值 —— 这种事发生在安全开关上最危险。
+    """
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail=i18n.tr("只有管理员能改策略"))
+
+    current = await aivm.policy()
+    merged = dict(current)
+
+    if "max_minutes" in payload:
+        try:
+            value = int(payload["max_minutes"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=i18n.tr("授权时长必须是整数"))
+        if not 5 <= value <= 480:
+            raise HTTPException(
+                status_code=400, detail=i18n.tr("授权时长需在 5–480 分钟之间")
+            )
+        merged["max_minutes"] = value
+
+    for key in ("double_approve", "auto_snapshot"):
+        if key in payload:
+            merged[key] = bool(payload[key])
+
+    # 「允许运维授权」是这张策略里最宽的一档开关：关掉之后连管理员也不能再签发
+    # 整机 shell 的票。已有票据不受影响（级别在签发时就固化在票面上）。
+    if "allow_ops" in payload:
+        merged["allow_ops"] = bool(payload["allow_ops"])
+
+    if "keep_snapshot_hours" in payload:
+        try:
+            hours = int(payload["keep_snapshot_hours"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=i18n.tr("快照保留时长必须是整数"))
+        if not 1 <= hours <= 24 * 30:
+            raise HTTPException(
+                status_code=400, detail=i18n.tr("快照保留时长需在 1–720 小时之间")
+            )
+        merged["keep_snapshot_hours"] = hours
+
+    if "deny_write_tags" in payload:
+        raw = payload["deny_write_tags"]
+        if not isinstance(raw, list):
+            raise HTTPException(status_code=400, detail=i18n.tr("禁写标签必须是列表"))
+        tags: List[str] = []
+        for item in raw:
+            tag = str(item or "").strip()
+            if not tag:
+                continue
+            if len(tag) > 32:
+                raise HTTPException(status_code=400, detail=i18n.tr("标签过长（上限 32）"))
+            if tag not in tags:
+                tags.append(tag)
+        merged["deny_write_tags"] = tags
+
+    await store.set_setting(aivm.POLICY_KEY, json.dumps(merged, ensure_ascii=False))
+    await security.audit(
+        request,
+        user,
+        "ai.vm.policy",
+        target="ai_vm_policy",
+        result="success",
+        detail="更新虚拟机授权策略：" + json.dumps(merged, ensure_ascii=False)[:300],
+    )
+    return {"policy": merged}
+
+
+@router.post("/vm/leases/{lease_id}/rollback")
+async def vm_lease_rollback(
+    lease_id: str,
+    payload: Dict[str, Any],
+    request: Request,
+    user: Dict[str, Any] = Depends(VIEW),
+) -> Dict[str, Any]:
+    """回滚：按动作还原单个文件，或整机回到授权前打的快照。"""
+    if not security.has_user_permission(user, VM_WRITE):
+        raise HTTPException(
+            status_code=403, detail=i18n.tr("没有「虚拟机内变更」的权限")
+        )
+    lease = await _require_own_lease(lease_id, user)
+    if lease.get("status") != "active":
+        # 到期后不给回滚是刻意的：租约的有效期就是「这段时间内的改动由我负责」。
+        raise HTTPException(
+            status_code=400, detail=i18n.tr("这条授权已失效，不能再回滚")
+        )
+    mode = "snapshot" if str(payload.get("mode") or "") == "snapshot" else "file"
+    result = await aivm.rollback(
+        lease, action_id=str(payload.get("action_id") or ""), mode=mode
+    )
+    await security.audit(
+        request,
+        user,
+        "ai.vm.rollback",
+        target=f"{lease.get('node')}/{lease.get('vmid')}",
+        result="success" if result.get("ok") else "failed",
+        detail=(
+            f"回滚 {'快照' if mode == 'snapshot' else '文件'}："
+            + str(payload.get("action_id") or "全部")
+        ),
+    )
+    return result
 
 
 # ------------------------------------------------------------------ 会话式对话
@@ -546,12 +1016,22 @@ async def create_conversation(
     越权在动模型之前就挡住：``resolve_host`` 会确认这台主机在该用户的可见范围内，
     不合法直接 400 —— 不能等采集完证据才发现「你没权限看这台机器」。
     """
-    host_id = str(payload.get("host_id") or "local")
+    host_id = str(payload.get("host_id") or "")
     allowed = await hostscope.allowed_host_ids(user)
-    try:
-        host = await ai.resolve_host(host_id, allowed)
-    except ai.AIError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if host_id:
+        try:
+            host = await ai.resolve_host(host_id, allowed)
+        except ai.AIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        # 纯虚拟机目标：没有主机，会话靠后续的虚拟机租约工作。名称只需要用于
+        # 记录与会话列表展示，真正的执行目标由票面决定。
+        vm_name = str(payload.get("vm_name") or "").strip()
+        if not vm_name:
+            raise HTTPException(
+                status_code=400, detail=i18n.tr("缺少目标主机或虚拟机")
+            )
+        host = {"id": "", "name": vm_name}
 
     # 会话级的「允许上机执行」授权：与逐轮 payload 同一道权限门
     allow_exec = bool(payload.get("allow_exec"))
@@ -631,6 +1111,25 @@ async def conversation_stream(
             detail=i18n.tr("没有「授权 AI 上机执行」的权限"),
         )
 
+    # 虚拟机授权：带上租约 id 才会启用进虚拟机的那几个工具。租约必须属于本人、
+    # 未过期、未撤销；权限位在创建租约时校验过，这里再查一次 —— 权限可能在
+    # 会话存续期间被管理员回收。
+    lease = None
+    lease_id = str(payload.get("vm_lease") or "")
+    if lease_id:
+        if not security.has_user_permission(user, "ai.vm.read"):
+            raise HTTPException(
+                status_code=403, detail=i18n.tr("没有「虚拟机内取证」的权限")
+            )
+        lease = await aivm.resolve_lease(
+            lease_id, username=username, is_admin=is_admin
+        )
+        if lease is None:
+            raise HTTPException(
+                status_code=403,
+                detail=i18n.tr("这条虚拟机授权已失效，请重新授权"),
+            )
+
     text = str(payload.get("text") or "")
     provider_id = str(payload.get("provider_id") or "")
     # chat（默认，自由对话）/ inspect（体检模板，产出报告）。未知值一律当自由对话。
@@ -662,19 +1161,22 @@ async def conversation_stream(
                     mode="chat",
                     conversation_id=conversation_id,
                 )
-                result = await aichat.chat_turn(
-                    conversation_id,
-                    text,
-                    mode=mode,
-                    preset=preset,
-                    emit=emit,
-                    allowed=allowed,
-                    provider_id=provider_id,
-                    username=username,
-                    is_admin=is_admin,
-                    allow_exec=allow_exec,
-                    perms=perms,
-                )
+                # 租约只在这一轮对话期间生效（contextvar）。放 worker 内部而不是
+                # 端点函数体：worker 是独立 task，在它外面设置不会传进来。
+                with aivm.scope(lease):
+                    result = await aichat.chat_turn(
+                        conversation_id,
+                        text,
+                        mode=mode,
+                        preset=preset,
+                        emit=emit,
+                        allowed=allowed,
+                        provider_id=provider_id,
+                        username=username,
+                        is_admin=is_admin,
+                        allow_exec=allow_exec,
+                        perms=perms,
+                    )
                 calls = result.get("tool_calls") or []
                 await aiaudit.record_calls(session_id, calls)
                 await aiaudit.finish_session(

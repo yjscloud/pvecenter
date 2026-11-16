@@ -38,6 +38,7 @@ from . import (
     ai_approval,
     aiterm,
     aitools,
+    aivm,
     alerting,
     backupguard,
     baseline,
@@ -400,18 +401,19 @@ def capabilities(perms: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     for kind, catalog in (
         ("host", aitools.HOST_TOOLS),
         ("internal", aitools.INTERNAL_TOOLS),
+        # 虚拟机内动作：只有在**签发租约后**才会下发给模型，但说明页必须如实列出 ——
+        # 「说明书里没有、实际能跑」比多写一行说明危险得多。
+        ("guest", aivm.VM_TOOLS),
     ):
         for item in catalog:
             name = str(item.get("name") or "")
             if not aitools.allowed_by_permissions(perms, name):
                 continue
-            tools.append(
-                {
-                    "name": name,
-                    "description": i18n.tr(str(item.get("description") or "")),
-                    "kind": kind,
-                }
-            )
+            raw = item.get("description")
+            # 虚拟机工具的描述是 (中文, English) 二元组（下发给模型时也取同一份），
+            # 其它工具是单个中文串、走 i18n.tr 查表。
+            desc = i18n.pick(*raw) if isinstance(raw, tuple) else i18n.tr(str(raw or ""))
+            tools.append({"name": name, "description": desc, "kind": kind})
     return {
         "tools": tools,
         "max_steps": MAX_STEPS,
@@ -2063,12 +2065,28 @@ async def _dispatch_tool(
     说明页里看不见的工具，模型就算被提示词注入点名也跑不起来。没有这一层，
     「按权限过滤工具列表」只是把文档藏起来。
     """
+    # 虚拟机内工具单独走一条：它们的效果依赖「本次请求有没有生效的租约」，
+    # 而租约是运行时上下文（contextvar），不在这个函数的参数里。
+    # 权限位仍在 aivm 内部用同一张 TOOL_PERMISSIONS 校验，不在这里重复一遍。
+    if aivm.is_vm_tool(name):
+        return await aivm.run_tool(name, args, perms=perms)
     if not aitools.allowed_by_permissions(perms, name):
         return {
             "ok": False,
             "output": i18n.pick(
                 "没有使用该工具的权限",
                 "You do not have permission to use this tool",
+            ),
+        }
+    if name in aitools.HOST_TOOL_MAP and not host_id:
+        # 纯虚拟机目标：工具表里已过滤掉主机工具，这里再挡一层，防止模型从
+        # 上下文里学到旧工具名后硬调 —— 没有执行目标的主机命令只会砸出异常。
+        return {
+            "ok": False,
+            "output": i18n.pick(
+                "当前没有目标主机，这条命令无法执行。需要时请让用户先选择受管主机。",
+                "There is no target host, so this command cannot run. Ask the user to "
+                "pick a managed host first.",
             ),
         }
     if name in aitools.INTERNAL_TOOL_MAP:
@@ -2091,20 +2109,42 @@ async def _dispatch_tool(
 
             approver = _approve_with_notice
 
+        # 把命令与它的输出镜像到用户打开的终端：左侧就是「AI 在干什么」的实况。
+        # 命令一确定就写标题行，输出**边跑边追加** —— 用户看到的是执行过程，
+        # 而不是等几十秒后整段结果一次刷出来（没有开终端时是空操作）。
+        streamed = {"command": False}
+
+        def _on_command(command: str) -> None:
+            streamed["command"] = True
+            aiterm.mirror_command_start(username, host_id, command)
+
+        def _on_output(chunk: str) -> None:
+            # 从 SSH 的阻塞线程回调过来（见 sshremote._read_channel）
+            aiterm.mirror_output(username, host_id, chunk)
+
         outcome = await aitools.run_host_tool(
-            name, args, row=row, local=local, approval=approver
+            name,
+            args,
+            row=row,
+            local=local,
+            approval=approver,
+            on_output=_on_output,
+            on_command=_on_command,
         )
-        # 把这条命令与它的输出镜像到用户打开的终端：左侧就是「AI 在干什么」的
-        # 实况窗口（没有开终端时是一次空操作，见 aiterm.mirror_command）。
-        command_text = str(outcome.get("command") or "").strip()
-        if command_text:
-            aiterm.mirror_command(
-                username,
-                host_id,
-                command_text,
-                bool(outcome.get("ok")),
-                str(outcome.get("output") or ""),
-            )
+        if streamed["command"]:
+            aiterm.mirror_command_end(username, host_id, bool(outcome.get("ok")))
+        else:
+            # 没走到执行（参数被拒 / 用户没批准）：退回一次性镜像，
+            # 至少让终端里留下「AI 试过什么、为什么没跑」的痕迹
+            command_text = str(outcome.get("command") or "").strip()
+            if command_text:
+                aiterm.mirror_command(
+                    username,
+                    host_id,
+                    command_text,
+                    bool(outcome.get("ok")),
+                    str(outcome.get("output") or ""),
+                )
         return outcome
     return {"ok": False, "output": i18n.pick("没有这个工具", "No such tool")}
 
@@ -2134,6 +2174,7 @@ def _make_notify(
 
 def _make_approver(
     notify: Callable[[Dict[str, Any]], Awaitable[None]],
+    owner: str = "",
 ) -> Callable[[str, str], Awaitable[bool]]:
     """构造「把待批准的写命令推给前端并挂起等待」的审批回调。
 
@@ -2143,6 +2184,10 @@ def _make_approver(
 
     async def approve(command: str, purpose: str) -> bool:
         approval_id = uuid.uuid4().hex[:12]
+        # 先登记等待点再推送 —— 与 ``aivm._ask`` 同一条理由：用户看到卡片后常常
+        # 是秒点「批准」，若此刻 Future 还没建好，那一票会落空，表现为「批了却
+        # 一直停着不动」，直到 120 秒超时被当成拒绝。
+        ai_approval.prepare(approval_id, owner=owner)
         await notify(
             {
                 "type": "approval",
@@ -2152,7 +2197,16 @@ def _make_approver(
                 "timeout": int(ai_approval.APPROVAL_TIMEOUT),
             }
         )
-        return await ai_approval.wait_for_approval(approval_id)
+        waited = time.time()
+        approved = await ai_approval.wait_for_approval(approval_id, owner=owner)
+        logger.info(
+            "写命令审批收口：id=%s approved=%s 等待=%.1fs command=%r",
+            approval_id,
+            approved,
+            time.time() - waited,
+            command[:120],
+        )
+        return approved
 
     return approve
 
@@ -2219,6 +2273,21 @@ async def run_tool_loop(
     """
     started = started if started is not None else time.time()
     notify_fn = notify or _make_notify(None)
+    # 虚拟机授权：有租约才下发 VM 工具，并把边界写进系统提示。
+    # 两件事都在这里做而不是在调用方，是因为 L2 排查与会话追问共用这个循环，
+    # 在调用方各写一遍迟早会漏掉一处（漏掉的表现是「授权了但模型不知道能干什么」）。
+    aivm.set_notify(notify_fn)
+    lease = aivm.current_lease()
+    if lease is not None:
+        # 工具说明随票面级别变化：只读票说「只读」，运维票说「可装包改配置」。
+        # 说明写死会让模型在运维授权下依然只给建议。
+        specs = list(specs) + aivm.tool_specs(lease)
+        hint = aivm.prompt_hint(lease)
+        if hint and messages and messages[0].get("role") == "system":
+            messages[0] = {
+                **messages[0],
+                "content": str(messages[0].get("content") or "") + hint,
+            }
     seen: Dict[str, int] = {}
     calls: List[Dict[str, Any]] = []
     usage: Dict[str, int] = {}
@@ -2498,7 +2567,7 @@ async def inspect_agent(
     started = time.time()
 
     notify = _make_notify(emit)
-    approve = _make_approver(notify)
+    approve = _make_approver(notify, owner=username)
     local, row = await _resolve_target(host_id)
 
     await notify({"type": "stage", "stage": "collect"})

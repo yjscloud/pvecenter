@@ -1667,7 +1667,17 @@ async def managed_hosts() -> List[Dict[str, Any]]:
 
 
 def host_card(row: Dict[str, Any]) -> Dict[str, Any]:
-    """主机记录的**展示形态**：给前端挑主机用，凭据一个字段都不带。"""
+    """主机记录的**展示形态**：给前端挑主机用，凭据一个字段都不带。
+
+    ``node`` / ``vmid`` / ``conn_id`` 是「这台主机由哪台虚拟机登记而来」的来源
+    信息（面板下发的机器才有）。它不是凭据，但能让前端把虚拟机和主机对上 ——
+    AI 助手因此可以「只选一台虚拟机」，由它自动带出对应的受管主机。
+    """
+    vmid = row.get("vmid")
+    try:
+        vmid_num = int(vmid) if vmid not in (None, "") else None
+    except (TypeError, ValueError):
+        vmid_num = None
     return {
         "id": str(row.get("id") or ""),
         "name": str(row.get("name") or row.get("host") or ""),
@@ -1675,6 +1685,9 @@ def host_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "address": str(row.get("host") or ""),
         "local": False,
         "enabled": bool(row.get("enabled", True)),
+        "node": str(row.get("node") or ""),
+        "vmid": vmid_num,
+        "conn_id": str(row.get("conn_id") or ""),
     }
 
 

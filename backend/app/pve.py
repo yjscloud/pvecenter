@@ -1494,6 +1494,15 @@ def _active_connection_id() -> str:
         return ""
 
 
+def target_connection_id() -> str:
+    """本次请求最终会打到哪条连接（硬指定优先，其次当前激活连接）。
+
+    给「带来源信息的清单」用：例如虚拟机列表要带上 connection_id，前端才能
+    把它和受管主机记录里的 ``conn_id`` 对上，从而由虚拟机反查主机。
+    """
+    return requested_connection() or _active_connection_id()
+
+
 #: 客户端指纹只覆盖「会改变上游行为」的字段。原先是对整份 profile 做
 #: ``json.dumps(sort_keys=True)`` + sha256 —— 每次取客户端都要把含密钥的 dict
 #: 完整序列化一遍，而这段代码在一次请求里会被调用 N 次

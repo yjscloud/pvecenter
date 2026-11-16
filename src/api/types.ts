@@ -4605,6 +4605,15 @@ export interface BaselineHost {
   address: string;
   local: boolean;
   enabled: boolean;
+  /**
+   * 这台主机由哪台虚拟机登记而来（面板下发的机器才有）。
+   *
+   * 不是凭据，但足够让前端把「虚拟机」和「受管主机」对上 —— 于是选择器可以
+   * 只让用户选一次：选中一台虚拟机，就同时确定了主机命令与进机取证两个目标。
+   */
+  node?: string;
+  vmid?: number | null;
+  conn_id?: string;
 }
 
 export interface BaselineCheck {
@@ -5229,8 +5238,11 @@ export interface AiCapabilities {
   tools: Array<{
     name: string;
     description: string;
-    /** host = 会在目标主机上执行命令；internal = 只读平台已有的巡检数据 */
-    kind: 'host' | 'internal';
+    /**
+     * host = 会在目标主机上执行命令；internal = 只读平台已有的巡检数据；
+     * guest = 进入虚拟机内部，只有签发限时授权后才会下发给模型
+     */
+    kind: 'host' | 'internal' | 'guest';
   }>;
   max_steps: number;
   timeout_seconds: number;
@@ -5601,6 +5613,12 @@ export type AiChatStreamEvent =
       command: string;
       purpose: string;
       timeout: number;
+      /** ``vm_action`` 表示这是虚拟机内的写操作（带 diff），缺省是宿主机命令 */
+      kind?: string;
+      risk?: number;
+      risk_label?: string;
+      /** 变更预览：虚拟机内写文件的 unified diff */
+      detail?: string;
     }
   /** 开始新一段流式文本（上一次的增量到此为止）；收尾时的 ``assistant`` 才是权威文本 */
   | { type: 'token_reset' }
@@ -5626,6 +5644,12 @@ export type AiStreamEvent =
       purpose: string;
       /** 等待上限（秒），超时按拒绝处理 */
       timeout: number;
+      /** ``vm_action`` 表示虚拟机内的写操作（带 diff），缺省是宿主机命令 */
+      kind?: string;
+      risk?: number;
+      risk_label?: string;
+      /** 变更预览：虚拟机内写文件的 unified diff */
+      detail?: string;
     }
   | {
       type: 'tool_start';
