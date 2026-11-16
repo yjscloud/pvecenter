@@ -4257,9 +4257,10 @@ body.is-col-resizing * {
    表格单元格辅助
    --------------------------------------------------------------------------- */
 
-/* 「来源模板」列：只放模板名，不换行、超长省略。
-   table-layout: fixed + overflow: hidden 已经裁掉溢出，这里补 white-space
-   让长名字走省略号而不是把行高撑成两行 —— 与其它单行文本列保持同一行高。 */
+/* 「来源模板」列：现在只放一个系统图标（悬停出系统名）。
+   保留不换行与省略号：没有模板名时那一格会退回 `#VMID` 文本，仍要走单行；
+   table-layout: fixed + overflow: hidden 已经裁掉溢出，这里只补 white-space，
+   别让任何兜底文本把行高撑成两行。 */
 .table th.col-source-template,
 .table td.col-source-template {
   white-space: nowrap;
@@ -5235,69 +5236,8 @@ body.is-col-resizing * {
   color: var(--text-muted);
 }
 
-/* 克隆源预览卡 */
-.clone-preview {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 12px 14px;
-  border: 1px solid var(--accent-border);
-  border-radius: var(--radius-sm);
-  background-image: linear-gradient(135deg, var(--accent-dim), transparent 72%);
-}
-
-.clone-preview-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 36px;
-  height: 36px;
-  border-radius: var(--radius-sm);
-  background: var(--accent-dim);
-  color: var(--accent);
-  flex-shrink: 0;
-}
-
-.clone-preview-body {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  flex: 1;
-}
-
-.clone-preview-name {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.clone-preview-node {
-  font-size: var(--font-size-xs);
-  color: var(--text-muted);
-}
-
-.clone-preview-specs {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.spec-chip {
-  display: inline-flex;
-  align-items: center;
-  padding: 3px 9px;
-  border-radius: var(--radius-pill);
-  background: var(--bg-base);
-  border: 1px solid var(--border);
-  font-size: var(--font-size-xs);
-  color: var(--text-secondary);
-  white-space: nowrap;
-}
+/* 克隆源预览卡已并入 SystemTemplatePicker 的摘要卡（.os-current），
+   这里不再保留一套重复的「图标 + 名字 + 规格 chip」样式。 */
 
 /* 克隆方式：两个可选卡 */
 .clone-methods {
@@ -9246,4 +9186,837 @@ button.pbs-task-row:focus-visible {
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ---------------------------------------------------------------------------
+   重装系统：来源模板选择器（分类 + 密集行）
+
+   一屏之内要能「看清楚 + 比得了」：
+   · 行高 38px、字段横向对齐（名字 / 版本 / 场景 / 系统盘 / 已用），同一个字段
+     上下成列，扫一眼就能比出哪张盘更大；卡片式做不到这件事；
+   · 列表自己滚动并封顶（clamp），模板从 5 个涨到 100 个，弹窗高度不变；
+   · 两层吸顶：列名 24px（sticky top 0）+ 分组头 26px（top 24px），滚到哪都
+     知道当前在看哪一类；
+   · 选中态三条信号：左侧 2px 强调色竖条、行底色、左侧实心圆点。三者都不占
+     布局空间（box-shadow / 绝对定位），选中不会把整列文字挤动。
+   --------------------------------------------------------------------------- */
+
+.os-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* ---- 创建流程里的紧凑版（SystemTemplatePicker）-----------------------------
+
+   外层已经是一张卡片 / 一块面板（自带边框与底色），这里再套同色盒子就是盒中盒：
+   多一圈内边距、多一道边框，还把列表顶得更矮。所以紧凑版不再画自己的框，只留
+   「标题行 + 分类 chip + 一列带边框的列表」，视觉上是一块内容。
+
+   四个入口（快速部署 / 自定义部署 × 虚拟机 / 容器）用的都是这一个类 —— 两条流程
+   的模板选择器因此是同一个高度、同一种留白，不会再一个胖一个瘦。 */
+
+.os-pick.is-compact {
+  gap: 6px;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+}
+
+.os-pick.is-compact .os-pick-list {
+  /* 比重装那套再矮一档：168px ≈ 列名 + 一个分组头 + 3 行；256px 上限约 5 行。
+     屏幕矮（1366×768 的笔记本）时按 24vh 收，列表自己滚动，弹窗不跟着长。 */
+  max-height: clamp(168px, 24vh, 256px);
+}
+
+.os-pick.is-compact .os-pick-foot {
+  padding: 0 2px;
+}
+
+/* ---- 第一行：标题 + 总数 + 原系统 + 搜索 ---- */
+.os-pick-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.os-pick-title {
+  flex: none;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.os-pick-count,
+.os-pick-group-count {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+}
+
+/* 原系统提示原本独占一行，现在跟在标题后面：它是上下文，不是操作 */
+.os-pick-hint {
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.os-pick-hint.is-warning {
+  color: var(--warning);
+  white-space: normal;
+}
+
+.os-pick-search {
+  width: 200px;
+  max-width: 100%;
+  margin-left: auto;
+}
+
+/* 搜索框比表单输入再矮 4px：工具条里不需要 34px 的触控高度 */
+.os-pick-search .input-wrap {
+  height: 30px;
+  padding: 0 8px;
+}
+
+.os-pick-search .input {
+  font-size: 12.5px;
+}
+
+/* ---- 第二行：分类 chip + 兼容开关 ---- */
+.os-pick-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.os-pick-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* chip 沿用模板页那套（含系统 logo），这里只收紧 2px 高度 */
+.os-pick-chips .os-chip {
+  height: 26px;
+  padding: 0 9px;
+  gap: 5px;
+  font-size: 12px;
+}
+
+.os-pick-chips .os-chip-count {
+  font-size: 10px;
+}
+
+.os-pick-toggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+}
+
+.os-pick-toggle .switch-field {
+  align-items: center;
+  gap: 8px;
+}
+
+.os-pick-toggle .switch-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* ---- 列表：滚动容器 + 列名 / 分组头两层吸顶 ---- */
+.os-pick-list {
+  /* 行模板写成变量：列名与数据行共用一套，媒体查询里只改一处也不会错位 */
+  --os-row-cols: 16px 18px minmax(120px, 1.5fr) 48px minmax(90px, 1fr) 64px 56px minmax(0, auto);
+  --os-row-gap: 8px;
+  --os-colhead-h: 24px;
+
+  position: relative;
+  /* 228px ≈ 列名 + 两组头 + 4 行；再小的屏幕也没有意义，交给外层滚动 */
+  max-height: clamp(228px, 40vh, 360px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 滚到底就停：别把滚动甩给外层弹窗，鼠标在列表上时视野不该整体跑掉 */
+  overscroll-behavior: contain;
+  /* 模板多的时候要能「抓」住滚动条：写 scrollbar-width: thin 会让 Chromium 改用
+     原生细条，在 Linux / 高分屏上几乎看不见、也抓不住。这里恢复默认宽度（让
+     ::-webkit-scrollbar 生效），Firefox 读 scrollbar-color；scrollbar-gutter
+     预留滑块位置，展开分组时行不会左右跳。 */
+  scrollbar-width: auto;
+  scrollbar-color: color-mix(in srgb, var(--text-muted) 45%, transparent) transparent;
+  scrollbar-gutter: stable;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  /* 底部内阴影：提示「下面还有」，同时柔化被裁切的那一行 */
+  box-shadow: inset 0 -10px 12px -12px rgba(15, 23, 42, 0.28);
+}
+
+/* 滑块比全局那条更实一点：这个列表是「挑东西」的地方，滚动条要像可拖的控件，
+   悬停再加深一档，用户不用猜能不能抓。 */
+.os-pick-list::-webkit-scrollbar {
+  width: 10px;
+}
+
+.os-pick-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.os-pick-list::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: var(--radius-pill);
+  background-color: color-mix(in srgb, var(--text-muted) 45%, transparent);
+  background-clip: content-box;
+}
+
+.os-pick-list::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--text-muted) 72%, transparent);
+}
+
+.os-pick-colhead {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: var(--os-row-cols);
+  align-items: center;
+  gap: var(--os-row-gap);
+  height: var(--os-colhead-h);
+  padding: 0 8px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.os-pick-colhead .is-disk,
+.os-pick-colhead .is-used {
+  text-align: right;
+}
+
+/* ---- 分组头（可折叠，吸在列名下方） ---- */
+/* 分组头 = 一条「分类带」，不是一条分隔线。
+
+   之前它只有 26px 高、12px 常规字重、浅灰底 + 一条渐隐细线，扫一眼像是表格里
+   多出来的一行空行 —— 模板一多，用户根本分不清「哪几行属于 CentOS」。现在：
+
+   · 底色用该系统的家族色（10% 混合白底），每个分类是一条有颜色的带子，
+     扫视时靠颜色就能分块；
+   · 左侧 2px 家族色竖条 + 分类名同色加粗，与已选中行的强调条同一套语汇；
+   · 计数胶囊也换成家族色，不再是被冲淡的灰；
+   · 高度 26 → 30px，给文字和 logo 留出呼吸，同时仍是一行的高度。 */
+.os-pick-group-head {
+  position: sticky;
+  top: var(--os-colhead-h);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 30px;
+  margin: 0;
+  padding: 0 8px;
+  border: 0;
+  border-top: 1px solid color-mix(in srgb, var(--os-color) 16%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--os-color) 22%, transparent);
+  /* 底色必须**不透明**：这条带子是吸顶的，行会从它下面滚过去。
+     --os-tint 是 10% alpha 的家族色，直接当背景会把滚过去的行名透出来，
+     看起来像两行字叠在一起。所以用 10% 家族色去混白底，既有颜色又不透。 */
+  background: color-mix(in srgb, var(--os-color) 10%, var(--bg-surface));
+  box-shadow: inset 2px 0 0 var(--os-color);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+/* hover 也要保持不透明，否则鼠标一移到分类带上，下面的行又会透出来 */
+.os-pick-group-head:hover {
+  background: color-mix(in srgb, var(--os-color) 16%, var(--bg-surface));
+}
+
+.os-pick-group-head:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.os-pick-caret {
+  flex: none;
+  display: inline-flex;
+  color: var(--os-color);
+  opacity: 0.75;
+  transition: transform var(--transition-fast);
+}
+
+.os-pick-group-head[aria-expanded='true'] .os-pick-caret {
+  transform: rotate(90deg);
+}
+
+.os-pick-group-name {
+  flex: none;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--os-color);
+}
+
+.os-pick-group-rule {
+  flex: 1 1 auto;
+  min-width: 16px;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--os-color) 30%, transparent),
+    transparent 80%
+  );
+}
+
+/* 计数胶囊：家族色而不是被冲淡的灰，和左边的分类名是同一档强度 */
+.os-pick-group-head .os-pick-group-count {
+  margin-left: 1px;
+  background: color-mix(in srgb, var(--os-color) 14%, transparent);
+  color: var(--os-color);
+  font-weight: 700;
+}
+
+/* ---- 分类 chip：和分组头同一套家族色 ----
+   7 个系统并排时，光靠 13px 的 logo 认不出谁是谁；给未选中的 chip 也铺一层
+   极浅家族色（10%），颜色本身就是区分依据。选中态仍是全局强调色，不和列表里
+   的选中行抢同一套色。
+   「全部」没有 data-os，色值要有兜底，否则 var() 解析失败、整块底就没了。 */
+.os-pick-chips .os-chip {
+  background: var(--os-tint, var(--bg-surface));
+  border-color: color-mix(
+    in srgb,
+    var(--os-color, var(--border)) 22%,
+    transparent
+  );
+  color: color-mix(
+    in srgb,
+    var(--os-color, var(--text-secondary)) 80%,
+    var(--text-primary)
+  );
+  font-weight: 600;
+}
+
+/* 「全部」没有 data-os：显式给回中性色，别让 color-mix 的兜底算出个几乎看不见的边 */
+.os-pick-chips .os-chip:not([data-os]) {
+  background: var(--bg-surface);
+  border-color: var(--border);
+  color: var(--text-secondary);
+}
+
+.os-pick-chips .os-chip:not([data-os]) .os-chip-count {
+  background: var(--bg-hover);
+  color: var(--text-muted);
+}
+
+.os-pick-chips .os-chip:hover {
+  background: color-mix(
+    in srgb,
+    var(--os-color, var(--text-muted)) 16%,
+    transparent
+  );
+  color: var(--os-color, var(--text-primary));
+}
+
+.os-pick-chips .os-chip .os-chip-count {
+  background: color-mix(
+    in srgb,
+    var(--os-color, var(--text-muted)) 14%,
+    transparent
+  );
+  color: var(--os-color, var(--text-muted));
+  font-weight: 600;
+}
+
+.os-pick-chips .os-chip.is-on {
+  background: var(--accent-dim);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.os-pick-chips .os-chip.is-on .os-chip-count {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ---- 一行模板（label 包隐藏的 radio） ---- */
+.os-row {
+  display: grid;
+  grid-template-columns: var(--os-row-cols);
+  align-items: center;
+  gap: var(--os-row-gap);
+  height: 38px;
+  padding: 0 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  cursor: pointer;
+  transition: background var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.os-row:last-child {
+  border-bottom: 0;
+}
+
+.os-row:hover {
+  background: var(--bg-hover);
+}
+
+.os-row.is-on {
+  background: var(--accent-dim);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.os-row.is-on:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.os-row:focus-within {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* 视觉隐藏但保留聚焦 / 方向键切换：整行的点击由 label 承担 */
+.os-row-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* 单选圆点：未选中是细描边，选中是实心 —— 与左侧竖条、行底色一起构成三层信号 */
+.os-row-radio {
+  position: relative;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border);
+  background: var(--bg-surface);
+  transition: border-color var(--transition-fast);
+}
+
+.os-row:hover .os-row-radio {
+  border-color: var(--accent-border);
+}
+
+.os-row.is-on .os-row-radio {
+  border-color: var(--accent);
+}
+
+.os-row.is-on .os-row-radio::after {
+  content: '';
+  position: absolute;
+  inset: 2.5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.os-row-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+}
+
+.os-row-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.os-row-ver,
+.os-row-disk,
+.os-row-used {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.os-row-disk,
+.os-row-used {
+  text-align: right;
+}
+
+.os-row-used {
+  color: var(--text-muted);
+}
+
+.os-row-scene {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.os-row-tags {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* 行内标签刻意不用 .badge：18px 高的胶囊在 38px 的行里会顶满整行 */
+.os-row-tag {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.os-row-tag.is-accent {
+  background: var(--accent-dim);
+  border-color: var(--accent-border);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.os-row-tag.is-warn {
+  background: var(--warning-dim);
+  color: var(--warning);
+}
+
+/* ---- 「展开其余 N 个」：分组截断后的续接点 ---- */
+.os-pick-more {
+  display: block;
+  width: 100%;
+  height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.os-pick-more:hover {
+  background: var(--bg-hover);
+  color: var(--accent);
+}
+
+/* ---- 已选摘要：18px 的一行，始终在列表外可见 ---- */
+.os-pick-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 18px;
+  padding: 0 2px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.os-pick-foot-icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+}
+
+.os-pick-foot strong {
+  flex: none;
+  max-width: 40%;
+  color: var(--text-primary);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.os-pick-foot-meta {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- 筛到空 ---- */
+.os-pick-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 12px;
+  background: var(--bg-surface);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.os-pick-empty-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.os-pick-empty-body {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------------------
+   窄屏：按「场景 → 已用 → 版本 → 标签」的顺序逐级收起。
+   列名与数据行同时隐藏同一列，靠 auto-placement 保持对齐；
+   名字列永远保留 —— 它是选择依据本身。
+   --------------------------------------------------------------------------- */
+@media (max-width: 840px) {
+  .os-pick-list {
+    --os-row-cols: 16px 18px minmax(110px, 1fr) 48px 64px 56px minmax(0, auto);
+  }
+
+  .os-pick-colhead .is-scene,
+  .os-row-scene {
+    display: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .os-pick-list {
+    --os-row-cols: 16px 18px minmax(110px, 1fr) 48px 64px minmax(0, auto);
+  }
+
+  .os-pick-colhead .is-used,
+  .os-row-used {
+    display: none;
+  }
+}
+
+@media (max-width: 620px) {
+  .os-pick-list {
+    --os-row-cols: 16px 18px minmax(100px, 1fr) 64px minmax(0, auto);
+  }
+
+  .os-pick-colhead .is-ver,
+  .os-row-ver {
+    display: none;
+  }
+
+  /* 窄屏：分类 chip 收成一行横向滚动。8 个系统铺成三行要吃掉 80px 高度，
+     而这 80px 本该留给列表本身。 */
+  .os-pick.is-compact .os-pick-chips {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 2px;
+    scrollbar-width: none;
+  }
+
+  .os-pick.is-compact .os-pick-chips::-webkit-scrollbar {
+    display: none;
+  }
+
+  .os-pick.is-compact .os-chip {
+    flex: none;
+  }
+}
+
+@media (max-width: 520px) {
+  .os-pick-list {
+    --os-row-cols: 16px 18px minmax(0, 1fr) 62px;
+  }
+
+  .os-pick-colhead > span:last-child,
+  .os-row-tags {
+    display: none;
+  }
+
+  .os-pick-search {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .os-pick-hint {
+    width: 100%;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   默认态：当前系统摘要（收起态）
+
+   重装的默认路径是「原样再来一次」，所以打开时不该先甩给用户一个几十行的
+   模板列表。这里只留一张卡：系统、版本、容量、场景，外加一个「更换系统」。
+   列表属于「我要换」的分支，不是首屏内容。
+   --------------------------------------------------------------------------- */
+
+.os-current-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.os-current {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius);
+}
+
+/* 换过系统之后边框跟着换成警告色：与卡片里「将更换为」的文字同一套语义 */
+.os-current.is-switch {
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+}
+
+.os-current-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.os-current-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+/* 「当前系统 / 将更换为」是这张卡的语义所在：默认态说「你现在就是这个」， */
+/* 换过之后必须改成警告色，否则用户会以为还是原系统 */
+.os-current-kicker {
+  flex: none;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.os-current-kicker.is-switch {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.os-current-name {
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.os-current-ver {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.os-current-meta {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.os-current-scene {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.os-current-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.os-current-note {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  padding-left: 2px;
+}
+
+/* ---- 列表工具条里的「收起」：文字按钮，不抢搜索框的位置 ---- */
+.os-pick-collapse {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.os-pick-collapse:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+@media (max-width: 620px) {
+  .os-current {
+    flex-wrap: wrap;
+  }
+
+  .os-current-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }

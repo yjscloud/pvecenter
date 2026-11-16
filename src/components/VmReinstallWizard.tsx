@@ -12,7 +12,10 @@
    * 删旧盘是既定行为（省一半空间），没有「保留旧盘」的开关 —— 想回滚就再做一次
      重装；留一块旧盘在机器上，只会悄悄吃掉空间；
    * 网络默认**沿用原系统在用的地址**（见下面 netQuery），不默认 DHCP：重装最气人的
-     结果不是装失败，而是装完机器换了个 IP，用户按记忆里的地址连不上。
+    结果不是装失败，而是装完机器换了个 IP，用户按记忆里的地址连不上；
+   * 模板默认**选中与当前系统同名的那张**，目标存储也默认落在它所在的存储上
+     （同存储才能链接克隆，秒级完成）。换系统是显式动作：模板选择器默认收起，
+     用户点「更换系统」才看到其他模板 —— 默认路径上不给他误选的机会。
    ========================================================================== */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -35,21 +38,74 @@ import { ConfirmDialog } from './ui/ConfirmDialog';
 import { Field, Input, SegmentedControl, Select, Switch, Textarea } from './ui/Input';
 import { Notice } from './ui/EmptyState';
 import { IconAlert } from './Icons';
+import { ReinstallTemplatePicker } from './ReinstallTemplatePicker';
 import { formatBytes } from '../utils/format';
-import { ostypeLabel } from '../utils/status';
 import {
-  groupTemplates,
-  osFamilyLabel,
+  findOriginalTemplate,
   osFamilyOf,
   recommendTemplate,
   samePlatform,
   templateFamily,
 } from '../utils/osFamily';
-import type { VmSummary } from '../api/types';
+/**
+ * 重装弹窗真正读取的那几项。
+ *
+ * 不复用 ``VmSummary``：这个菜单有两个入口（虚拟机列表行的「更多操作」、详情页
+ * 标题栏的「更多操作」），两边交上来的对象来源不同 —— 列表是列表接口的行，详情页
+ * 是详情接口现拼的一份。用宽类型时，「详情页少交 source_template / maxdisk /
+ * connection_id」能悄悄通过类型检查，表现就是同一个弹窗在两个入口里「当前系统」、
+ * 「系统盘容量」、「网桥候选」都不是一回事。字段在这里列全，少一个编译期就报。
+ */
+export interface VmReinstallTarget {
+  node: string;
+  vmid: number;
+  name: string;
+  /** 机器当前电源状态：不是 stopped 时正文给出「先关机」的提示并禁用开始按钮 */
+  status: string;
+  /**
+   * 这条虚拟机属于哪套 PVE 连接。多连接部署里节点名与 VMID 都可能重名：
+   * 少了它，网桥、地址池、面板侧手动 IP 都会查到别的主机上。
+   */
+  connection_id: string | undefined;
+  /** 系统盘容量：「重装不会缩小系统盘」那句提示要用 */
+  maxdisk: number | undefined;
+  /** 来源模板：决定「当前系统」卡片、默认模板与同平台过滤；没有来源就是 null */
+  source_template: { node: string; vmid: number; name: string } | null | undefined;
+}
+
+/**
+ * 从列表行 / 详情对象里挑出与重装有关的那几项 —— 两个入口都走这一份映射，
+ * 不允许各自手拼一个对象（那样两边的字段迟早会漂）。
+ */
+export function reinstallTargetOf(
+  vm:
+    | {
+        node: string;
+        vmid: number;
+        name: string;
+        status: string;
+        connection_id?: string;
+        maxdisk?: number;
+        source_template?: { node: string; vmid: number; name: string } | null;
+      }
+    | null
+    | undefined,
+): VmReinstallTarget | null {
+  if (!vm) return null;
+  return {
+    node: vm.node,
+    vmid: vm.vmid,
+    name: vm.name,
+    status: vm.status,
+    connection_id: vm.connection_id,
+    maxdisk: vm.maxdisk,
+    source_template: vm.source_template ?? null,
+  };
+}
 
 export interface VmReinstallWizardProps {
   open: boolean;
-  vm: VmSummary | null;
+  vm: VmReinstallTarget | null;
   onClose: () => void;
   onDone: () => void;
 }
@@ -97,6 +153,8 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
   const networkTouched = useRef(false);
   /* 用户是不是自己挑过模板。挑过就不再按「与原系统匹配」覆盖他的选择 */
   const templateTouched = useRef(false);
+  /* 用户是不是自己挑过目标存储。挑过就不再跟着模板的存储自动改 */
+  const storageTouched = useRef(false);
 
   const node = vm?.node ?? '';
   const stopped = (vm?.status ?? '') === 'stopped';
@@ -165,11 +223,19 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     () => templatesQuery.data?.templates ?? [],
     [templatesQuery.data],
   );
-  const targets = (storagesQuery.data ?? []).filter((item) =>
-    String(item.content ?? '')
-      .split(',')
-      .some((c) => c === 'images' || c === 'rootdir'),
+  const targets = useMemo(
+    () =>
+      (storagesQuery.data ?? []).filter((item) =>
+        String(item.content ?? '')
+          .split(',')
+          .some((c) => c === 'images' || c === 'rootdir'),
+      ),
+    [storagesQuery.data],
   );
+
+  /* 当前选中的模板；它的系统盘存储决定「新盘放哪」与是否链接克隆 */
+  const selected = templates.find((item) => String(item.vmid) === templateId);
+  const templateStorage = selected?.disk ? String(selected.disk).split(':')[0] : '';
 
   /* 原机器是什么系统：来源模板名最可信（重装 / 克隆时记下来的），其次机器名，
      最后才是 PVE 的 ostype —— 它对 Linux 一律 l26，只够分 Windows / Linux */
@@ -198,10 +264,20 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     !templates.some((item) => samePlatform(originalFamily, templateFamily(item)));
 
   const visibleTemplates = compatibleOnly ? compatibleTemplates : templates;
-  const templateGroups = useMemo(
-    () => groupTemplates(visibleTemplates),
-    [visibleTemplates],
-  );
+  /* 「当前系统模板」的证据，从强到弱：
+     1. 来源模板的 node+vmid —— 模板改名也认得出来；
+     2. 与来源模板 / 机器名同名（忽略大小写与分隔符）—— 模板重建过（vmid 变了）时用；
+     3. 都没有就退到同系列推荐，但那时界面上不会写「当前系统」。 */
+  const originalTemplate = useMemo(() => {
+    const ref = vm?.source_template;
+    if (ref) {
+      const byId = templates.find(
+        (item) => item.vmid === ref.vmid && item.node === ref.node,
+      );
+      if (byId) return byId;
+    }
+    return findOriginalTemplate(templates, [ref?.name, vm?.name]);
+  }, [templates, vm?.source_template, vm?.name]);
   const recommendedTemplate = useMemo(
     () =>
       recommendTemplate(
@@ -229,6 +305,7 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     setGateway('');
     setDns('');
     setBridge('');
+    setStorage('');
     setStartAfter(true);
     setWipeDisks(true);
     setBusy(false);
@@ -237,21 +314,37 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     networkAuto.current = false;
     networkTouched.current = false;
     templateTouched.current = false;
+    storageTouched.current = false;
   }, [open, vm?.node, vm?.vmid]);
 
-  /* 数据到了以后补默认选项（用户已经改过就不覆盖）。
-     模板优先选「与原系统同类型」的那个，而不是列表里的第一个 —— 列表第一个
-     很可能是另一种系统，装上去直接起不来。切换兼容开关后，原来选的模板若已
-     不在可见列表里，也回到推荐项。 */
+  /* 默认选中「与当前系统同名的那张模板」，其余配置跟着它预置。
+     这样打开弹窗就是「原样重装一次」，用户什么都不用改就能直接开始；要看别的
+     系统必须自己点「更换系统」（见 ReinstallTemplatePicker 的收起态）。
+     切换兼容开关后，用户选的模板若已不在可见列表里，回到默认项。 */
   useEffect(() => {
     if (!open) return;
-    setStorage((prev) => prev || (targets[0]?.storage ?? ''));
     if (!visibleTemplates.length) return;
     const keeps = visibleTemplates.some((item) => String(item.vmid) === templateId);
     if (templateTouched.current && keeps) return;
-    const next = recommendedTemplate ?? visibleTemplates[0];
-    if (next) setTemplateId(String(next.vmid));
-  }, [open, visibleTemplates, recommendedTemplate, targets, templateId]);
+    const preferred =
+      originalTemplate &&
+      visibleTemplates.some((item) => item.vmid === originalTemplate.vmid)
+        ? originalTemplate
+        : recommendedTemplate ?? visibleTemplates[0];
+    if (preferred) setTemplateId(String(preferred.vmid));
+  }, [open, visibleTemplates, recommendedTemplate, originalTemplate, templateId]);
+
+  /* 新盘默认落在模板自己所在的存储：同存储才能链接克隆（秒级完成），换存储就是
+     整盘复制（几分钟）。用户自己动过存储就不再自动改 —— 预置的是「省事的默认」，
+     不是替他做决定。 */
+  useEffect(() => {
+    if (!open || storageTouched.current) return;
+    const preferred =
+      templateStorage && targets.some((item) => item.storage === templateStorage)
+        ? templateStorage
+        : targets[0]?.storage ?? '';
+    if (preferred) setStorage(preferred);
+  }, [open, templateStorage, targets]);
 
   /* 默认「沿用原系统在用的地址」。
      重装最气人的结果不是装失败，而是装完机器换了个 IP —— 用户按记忆里的地址连不上，
@@ -301,10 +394,8 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     return metaIp ? t('vmReinstall.ipFromMeta', { ip: metaIp }) : '';
   })();
 
-  const selected = templates.find((item) => String(item.vmid) === templateId);
-  /* 模板系统盘所在的存储。链接克隆靠 backing file 指向母盘，**必须同存储** ——
-     换存储就只能整盘复制。把这件事在选存储时就说明白，别等重装完才发现慢了几分钟。 */
-  const templateStorage = selected?.disk ? String(selected.disk).split(':')[0] : '';
+  /* 链接克隆靠 backing file 指向母盘，**必须同存储** —— 换存储就只能整盘复制。
+     把这件事在选存储时就说明白，别等重装完才发现慢了几分钟。 */
   const linked = Boolean(templateStorage) && templateStorage === storage;
 
   const submit = async () => {
@@ -342,7 +433,9 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
     }
   };
 
-  const blocked = !stopped || !templates.length || !storage;
+  /* selected 也要算进来：模板列表刷新后原来的 vmid 可能已经不在里面，
+     这时按钮不该亮着却点了没反应（submit 里会直接 return） */
+  const blocked = !stopped || !templates.length || !selected || !storage;
 
   return (
     <>
@@ -351,7 +444,10 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
         onClose={busy ? () => undefined : onClose}
         title={t('vmReinstall.title', { name: vm?.name ?? '' })}
         description={t('vmReinstall.subtitle')}
-        size="md"
+        /* 模板列表是「名字 / 版本 / 场景 / 系统盘 / 已用」五列对齐的密集行：
+           md（640px）塞不下这五列，要么把场景挤成省略号，要么把容量折行 ——
+           而这两列正是用来比较的。 */
+        size="lg"
         closeOnOverlay={!busy}
         hideClose={busy}
         footer={
@@ -394,65 +490,32 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
             </Notice>
           ) : null}
 
-          <Field label={t('vmReinstall.template')} hint={t('vmReinstall.templateHint')}>
-            <Select
-              value={templateId}
-              onChange={(e) => {
-                templateTouched.current = true;
-                setTemplateId(e.target.value);
-              }}
-              disabled={!visibleTemplates.length}
-            >
-              {templateGroups.map((group) => (
-                <optgroup
-                  key={group.family.key}
-                  label={osFamilyLabel(group.family, t)}
-                >
-                  {group.items.map((item) => (
-                    <option key={String(item.vmid)} value={String(item.vmid)}>
-                      {`${item.name}（${ostypeLabel(item.ostype, t)} · ${t(
-                        'vmReinstall.templateSize',
-                        { size: formatBytes(item.size) },
-                      )}）`}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </Select>
-          </Field>
+          {/* 来源模板：分类 + 密集行（见 ReinstallTemplatePicker）。
+              「原系统 / 已隐藏 N 个 / 只显示兼容模板」这些判断依据全在组件内部 ——
+              它们只在选模板时才有意义，散落在向导正文里会被当成页面说明。 */}
+          <ReinstallTemplatePicker
+            templates={templates}
+            compatible={compatibleTemplates}
+            originalFamily={originalFamily}
+            value={templateId}
+            onChange={(vmid) => {
+              templateTouched.current = true;
+              setTemplateId(vmid);
+            }}
+            recommendedVmid={recommendedTemplate?.vmid}
+            /* 有同名模板时，选择器默认收起成一张「当前系统」卡片：
+               其余系统要用户自己点「更换系统」才展开，默认流程只有一步 */
+            currentVmid={originalTemplate?.vmid}
+            filterable={filterable}
+            compatibleOnly={compatibleOnly}
+            onCompatibleOnlyChange={setCompatibleOnly}
+            noPlatformMatch={noPlatformMatch}
+            disabled={busy}
+          />
 
-          {/* 原系统识别结果 + 过滤说明。没有这个提示，用户只会看到「模板少了几个」
-              却不知道为什么 */}
-          {originalFamily.key !== 'other' ? (
-            <div className="fs-xs text-muted">
-              {t('vmReinstall.osCurrent', {
-                os: osFamilyLabel(originalFamily, t),
-              })}
-              {filterable && compatibleOnly
-                ? ` ${t('vmReinstall.templateFiltered', {
-                    n: templates.length - compatibleTemplates.length,
-                  })}`
-                : ''}
-            </div>
-          ) : null}
-
-          {noPlatformMatch ? (
-            <Notice tone="warning">
-              {t('vmReinstall.templateNoPlatform', {
-                os: osFamilyLabel(originalFamily, t),
-              })}
-            </Notice>
-          ) : null}
-
-          {filterable ? (
-            <Switch
-              checked={compatibleOnly}
-              onChange={setCompatibleOnly}
-              label={t('vmReinstall.templateCompatible')}
-              hint={t('vmReinstall.templateCompatibleHint', {
-                os: osFamilyLabel(originalFamily, t),
-              })}
-            />
+          {/* 同名模板被删掉或改名了：默认仍给了同系列推荐，但不能假装是「当前系统」 */}
+          {!originalTemplate && templates.length && vm?.source_template?.name ? (
+            <div className="fs-xs text-muted">{t('vmReinstall.originalMissing')}</div>
           ) : null}
 
           <div className="field-row">
@@ -468,7 +531,10 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
             >
               <Select
                 value={storage}
-                onChange={(e) => setStorage(e.target.value)}
+                onChange={(e) => {
+                  storageTouched.current = true;
+                  setStorage(e.target.value);
+                }}
                 options={targets.map((item) => ({
                   label: `${item.storage}（${item.type}）`,
                   value: item.storage,

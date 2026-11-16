@@ -72,8 +72,14 @@ import { LxcCreateWizard } from '../components/LxcCreateWizard';
 import { VmImportWizard } from '../components/VmImportWizard';
 import { VmExportDialog } from '../components/VmExportDialog';
 /* 重装系统：用 Cloud-Init 模板重建系统盘（机器身份不变），只有虚拟机有 */
-import { VmReinstallWizard } from '../components/VmReinstallWizard';
+import {
+  VmReinstallWizard,
+  reinstallTargetOf,
+  type VmReinstallTarget,
+} from '../components/VmReinstallWizard';
 import { ResetGuestPasswordDialog } from '../components/ResetGuestPasswordDialog';
+import { OsLogo } from '../components/OsLogo';
+import { osFamilyLabel, templateFamily } from '../utils/osFamily';
 import {
   IconBox,
   IconVm,
@@ -616,8 +622,12 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   const [cloneTarget, setCloneTarget] = useState<VmSummary | null>(null);
   const [templateTarget, setTemplateTarget] = useState<VmSummary | null>(null);
   const [migrateTarget, setMigrateTarget] = useState<VmSummary | null>(null);
-  /* 重装系统（仅虚拟机）：用 Cloud-Init 模板重建系统盘，机器身份保持不变 */
-  const [reinstallTarget, setReinstallTarget] = useState<VmSummary | null>(null);
+  /* 重装系统（仅虚拟机）：用 Cloud-Init 模板重建系统盘，机器身份保持不变。
+     状态里存的是「重装要用的那几项」（见 reinstallTargetOf），不是整行 —— 详情页
+     的入口也走同一个映射，两个弹窗的字段来源因此完全一致。 */
+  const [reinstallTarget, setReinstallTarget] = useState<VmReinstallTarget | null>(
+    null,
+  );
   const [snapshotTarget, setSnapshotTarget] = useState<VmSummary | null>(null);
   const [assignTarget, setAssignTarget] = useState<VmSummary | null>(null);
   /* 重置客户机内用户口令（虚拟机走 Guest Agent / cloud-init，容器走宿主机 SSH） */
@@ -1596,24 +1606,49 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
     },
     {
       key: 'sourceTemplate',
+      /* 列里只剩一个系统图标，「来源模板」四个字仍然成立：显示的是**来源**的
+         操作系统。表头挂一句说明，免得用户以为这一列在讲机器自己的系统。 */
       header: t('guestList.colSourceTemplate'),
-      /* 与原来的「标签」列同宽，表格的列宽总和不变，不会把后面的归属 /
-         操作列挤出去。只展示名称，节点 / VMID / 路径一律不进单元格。 */
-      width: 140,
+      title: t('guestList.colSourceTemplateTitle'),
+      /* 140px 是给模板名的宽度；22px 的图标只占一小格，省下的还回去。
+         但别压到极限：英文表头 "Template" 比中文「来源模板」宽，76px 会把它
+         截成 "Templ…"，96px 才两头都够。 */
+      width: 96,
       className: 'col-source-template',
       render: (vm) => {
         const source = vm.source_template;
-        const name = source?.name?.trim();
+        const name = source?.name?.trim() ?? '';
         /* 名字取不到（来源模板被改名 / 被删，或不在当前这一页的清单里）时退回
            `#VMID` —— VMID 是来源里唯一不会变的部分，比「—」有用得多。
            容器用系统模板新建时 vmid 是 0，只有文件名，所以两样都空才算没有。 */
-        const label = name || (source?.vmid ? `#${source.vmid}` : '');
-        if (!label) {
-          return <span className="fs-sm text-muted">—</span>;
+        if (!name) {
+          if (!source?.vmid) return <span className="fs-sm text-muted">—</span>;
+          return (
+            <span className="fs-sm text-muted" title={`#${source.vmid}`}>
+              #{source.vmid}
+            </span>
+          );
         }
+
+        /* 容器模板名就是文件名（`debian-12-standard_12.7-1_amd64.tar.zst`），
+           虚拟机则是克隆来源的名字；两种都由 templateFamily 从名字里认发行版。
+           认不出时 family.key === 'other'，OsLogo 会渲染统一的「···」占位块 ——
+           宁可给一个中性标记，也不要随便挑一个发行版 logo 误导人。 */
+        const family = templateFamily({ name });
+        /* 悬停给**模板名**：图标已经说明是哪套系统了，而「具体是这张模板的哪一份」
+           （发行版同版本可能有多张）只有名字说得清 —— 那正是这一列改成图标后
+           丢掉的信息。读屏再把系统名一起念出来（图标对读屏不可见）。 */
         return (
-          <span className="fs-sm" title={label}>
-            {label}
+          <span
+            className="os-tag source-os"
+            data-os={family.key}
+            role="img"
+            aria-label={`${osFamilyLabel(family, t)} · ${name}`}
+            title={name}
+          >
+            <span className="os-tag-mark">
+              <OsLogo family={family} size="table" />
+            </span>
           </span>
         );
       },
@@ -1745,7 +1780,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
               onTemplate={() => setTemplateTarget(vm)}
               onSnapshot={() => setSnapshotTarget(vm)}
               onMigrate={() => setMigrateTarget(vm)}
-              onReinstall={() => setReinstallTarget(vm)}
+              onReinstall={() => setReinstallTarget(reinstallTargetOf(vm))}
               onAssign={() => setAssignTarget(vm)}
               canAssign={canAssign}
               onResetPassword={() => setPasswordTarget(vm)}
@@ -2817,13 +2852,33 @@ function SnapshotDialog({
   /* 快照额度：配了就在这儿说清还剩几张，别等提交后被 403 打回来 */
   const snap = useSnapshotQuota(Boolean(vm));
 
+  /* 容器快照的存储能力：列表页也先问一次。后端会以 409 拦下（detail 里带完整
+     原因），但在这里就把「盘在哪块存储、能用哪些」摆出来，能省掉一次注定失败
+     的提交 —— 尤其是 dir / NFS 这类大盘，用户往往试一次才知道不行。 */
+  const capQuery = useQuery({
+    queryKey: ['lxc', vm?.node, vm?.vmid, 'snapshot-capability'],
+    queryFn: () => lxcApi.snapshotCapability(vm?.node ?? '', vm?.vmid ?? 0),
+    enabled: Boolean(vm) && isLxc,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const cap = capQuery.data;
+  const storageBlocked = cap?.supported === false;
+  const describeStorage = (item: { storage: string; type_label: string }) =>
+    `${item.storage}（${item.type_label}）`;
+  const blockedVolumes = (cap?.blocking ?? []).map(describeStorage).join('、');
+  const availableStorages = (cap?.available_storages ?? [])
+    .map(describeStorage)
+    .join('、');
+
   const nameError =
     name && !/^[A-Za-z][A-Za-z0-9_-]*$/.test(name)
       ? t('guestList.snap.nameError')
       : undefined;
 
   const submit = async () => {
-    if (!vm || !name || nameError) return;
+    /* 存储不支持时后端一定 409：按钮已置灰，这里再兜一层（键盘 / 旧缓存） */
+    if (!vm || !name || nameError || storageBlocked) return;
     setBusy(true);
     try {
       await runner.run(
@@ -2868,11 +2923,13 @@ function SnapshotDialog({
             variant="primary"
             onClick={submit}
             loading={busy}
-            disabled={!name || Boolean(nameError) || snap.blocked}
+            disabled={!name || Boolean(nameError) || snap.blocked || storageBlocked}
             title={
-              snap.blocked
-                ? t('guestList.snap.quotaUsedUp', { limit: Number(snap.limit) })
-                : undefined
+              storageBlocked
+                ? t('lxcDetail.snapStorageBlockedHint')
+                : snap.blocked
+                  ? t('guestList.snap.quotaUsedUp', { limit: Number(snap.limit) })
+                  : undefined
             }
           >
             {t('guestList.snap.create')}
@@ -2881,6 +2938,29 @@ function SnapshotDialog({
       }
     >
       <div className="flex flex-col gap-16">
+        {/* 存储不支持快照：先把「当前存储 / 支持的类型 / 可用存储」讲清楚，
+            再让用户决定要不要先去迁磁盘，而不是提交后吃一句插件报错 */}
+        {storageBlocked ? (
+          <Notice tone="warning" title={t('lxcDetail.snapStorageTitle')}>
+            <div className="flex flex-col gap-6">
+              <div>
+                {t('lxcDetail.snapStorageBlockedBody', { volumes: blockedVolumes })}
+              </div>
+              <div>
+                {t('lxcDetail.snapStorageTypes', {
+                  types: (cap?.supported_type_labels ?? []).join(' / '),
+                })}
+              </div>
+              <div>
+                {availableStorages
+                  ? t('lxcDetail.snapStorageAvailable', {
+                      storages: availableStorages,
+                    })
+                  : t('lxcDetail.snapStorageNone')}
+              </div>
+            </div>
+          </Notice>
+        ) : null}
         <Input
           label={t('guestList.snap.nameLabel')}
           required

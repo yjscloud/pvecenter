@@ -2795,13 +2795,13 @@
 /* ---------------------------------------------------------------------------
    模板页：按操作系统分类（筛选条 / 分组头 / 卡片 / 系统标识）
 
-   一处定义、四处复用：同一个 --os-color 喂给筛选条圆点、分组头圆点、卡片左上
-   的头像块与列表里的系统单元格，颜色天然对得上，不会出现「卡片是橙的、列表
-   却说这是 Debian」那种自相矛盾。
+   一处定义、四处复用：同一个 --os-color / --os-tint 喂给筛选条、分组头、卡片
+   左上的头像块与列表里的系统单元格，颜色天然对得上，不会出现「卡片是橙的、
+   列表却说这是 Debian」那种自相矛盾。
 
-   取色刻意压低饱和度：头像块只有 38px，鲜亮色会变成噪点，把整版拉回花花绿绿。
-   家族用色也不追求和官方品牌色一模一样 —— 面板的主色只有一个蓝，
-   这里要的是「一眼能把几类分开」，不是复刻各家 logo。
+   系统标识本身用各家**官方 logo**（见 OsLogo.tsx 与下面的 .os-logo-* 规范），
+   家族色只剩两个职责：给 logo 铺一层极浅的底、在 logo 缺席时给缩写块上色。
+   取色刻意压低饱和度 —— 38px 的头像块旁边再摆一块鲜亮色，整版就花了。
    --------------------------------------------------------------------------- */
 
 [data-os] {
@@ -2821,6 +2821,58 @@
 [data-os='arch']    { --os-color:#0f7fb8; --os-tint:rgba(15,127,184,.10); }
 [data-os='linux']   { --os-color:#4b5a74; --os-tint:rgba(75,90,116,.10); }
 [data-os='other']   { --os-color:#8c8c8c; --os-tint:rgba(140,140,140,.10); }
+
+/* ---------------------------------------------------------------------------
+   系统 logo 显示规范（组件：src/components/OsLogo.tsx）
+
+   同一张官方 logo 在四处出现，尺寸只有这四个值 —— 新增位置请先归到其中一种，
+   不要再造第五个尺寸，否则同一系统在相邻区块里大小不一：
+
+     位置                类名              尺寸    容器
+     模板卡片头像        .os-logo-card     26×26   .tpl-os-mark（38×38 tint 底）
+     列表「系统」列      .os-logo-table    16×16   .os-tag-mark（22×22 tint 底）
+     分类分组头          .os-logo-group    16×16   无底，坐在原圆点位置
+     分类筛选条 chip     .os-logo-chip     13×13   无底，坐在文字左侧
+
+   两条硬规则：
+   · object-fit: contain —— 各家 logo 画布比例不同（Debian 竖、CentOS 横），
+     一律等比缩放居中，不拉伸不裁切；
+   · 不改色 —— 保留品牌原色，不加 filter/灰度/反色。深色 logo（Fedora、
+     Windows）靠卡片那层浅 tint 底保证对比度，所以别把底去掉。
+   --------------------------------------------------------------------------- */
+.os-logo {
+  display: block;
+  flex: none;
+  object-fit: contain;
+  object-position: center;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.os-logo-card { width: 26px; height: 26px; }
+.os-logo-table { width: 16px; height: 16px; }
+.os-logo-group { width: 16px; height: 16px; }
+.os-logo-chip { width: 13px; height: 13px; }
+
+/* 回退：认不出的系统（other）或图片加载失败时，退化成文字缩写块。
+   尺寸与上面的 logo 一致，切换时行高不变。 */
+.os-logo-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background: var(--os-tint);
+  color: var(--os-color);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.02em;
+}
+
+.os-logo-fallback.os-logo-card { font-size: 11px; }
+.os-logo-fallback.os-logo-table { font-size: 8px; }
+.os-logo-fallback.os-logo-group { font-size: 8px; }
+.os-logo-fallback.os-logo-chip { font-size: 7px; }
 
 /* 工具栏后面接的是筛选条 / 卡片，而不是紧贴的表格：把专为「贴表格」省掉的
    下边框与上圆角补回来，否则它看起来像个没封口的盒子。 */
@@ -2892,12 +2944,10 @@
   box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
-.os-chip-dot {
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--os-color);
+/* 筛选条里的系统 logo：13px，落在 chip 文字左侧（原先是 6px 家族色圆点）。
+   尺寸规范与卡片/列表同一份，见下方 .os-logo-* 一节。 */
+.os-chip > .os-logo {
+  margin-right: -1px;
 }
 
 .os-chip-count {
@@ -2957,13 +3007,10 @@
   transform: rotate(-90deg);
 }
 
-.os-group-dot {
-  flex: none;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--os-color);
-  box-shadow: 0 0 0 3px var(--os-tint);
+/* 分组头的系统 logo：16px，占原来家族色圆点的位置。
+   底部对齐到标题文字基线附近，logo 高度不同（Debian 偏竖）时也不会把标题顶歪。 */
+.os-group-head > .os-logo {
+  align-self: center;
 }
 
 .os-group-name {
@@ -3054,6 +3101,8 @@
   flex: none;
 }
 
+/* 卡片头像：38×38 的浅家族色方块，里面嵌 26×26 的官方 logo（见 .os-logo-card）。
+   方块本身不画字母 —— 文字只在 logo 缺席时由 .os-logo-fallback 回退出来。 */
 .tpl-os-mark {
   flex: none;
   display: inline-flex;
@@ -3063,12 +3112,7 @@
   height: 38px;
   border-radius: var(--radius);
   background: var(--os-tint);
-  color: var(--os-color);
   border: 1px solid color-mix(in srgb, var(--os-color) 18%, transparent);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
 }
 
 .tpl-card-id {
@@ -3178,20 +3222,17 @@
   min-width: 0;
 }
 
+/* 列表里的系统图标：22×22 浅底方块 + 16×16 官方 logo。
+   原来是 26×18 的字母块，改成方形是为了让偏竖的 logo（Debian）不被压扁。 */
 .os-tag-mark {
   flex: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 18px;
+  width: 22px;
+  height: 22px;
   border-radius: var(--radius-sm);
   background: var(--os-tint);
-  color: var(--os-color);
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: 0.03em;
 }
 
 .os-tag-name {

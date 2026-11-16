@@ -38,6 +38,8 @@ import { Notice } from './ui/EmptyState';
 import { Badge } from './ui/Badge';
 import { NodePicker } from './NodePicker';
 import { QuickDeployForm } from './QuickDeployForm';
+import { SystemTemplatePicker } from './SystemTemplatePicker';
+import { vmTemplatePickItems } from '../utils/templatePick';
 import { isPathDisabled, SSH_SECURITY_NAV_PATH } from './Sidebar';
 import {
   IconPlus,
@@ -866,20 +868,11 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
     [vmsQuery.data],
   );
 
-  const cloneOptions = useMemo(
-    () => [
-      { label: t('vmCreate.cloneSourcePlaceholder'), value: '' },
-      /* 内层变量改叫 tpl：若沿用 t 会把外层的翻译函数遮住 */
-      ...cloneSources.map((tpl) => ({
-        /* 全部是模板，不再带 [模板] 后缀 —— 只有一种东西时那个后缀就是噪音 */
-        label: t('vmCreate.cloneSourceOption', {
-          name: tpl.name || t('vmCreate.templateName', { vmid: tpl.vmid }),
-          vmid: tpl.vmid,
-          node: tpl.node,
-        }),
-        value: `${tpl.node}:${tpl.vmid}`,
-      })),
-    ],
+  /* 选择器只吃「已格式化好的文本」：映射统一在 utils/templatePick —— 快速部署
+     那条流程用的是同一个函数，同一张模板在两个入口里的名称 / 容量 / 标签才不会
+     各写一套。 */
+  const clonePickItems = useMemo(
+    () => vmTemplatePickItems(cloneSources, t),
     [cloneSources, t],
   );
 
@@ -894,16 +887,19 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
      第 2 步的 clone-method 卡片），不改写用户已选的值 */
   const panelDefaultFull = Boolean(vmDefaultsQuery.data?.full_clone);
 
-  /* 默认选中第一个模板，省去手动选择 */
+  /* 默认选中第一个模板，省去手动选择。
+     取的是**过滤后**的 cloneSources：直接用接口返回的第一条，可能是一张容器
+     模板或别的主机的模板，写进 cloneFrom 后选择器找不到对应项，摘要卡会整个
+     消失 —— 看着像「没选」。 */
   useEffect(() => {
     if (!open || autoPickedRef.current) return;
     if (form.mode !== 'clone' || form.cloneFrom) return;
-    const first = (templatesQuery.data ?? [])[0];
+    const first = cloneSources[0];
     if (first) {
       autoPickedRef.current = true;
       setForm((f) => (f.cloneFrom ? f : { ...f, cloneFrom: `${first.node}:${first.vmid}` }));
     }
-  }, [open, form.mode, form.cloneFrom, templatesQuery.data]);
+  }, [open, form.mode, form.cloneFrom, cloneSources]);
 
   /* ---- 通用更新 ---- */
   const update = useCallback(<K extends keyof FormState>(key: K, value: FormState[K]) => {
@@ -987,6 +983,18 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
         t('vmCreate.toastInvalid'),
         t('vmCreate.toastInvalidHint'),
       );
+      return;
+    }
+
+    /* 「从模板克隆」但选中的模板已经不在列表里（模板被删 / 换了主机）：
+       此时 cloneFrom 是一段失效的引用，若继续往下走会掉进「全新安装」分支，
+       悄悄建出一台空盘机器 —— 宁可退回上一步让用户重选。 */
+    if (form.mode === 'clone' && !selectedCloneSource) {
+      toast.error(
+        t('vmCreate.cloneSourceEmptyTitle'),
+        t('templatePicker.vmEmptyHint'),
+      );
+      setStep(1);
       return;
     }
 
@@ -1631,19 +1639,26 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                   <span className="choice-panel-hint">{t('vmCreate.cloneParamsHint')}</span>
                 </div>
 
-                <Select
-                  label={t('vmCreate.cloneSource')}
+                {/* 克隆源：模板少时直接平铺，多时先给一张「将使用此模板」摘要卡，
+                    其余收进「更换模板」—— 与重装选模板同一套交互（见
+                    SystemTemplatePicker）。 */}
+                <Field
+                  label={t('templatePicker.vmLabel')}
                   required
-                  value={form.cloneFrom}
-                  onChange={(e) => update('cloneFrom', e.target.value)}
-                  options={cloneOptions}
                   error={errors.cloneFrom}
                   hint={
                     cloneSources.length === 0
-                      ? t('vmCreate.cloneSourceNoTemplates')
-                      : t('vmCreate.cloneSourceHint')
+                      ? t('templatePicker.vmEmptyHint')
+                      : t('templatePicker.vmHint')
                   }
-                />
+                >
+                  <SystemTemplatePicker
+                    kind="vm"
+                    items={clonePickItems}
+                    value={form.cloneFrom}
+                    onChange={(next) => update('cloneFrom', next)}
+                  />
+                </Field>
 
                 {vmsQuery.isError || templatesQuery.isError ? (
                   <Notice
@@ -1661,38 +1676,6 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                   >
                     {t('vmCreate.cloneSourceEmptyBody', { conn: targetConnLabel })}
                   </Notice>
-                ) : null}
-
-                {selectedCloneSource ? (
-                  <div className="clone-preview">
-                    <span className="clone-preview-icon">
-                      <IconTemplate size={18} />
-                    </span>
-                    <div className="clone-preview-body">
-                      <div className="clone-preview-name">
-                        {selectedCloneSource.name || `VM ${selectedCloneSource.vmid}`}
-                        <Badge variant="neutral" size="sm">
-                          VMID {selectedCloneSource.vmid}
-                        </Badge>
-                      </div>
-                      <div className="clone-preview-node">
-                        {t('vmCreate.clonePreviewNode', {
-                          node: selectedCloneSource.node,
-                        })}
-                      </div>
-                    </div>
-                    <div className="clone-preview-specs">
-                      <span className="spec-chip">{selectedCloneSource.maxcpu ?? '?'} vCPU</span>
-                      <span className="spec-chip">
-                        {t('vmCreate.clonePreviewMemory', {
-                          size: formatBytes(selectedCloneSource.maxmem),
-                        })}
-                      </span>
-                      <span className="spec-chip">
-                        {ostypeLabel(selectedCloneSource.type ?? '', t)}
-                      </span>
-                    </div>
-                  </div>
                 ) : null}
 
                 <Select
@@ -2679,7 +2662,7 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                 {form.mode === 'clone' ? (
                   <>
                     <SummaryRow
-                      label={t('vmCreate.cloneSource')}
+                      label={t('templatePicker.vmLabel')}
                       value={
                         selectedCloneSource
                           ? `${selectedCloneSource.name || selectedCloneSource.vmid} @ ${selectedCloneSource.node}`

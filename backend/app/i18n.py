@@ -394,6 +394,26 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "the certificate, and the reload command runs inside the container too. "
         "Use SSH or Proxmox VM deployment instead.",
     },
+    # ------------------------------------------------------------ 快照存储能力
+    # PVE 只在真正建快照时才拒绝（而且报的是英文插件错误）。面板提前判一次，
+    # 并把「当前这块存储是什么类型」「支持快照的又是哪些」一起说清楚，
+    # 见 app/storagecaps.py。
+    "storage.snapshot_blocked": {
+        "zh-CN": "存储 {volumes} 不支持快照。支持快照的存储类型：{types}。"
+        "当前环境可用的快照存储：{available}。如需快照，请先把磁盘迁移到上述存储再重试。",
+        "en": "Storage {volumes} does not support snapshots. Snapshot-capable "
+        "storage types: {types}. Available in this environment: {available}. "
+        "Move the disk to one of those storages and retry.",
+    },
+    "storage.snapshot_blocked_no_target": {
+        "zh-CN": "存储 {volumes} 不支持快照。支持快照的存储类型：{types}。"
+        "当前环境没有可用的快照存储：请先在节点上添加这些类型的存储，"
+        "或把磁盘迁移过去再重试。",
+        "en": "Storage {volumes} does not support snapshots. Snapshot-capable "
+        "storage types: {types}. No snapshot-capable storage is available in this "
+        "environment yet — add one of those types on the node, or move the disk "
+        "there and retry.",
+    },
 }
 
 

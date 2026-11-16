@@ -29,7 +29,7 @@ import { OwnerAssignDialog } from './OwnerAssignDialog';
 import { ResetGuestPasswordDialog } from './ResetGuestPasswordDialog';
 import { VmExportDialog } from './VmExportDialog';
 import { formatBytes } from '../utils/format';
-import { VmReinstallWizard } from './VmReinstallWizard';
+import { VmReinstallWizard, reinstallTargetOf } from './VmReinstallWizard';
 import {
   IconCopy,
   IconDisk,
@@ -105,6 +105,11 @@ export function VmMoreMenu({ vm, onDelete, onChanged }: VmMoreMenuProps) {
     setOpen(false);
     setDialog(null);
   }, [vm?.node, vm?.vmid]);
+
+  /* 重装只吃 reinstallTargetOf 挑出来的那几项（见 VmReinstallWizard）：
+     列表页的同名入口走的是同一个函数，两个入口的弹窗内容才对得上。
+     useMemo 只是为了别让表单初始化 effect 跟着每次重渲染重启。 */
+  const reinstallVm = useMemo(() => reinstallTargetOf(vm), [vm]);
 
   const toTemplate = async () => {
     if (!vm) return;
@@ -241,7 +246,7 @@ export function VmMoreMenu({ vm, onDelete, onChanged }: VmMoreMenuProps) {
           那正是用户想确认的东西（尤其旧盘是删了还是留了） */}
       <VmReinstallWizard
         open={dialog === 'reinstall'}
-        vm={dialog === 'reinstall' ? vm : null}
+        vm={dialog === 'reinstall' ? reinstallVm : null}
         onClose={() => setDialog(null)}
         onDone={() => onChanged()}
       />

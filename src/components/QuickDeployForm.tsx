@@ -15,10 +15,10 @@
    两个刻意的固定做法：
 
    * **克隆方式**：初值取「设置 → 创建默认值」里的面板默认（未配置即链接克隆），
-     「系统镜像」卡里那个开关紧挨着模板下拉、同一行摆放 —— 它决定的正是「这个
-     模板怎么变成一台机器」，与模板本就是一回事。存储下拉框只在「磁盘真要落到
-     某个存储上」时出现：链接克隆不写任何存储（磁盘留在模板所在存储），
-     摆一个必填的下拉框只会让人以为必须选。
+     「系统镜像」卡里那个开关紧挨着模板选择器 —— 它决定的正是「这个模板怎么
+     变成一台机器」，与模板本就是一回事。存储下拉框只在「磁盘真要落到某个
+     存储上」时出现：链接克隆不写任何存储（磁盘留在模板所在存储），摆一个
+     必填的下拉框只会让人以为必须选。
    * **静态 IP**：绝大多数机器要固定地址，所以默认静态，并从「网络 → IP 地址池」
      里自动挑一个空闲地址（可改）。池子为空时退回 DHCP，而不是让用户卡在
      一个选不出东西的下拉框前。
@@ -61,6 +61,11 @@ import {
 import { Notice } from './ui/EmptyState';
 import { Spinner } from './ui/Spinner';
 import { NodePicker } from './NodePicker';
+import { SystemTemplatePicker } from './SystemTemplatePicker';
+import {
+  ctTemplatePickItems,
+  vmTemplatePickItems,
+} from '../utils/templatePick';
 import { isPathDisabled, SSH_SECURITY_NAV_PATH } from './Sidebar';
 import { IconCloud, IconPlus, IconTrash } from './Icons';
 import { useNodeBridges } from '../hooks/useNodeBridges';
@@ -200,7 +205,7 @@ export function QuickDeployForm({
   const [specId, setSpecId] = useState('');
   const [targetConn, setTargetConn] = useState('');
   const [node, setNode] = useState('');
-  const [templateRef, setTemplateRef] = useState(''); // "node/vmid"
+  const [templateRef, setTemplateRef] = useState(''); // "node:vmid"
   const [osTemplate, setOsTemplate] = useState('');
   const [storage, setStorage] = useState('');
   /* 完整克隆：关 = 链接克隆（秒级完成、不额外占空间，但磁盘依赖模板）。
@@ -228,6 +233,9 @@ export function QuickDeployForm({
 
   /** 用户自己点过 IP 获取方式：之后不再被「有没有可用网段」的自动判断覆盖 */
   const ipModeTouchedRef = useRef(false);
+
+  /** 用户自己挑过模板：之后不再被「默认选中第一张」覆盖（与自定义部署同一规则） */
+  const templateTouchedRef = useRef(false);
 
   /** 已经按面板默认值预选过克隆方式：每次打开只填一次，不覆盖用户的选择 */
   const cloneDefaultRef = useRef(false);
@@ -275,6 +283,7 @@ export function QuickDeployForm({
     setFullClone(false);
     cloneDefaultRef.current = false;
     ipModeTouchedRef.current = false;
+    templateTouchedRef.current = false;
     /* targetConn 不清：保留上次选的主机（多台 PVE 时省一次选择），下面那个
        effect 只在它为空时兜底选当前连接 */
   }, [open]);
@@ -406,12 +415,14 @@ export function QuickDeployForm({
     if (target) setTargetConn(target.id);
   }, [open, targetConn, connectionsQuery.data]);
 
-  /* 换主机：节点、存储、模板都不通用，全部清掉重选 */
+  /* 换主机：节点、存储、模板都不通用，全部清掉重选。
+     一并放开「用户挑过模板」的锁：清空之后要按新主机的模板重新落一次默认值。 */
   useEffect(() => {
     setNode('');
     setStorage('');
     setTemplateRef('');
     setOsTemplate('');
+    templateTouchedRef.current = false;
   }, [targetConn]);
 
   /* 换节点：节点名不通用，存储与模板也跟着变 */
@@ -714,41 +725,36 @@ export function QuickDeployForm({
   const globalQuotaBlocked = Boolean(quota && !quota.can_create);
   const quotaBlocked = globalQuotaBlocked || quotaOver.length > 0;
 
-  const templateOptions = useMemo(() => {
-    const list = (templatesQuery.data ?? []).filter(
-      (t) => !targetConn || !t.connection_id || t.connection_id === targetConn,
-    );
-    return [
-      { label: t('quickDeploy.selectTemplate'), value: '' },
-      ...list.map((tpl) => ({
-        label: `${t('quickDeploy.templateOption', {
-          name: tpl.name,
-          vmid: tpl.vmid,
-          node: tpl.node,
-        })}${
-          tpl.maxdisk
-            ? t('quickDeploy.diskSuffix', {
-                size: formatBytes(tpl.maxdisk, 0),
-              })
-            : ''
-        }`,
-        value: `${tpl.node}/${tpl.vmid}`,
-      })),
-    ];
-  }, [templatesQuery.data, targetConn, t]);
-
-  const osTemplateOptions = useMemo(
-    () => [
-      { label: t('quickDeploy.selectOsTemplate'), value: '' },
-      ...(osTemplatesQuery.data ?? []).map((tpl) => ({
-        label: `${tpl.name}${
-          tpl.size ? `（${formatBytes(tpl.size, 0)}）` : ''
-        }`,
-        value: tpl.volid,
-      })),
-    ],
-    [osTemplatesQuery.data, t],
+  /* 模板选择器的候选：只有「属于当前连接」这一层过滤是快速部署自己的业务，
+     其余映射（名称 / 两列容量 / 标签 / 摘要说明）与自定义部署共用同一份
+     （见 utils/templatePick）。 */
+  const vmPickItems = useMemo(
+    () =>
+      vmTemplatePickItems(
+        (templatesQuery.data ?? []).filter(
+          (tpl) =>
+            !targetConn ||
+            !tpl.connection_id ||
+            tpl.connection_id === targetConn,
+        ),
+        t,
+      ),
+    [templatesQuery.data, targetConn, t],
   );
+
+  const ctPickItems = useMemo(
+    () => ctTemplatePickItems(osTemplatesQuery.data ?? []),
+    [osTemplatesQuery.data],
+  );
+
+  /* 默认选中第一张模板 —— 与自定义部署（见 VmCreateWizard 的 autoPickedRef）
+     同一条规则：模板是创建的前提，列表到了就先落一个默认值，用户要换再换。
+     用户自己点过之后不再覆盖；换主机后引用已失效，锁会在上面那个效果里放开。 */
+  useEffect(() => {
+    if (!open || !isVm || templateTouchedRef.current || templateRef) return;
+    const first = vmPickItems[0];
+    if (first) setTemplateRef(first.value);
+  }, [open, isVm, templateRef, vmPickItems]);
 
   const storageOptions = useMemo(() => {
     const want = isVm ? 'images' : 'rootdir';
@@ -889,7 +895,9 @@ export function QuickDeployForm({
       const nicRate = (nic: QuickNic) =>
         nic.rate.trim() ? Number(nic.rate) : undefined;
 
-      const [tplNode, tplVmid] = templateRef.split('/');
+      /* `node:vmid` —— 与自定义部署的选择器同一个值格式（见 utils/templatePick），
+         节点的名字里不会出现冒号 */
+      const [tplNode, tplVmid] = templateRef.split(':');
 
       const buildVmPayload = (
         instanceName: string,
@@ -1277,37 +1285,43 @@ export function QuickDeployForm({
                 : t('quickDeploy.imageSubtitleLxc')
             }
           />
-          <div className="form-grid-2">
-            {isVm ? (
-              <Select
-                label={t('quickDeploy.labelTemplate')}
-                required
-                value={templateRef}
-                onChange={(e) => setTemplateRef(e.target.value)}
-                options={templateOptions}
-                hint={
-                  templatesQuery.isError
-                    ? errorMessage(templatesQuery.error)
-                    : t('quickDeploy.templateHint')
+          {/* 系统模板用与「创建虚拟机 / 创建容器」向导同一套选择器（见
+              SystemTemplatePicker）：一两张时直接平铺成行，几十张时先给一张
+              摘要卡再展开搜索/分类。原来的原生下拉把发行版、版本、容量全塞进
+              一行，模板一多就只能靠运气翻。 */}
+          <Field
+            label={isVm ? t('templatePicker.vmLabel') : t('templatePicker.ctLabel')}
+            required
+            hint={
+              isVm
+                ? templatesQuery.isError
+                  ? errorMessage(templatesQuery.error)
+                  : vmPickItems.length
+                    ? t('templatePicker.vmHint')
+                    : t('templatePicker.vmEmptyHint')
+                : osTemplatesQuery.isError
+                  ? errorMessage(osTemplatesQuery.error)
+                  : t('templatePicker.ctHint')
+            }
+          >
+            <SystemTemplatePicker
+              kind={isVm ? 'vm' : 'ct'}
+              items={isVm ? vmPickItems : ctPickItems}
+              value={isVm ? templateRef : osTemplate}
+              onChange={(next) => {
+                if (isVm) {
+                  /* 用户自己挑过：之后的自动默认值不再覆盖他 */
+                  templateTouchedRef.current = true;
+                  setTemplateRef(next);
+                } else {
+                  setOsTemplate(next);
                 }
-              />
-            ) : (
-              <Select
-                label={t('quickDeploy.labelOsTemplate')}
-                required
-                value={osTemplate}
-                onChange={(e) => setOsTemplate(e.target.value)}
-                options={osTemplateOptions}
-                hint={
-                  osTemplatesQuery.isError
-                    ? errorMessage(osTemplatesQuery.error)
-                    : t('quickDeploy.osTemplateHint')
-                }
-              />
-            )}
+              }}
+            />
+          </Field>
 
-            {/* 克隆方式紧挨着模板下拉（同一行右侧）：它决定的正是「这个模板怎么变成
-                一台机器」，与模板是同一件事，不该另起一行占位。
+          <div className="form-grid-2">
+            {/* 克隆方式紧挨着模板：它决定的正是「这个模板怎么变成一台机器」。
                 开关只留「完整克隆」四个字、不挂说明文字 —— 后果交给卡片底部那句
                 随开关变化的短提示（见下），这张卡要紧凑。
                 只有虚拟机克隆，容器是从 OS 模板建 rootfs，没有这一层。 */}
@@ -1322,8 +1336,8 @@ export function QuickDeployForm({
             ) : null}
 
             {/* 容器建 rootfs 要选存储；虚拟机只有开了完整克隆才需要（磁盘要有落点）。
-                排在开关之后：虚拟机开完整克隆时它落到第二行、正好在模板下方；
-                容器没有开关，存储仍与系统模板并排（与改动前一致）。 */}
+                它排在模板选择器下方：模板占满整行，存储是「这个模板落到哪」的
+                下一步，不该再挤回模板那一行。 */}
             {storageNeeded ? (
               <Select
                 label={t('quickDeploy.labelStorage')}

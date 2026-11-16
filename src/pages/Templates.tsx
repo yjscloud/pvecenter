@@ -55,12 +55,12 @@ import {
   IconFilter,
 } from '../components/Icons';
 import { LxcCreateWizard } from '../components/LxcCreateWizard';
+import { OsLogo } from '../components/OsLogo';
 import { formatBytes, formatUptime, formatUptimeShort, parseTags } from '../utils/format';
 import { isTaskSuccess, ostypeLabel } from '../utils/status'
 import {
   groupTagged,
   osFamilyLabel,
-  osFamilyMark,
   tagFamilies,
   templateFamily,
   type FamilyTagged,
@@ -784,7 +784,7 @@ export function Templates() {
                   aria-pressed={activeFamily === chip.family.key}
                   onClick={() => setFamilyFilter(chip.family.key)}
                 >
-                  <span className="os-chip-dot" aria-hidden="true" />
+                  <OsLogo family={chip.family} size="chip" />
                   {osFamilyLabel(chip.family, t)}
                   <span className="os-chip-count">{chip.count}</span>
                 </button>
@@ -1063,7 +1063,7 @@ function OsGroupHead({
         className={`os-chevron${folded ? ' is-folded' : ''}`}
         aria-hidden="true"
       />
-      <span className="os-group-dot" aria-hidden="true" />
+      <OsLogo family={family} size="group" />
       <span className="os-group-name">{name}</span>
       <span className="os-group-count">{count}</span>
       <span className="os-group-rule" aria-hidden="true" />
@@ -1076,8 +1076,8 @@ function OsTag({ family }: { family: OsFamily }) {
   const t = useT();
   return (
     <span className="os-tag" data-os={family.key}>
-      <span className="os-tag-mark" aria-hidden="true">
-        {osFamilyMark(family)}
+      <span className="os-tag-mark">
+        <OsLogo family={family} size="table" />
       </span>
       <span className="os-tag-name">{osFamilyLabel(family, t)}</span>
     </span>
@@ -1106,8 +1106,8 @@ function CtSystemTemplateCard({
   return (
     <article className="tpl-card" data-os={family.key}>
       <div className="tpl-card-head">
-        <span className="tpl-os-mark" aria-hidden="true">
-          {osFamilyMark(family)}
+        <span className="tpl-os-mark">
+          <OsLogo family={family} />
         </span>
         <div className="tpl-card-id">
           <span className="tpl-card-name" title={template.volid}>
@@ -1176,8 +1176,8 @@ function TemplateCard({
   return (
     <article className="tpl-card" data-os={family.key}>
       <div className="tpl-card-head">
-        <span className="tpl-os-mark" aria-hidden="true">
-          {osFamilyMark(family)}
+        <span className="tpl-os-mark">
+          <OsLogo family={family} />
         </span>
         <div className="tpl-card-id">
           <span className="tpl-card-name" title={template.name}>

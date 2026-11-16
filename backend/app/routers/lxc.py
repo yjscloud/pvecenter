@@ -36,6 +36,7 @@ from .. import (
     pvecache,
     quota,
     security,
+    storagecaps,
     store,
     vmconfig,
 )
@@ -1377,6 +1378,25 @@ async def list_container_snapshots(
     return await _filter_snapshots(user, node, vmid, snaps, ownership.KIND_CT)
 
 
+@router.get("/lxc/{node}/{vmid}/snapshot-capability")
+async def container_snapshot_capability(
+    node: str,
+    vmid: int,
+    user: Dict[str, Any] = Depends(security.require_permission("ct.view")),
+) -> Dict[str, Any]:
+    """这台容器的盘能不能快照，以及当前环境里哪些存储可以。
+
+    前端在打开「快照」页签时就问一次：不支持的存储直接在界面上说清楚并把
+    「创建快照」置灰，而不是让用户填完对话框再吃一句 PVE 的英文报错。
+    读权限与快照列表一致（``ct.view``）—— 它只暴露存储类型，不改任何东西。
+    """
+    client = get_client()
+    try:
+        return await storagecaps.snapshot_capability(client, node, vmid)
+    except ProxmoxError as exc:
+        _raise(exc)
+
+
 @router.post("/lxc/{node}/{vmid}/snapshot")
 async def create_container_snapshot(
     node: str,
@@ -1386,6 +1406,28 @@ async def create_container_snapshot(
     user: Dict[str, Any] = Depends(security.require_permission("ct.snapshot")),
 ) -> Dict[str, Any]:
     client = get_client()
+
+    # 先判存储能力，**再**动额度：注定失败的请求不该先占掉一次配额。
+    # 前端虽然已经按 /snapshot-capability 置灰了按钮，这里仍要拦一次 —— 界面
+    # 打开后磁盘被移到 dir 存储、或用了别的客户端直接打接口，都会走到这条路上。
+    # 拒绝时返回 409 + 一段能独立读懂的话（当前存储类型、支持的类型、可用的存储）。
+    try:
+        capability = await storagecaps.snapshot_capability(client, node, vmid)
+    except ProxmoxError as exc:
+        await security.audit(
+            request, user, "snapshot.create",
+            target=f"{node}/{vmid}/{payload.name}",
+            result="failed", detail=exc.message,
+        )
+        _raise(exc)
+    if not capability["supported"]:
+        reason = storagecaps.blocked_message(capability)
+        await security.audit(
+            request, user, "snapshot.create",
+            target=f"{node}/{vmid}/{payload.name}",
+            result="failed", detail=reason,
+        )
+        raise HTTPException(status_code=409, detail=reason)
 
     # 快照额度（总数 / 单机上限）：与建机那套分开记账，只看 snapshot 这一组
     await quota.enforce_snapshot(user, request, "snapshot.create", "lxc", node, vmid)

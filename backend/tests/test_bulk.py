@@ -110,6 +110,15 @@ class FakeClient:
         self.calls.append(("lxc_snapshot_create", node, vmid, name))
         return "UPID:pve:4:4:4::snapshot:"
 
+    async def storages(self, node):
+        """快照前的存储能力校验会读节点存储清单。
+
+        这里返回空清单 = 类型未知：能力判定按「放行 + 标记未知」处理，
+        批量测试关心的仍然只有「容器快照不传 vmstate」这件事。
+        """
+        self.calls.append(("storages", node))
+        return []
+
 
 def _request() -> SimpleNamespace:
     return SimpleNamespace(state=SimpleNamespace(session={"elevated_until": 0}))

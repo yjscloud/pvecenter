@@ -83,7 +83,11 @@ import { useToast } from '../hooks/useToast';
 import { useAuth } from '../hooks/useAuth';
 import { useSnapshotQuota } from '../hooks/useSnapshotQuota';
 import type { RrdPoint, RrdTimeframe } from '../api/types';
-import type { LxcMountConfig, LxcNetworkConfig } from '../api/types';
+import type {
+  LxcMountConfig,
+  LxcNetworkConfig,
+  SnapshotCapabilityVolume,
+} from '../api/types';
 
 type TabKey = 'overview' | 'monitor' | 'network' | 'storage' | 'snapshot' | 'console';
 
@@ -420,6 +424,37 @@ export function LxcDetail() {
 
   /* ---- 快照 ---- */
   const [snapOpen, setSnapOpen] = useState(false);
+  /* 快照的**存储能力**：容器的盘落在什么存储上、支不支持快照、当前环境里
+     哪些存储可用。打开「快照」页签或创建对话框时问一次 —— 这是 PVE 自己只在
+     真正执行时才检查的部分，等到那时用户已经填完对话框了。
+
+     `undefined` 表示还没查到：此时绝不能按「不支持」处理，否则每次进页签都会
+     先闪一下灰按钮。只有明确 `supported === false` 才置灰。 */
+  const snapCapQuery = useQuery({
+    queryKey: ['lxc', node, ctId, 'snapshot-capability'],
+    queryFn: () => lxcApi.snapshotCapability(node, ctId),
+    enabled:
+      (tab === 'snapshot' || snapOpen) && Boolean(node) && Number.isFinite(ctId),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const snapCap = snapCapQuery.data;
+  const snapStorageBlocked = snapCap?.supported === false;
+
+  /* 提示文案共用的拼装：存储名 + 类型（`local（dir）`） */
+  const describeStorage = (item: { storage: string; type_label: string }) =>
+    `${item.storage}（${item.type_label}）`;
+  const snapBlockedText = (snapCap?.blocking ?? []).map(describeStorage).join('、');
+  const snapUnknownText = (snapCap?.unknown ?? []).map(describeStorage).join('、');
+  const snapSupportedTypes = (snapCap?.supported_type_labels ?? []).join(' / ');
+  const snapAvailableText = (snapCap?.available_storages ?? [])
+    .map(describeStorage)
+    .join('、');
+  /* 每块盘的位置：`系统盘：local-zfs（ZFS）`，rootfs 翻成人话，mpN 保留 PVE 键名 */
+  const snapVolumeLabel = (item: SnapshotCapabilityVolume) =>
+    `${
+      item.key === 'rootfs' ? t('lxcDetail.snapStorageRootfs') : item.key
+    }：${describeStorage(item)}`;
   /* 快照额度（提示用）：只有管理员配了总额度时才显示，单机上限由后端按精确数字拒 */
   const snapQuota = useSnapshotQuota(snapOpen);
   const [snapName, setSnapName] = useState('');
@@ -427,6 +462,15 @@ export function LxcDetail() {
   const submitSnapshot = async () => {
     if (!snapName.trim()) {
       toast.warning(t('lxcDetail.snapshotNameRequired'));
+      return;
+    }
+    /* 能力查询可能还在路上（或刚被缓存过期）：先挡一次，别把注定 409 的请求发出去。
+       后端同样会拦（见 routers/lxc.py），这里只是为了不让用户白等一次往返。 */
+    if (snapStorageBlocked) {
+      toast.warning(
+        t('lxcDetail.snapStorageTitle'),
+        t('lxcDetail.snapStorageBlockedBody', { volumes: snapBlockedText }),
+      );
       return;
     }
     setPending(true);
@@ -446,7 +490,11 @@ export function LxcDetail() {
       setSnapName('');
       setSnapDesc('');
     } catch {
-      /* toast 已提示 */
+      /* toast 已提示（后端 409 的那段话本身就带「当前存储 / 支持的类型 / 可用存储」）。
+         顺手让能力查询失效：失败常常意味着磁盘刚被挪到别的存储，界面上的结论已经旧了。 */
+      void queryClient.invalidateQueries({
+        queryKey: ['lxc', node, ctId, 'snapshot-capability'],
+      });
     } finally {
       setPending(false);
     }
@@ -1206,13 +1254,48 @@ export function LxcDetail() {
               <Button
                 size="sm"
                 icon={<IconPlus size={14} />}
-                disabled={!canSnapshot || busy}
+                disabled={!canSnapshot || busy || snapStorageBlocked}
+                title={
+                  snapStorageBlocked
+                    ? t('lxcDetail.snapStorageBlockedHint')
+                    : undefined
+                }
                 onClick={() => setSnapOpen(true)}
               >
                 {t('lxcDetail.createSnapshot')}
               </Button>
             }
           />
+          {/* 存储不支持快照：在用户点按钮之前就说清楚，并把「能用什么」一起给出。
+              PVE 自己只会在真正执行时抛一句英文插件错误，且不提替代方案。 */}
+          {snapStorageBlocked ? (
+            <Notice tone="warning" title={t('lxcDetail.snapStorageTitle')}>
+              <div className="flex flex-col gap-6">
+                <div>
+                  {t('lxcDetail.snapStorageBlockedBody', {
+                    volumes: snapBlockedText,
+                  })}
+                </div>
+                <div>{t('lxcDetail.snapStorageTypes', { types: snapSupportedTypes })}</div>
+                <div>
+                  {snapAvailableText
+                    ? t('lxcDetail.snapStorageAvailable', {
+                        storages: snapAvailableText,
+                      })
+                    : t('lxcDetail.snapStorageNone')}
+                </div>
+                <div>{t('lxcDetail.snapStorageMoveHint')}</div>
+              </div>
+            </Notice>
+          ) : null}
+
+          {/* 类型无法确定：不拦（PVE 才是最终裁决），但把「可能失败」讲明白 */}
+          {!snapStorageBlocked && snapUnknownText ? (
+            <Notice tone="info" title={t('lxcDetail.snapStorageUnknownTitle')}>
+              {t('lxcDetail.snapStorageUnknownBody', { volumes: snapUnknownText })}
+            </Notice>
+          ) : null}
+
           <Notice tone="info" title={t('lxcDetail.snapshotNoticeTitle')}>
             {t('lxcDetail.snapshotNoticeBody')}
           </Notice>
@@ -1465,11 +1548,13 @@ export function LxcDetail() {
               variant="primary"
               loading={pending}
               onClick={() => void submitSnapshot()}
-              disabled={snapQuota.blocked}
+              disabled={snapQuota.blocked || snapStorageBlocked}
               title={
-                snapQuota.blocked
-                  ? t('guestList.snap.quotaUsedUp', { limit: Number(snapQuota.limit) })
-                  : undefined
+                snapStorageBlocked
+                  ? t('lxcDetail.snapStorageBlockedHint')
+                  : snapQuota.blocked
+                    ? t('guestList.snap.quotaUsedUp', { limit: Number(snapQuota.limit) })
+                    : undefined
               }
             >
               {t('common.create')}
@@ -1478,6 +1563,34 @@ export function LxcDetail() {
         }
       >
         <div className="form-grid">
+          {/* 存储能力：对话框可能在能力查询返回之前就打开了（用户点得快），
+              这里再兜一次 —— 不支持时连同替代存储一起说明，而不是只灰掉按钮。 */}
+          {snapStorageBlocked ? (
+            <Notice tone="warning" title={t('lxcDetail.snapStorageTitle')}>
+              <div className="flex flex-col gap-6">
+                <div>
+                  {t('lxcDetail.snapStorageBlockedBody', {
+                    volumes: snapBlockedText,
+                  })}
+                </div>
+                <div>{t('lxcDetail.snapStorageTypes', { types: snapSupportedTypes })}</div>
+                <div>
+                  {snapAvailableText
+                    ? t('lxcDetail.snapStorageAvailable', {
+                        storages: snapAvailableText,
+                      })
+                    : t('lxcDetail.snapStorageNone')}
+                </div>
+              </div>
+            </Notice>
+          ) : snapCap && snapCap.volumes.length ? (
+            /* 支持时也把「快照写在哪块盘上」摆出来：出问题时这是第一个要看的字段 */
+            <div className="fs-xs text-muted">
+              {t('lxcDetail.snapStorageCurrent', {
+                volumes: snapCap.volumes.map(snapVolumeLabel).join(' · '),
+              })}
+            </div>
+          ) : null}
           {/* 快照额度：只在管理员配了总额度时出现 */}
           {snapQuota.limited ? (
             <Notice tone={snapQuota.blocked ? 'warning' : 'info'}>

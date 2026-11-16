@@ -41,6 +41,8 @@ import { Notice } from './ui/EmptyState';
 import { Spinner } from './ui/Spinner';
 import { NodePicker } from './NodePicker';
 import { QuickDeployForm } from './QuickDeployForm';
+import { SystemTemplatePicker } from './SystemTemplatePicker';
+import { ctTemplatePickItems } from '../utils/templatePick';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../hooks/useToast';
 import { useNodeStorages } from '../hooks/useNodeStorages';
@@ -340,6 +342,16 @@ export function LxcCreateWizard({
     staleTime: 60_000,
   });
 
+  /* 节点（或主机）一换，模板列表就是另一份：原来选中的 volid 若不在新列表里
+     就清掉 —— 否则界面上一个都没选中，提交时却带着上一台节点的模板路径。 */
+  useEffect(() => {
+    if (!open || !form.ostemplate || templatesQuery.isLoading) return;
+    const list = templatesQuery.data;
+    if (!list) return;
+    if (list.some((tpl) => tpl.volid === form.ostemplate)) return;
+    setForm((f) => (f.ostemplate === form.ostemplate ? { ...f, ostemplate: '' } : f));
+  }, [open, form.ostemplate, templatesQuery.data, templatesQuery.isLoading]);
+
   /* 存储：只列**所选节点上**的存储池（含显式带连接，见 useNodeStorages） */
   const storagesQuery = useNodeStorages(form.node, targetConn, open && Boolean(targetConn));
 
@@ -406,12 +418,10 @@ export function LxcCreateWizard({
     }));
   }, [storagesQuery.data]);
 
-  const templateOptions = useMemo(
-    () =>
-      (templatesQuery.data ?? []).map((t) => ({
-        label: `${t.name}（${t.storage}）`,
-        value: t.volid,
-      })),
+  /* 系统模板：映射与快速部署共用（见 utils/templatePick），两处入口显示的
+     名称、大小、存储才会是同一份 */
+  const templatePickItems = useMemo(
+    () => ctTemplatePickItems(templatesQuery.data ?? []),
     [templatesQuery.data],
   );
 
@@ -739,25 +749,26 @@ export function LxcCreateWizard({
                 {errorMessage(templatesQuery.error)}
               </Notice>
             ) : null}
-            {!templatesQuery.isLoading && templateOptions.length === 0 ? (
+            {!templatesQuery.isLoading && templatePickItems.length === 0 ? (
               <Notice tone="warning" title={t('lxcWizard.templatesEmptyTitle')}>
                 {t('lxcWizard.templatesEmptyPre')}
                 <code> pveam update && pveam download local debian-12-standard</code>
               </Notice>
             ) : null}
+            {/* 系统模板：少量模板直接平铺成行（一次点击选完），多了先给摘要卡
+                再展开搜索/分类 —— 与重装选模板同一套交互（见 SystemTemplatePicker）。
+                容器模板没有「默认值」：不预选，必须由用户自己确认装哪套系统。 */}
             <Field
-              label={t('lxcWizard.fieldTemplate')}
+              label={t('templatePicker.ctLabel')}
               required
               error={errors.ostemplate}
-              hint={t('lxcWizard.fieldTemplateHint')}
+              hint={t('templatePicker.ctHint')}
             >
-              <Select
+              <SystemTemplatePicker
+                kind="ct"
+                items={templatePickItems}
                 value={form.ostemplate}
-                onChange={(e) => update('ostemplate', e.target.value)}
-                options={[
-                  { label: t('lxcWizard.selectTemplate'), value: '' },
-                  ...templateOptions,
-                ]}
+                onChange={(next) => update('ostemplate', next)}
               />
             </Field>
           </div>

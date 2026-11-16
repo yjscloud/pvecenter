@@ -177,6 +177,7 @@ import type {
   ZfsPool,
   RrdTimeframe,
   Snapshot,
+  SnapshotCapability,
   SnapshotCreateRequest,
   Storage,
   StorageContent,
@@ -1226,6 +1227,13 @@ export const lxcApi = {
   /* 快照（没有 vmstate） */
   snapshots: (node: string, vmid: number) =>
     get<Snapshot[]>(`/lxc/${node}/${vmid}/snapshot`),
+  /**
+   * 快照存储能力：容器的盘落在什么存储上、支不支持快照、当前环境里哪些存储可用。
+   * 在打开「快照」页签时问一次，用来把「创建快照」置灰并给出替代方案 ——
+   * 别等用户填完对话框再吃一句 PVE 的英文插件错误。
+   */
+  snapshotCapability: (node: string, vmid: number) =>
+    get<SnapshotCapability>(`/lxc/${node}/${vmid}/snapshot-capability`),
   createSnapshot: (node: string, vmid: number, body: SnapshotCreateRequest) =>
     post<TaskResponse>(`/lxc/${node}/${vmid}/snapshot`, body),
   rollbackSnapshot: (node: string, vmid: number, name: string) =>

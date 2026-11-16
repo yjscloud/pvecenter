@@ -348,7 +348,13 @@ export function VmDetail() {
 
   /* 「更多操作」菜单按 VmSummary 的形态工作（同一套菜单也会用在别处）。
      这里 useMemo 缓一份：详情页每次轮询都会重渲染，若传对象字面量进子组件，
-     子组件的表单初始化 effect 会跟着重启，用户填到一半的克隆表单会被清空。 */
+     子组件的表单初始化 effect 会跟着重启，用户填到一半的克隆表单会被清空。
+
+     source_template / maxdisk / connection_id 是重装弹窗要用的：列表页那个入口
+     交的是列表行，本来就有这三项；详情页原先只挑 node/vmid/name/status，于是同一台
+     机器从两个入口打开是两份不同的弹窗（「当前系统」认不出、系统盘容量那句没了、
+     多连接下网桥与地址池查错主机）。连接从 URL 上的 ?connection= 来 —— 详情页的
+     所有请求本来就按它走（见 api/client 的 setPageConnection）。 */
   const moreVm = useMemo(
     () =>
       vm
@@ -358,9 +364,21 @@ export function VmDetail() {
             name: vm.name,
             status: vm.status,
             template: vm.template,
+            connection_id: pageConnection || undefined,
+            maxdisk: vm.maxdisk,
+            source_template: vm.source_template ?? null,
           }
         : null,
-    [vm?.node, vm?.vmid, vm?.name, vm?.status, vm?.template],
+    [
+      vm?.node,
+      vm?.vmid,
+      vm?.name,
+      vm?.status,
+      vm?.template,
+      vm?.maxdisk,
+      vm?.source_template,
+      pageConnection,
+    ],
   );
 
   /* 进页面自动探测一次客户机磁盘用量，KPI 一打开就是真实使用率。

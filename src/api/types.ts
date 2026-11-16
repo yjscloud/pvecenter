@@ -2984,6 +2984,47 @@ export interface SnapshotCreateRequest {
 }
 
 /* ---------------------------------------------------------------------------
+   快照的存储能力（容器）
+   --------------------------------------------------------------------------- */
+
+/** 容器的一块盘（rootfs / mpN）与它所在存储的快照能力 */
+export interface SnapshotCapabilityVolume {
+  /** PVE 配置键：`rootfs` / `mp0`，界面自己把 rootfs 显示成「系统盘」 */
+  key: string;
+  storage: string;
+  /** PVE 存储插件名；读不到存储清单时为空串 */
+  type: string;
+  /** 展示名：ZFS / LVM-thin / Ceph RBD / dir … */
+  type_label: string;
+  storage_known: boolean;
+  /** true = 支持；false = 明确不支持；null = 无法确定（放行，由 PVE 最终裁决） */
+  supports_snapshot: boolean | null;
+  active: boolean;
+  shared: boolean;
+}
+
+/** 当前环境里可用（类型支持、已启用、在线）的快照存储 */
+export interface SnapshotStorageOption {
+  storage: string;
+  type: string;
+  type_label: string;
+  shared: boolean;
+}
+
+export interface SnapshotCapability {
+  /** 没有任何一块盘落在不支持快照的存储上 */
+  supported: boolean;
+  volumes: SnapshotCapabilityVolume[];
+  /** 明确不支持、会挡住快照的卷 */
+  blocking: SnapshotCapabilityVolume[];
+  /** 类型无法确定的卷：不阻止，但界面要提示 */
+  unknown: SnapshotCapabilityVolume[];
+  supported_types: string[];
+  supported_type_labels: string[];
+  available_storages: SnapshotStorageOption[];
+}
+
+/* ---------------------------------------------------------------------------
    备份
    --------------------------------------------------------------------------- */
 

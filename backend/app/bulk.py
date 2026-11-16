@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Request
 
-from . import frp, ippool, ownership, quota, security, store, vm_scope
+from . import frp, ippool, ownership, quota, security, storagecaps, store, vm_scope
 from .pve import (
     ProxmoxError,
     client_for_connection,
@@ -325,6 +325,13 @@ async def _run_one(
 
         elif action == "snapshot":
             name = (params.name or "").strip()
+            # 容器先判存储能力：批量里只要有一台在 dir / NFS 这类存储上，PVE 就会
+            # 抛一句英文插件错误，整批结果页里看不出该改什么。这里逐台给出
+            # 「哪块存储、什么类型、能用什么」的说明（与单机接口同一份实现）。
+            if gtype != "qemu":
+                capability = await storagecaps.snapshot_capability(client, node, vmid)
+                if not capability["supported"]:
+                    raise ProxmoxError(storagecaps.blocked_message(capability), 409)
             # 快照额度：批量建快照同样要按台判（逐台一次，超了只拒这一台）
             await quota.enforce_snapshot(
                 user, request, "snapshot.create", gtype, node, vmid

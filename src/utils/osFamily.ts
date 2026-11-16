@@ -58,7 +58,10 @@ const FAMILIES: Record<OsFamilyKey, OsFamily> = {
 
 /** 名称 → 家族。顺序有意义：更具体的词排在更宽泛的前面。 */
 const NAME_RULES: Array<[RegExp, OsFamilyKey]> = [
-  [/\bwindows\b|w2k|wxp|win(?:7|8|10|11|vista)/i, 'windows'],
+  /* `\bwindows` 而不是 `\bwindows\b`：模板名常把版本直接粘在后面
+     （`windows2022-server` / `windows2019-template`），要求词尾边界会把它们
+     全漏进「认不出的系统」。`win2019` 这类缩写同样要能认出来。 */
+  [/\bwindows|w2k|wxp|win(?:7|8|10|11|20\d\d|vista)/i, 'windows'],
   [/ubuntu/i, 'ubuntu'],
   [/debian/i, 'debian'],
   [/rocky/i, 'rocky'],
@@ -68,6 +71,13 @@ const NAME_RULES: Array<[RegExp, OsFamilyKey]> = [
   [/open\s*suse|suse|sles/i, 'suse'],
   [/alpine/i, 'alpine'],
   [/\barch(?:linux)?\b/i, 'arch'],
+  /* 认得出是 Linux、但没有（也不需要）单独 logo 的发行版：RHEL / Oracle /
+     Amazon Linux 与国产发行版。落到通用的 Tux，比扔进「认不出」诚实 ——
+     列表里一排「···」会让人以为面板坏了。 */
+  [
+    /rhel|red\s*hat|oracle\s*linux|\bol\d|amazon\s*linux|\bamzn\b|euler|kylin|deepin|\buos\b|gentoo|slackware|nixos|void\s*linux/i,
+    'linux',
+  ],
 ];
 
 function matchName(text: string): OsFamily | null {
@@ -121,6 +131,18 @@ export function osFamilyLabel(family: OsFamily, t: TFunc): string {
   if (family.key === 'linux') return t('osFamily.linux');
   if (family.key === 'other') return t('osFamily.other');
   return family.label;
+}
+
+/**
+ * 家族的「适用场景」一句话。
+ *
+ * 重装选模板时最大的认知负担不是「找哪张」，而是「哪张适合我」：名字、
+ * 版本号、磁盘大小都摆出来之后，用户仍然不知道 Ubuntu 与 Debian 该选哪个。
+ * 这里给每个家族一句用途描述（通用服务器 / 企业存量 / 轻量容器……），
+ * 让选择依据从「我记得这个名字」变成「我要跑什么」。
+ */
+export function osFamilyScene(family: OsFamily, t: TFunc): string {
+  return t(`osScene.${family.key}`);
 }
 
 /**
@@ -214,10 +236,12 @@ export function groupTemplates<T extends OsLabeled>(
 }
 
 /**
- * 家族缩写成 3 个字母，给卡片左侧的系统标识块用。
+ * 家族缩写成 3 个字母。
  *
- * 不做成图标：发行版几十个，手绘图标既画不全也不一致；三个大写字母 + 家族色
- * 在十几张卡里扫一眼就能分辨，而且增删发行版只是改一行映射。
+ * **只作回退用**：系统标识的正式形态是各家官方 logo（见 components/OsLogo.tsx），
+ * 字母块只在两种情况下顶上来 —— 认不出的系统（`other`）与 logo 资源加载失败。
+ * 保留 3 字母而不是一个「?」，是因为「···」也说不清是哪一类，而 LNX / WIN
+ * 至少还保留了「大类」这条信息；增删发行版仍然只是改一行映射。
  */
 const MARKS: Record<OsFamilyKey, string> = {
   windows: 'WIN',
@@ -248,6 +272,28 @@ export function osFamilyMark(family: OsFamily): string {
  *
  * @param names 原系统的线索，按可信度排列：来源模板名 → 机器名
  */
+/**
+ * 找出这台机器**当初用的那一张**模板（名字一致，忽略大小写与分隔符）。
+ *
+ * 与 :func:`recommendTemplate` 的区别：那个是「找不到就给个同类推荐」，这里只认
+ * 真正同名的一张。重装界面要写「当前系统」就必须有这条证据 —— 拿同族的另一张
+ * 顶上去，用户会以为在重装同一套系统，实际换了发行版。
+ *
+ * @param names 原系统的线索，按可信度排列：来源模板名 → 机器名
+ */
+export function findOriginalTemplate<T extends OsLabeled>(
+  templates: T[],
+  names: Array<string | null | undefined>,
+): T | null {
+  for (const raw of names) {
+    const key = normName(raw);
+    if (!key) continue;
+    const hit = templates.find((item) => normName(item.name) === key);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 export function recommendTemplate<T extends OsLabeled>(
   templates: T[],
   names: Array<string | null | undefined>,
