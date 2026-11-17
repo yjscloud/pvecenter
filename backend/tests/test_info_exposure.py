@@ -84,7 +84,8 @@ class TestAiCapabilities:
 
         assert "policy" not in body
         names = {item["name"] for item in body["tools"]}
-        assert "host_disk_usage" in names  # 只读诊断命令不受额外限制
+        # 只读诊断命令不受额外限制（磁盘/内存/负载已合并进 host_system_overview）
+        assert "host_system_overview" in names
         assert "host_run_command" not in names
         assert "host_propose_command" not in names
         assert "get_ssh_failures" not in names

@@ -2817,9 +2817,18 @@
 [data-os='rocky']   { --os-color:#0f766e; --os-tint:rgba(15,118,110,.10); }
 [data-os='alma']    { --os-color:#0e7490; --os-tint:rgba(14,116,144,.10); }
 [data-os='fedora']  { --os-color:#34558f; --os-tint:rgba(52,85,143,.10); }
+/* ---- 国产发行版：取各家官方标识的主色 ---- */
+[data-os='kylin']    { --os-color:#1653c7; --os-tint:rgba(22,83,199,.10); }
+[data-os='uos']      { --os-color:#1a73e8; --os-tint:rgba(26,115,232,.10); }
+[data-os='openeuler']{ --os-color:#0b57c2; --os-tint:rgba(11,87,194,.10); }
+[data-os='anolis']   { --os-color:#12a08f; --os-tint:rgba(18,160,143,.10); }
 /* 腾讯品牌蓝，取自官方标识本身（#0052d9） */
 [data-os='tencent'] { --os-color:#0052d9; --os-tint:rgba(0,82,217,.10); }
 [data-os='opencloudos'] { --os-color:#52d67f; --os-tint:rgba(82,214,127,.12); }
+[data-os='deepin']   { --os-color:#007cff; --os-tint:rgba(0,124,255,.10); }
+[data-os='alios']    { --os-color:#ff6a00; --os-tint:rgba(255,106,0,.10); }
+[data-os='redflag']  { --os-color:#d71920; --os-tint:rgba(215,25,32,.10); }
+[data-os='proxmox']  { --os-color:#e57000; --os-tint:rgba(229,112,0,.10); }
 [data-os='suse']    { --os-color:#2f855a; --os-tint:rgba(47,133,90,.10); }
 [data-os='coreos']  { --os-color:#53a3da; --os-tint:rgba(83,163,218,.12); }
 [data-os='openwrt'] { --os-color:#00ace2; --os-tint:rgba(0,172,226,.12); }
@@ -6885,14 +6894,94 @@
    注意 ``min-height: 0``：flex 子项的默认 ``min-height:auto`` 会以内容高度
    为下限，不写这一句时内部滚动区撑不回去，整页会被顶高。 */
 .ai-console {
-  height: clamp(460px, calc(100vh - 410px), 820px);
+  display: flex;
   align-items: stretch;
+  height: clamp(560px, calc(100vh - 320px), 940px);
+  min-height: 0;
 }
 
-.ai-console > * {
+/* 左右两栏：左栏宽度由 --ai-split 决定（拖拽时只改这一个变量），右栏吃掉剩余 */
+.ai-console-col {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
+}
+
+.ai-console-col-left {
+  flex: 0 0 auto;
+  width: var(--ai-split, 56%);
+}
+
+.ai-console-col-right {
+  flex: 1 1 0;
+}
+
+/* 分隔条：平时只是一条竖线，悬停 / 拖拽 / 键盘聚焦时才显出手柄。
+   宽度 11px 比线宽得多 —— 1px 的拖拽目标是没法用的。 */
+.ai-console-resizer {
+  position: relative;
+  flex: 0 0 11px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.ai-console-resizer::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--border-muted);
+  transition: width 0.15s ease, background 0.15s ease;
+}
+
+.ai-console-resizer:hover::before,
+.ai-console-resizer.is-active::before,
+.ai-console-resizer:focus-visible::before {
+  width: 2px;
+  background: var(--accent);
+}
+
+.ai-console-resizer:focus-visible {
+  outline: none;
+}
+
+/* 手柄常驻一点点透明度：不留痕迹的话没人知道这里能拖 */
+.ai-console-resizer-grip {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 5px;
+  height: 36px;
+  transform: translate(-50%, -50%);
+  border-radius: var(--radius-pill);
+  background: var(--text-muted);
+  opacity: 0.28;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.ai-console-resizer:hover .ai-console-resizer-grip,
+.ai-console-resizer:focus-visible .ai-console-resizer-grip {
+  background: var(--accent);
+  opacity: 0.6;
+}
+
+.ai-console-resizer.is-active .ai-console-resizer-grip {
+  background: var(--accent);
+  opacity: 0.95;
+}
+
+/* 拖拽时锁住指针与选区，避免选区跟着跑、终端把鼠标事件抢走 */
+.ai-console.is-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.ai-console.is-resizing .ai-console-col > * {
+  pointer-events: none;
 }
 
 /* 左栏两个页签各是一个占满整格的容器，切换只改 display（见 AiAssistant） */
@@ -6958,6 +7047,147 @@
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
+}
+
+/* 滚动条：10px 宽、拇指内缩，浅色面板里不抢视线；终端里换成浅色拇指 */
+.ai-console-scroll,
+.ai-console-term .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.ai-console-scroll::-webkit-scrollbar,
+.ai-console-term .xterm-viewport::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.ai-console-scroll::-webkit-scrollbar-track,
+.ai-console-term .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.ai-console-scroll::-webkit-scrollbar-thumb,
+.ai-console-term .xterm-viewport::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: var(--radius-pill);
+  background: var(--border);
+  background-clip: padding-box;
+}
+
+.ai-console-scroll::-webkit-scrollbar-thumb:hover,
+.ai-console-term .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+  background-clip: padding-box;
+}
+
+.ai-console-term .xterm-viewport {
+  scrollbar-color: rgba(255, 255, 255, 0.24) transparent;
+}
+
+.ai-console-term .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  background-clip: padding-box;
+}
+
+/* 终端外框：深底 + 一点内高光，和浅色面板拉开层次 */
+.ai-console-term {
+  border: 1px solid rgba(15, 23, 42, 0.55);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 1px 3px rgba(15, 23, 42, 0.14);
+}
+
+.ai-term-hint {
+  margin-bottom: 10px;
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* ---- 对话区：气泡、工具条、输入区 ---- */
+.ai-chat-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* 两个下拉各限一个上限：不限制时它们会吃掉整行，把标题挤到第二行去。
+   允许收缩（min-width 104）—— 半宽列里三个控件 + 折叠按钮正好能排成一行，
+   历史会话名超出部分由原生 select 自己截断。 */
+.ai-chat-tools .select-wrap {
+  flex: 0 1 auto;
+  min-width: 104px;
+  max-width: 172px;
+}
+
+.ai-chat-tools .select {
+  max-width: 100%;
+}
+
+.ai-chat-tools > * {
+  min-width: 0;
+}
+
+.ai-bubble-row {
+  display: flex;
+}
+
+.ai-bubble-row[data-role='user'] {
+  justify-content: flex-end;
+}
+
+.ai-bubble-row[data-role='assistant'] {
+  justify-content: flex-start;
+}
+
+/* 气泡：圆角 12，靠说话人那一侧收成 4 —— 方向比颜色更快被读出来。
+   边框 + 极轻的投影只为把气泡从面板底色上「托」起来一层。 */
+.ai-bubble {
+  max-width: 92%;
+  padding: 9px 12px;
+  border: 1px solid var(--border-muted);
+  border-radius: 12px;
+  border-bottom-left-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  line-height: 1.72;
+  box-shadow: 0 1px 1px rgba(15, 23, 42, 0.04);
+  overflow-wrap: anywhere;
+}
+
+.ai-bubble[data-role='user'] {
+  max-width: 88%;
+  border-color: var(--accent-border);
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 4px;
+  background: var(--accent-dim);
+}
+
+/* 输入区贴在卡片底部，与上面的对话流用一条分隔线断开 */
+.ai-composer {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-muted);
+}
+
+/* 输入框外层是 Field，撑满的是它，不是 .input-wrap */
+.ai-composer .field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ai-composer .input-wrap {
+  height: 38px;
+  border-radius: 10px;
+  background: var(--bg-surface);
 }
 
 /* 「排查过程」里那条命令的原文。
@@ -7421,11 +7651,29 @@
   overflow: hidden;
 }
 
-/* 窄屏下 grid-2 会塌成单列，再锁死总高就会把两张卡各压一半 —— 那时改回
-   自然高度，让页面正常滚动。 */
-@media (max-width: 768px) {
+/* 窄屏下两栏没法并排读（各剩不到 300px），改成上下堆叠：
+   总高回到自然高度，由两块固定的滚动区各自滚动，整页正常往下走。
+   分隔条同时隐藏 —— 竖着堆的时候它已经没有可调的方向。 */
+@media (max-width: 900px) {
   .ai-console {
+    flex-direction: column;
     height: auto;
+  }
+
+  .ai-console-col-left {
+    width: auto;
+  }
+
+  .ai-console-resizer {
+    display: none;
+  }
+
+  .ai-console-col-right {
+    /* 竖排时主轴变成高度：flex:1 1 0 的零 basis 会把整栏压成 0 高 */
+    flex: 0 0 auto;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-muted);
   }
 
   .ai-console-scroll,

@@ -24,7 +24,18 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Request
 
-from . import frp, ippool, ownership, quota, security, storagecaps, store, vm_scope
+from . import (
+    frp,
+    ippool,
+    ownership,
+    prefs,
+    pvecache,
+    quota,
+    security,
+    storagecaps,
+    store,
+    vm_scope,
+)
 from .pve import (
     ProxmoxError,
     client_for_connection,
@@ -49,6 +60,7 @@ ACTION_PERMISSION: Dict[str, str] = {
     "migrate": "vm.migrate",
     "balloon": "vm.config",
     "snapshot": "vm.snapshot",
+    "snapshot_restore": "vm.snapshot",
     "assign": "vm.assign",
 }
 
@@ -61,6 +73,7 @@ ACTION_PERMISSION_CT: Dict[str, str] = {
     "migrate": "ct.migrate",
     "balloon": "ct.config",  # 容器不支持气球，会逐台报错；权限点仍需占位
     "snapshot": "ct.snapshot",
+    "snapshot_restore": "ct.snapshot",
     "assign": "ct.assign",
 }
 
@@ -85,6 +98,7 @@ ACTION_LABELS: Dict[str, str] = {
     "migrate": "迁移",
     "balloon": "设置内存气球",
     "snapshot": "创建快照",
+    "snapshot_restore": "还原快照",
     "assign": "指派归属",
 }
 
@@ -93,6 +107,10 @@ def _audit_action(action: str, prefix: str, params: BulkParams) -> str:
     """审计里的动作名：指派与收回分开记（与单机接口的 ``vm.assign``/``vm.unassign`` 对齐）。"""
     if action == "assign":
         return f"{prefix}.{'assign' if (params.username or '').strip() else 'unassign'}"
+    # 还原快照与单机接口共用 ``snapshot.rollback`` 这个名字，审计里能按同一
+    # 关键词把「单台回滚」和「批量回滚」一起捞出来
+    if action == "snapshot_restore":
+        return "snapshot.rollback"
     return f"{prefix}.{action}"
 
 
@@ -165,6 +183,18 @@ def validate_action(action: str, params: BulkParams) -> None:
         from .schemas import SnapshotCreate
 
         SnapshotCreate(name=name, description=params.description)
+
+    if action == "snapshot_restore":
+        name = (params.name or "").strip()
+        if not name:
+            raise HTTPException(
+                status_code=400, detail="批量还原快照需要指定要还原到的快照名称"
+            )
+        # 「current」是 PVE 快照清单里的伪条目，不是可回滚的目标
+        if name.lower() == "current":
+            raise HTTPException(
+                status_code=400, detail="「current」不是可还原的快照，请选择具体快照"
+            )
 
     if action == "tag" and params.tags is None:
         raise HTTPException(status_code=400, detail="批量打标签需要填写标签内容")
@@ -295,6 +325,15 @@ async def _run_one(
             await ownership.forget_guest(conn_id, node, vmid)
             # 从地址池分配出去的地址同样立即释放（与单机删除同一口径）
             await ippool.release_guest(conn_id, node, vmid)
+            # 置顶 / 收藏同样按 vmid 记账：回收时清掉，同号的新机器才不会
+            # 一出生就带着上一台的星标与置顶（这个函数自己吞掉异常并记日志）
+            await prefs.forget_guest_refs(conn_id, node, vmid)
+            # 面板备注（手动 IP / 系统标识）也是按 vmid 记账：批量删除与单机删除
+            # 必须同一口径，否则同号的新机器会继承上一台的操作系统徽标。
+            # 延迟导入：vm_meta 是路由模块，顶层导入会让 bulk ↔ routers 绕成环。
+            from .routers.vm_meta import drop_entry as drop_vm_meta
+
+            await drop_vm_meta(conn_id, node, vmid)
 
         elif action == "tag":
             config_getter = client.qemu_config if gtype == "qemu" else client.lxc_config
@@ -346,6 +385,26 @@ async def _run_one(
                     node, vmid, name, params.description
                 )
 
+        elif action == "snapshot_restore":
+            name = (params.name or "").strip()
+            # 批量还原要求「每台机器上都有同名快照」。先在本地清单里核对一遍：
+            # 直接打 rollback 的话，缺快照的那台会回一句 PVE 的英文错误，整批
+            # 结果里看不出到底是哪台没有、该改什么。这里点名到具体机器。
+            list_snaps = (
+                client.qemu_snapshots if gtype == "qemu" else client.lxc_snapshots
+            )
+            snaps = await list_snaps(node, vmid)
+            if not any(str(s.get("name") or "") == name for s in snaps):
+                raise ProxmoxError(
+                    f"{vmid} 上没有名为「{name}」的快照，无法还原", 404
+                )
+            rollback = (
+                client.qemu_snapshot_rollback
+                if gtype == "qemu"
+                else client.lxc_snapshot_rollback
+            )
+            result = await rollback(node, vmid, name)
+
         elif action == "assign":
             # 归属变更走唯一入口：连带清快照标记、搬活动告警、复核穿透规则。
             # notify/restart 交给 run_bulk 在整批末尾统一做一次 —— 200 台如果每台
@@ -369,6 +428,9 @@ async def _run_one(
             detail={
                 "bulk": True,
                 "type": gtype,
+                # 快照类动作记下具体快照名：出问题时能直接定位到是哪一份
+                **({"snapshot": (params.name or "").strip() or None}
+                   if action in ("snapshot", "snapshot_restore") else {}),
                 # 指派/收回：把「从谁到什么」和变更理由记下来
                 **({"username": (params.username or "").strip() or None,
                     "previous": item.get("previous") or None,
@@ -477,6 +539,11 @@ async def run_bulk(
         results.append(item)
 
     ok_count = sum(1 for r in results if r["ok"])
+
+    # 快照类动作会改变快照清单：整批成功至少一台就把 /snapshots 的缓存作废。
+    # 批量创建原先漏了这一步，前端「快照」页要等缓存过期才看得到新数据。
+    if action in ("snapshot", "snapshot_restore") and ok_count:
+        pvecache.invalidate("snapshots:")
 
     if action == "assign" and ok_count:
         # 整批只做一次：逐台作废缓存会把同一份缓存反复打成冷启动，逐台重启 frpc

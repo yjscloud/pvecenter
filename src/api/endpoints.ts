@@ -28,7 +28,7 @@ import type {
   AiSessionDetail,
   AiSessionPage,
   AiUsageStats,
-  AiStatus,
+  AiTargetsResponse,
   AiTerminalPreflight,
   RemediationAction,
   RemediationPreview,
@@ -177,6 +177,8 @@ import type {
   ZfsPool,
   RrdTimeframe,
   Snapshot,
+  SnapshotBulkDeleteItem,
+  SnapshotBulkRestoreItem,
   SnapshotCapability,
   SnapshotCreateRequest,
   Storage,
@@ -675,7 +677,24 @@ export const vmMetaApi = {
     node: string;
     vmid: number;
     connection_id?: string | null;
+    /**
+     * 客户机类型：后端据此决定用 `vm.config` 还是 `ct.config` 判权，以及按
+     * `vm` / `ct` 查归属（容器的归属不记在虚拟机名下，传错会 404）。
+     */
+    type?: 'qemu' | 'lxc';
     ip: string;
+    /**
+     * 系统家族 key（如 `tencent`）。空串 = 清除标注、回到按来源模板/ostype 推断；
+     * 不传 = 保留已有标注（只改 IP 的调用方不用管它）。
+     */
+    os?: string;
+    /**
+     * 手工关联的来源模板。`template_node` 三态：不传 = 保持原关联；
+     * `''` = 解除关联；节点 + vmid = 关联到某张模板（name 只作存档展示）。
+     */
+    template_node?: string | null;
+    template_vmid?: number | null;
+    template_name?: string | null;
   }) => put<{ key: string; item: VmMetaEntry | null }>('/vm-meta', body),
 };
 
@@ -1037,6 +1056,24 @@ export const vmsApi = {
     }),
   snapshots: (node: string, vmid: number) =>
     get<Snapshot[]>(`/vms/${node}/${vmid}/snapshot`),
+  /**
+   * 批量删除快照（全局快照页）：一次请求逐条受理，返回逐条结果。
+   *
+   * 不循环调单条删除：归属与快照级隔离只能在服务端判，N 次往返还容易撞上
+   * 每 IP 每分钟 300 次的限流，中途失败也说不清到底删掉了几条。
+   */
+  bulkDeleteSnapshots: (items: SnapshotBulkDeleteItem[]) =>
+    post<BulkResponse>('/snapshots/bulk-delete', { items }),
+  /**
+   * 批量还原快照：每台机器回到**各自**指定的那一份快照。
+   *
+   * 与 `vmsApi.bulk({action:'snapshot_restore'})` 的区别是那边全批共用一个
+   * 快照名；这里逐条带 name，因为每台机器的快照链是独立的。同样一次请求逐条
+   * 受理、逐条回报 —— 快照级隔离只在服务端判，循环发 N 个单条请求既容易撞限流，
+   * 中途失败也说不清动了几台。
+   */
+  bulkRestoreSnapshots: (items: SnapshotBulkRestoreItem[]) =>
+    post<BulkResponse>('/snapshots/bulk-restore', { items }),
   createSnapshot: (node: string, vmid: number, body: SnapshotCreateRequest) =>
     post<TaskResponse>(`/vms/${node}/${vmid}/snapshot`, body),
   rollbackSnapshot: (node: string, vmid: number, name: string) =>
@@ -2842,18 +2879,49 @@ async function streamSse<T>(
   signal?: AbortSignal,
 ): Promise<void> {
   const base = import.meta.env.VITE_API_BASE || '/api';
-  const resp = await fetch(`${base}${path}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      // 这条是手写 fetch，不经过 axios 的请求拦截器，CSRF 头必须自己补上 ——
-      // 漏掉会被后端直接拒（"请求缺少 CSRF 校验信息"）。
-      [CSRF_HEADER]: readCsrfToken(),
-    },
-    credentials: 'include',
-    body: JSON.stringify(body),
-    signal,
-  });
+
+  /*
+   * 读超时：后端每 15 秒发一条 SSE 注释帧（`: ping`）保活，所以正常情况下
+   * 45 秒收不到任何字节就是真的断了（上游挂死 / 代理掐连接）。以前这里只有
+   * `await reader.read()`，断了也永远等下去，界面一直转圈、没有任何提示。
+   * 自己的 AbortController 与调用方传进来的（用户点「终止」）串起来。
+   */
+  const controller = new AbortController();
+  if (signal) {
+    if (signal.aborted) controller.abort(signal.reason);
+    else
+      signal.addEventListener(
+        'abort',
+        () => controller.abort(signal.reason),
+        { once: true },
+      );
+  }
+  let lastChunkAt = Date.now();
+  const watchdog = window.setInterval(() => {
+    if (Date.now() - lastChunkAt > 45_000) {
+      controller.abort(new Error('服务端 45 秒没有返回数据，连接可能已中断，请重试'));
+    }
+  }, 5_000);
+
+  let resp: Response;
+  try {
+    resp = await fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // 这条是手写 fetch，不经过 axios 的请求拦截器，CSRF 头必须自己补上 ——
+        // 漏掉会被后端直接拒（"请求缺少 CSRF 校验信息"）。
+        [CSRF_HEADER]: readCsrfToken(),
+      },
+      credentials: 'include',
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    window.clearInterval(watchdog);
+    if (controller.signal.reason instanceof Error) throw controller.signal.reason;
+    throw err;
+  }
 
   if (!resp.ok) {
     // 后端把可预期的失败放在 detail 里（没配模型、越权、上游报错）
@@ -2864,30 +2932,46 @@ async function streamSse<T>(
     } catch {
       /* 不是 JSON 就用状态码 */
     }
+    window.clearInterval(watchdog);
     throw new Error(message);
   }
-  if (!resp.body) throw new Error('当前浏览器不支持流式响应');
+  if (!resp.body) {
+    window.clearInterval(watchdog);
+    throw new Error('当前浏览器不支持流式响应');
+  }
 
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      lastChunkAt = Date.now();
+      buffer += decoder.decode(value, { stream: true });
 
-    const frames = buffer.split('\n\n');
-    buffer = frames.pop() ?? ''; // 最后一段可能不完整，留到下一轮
-    for (const frame of frames) {
-      const line = frame.trim();
-      if (!line.startsWith('data:')) continue;
-      try {
-        onEvent(JSON.parse(line.slice(5).trim()) as T);
-      } catch {
-        /* 坏帧跳过，不能让一行解析失败中断整次排查 */
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop() ?? ''; // 最后一段可能不完整，留到下一轮
+      for (const frame of frames) {
+        const line = frame.trim();
+        // 后端的心跳帧（`: ping`）不是 data 事件，直接忽略即可
+        if (!line.startsWith('data:')) continue;
+        try {
+          onEvent(JSON.parse(line.slice(5).trim()) as T);
+        } catch {
+          /* 坏帧跳过，不能让一行解析失败中断整次排查 */
+        }
       }
     }
+  } catch (err) {
+    // 读超时是我们自己 abort 的：把原因变成可读错误，而不是 DOMException
+    if (controller.signal.aborted && controller.signal.reason instanceof Error) {
+      throw controller.signal.reason;
+    }
+    throw err;
+  } finally {
+    window.clearInterval(watchdog);
   }
 }
 
@@ -2962,6 +3046,62 @@ export interface VmAiTarget {
   name: string;
   guest_type: 'qemu' | 'lxc';
   status: string;
+  /** 所属 PVE 连接：统一授权要靠它把主机与虚拟机对上 */
+  connection_id?: string;
+}
+
+/** 统一授权的虚拟机部分 */
+export interface AiAuthorizationVmGrant {
+  node: string;
+  vmid: number;
+  connection_id?: string;
+  vm_name?: string;
+  guest_type?: string;
+  access: 'read' | 'write' | 'ops';
+  minutes?: number;
+  actions_max?: number;
+  fs_ro?: string[];
+  fs_rw?: string[];
+  units?: string[];
+  reason?: string;
+}
+
+/** 一次确认同时处理两条通道 */
+export interface AiAuthorizationGrantInput {
+  conversation_id?: string;
+  host_id?: string;
+  host_name?: string;
+  /** 期望的主机通道状态 */
+  host: boolean;
+  /** 主机命令级别：read 只读，write 允许提议写命令 */
+  exec_access?: 'read' | 'write';
+  /** 期望的虚拟机通道状态；false 会撤销该目标上仍生效的票 */
+  vm: boolean;
+  vm_grant?: AiAuthorizationVmGrant;
+  /** 已有不同级别 / 范围票据时，是否在同一动作里撤销并重签 */
+  replace_existing?: boolean;
+}
+
+export interface AiAuthorizationGrantResult {
+  conversation: AiConversation;
+  host: {
+    authorized: boolean;
+    scope: 'session' | string;
+    access: 'read' | 'write' | string;
+  };
+  lease: VmAiLease | null;
+  reused: boolean;
+  /** 被替换掉的旧票（同一动作里已撤销） */
+  replaced: VmAiLease | null;
+  /** 因取消虚拟机通道而撤销的票 */
+  revoked: VmAiLease | null;
+  warnings: string[];
+}
+
+export interface AiAuthorizationRevokeResult {
+  host_updated: boolean;
+  lease: VmAiLease | null;
+  kill?: { ok: boolean; output: string };
 }
 
 /** 一条虚拟机内动作的流水：做了啥、被判了什么风险、结果与可回滚点 */
@@ -3020,8 +3160,13 @@ export const aiApi = {
       provider,
     }),
 
-  /** 可排查的主机 + 助手可用状态（区分「没配模型」与「可以排查」） */
-  targets: () => get<{ hosts: BaselineHost[]; status: AiStatus }>('/ai/targets'),
+  /**
+   * 可排查的主机 + 助手可用状态（区分「没配模型」与「可以排查」）。
+   *
+   * 后端已按「运行中 + 已纳管 + Guest Agent + cloud-init + 虚拟机」五项
+   * 与运算筛过；`excluded` 只给计数与原因，用来解释列表为什么变短。
+   */
+  targets: () => get<AiTargetsResponse>('/ai/targets'),
 
   /** 已接入的模型清单（不含密钥，普通用户可见，用于页面上的状态条） */
   models: () => get<AiModelsResponse>('/ai/models'),
@@ -3081,6 +3226,34 @@ export const aiApi = {
 
   /** 我的授权记录；管理员看全部 */
   vmLeases: () => get<{ items: VmAiLease[] }>('/ai/vm/leases'),
+
+  /** 统一授权：一次确认同时处理主机命令与虚拟机票据 */
+  authorizationGrant: (payload: AiAuthorizationGrantInput) =>
+    post<AiAuthorizationGrantResult>('/ai/authorization/grant', payload),
+
+  /** 续期虚拟机票据（不改变级别与范围） */
+  authorizationRenew: (payload: { lease_id: string; minutes?: number }) =>
+    post<{ lease: VmAiLease }>('/ai/authorization/renew', payload),
+
+  /** 撤销统一授权：两条通道可分别撤或一次撤全部 */
+  authorizationRevoke: (payload: {
+    conversation_id?: string;
+    host?: boolean;
+    vm?: boolean;
+    lease_id?: string;
+    vm_grant?: { connection_id?: string; node: string; vmid: number };
+    reason?: string;
+  }) => post<AiAuthorizationRevokeResult>('/ai/authorization/revoke', payload),
+
+  /** 仅同步会话的主机授权状态（切主机接续旧会话时关闭旧授权） */
+  setExecAuthorization: (
+    conversationId: string,
+    payload: { enabled: boolean; exec_access?: 'read' | 'write' },
+  ) =>
+    post<{ conversation_id: string; allow_exec: number; exec_access: string }>(
+      `/ai/conversations/${encodeURIComponent(conversationId)}/exec-authorization`,
+      payload,
+    ),
 
   /** 授权详情 + 完整动作流水（谁、改了什么、能不能回滚） */
   vmLease: (id: string) =>
@@ -3188,6 +3361,7 @@ export const aiApi = {
     signal?: AbortSignal,
     providerId?: string,
     allowExec = false,
+    execAccess: 'read' | 'write' = 'write',
   ) =>
     streamSse<AiStreamEvent>(
       '/ai/inspect/stream',
@@ -3196,6 +3370,7 @@ export const aiApi = {
         provider_id: providerId || undefined,
         // 用户本次是否授权 AI 上机执行只读命令（不勾就不带这个字段）
         allow_exec: allowExec || undefined,
+        exec_access: allowExec ? execAccess : undefined,
       },
       onEvent,
       signal,
@@ -3209,6 +3384,8 @@ export const aiApi = {
     provider_id?: string;
     /** 会话级授权：记在会话上，刷新后开关能回到用户上次的选择 */
     allow_exec?: boolean;
+    /** 主机命令级别：read 只读 / write 允许提议写命令 */
+    exec_access?: 'read' | 'write';
   }) => post<AiConversation>('/ai/conversations', body),
 
   /** 排障预案清单：空会话的快捷入口由它渲染（后端可插拔，前端不用改） */
@@ -3230,9 +3407,16 @@ export const aiApi = {
     );
   },
 
-  /** 会话详情：元信息 + 全部消息 + 最近一次运行的元信息 */
-  conversation: (id: string) =>
-    get<AiConversationDetail>(`/ai/conversations/${encodeURIComponent(id)}`),
+  /**
+   * 会话详情：元信息 + 消息 + 最近一次运行的元信息。
+   *
+   * ``sinceSeq`` 只取比它更新的消息 —— 一轮结束后页面只需要新追加的那几条，
+   * 不必把整条会话重新拉一遍（长会话那一下能明显感觉到卡顿）。
+   */
+  conversation: (id: string, sinceSeq?: number) =>
+    get<AiConversationDetail>(`/ai/conversations/${encodeURIComponent(id)}`, {
+      params: sinceSeq ? { since_seq: sinceSeq } : {},
+    }),
 
   /**
    * 在会话里发一条消息，边跑边推事件。
@@ -3252,6 +3436,8 @@ export const aiApi = {
     preset = '',
     /** 生效中的虚拟机授权（租约 id）。不传则模型拿不到进虚拟机的工具 */
     vmLease = '',
+    /** 主机命令级别：read 只读 / write 允许提议写命令 */
+    execAccess: 'read' | 'write' = 'write',
   ) =>
     streamSse<AiChatStreamEvent>(
       `/ai/conversations/${encodeURIComponent(conversationId)}/messages/stream`,
@@ -3262,6 +3448,7 @@ export const aiApi = {
         preset: preset || undefined,
         provider_id: providerId || undefined,
         allow_exec: allowExec || undefined,
+        exec_access: allowExec ? execAccess : undefined,
         vm_lease: vmLease || undefined,
       },
       onEvent,

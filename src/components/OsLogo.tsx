@@ -33,21 +33,27 @@
    ========================================================================== */
 
 import { useState } from 'react';
-import archLinuxLogo from '../assets/os-logos/arch.svg';
+import alibabaLogo from '../assets/os-logos/alios.svg';
 import alpineLogo from '../assets/os-logos/alpine.svg';
+import archLinuxLogo from '../assets/os-logos/arch.svg';
 import almaLinuxLogo from '../assets/os-logos/alma.svg';
+import anolisLogo from '../assets/os-logos/anolis.png';
 import centosLogo from '../assets/os-logos/centos.svg';
 import coreosLogo from '../assets/os-logos/coreos.svg';
 import debianLogo from '../assets/os-logos/debian.svg';
+import deepinLogo from '../assets/os-logos/deepin.svg';
 import fedoraLogo from '../assets/os-logos/fedora.svg';
 import fnosLogo from '../assets/os-logos/fnos.svg';
 import linuxLogo from '../assets/os-logos/linux.svg';
 import opencloudosLogo from '../assets/os-logos/opencloudos.svg';
+import openEulerLogo from '../assets/os-logos/openeuler.svg';
 import openwrtLogo from '../assets/os-logos/openwrt.svg';
+import proxmoxLogo from '../assets/os-logos/proxmox.svg';
 import redhatLogo from '../assets/os-logos/redhat.svg';
 import rockyLogo from '../assets/os-logos/rocky.svg';
 import suseLogo from '../assets/os-logos/suse.svg';
 import tencentLogo from '../assets/os-logos/tencent.svg';
+import uosLogo from '../assets/os-logos/uos.svg';
 import ubuntuLogo from '../assets/os-logos/ubuntu.svg';
 import windowsLogo from '../assets/os-logos/windows.svg';
 import { osFamilyMark, type OsFamily, type OsFamilyKey } from '../utils/osFamily';
@@ -58,6 +64,11 @@ import { osFamilyMark, type OsFamily, type OsFamilyKey } from '../utils/osFamily
  * `linux`（认得出是 Linux、但认不出发行版）用 Tux —— 它本来就是 Linux 的官方
  * 标识，比随便挑一个发行版诚实。`other` 刻意**没有**图标：那代表「认不出」，
  * 给任何图形都会暗示一个并不存在的结论，交给文字缩写块回退。
+ *
+ * `kylin` / `redflag` 同样**不进这张表**：两家都没有可直接使用的方形矢量标识
+ * （麒麟只有位图与横排文字标，红旗是书法字 + Linux 的组合标），自己描出来的
+ * 图形既不是官方标、也认不出是什么。这两个家族退回文字缩写块（KYL / RFL）——
+ * 宁可退化，也不要一个「像那么回事」的假 logo。
  */
 const OS_LOGOS: Partial<Record<OsFamilyKey, string>> = {
   windows: windowsLogo,
@@ -68,11 +79,24 @@ const OS_LOGOS: Partial<Record<OsFamilyKey, string>> = {
   rocky: rockyLogo,
   alma: almaLinuxLogo,
   fedora: fedoraLogo,
+  /* 统信 UOS：官方「UOS」字标的重绘（含官方蓝 → 青绿渐变）。它没有方形徽标，
+     画布是横排的 2.3:1，按 contain 缩放即可，不为图标位改版。 */
+  uos: uosLogo,
+  /* openEuler / 龙蜥 / 深度 / 阿里云 / Proxmox：官方标识的原始矢量或官方站点图标，
+     未做二次描摹。来源见各文件头注释；龙蜥是 openanolis.cn 的 118×118 官方图标
+     （PNG 没有注释位，记在这里）。 */
+  openeuler: openEulerLogo,
+  anolis: anolisLogo,
   /* TencentOS：官方标识只有位图（蓝底 #0052d9 的斜方形 + 白色 t）。这里按轮廓
      重绘成矢量（外框 4 个顶点、内圈 11 个），斜边才不会像放大位图那样出现台阶 ——
      列表里它只有 16px。**是重绘不是原图**：拿到官方 SVG 直接替换这个文件即可。 */
   tencent: tencentLogo,
+  /* openCloudOS：按官方图标重绘的两叶 + 两楔形（官方只有位图），三色取自原图。
+     详见文件头注释。 */
   opencloudos: opencloudosLogo,
+  deepin: deepinLogo,
+  alios: alibabaLogo,
+  proxmox: proxmoxLogo,
   suse: suseLogo,
   coreos: coreosLogo,
   openwrt: openwrtLogo,

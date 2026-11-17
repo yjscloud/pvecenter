@@ -15,9 +15,11 @@ import {
   IconChevronDown,
   IconLogout,
   IconMenu,
+  IconMoon,
   IconRefresh,
   IconSearch,
   IconSettings,
+  IconSun,
   IconUser,
   IconUsers,
 } from './Icons';
@@ -26,6 +28,7 @@ import { ConsoleStatus } from './ConsoleStatus';
 import { ScopeSelect } from './ScopeSelect';
 import { useI18n, useT } from '../i18n';
 import { LanguageSelect } from './LanguageSelect';
+import { getThemeMode, resolveTheme, setThemeMode, subscribeTheme, type ThemeMode } from '../utils/theme';
 
 /** 命令面板的快捷键提示：Mac 上是 ⌘K，其它平台是 Ctrl K */
 const SHORTCUT =
@@ -53,6 +56,11 @@ export function Topbar({ onOpenMobileNav, onOpenSearch, title }: TopbarProps) {
   const disabledPaths = useUiPrefs().nav_disabled;
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  /* 主题偏好：跟随系统 / 浅色 / 深色。只影响本机，不写账号配置 */
+  const [themeMode, setThemeModeState] = useState<ThemeMode>(() => getThemeMode());
+  useEffect(() => subscribeTheme(() => setThemeModeState(getThemeMode())), []);
+  const isDark = resolveTheme(themeMode) === 'dark';
 
   /* 健康状态轮询：间隔跟「设置 → 面板设置 → 数据刷新间隔」走
      （顶栏不随切页卸载，所以设置改了会由 useRefreshInterval 立刻接上） */
@@ -147,6 +155,15 @@ export function Topbar({ onOpenMobileNav, onOpenSearch, title }: TopbarProps) {
           }}
         >
           <IconRefresh size={16} className={refreshing ? 'spin' : undefined} />
+        </IconButton>
+
+        {/* 深浅色切换：运维常熬夜值守，主题是高频偏好，放顶栏一键可达 */}
+        <IconButton
+          label={isDark ? t('topbar.themeLight') : t('topbar.themeDark')}
+          className="topbar-theme"
+          onClick={() => setThemeMode(isDark ? 'light' : 'dark')}
+        >
+          {isDark ? <IconSun size={16} /> : <IconMoon size={16} />}
         </IconButton>
 
         {/* 语言切换：常驻顶栏。收进头像菜单里等于没有 —— 用户找不到就不会用 */}

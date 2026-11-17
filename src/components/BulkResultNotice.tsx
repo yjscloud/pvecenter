@@ -40,6 +40,8 @@ const ACTION_LABEL_KEYS: Record<string, MessageKey> = {
   tag: 'bulk.tag',
   migrate: 'bulk.migrate',
   snapshot: 'bulk.snapshot',
+  snapshot_restore: 'bulk.snapshot_restore',
+  snapshot_delete: 'bulk.snapshot_delete',
   assign: 'bulk.assign',
 };
 
@@ -69,6 +71,11 @@ export function BulkResultNotice({
   const toast = useToast();
   const label = t(bulkActionKey(result.action));
   const tone = result.failed === 0 ? 'success' : result.ok === 0 ? 'danger' : 'warning';
+  /* 汇总里的量词随目标类型走：批量删除快照的每一条是「某个快照」，不是「某台
+     机器」。英文侧两者都为空串，同一套词条兼顾两种语言。 */
+  const unit = t(
+    result.action === 'snapshot_delete' ? 'bulk.unitSnapshot' : 'bulk.unitGuest',
+  );
 
   const hasFailure = result.failed > 0;
   /* 有失败就默认摊开 —— 用户此刻唯一想知道的就是「哪几台出问题了」；
@@ -100,11 +107,11 @@ export function BulkResultNotice({
     if (lines.length === 0) return;
     try {
       await navigator.clipboard.writeText(
-        `${t('bulk.failedList', { label, count: lines.length })}\n${lines.join('\n')}`,
+        `${t('bulk.failedList', { label, count: lines.length, unit })}\n${lines.join('\n')}`,
       );
       toast.success(
         t('bulk.copyList'),
-        t('bulk.copiedHint', { count: lines.length }),
+        t('bulk.copiedHint', { count: lines.length, unit }),
       );
     } catch {
       toast.error(t('common.copyFailed'), t('common.clipboardDenied'));
@@ -118,6 +125,7 @@ export function BulkResultNotice({
         label,
         ok: result.ok,
         failed: result.failed,
+        unit,
       })}
       action={
         <div className="flex items-center gap-8">
@@ -136,7 +144,7 @@ export function BulkResultNotice({
           </Button>
           {result.failed > 0 && onRetryFailed ? (
             <Button size="sm" variant="secondary" loading={retrying} onClick={onRetryFailed}>
-              {t('bulk.retryFailed', { count: result.failed })}
+              {t('bulk.retryFailed', { count: result.failed, unit })}
             </Button>
           ) : null}
           <Button size="sm" variant="ghost" onClick={onClose}>
@@ -188,7 +196,7 @@ export function BulkResultNotice({
                 <tbody>
                   {rows.map((item) => (
                     <tr
-                      key={`${item.node}-${item.vmid}`}
+                      key={`${item.node}-${item.vmid}-${item.name}`}
                       className={item.ok ? '' : 'is-failed'}
                     >
                       <td className="mono fs-sm">
@@ -220,8 +228,8 @@ export function BulkResultNotice({
         </div>
       ) : (
         <span className="fs-sm text-secondary">
-          {t('bulk.summaryOk', { count: result.ok })}
-          {hasFailure ? t('bulk.summaryFailed', { count: result.failed }) : ''}
+          {t('bulk.summaryOk', { count: result.ok, unit })}
+          {hasFailure ? t('bulk.summaryFailed', { count: result.failed, unit }) : ''}
           {t('bulk.summaryTail')}
         </span>
       )}

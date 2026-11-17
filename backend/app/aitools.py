@@ -358,6 +358,140 @@ HOST_TOOLS: List[Dict[str, Any]] = [
     },
 ]
 
+# ------------------------------------------------------------ 分组工具（瘦身）
+# 26 个「一条命令一个工具」摊在函数表里，代价是**每一步模型调用都要重发一遍**整张
+# 表（8KB 上下），而且模型为了拼一个全貌要来回好几轮。这里按「回答什么问题」合并：
+# 一次调用跑一组只读命令，回到模型手里是一份带命令标题的合集。
+#
+# 三条约束不变：
+#   1. 组里只允许**只读**原子工具（写命令仍是逐条审批的独立工具，绝不进组）；
+#   2. 每条命令仍走原子工具那套参数白名单 / 路径白名单 / quote；
+#   3. 单条输出照旧截断，整组合集再截一次 —— 分组不等于把上下文撑爆。
+#
+# 原子工具保留在 :data:`HOST_TOOLS` 里：历史会话与旧会话记录里可能还在引用它们，
+# 执行路径必须继续可用；只是不再下发给模型（见 :data:`HOST_SPECS`）。
+HOST_GROUPS: List[Dict[str, Any]] = [
+    {
+        "name": "host_system_overview",
+        "group": True,
+        "description": (
+            "一眼看整体：磁盘用量（df -h）、内存与 swap（free -m）、"
+            "负载与运行时长（uptime）。"
+        ),
+        "steps": [
+            {"step": "host_disk_usage"},
+            {"step": "host_memory"},
+            {"step": "host_load"},
+        ],
+        "params": {},
+        "limit": 3600,
+    },
+    {
+        "name": "host_process_top",
+        "group": True,
+        "description": (
+            "按 CPU 与常驻内存（RSS）倒序列出进程，定位吃资源的进程是谁。"
+        ),
+        "steps": [{"step": "host_top_processes"}, {"step": "host_top_memory"}],
+        "params": {},
+        "limit": 4000,
+    },
+    {
+        "name": "host_disk_diag",
+        "group": True,
+        "description": "磁盘侧：用量（df -h）与拓扑（lsblk），判断分区将满、盘位与挂载点。",
+        "steps": [{"step": "host_disk_usage"}, {"step": "host_block_devices"}],
+        "params": {},
+        "limit": 4000,
+    },
+    {
+        "name": "host_perf_deep",
+        "group": True,
+        "description": (
+            "性能深挖：CPU 型号与拓扑（lscpu）、1 秒 3 次的 vmstat 采样、"
+            "软中断在各核的分布（/proc/softirqs）。"
+        ),
+        "steps": [
+            {"step": "host_cpu_info"},
+            {"step": "host_vmstat"},
+            {"step": "host_softirqs"},
+        ],
+        "params": {},
+        "limit": 4000,
+    },
+    {
+        "name": "host_net_diag",
+        "group": True,
+        "description": (
+            "网络诊断：网卡地址（ip -br addr）、路由表、收发包与错误计数、套接字总览；"
+            "填 address 则加 ping，填 name 则加 DNS 解析。"
+        ),
+        "steps": [
+            {"step": "host_ip_addr"},
+            {"step": "host_ip_route"},
+            {"step": "host_net_stats"},
+            {"step": "host_socket_summary"},
+            {"step": "host_ping", "requires": ["address"]},
+            {"step": "host_dns_lookup", "requires": ["name"]},
+        ],
+        "params": {
+            "address": {"pattern": "host", "required": False},
+            "name": {"pattern": "host", "required": False},
+        },
+        "limit": 4000,
+    },
+    {
+        "name": "host_service_diag",
+        "group": True,
+        "description": (
+            "服务排查：不带 unit 列启动失败的单元（systemctl --failed）；"
+            "带 unit 则给 systemctl status 与该单元最近 60 行日志。"
+        ),
+        "steps": [
+            {"step": "host_failed_units", "unless": ["unit"]},
+            {"step": "host_unit_status", "requires": ["unit"]},
+            {"step": "host_read_log", "requires": ["unit"], "args": {"lines": "60"}},
+        ],
+        "params": {"unit": {"pattern": "unit", "required": False}},
+        "limit": 4000,
+    },
+    {
+        "name": "host_security_posture",
+        "group": True,
+        "description": "登录与时间：最近成功登录（last -n 20）与时间同步状态（timedatectl）。",
+        "steps": [{"step": "host_recent_logins"}, {"step": "host_time_sync"}],
+        "params": {},
+        "limit": 2800,
+    },
+    {
+        "name": "host_kernel_diag",
+        "group": True,
+        "description": (
+            "内核侧：最近的内核日志（journalctl -k）与启动参数（/proc/cmdline），"
+            "排查 OOM、驱动报错与 crashkernel。"
+        ),
+        "steps": [
+            {"step": "host_kernel_log"},
+            {"step": "host_kernel_cmdline"},
+        ],
+        "params": {"lines": {"pattern": "lines", "required": False, "default": "80"}},
+        "limit": 4000,
+    },
+]
+
+#: 已经被分组覆盖的原子工具：仍然可以执行（历史会话可能在调），但不再下发。
+HOST_GROUP_MEMBERS = frozenset(
+    str(item.get("step") or "")
+    for group in HOST_GROUPS
+    for item in group.get("steps") or []
+)
+
+#: 模型实际能看到的平台自身工具：分组工具 + 没被合并的原子工具。
+#: 顺序固定（分组在前、原子在后），tools 前缀才稳定、缓存才命中。
+HOST_SPECS: List[Dict[str, Any]] = list(HOST_GROUPS) + [
+    item for item in HOST_TOOLS if str(item.get("name") or "") not in HOST_GROUP_MEMBERS
+]
+
 # 平台内部数据：不走命令，直接读已有巡检模块的结果（零风险，且比读日志准）
 INTERNAL_TOOLS: List[Dict[str, Any]] = [
     {
@@ -423,8 +557,53 @@ INTERNAL_TOOLS: List[Dict[str, Any]] = [
     },
 ]
 
+#: 工具名 → 定义。分组工具也在里面：派发层用同一张表判断「这是不是主机工具」，
+#: 「有没有目标主机」「要不要写审批」都靠它，分成两张表迟早漏一处。
 HOST_TOOL_MAP = {item["name"]: item for item in HOST_TOOLS}
+HOST_TOOL_MAP.update({item["name"]: item for item in HOST_GROUPS})
 INTERNAL_TOOL_MAP = {item["name"]: item for item in INTERNAL_TOOLS}
+
+#: 体检轮**不需要再下发**的工具：``collect_evidence`` 已经把同样的数据放进证据里。
+#:
+#: 下发了却只是让模型把一份数据重查一遍 —— 一次重复调用就是一整个模型往返
+#: （几秒到十几秒），而且每一步的函数表都要重新 prefill。
+INSPECT_EVIDENCE_DUPLICATED = frozenset(
+    {"get_ssh_failures", "get_alert_history", "get_recent_changes"}
+)
+
+#: 少数工具的「一句话说明」不能靠自动截断 —— 第一句之后那句是**硬约束**
+#: （路径白名单、要不要审批），砍掉会让模型多试错一轮。这里显式写短版。
+_BRIEF_OVERRIDES: Dict[str, str] = {
+    "host_list_dir": "列目录（ls -la），仅限 /etc、/var/log、/opt、/srv、/usr/local",
+    "host_read_config": "读配置文件全文（cat），仅限固定白名单（sshd_config、fstab 等）",
+    "host_read_log": "读 systemd 单元最近日志（journalctl），unit 填 sshd、nginx、pveproxy 等",
+    "host_run_command": "执行一条只读诊断命令（需本次已授权）；可用 | 串联多个只读命令",
+    "host_propose_command": "提议一条写命令，用户逐条批准后才执行；被拒后不要重复提议",
+    "get_metrics_history": "取平台历史指标（CPU/内存/磁盘/网络）；scope=guest 需 node+vmid，scope=node 需 node",
+    "get_related_resources": "取节点负载、同节点邻居虚拟机与存储用量，判断是否宿主资源争抢",
+}
+
+#: 一句话说明的截断点：``，用于…`` / ``。第二句…`` 都是给人读的补充，
+#: 而这段说明**每一步、每一次模型调用**都要随 tools 重发一次，是要付钱的输入。
+_BRIEF_MARKS = ("。", "；", "，用于", "，避免", "，适合", "，免得", "，可在")
+
+
+def _brief_description(name: str, text: Any) -> str:
+    """把工具说明压成一行：模型选工具看的是「这个工具做什么」，不是使用手册。"""
+    override = _BRIEF_OVERRIDES.get(str(name or ""))
+    if override:
+        return override
+    flat = " ".join(str(text or "").split())
+    if not flat:
+        return ""
+    cut = len(flat)
+    for mark in _BRIEF_MARKS:
+        index = flat.find(mark)
+        # 只在句子中段截断：开头的标点或整句就是一个短语时不动
+        if 8 <= index < cut:
+            cut = index
+    brief = flat[:cut].strip()
+    return brief if len(brief) >= 6 else flat
 
 #: 工具 → 额外权限门槛。
 #:
@@ -498,22 +677,43 @@ def _params_schema(item: Dict[str, Any]) -> Dict[str, Any]:
     return {"type": "object", "properties": props, "required": required}
 
 
-def openai_tools(include_exec: bool = False) -> List[Dict[str, Any]]:
+def openai_tools(
+    include_exec: bool = False,
+    include_write: bool = True,
+    mode: str = "",
+) -> List[Dict[str, Any]]:
     """转成 OpenAI function calling 的 tools 格式（主机命令 + 平台内部工具）。
 
     ``include_exec=True`` 时额外带上 ``host_run_command``（模型自己拼只读命令）。
     只有本次排查拿到了用户授权、调用方才会传 True —— 默认这条路径不存在。
+    ``include_write=False`` 时连 ``host_propose_command`` 也不下发：只读级别下
+    模型连「提议写命令」的入口都没有，不能靠提示词约束来假装它不存在。
+
+    ``mode="inspect"`` 时跳过证据里已有的工具（见 :data:`INSPECT_EVIDENCE_DUPLICATED`）。
+
+    **顺序固定**（内部工具 → 主机工具）：tools 是 prompt 最前面那段，顺序与文案
+    逐字节稳定，上游的 prefix cache 才命中得了 —— 每步重发 8KB 工具表时，命中与
+    不命中的差别就是首字快慢与输入成本。
     """
     specs: List[Dict[str, Any]] = []
-    for item in INTERNAL_TOOLS + HOST_TOOLS:
+    skip = INSPECT_EVIDENCE_DUPLICATED if str(mode or "") == "inspect" else frozenset()
+    # 只下发 HOST_SPECS（分组工具 + 未合并的原子工具），不下发被分组合并掉的那些：
+    # 它们的价值已经在组里一次性拿到，单独列出来只会让函数表更贵、选错工具的概率更高
+    for item in INTERNAL_TOOLS + HOST_SPECS:
         if item.get("exec") and not include_exec:
+            continue
+        if item.get("writes") and not include_write:
+            continue
+        if item["name"] in skip:
             continue
         specs.append(
             {
                 "type": "function",
                 "function": {
                     "name": item["name"],
-                    "description": item["description"],
+                    "description": _brief_description(
+                        item["name"], item.get("description")
+                    ),
                     "parameters": _params_schema(item),
                 },
             }
@@ -622,6 +822,37 @@ def validate_args(tool: Dict[str, Any], raw: Any) -> List[str]:
     return argv
 
 
+def _group_steps(
+    tool: Dict[str, Any], raw: Any
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """把分组工具展开成「这次真正要跑的原子工具 + 参数」。
+
+    ``requires`` / ``unless`` 让同一组按参数走不同分支（带 unit 查某个服务、
+    不带 unit 列所有失败单元）。参数只从原子工具自己的 ``params`` 里取 ——
+    没登记过的键不会顺着分组工具漏给命令模板。
+    """
+    args = raw if isinstance(raw, dict) else {}
+    picked: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for item in tool.get("steps") or []:
+        atomic = HOST_TOOL_MAP.get(str(item.get("step") or ""))
+        if atomic is None or atomic.get("group"):
+            continue
+        if any(
+            not str(args.get(key) or "").strip()
+            for key in item.get("requires") or []
+        ):
+            continue
+        if any(str(args.get(key) or "").strip() for key in item.get("unless") or []):
+            continue
+        step_args: Dict[str, Any] = dict(item.get("args") or {})
+        for key in (atomic.get("params") or {}):
+            value = str(args.get(key) or "").strip()
+            if value:
+                step_args.setdefault(key, value)
+        picked.append((atomic, step_args))
+    return picked
+
+
 def command_preview(name: str, args: Any) -> str:
     """这次调用**打算**在主机上跑的那条命令；拿不到就返回空串。
 
@@ -647,6 +878,16 @@ def command_preview(name: str, args: Any) -> str:
     raw = args if isinstance(args, dict) else {}
     if tool.get("exec"):
         return str(raw.get("command") or "").strip()[:MAX_WRITE_COMMAND_LENGTH]
+    if tool.get("group"):
+        # 分组工具的「命令」是它这一轮要跑的几条命令，按执行顺序摊开 ——
+        # 用户核对时看到的是完整清单，不是一句「跑了 host_net_diag」
+        parts: List[str] = []
+        for atomic, step_args in _group_steps(tool, raw):
+            try:
+                parts.append(" ".join(validate_args(atomic, step_args)))
+            except ToolError:
+                return ""
+        return " ; ".join(parts)
     try:
         argv = validate_args(tool, raw)
     except ToolError:
@@ -967,10 +1208,28 @@ async def _run_remote(
 
 
 def _truncate(text: str, limit: int) -> str:
+    """超长输出按 **头 + 尾** 截断，而不是只留开头。
+
+    日志里最要紧的几行（OOM killer、最后一条报错、重启前后的状态）恰好都在末尾；
+    只切头部时模型看到的是「前面风平浪静」，于是得出错误结论。留一段尾部不增加
+    token（总量仍等于 limit 上下），却把结论保住了。
+
+    中间那段不是白丢的：标记里写了省略了多少字符，模型据此知道「还有更多」，
+    需要时可以用更精确的参数再查一次。
+    """
     body = (text or "").strip()
-    if len(body) <= limit:
+    if len(body) <= limit or limit <= 0:
         return body
-    return body[:limit] + "\n…（已截断，完整输出共 " + str(len(body)) + " 字符）"
+    head_len = int(limit * 0.6)
+    tail_len = max(0, limit - head_len)
+    omitted = max(0, len(body) - head_len - tail_len)
+    return (
+        body[:head_len]
+        + "\n…（中间省略 "
+        + str(omitted)
+        + " 字符，以下是输出末尾）…\n"
+        + body[-tail_len:]
+    )
 
 
 def _run_local_shell(
@@ -1137,6 +1396,62 @@ async def _run_propose_tool(
     }
 
 
+async def _run_group(
+    tool: Dict[str, Any],
+    args: Any,
+    *,
+    row: Optional[Dict[str, Any]],
+    local: bool,
+    approval: Optional[Callable[[str, str], Awaitable[bool]]] = None,
+    on_output: Optional[Callable[[str], None]] = None,
+    on_command: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """执行一个分组工具：按顺序跑组内只读命令，合成一份带标题的结果。
+
+    为什么串行而不是并行：这些命令共用一条 SSH 通道，并行只会让远端排队、把
+    实时输出搅在一起（终端里两行命令的输出交错，用户没法核对）。串行 4 条
+    只读命令通常几百毫秒，比再来一轮模型往返便宜得多。
+    """
+    steps = _group_steps(tool, args)
+    if not steps:
+        return {
+            "ok": False,
+            "output": i18n.pick(
+                "参数不完整，这一组检查项没有可执行的内容。",
+                "Incomplete arguments: nothing in this group can run.",
+            ),
+        }
+    started = time.time()
+    blocks: List[str] = []
+    commands: List[str] = []
+    ok_all = True
+    for atomic, step_args in steps:
+        outcome = await run_host_tool(
+            str(atomic["name"]),
+            step_args,
+            row=row,
+            local=local,
+            approval=approval,
+            on_output=on_output,
+            on_command=on_command,
+        )
+        command = str(outcome.get("command") or "").strip()
+        if command:
+            commands.append(command)
+        if not outcome.get("ok"):
+            ok_all = False
+        body = str(outcome.get("output") or "").strip()
+        blocks.append(f">>> {command or atomic['name']}\n{body}")
+    return {
+        "ok": ok_all,
+        "output": _truncate(
+            "\n\n".join(blocks), int(tool.get("limit") or MAX_OUTPUT)
+        ),
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "command": " ; ".join(commands),
+    }
+
+
 async def run_host_tool(
     name: str,
     args: Any,
@@ -1155,6 +1470,18 @@ async def run_host_tool(
     tool = HOST_TOOL_MAP.get(name)
     if tool is None:
         return {"ok": False, "output": i18n.pick("没有这个工具", "No such tool")}
+
+    # 分组工具：一次调用跑一组只读命令（见 _run_group）
+    if tool.get("group"):
+        return await _run_group(
+            tool,
+            args,
+            row=row,
+            local=local,
+            approval=approval,
+            on_output=on_output,
+            on_command=on_command,
+        )
 
     # 写命令：先过用户审批再落地
     if tool.get("writes"):

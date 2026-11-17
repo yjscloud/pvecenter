@@ -1,7 +1,7 @@
 {
   "name": "pvecenter-panel",
   "private": true,
-  "version": "0.5.7",
+  "version": "0.5.8",
   "type": "module",
   "engines": {
     "node": ">=22.22.0"
@@ -16,6 +16,7 @@
     "check:quota": "node scripts/check-quota-invalidation.mjs",
     "verify": "npm run typecheck && npm run check:graph && npm run check:i18n && npm run check:quota && npm run build",
     "serve:dist": "node scripts/serve-dist.mjs",
+    "perf:ai": "node scripts/perf-ai.mjs",
     "lint": "echo \"no lint configured\""
   },
   "dependencies": {

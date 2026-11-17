@@ -418,14 +418,23 @@ _KEEP_KEYS = (
 _KEEP_PREFIXES = ("net", "hostpci", "usb", "serial", "rng", "audio", "numa")
 
 
-def identity_overrides(old_config: Dict[str, Any]) -> Dict[str, Any]:
+def identity_overrides(
+    old_config: Dict[str, Any], *, target_ostype: str = ""
+) -> Dict[str, Any]:
     """重建后要写回新机器的「身份」：网卡（含 MAC）、CPU/内存、标签、直通设备…
 
     刻意**不含**磁盘与 cloud-init：磁盘已经随旧机器删掉了，cloud-init 则由这次
     重装的参数重新下发。``efidisk0`` / ``tpmstate0`` 单独处理（见
     :func:`firmware_overrides`）—— 它们也是盘，但少了机器起不来。
+
+    ``ostype`` 是唯一的例外：它虽然在 ``_KEEP_KEYS`` 里（同平台重装要保持原有
+    硬件口径），但**跨平台重装必须换成目标模板的值**。原机器若被错标成
+    ``win11``，只把系统盘换成 TencentOS 而不改这一个键，面板、AI 与 PVE 都会
+    继续把它当 Windows —— 启动参数、磁盘/网卡建议、徽标全错，且重装多少次
+    都不会自愈。
     """
     out: Dict[str, Any] = {}
+    wanted = str(target_ostype or "").strip().lower()
     for key, value in (old_config or {}).items():
         name = str(key)
         # 默认机型不往回写：各版本 PVE 对它的叫法不同（PVE 8 的 API 认 pc、PVE 9
@@ -433,8 +442,15 @@ def identity_overrides(old_config: Dict[str, Any]) -> Dict[str, Any]:
         # 自己的默认（就是 i440fx），两个版本都对。
         if name == "machine" and vmconfig.is_default_machine(value):
             continue
+        if name == "ostype" and wanted:
+            # 新系统来自模板，模板的 ostype 才是重装后的真实大类
+            out[name] = wanted
+            continue
         if name in _KEEP_KEYS or name.startswith(_KEEP_PREFIXES):
             out[name] = value
+    # 旧机器没写 ostype（PVE 用默认值）而模板有：补上新值
+    if wanted and "ostype" not in out:
+        out["ostype"] = wanted
     return out
 
 
@@ -672,7 +688,30 @@ async def _reclone(
             ) from exc
 
     # ---- 3. 把「身份」写回去 -------------------------------------------
-    restored = {**identity_overrides(old_config), **firmware_overrides(old_config)}
+    # 目标模板的 ostype 决定重装后的系统大类：跨平台重装时必须覆盖旧值，
+    # 否则错标的 win* 会跟着机器一直传下去（PVE 的启动参数、面板的徽标都看它）。
+    template_ostype = ""
+    try:
+        tpl_cfg = (
+            await client.get(
+                f"/nodes/{template_node}/qemu/{template_vmid}/config"
+            )
+            or {}
+        )
+        template_ostype = guest_ostype(tpl_cfg)
+    except ProxmoxError:
+        template_ostype = ""
+    old_ostype = guest_ostype(old_config).lower()
+    if template_ostype and template_ostype.lower() != old_ostype:
+        record(
+            "校准系统类型",
+            True,
+            f"ostype {old_ostype or '(未设置)'} → {template_ostype.lower()}（按目标模板）",
+        )
+    restored = {
+        **identity_overrides(old_config, target_ostype=template_ostype),
+        **firmware_overrides(old_config),
+    }
     if restored:
         try:
             await client.qemu_set_config(node, vmid, restored)
@@ -1509,6 +1548,13 @@ async def _run_reinstall(job: ReinstallJob, kwargs: Dict[str, Any]) -> None:
         logger.exception("重装作业 %s 异常结束", job.id)
     else:
         job.status = "success"
+        # 系统盘已经换成新模板：面板侧那句「这台是 X 系统」描述的是旧盘，
+        # 必须作废（保留手动 IP）—— 否则列表徽标会一直停在旧系统，
+        # 典型表现是重装成 TencentOS 之后仍显示 Windows 的 logo。
+        # 延迟导入：vm_meta 是路由模块（routers 反过来 import 本模块）。
+        from .routers.vm_meta import drop_os
+
+        await drop_os(job.connection, job.node, job.vmid)
         job.old_volume = str(result.get("old_volume") or "")
         job.new_volume = str(result.get("new_volume") or "")
         disk_gb = result.get("disk_gb")

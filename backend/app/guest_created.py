@@ -446,6 +446,46 @@ def config_source(config: Dict[str, Any], node: Any) -> Dict[str, Any]:
     return {}
 
 
+#: 删除动作：审计里 target 就是「节点/VMID」。用它给「来源模板」划一条时间下界。
+_DELETE_ACTIONS = ("vm.delete", "ct.delete")
+
+
+async def _delete_cutoffs(refs: List[str]) -> Dict[str, Tuple[float, int]]:
+    """每个目标最近一次被删除的 ``(timestamp, id)``；没删过就没有条目。
+
+    VMID 会被回收：机器删掉之后，同号的新机器可能从面板之外建出来（恢复备份、
+    PVE 界面克隆、ISO 安装），那条路**不会**写「来源」审计。不设下界的话，列表
+    会把上一台机器的克隆来源贴到新机器身上 —— 最刺眼的表现是刚下发的 TencentOS
+    顶着上一台 Windows 机器的徽标。删除本身一定在审计里，拿它当分界线即可。
+
+    同一秒内两条记录靠 ``id`` 分先后（时间戳只有秒级精度），所以返回的是二元组。
+    """
+    if not refs:
+        return {}
+    marks = ", ".join("?" for _ in refs)
+    out: Dict[str, Tuple[float, int]] = {}
+    try:
+        async with database.connect() as db:
+            cursor = await db.execute(
+                "SELECT target_guest, timestamp, id FROM audit_log "
+                f"WHERE action IN ({', '.join('?' for _ in _DELETE_ACTIONS)}) "
+                f"AND target_guest IN ({marks}) "
+                "ORDER BY timestamp DESC, id DESC",
+                (*_DELETE_ACTIONS, *refs),
+            )
+            rows = await cursor.fetchall()
+    except Exception:  # noqa: BLE001 - 查不到就不设下界，保持原来的行为
+        logger.debug("查询删除时间失败", exc_info=True)
+        return {}
+    for row in rows:
+        ref = str(row["target_guest"] or "")
+        if ref in out:
+            # 已按时间倒序：每个目标只认第一条（最近一次删除）
+            continue
+        out[ref] = (float(row["timestamp"] or 0), int(row["id"] or 0))
+    return out
+
+
 async def source_of(
     conn_id: Any, node: Any, vmid: Any, guest_type: Any
 ) -> Dict[str, Any]:
@@ -470,16 +510,23 @@ async def source_of(
         return {}
 
     actions = ", ".join("?" for _ in _SOURCE_ACTIONS)
+    ref = f"{node}/{vmid}"
+    # 这台机器上一次被删除之前的克隆记录不属于它（VMID 回收）
+    cutoff = (await _delete_cutoffs([ref])).get(ref, (0.0, 0))
     try:
         async with database.connect() as db:
-            # 只看成功的：失败的那次重装没动过系统盘，来源仍然是上一个模板。
+            # 只看成功 / 部分成功的：失败的那次重装没动过系统盘，来源仍然是上一个
+            # 模板；而 ``partial`` 表示机器**已经建出来了**（只是后续覆盖配置没
+            # 应用上），来源同样成立 —— 漏掉它会让这类机器在列表里没有徽标。
             # 用 target_guest（审计表上的虚拟列 + 索引）而不是前置通配的 LIKE：
             # 后者每台机器一次全表扫描，而它跑在详情 / 列表首屏路径上。
             cursor = await db.execute(
-                f"SELECT target FROM audit_log WHERE action IN ({actions}) "
-                "AND result = 'success' AND target_guest = ? "
+                f"SELECT target, timestamp, id FROM audit_log "
+                f"WHERE action IN ({actions}) "
+                "AND result IN ('success', 'partial') AND target_guest = ? "
+                "AND (timestamp > ? OR (timestamp = ? AND id > ?)) "
                 "ORDER BY timestamp DESC, id DESC LIMIT 1",
-                (*_SOURCE_ACTIONS, f"{node}/{vmid}"),
+                (*_SOURCE_ACTIONS, ref, cutoff[0], cutoff[0], cutoff[1]),
             )
             row = await cursor.fetchone()
     except Exception:  # noqa: BLE001 - 查不到就当「没有来源」，不影响详情页
@@ -492,7 +539,12 @@ async def source_of(
     src_node, _, src_vmid = origin.rpartition("/")
     if not src_vmid.isdigit():
         return {}
-    return {"node": src_node or str(node), "vmid": int(src_vmid)}
+    origin_node = src_node or str(node)
+    # 旧格式的克隆记录只写了目标机器（`… -> 104`），解析出来就是它自己。
+    # 宁可不填，也不能让列表显示「来源：自己」。
+    if int(src_vmid) == int(vmid) and origin_node == str(node):
+        return {}
+    return {"node": origin_node, "vmid": int(src_vmid)}
 
 
 async def sources_for(
@@ -532,11 +584,14 @@ async def sources_for(
     for start in range(0, len(refs), 400):
         chunk = refs[start : start + 400]
         marks = ", ".join("?" for _ in chunk)
+        # 同号机器被删过又重新建出来时，删除之前的克隆记录不属于现在这台
+        cutoffs = await _delete_cutoffs(list(chunk))
         try:
             async with database.connect() as db:
                 cursor = await db.execute(
-                    f"SELECT target_guest, target FROM audit_log "
-                    f"WHERE action IN ({actions}) AND result = 'success' "
+                    f"SELECT target_guest, target, timestamp, id FROM audit_log "
+                    f"WHERE action IN ({actions}) "
+                    "AND result IN ('success', 'partial') "
                     f"AND target_guest IN ({marks}) "
                     "ORDER BY timestamp DESC, id DESC",
                     (*_SOURCE_ACTIONS, *chunk),
@@ -551,11 +606,18 @@ async def sources_for(
             if key is None or key in out:
                 # ORDER BY timestamp DESC：每个目标只认第一条（最近一次）
                 continue
+            cutoff = cutoffs.get(ref)
+            if cutoff and (float(row["timestamp"] or 0), int(row["id"] or 0)) <= cutoff:
+                continue
             origin = str(row["target"] or "").split("->", 1)[0].strip()
             src_node, _, src_vmid = origin.rpartition("/")
             if not src_vmid.isdigit():
                 continue
-            out[key] = {"node": src_node or key[1], "vmid": int(src_vmid)}
+            origin_node = src_node or key[1]
+            # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
+            if int(src_vmid) == int(key[2]) and origin_node == key[1]:
+                continue
+            out[key] = {"node": origin_node, "vmid": int(src_vmid)}
     return out
 
 
@@ -637,10 +699,13 @@ async def lxc_sources_for(
     for start in range(0, len(refs), 400):
         chunk = refs[start : start + 400]
         marks = ", ".join("?" for _ in chunk)
+        # 同号容器被删过又重新建出来时，删除之前的建机 / 克隆记录不属于现在这台
+        cutoffs = await _delete_cutoffs(list(chunk))
         try:
             async with database.connect() as db:
                 cursor = await db.execute(
-                    f"SELECT target_guest, target, action, detail FROM audit_log "
+                    f"SELECT target_guest, target, action, detail, timestamp, id "
+                    f"FROM audit_log "
                     f"WHERE action IN ({actions}) AND result = 'success' "
                     f"AND target_guest IN ({marks}) "
                     "ORDER BY timestamp DESC, id DESC",
@@ -656,6 +721,9 @@ async def lxc_sources_for(
             if key is None or key in out:
                 # ORDER BY timestamp DESC：每个目标只认第一条（最近一次）
                 continue
+            cutoff = cutoffs.get(ref)
+            if cutoff and (float(row["timestamp"] or 0), int(row["id"] or 0)) <= cutoff:
+                continue
             if str(row["action"] or "") == _CREATE_ACTION:
                 name = template_file_name(_ostemplate_of(row["detail"]))
                 if name:
@@ -665,7 +733,11 @@ async def lxc_sources_for(
             src_node, _, src_vmid = origin.rpartition("/")
             if not src_vmid.isdigit():
                 continue
-            out[key] = {"node": src_node or key[1], "vmid": int(src_vmid)}
+            origin_node = src_node or key[1]
+            # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
+            if int(src_vmid) == int(key[2]) and origin_node == key[1]:
+                continue
+            out[key] = {"node": origin_node, "vmid": int(src_vmid)}
     return out
 
 

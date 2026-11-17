@@ -371,7 +371,7 @@ PERMISSION_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "key": "ai",
-        "label": "AI 排查助手",
+        "label": "AI 助手",
         "permissions": [
             {
                 "key": "ai.vm.read",

@@ -10,27 +10,63 @@ import type { MessageKey } from './zh-CN';
 export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.title': 'AI assistant',
   'ai.subtitle':
-    'Describe the symptom or just ask — the AI signs in to the host and can also investigate VMs you have granted. Read-only commands run directly; anything that changes the system or installs software needs your approval, step by step.',
+    'Describe the problem. The AI signs in to the host to read logs and run commands. Read-only commands run directly; anything that changes the system asks you first.',
   'ai.runningHint': 'Calling the model and running commands; usually 10-60 seconds',
   'ai.settings': 'Model settings',
   'ai.selectTarget': 'Target machine',
-  'ai.selectTargetPlaceholder': 'Select a machine…',
+  'ai.selectTargetPlaceholder': 'Choose a machine…',
   'ai.selectTargetHint':
-    'Pick one machine — host commands and in-VM access both follow it, no second choice',
+    'Only machines meeting all five conditions are listed: running, securely managed, Guest Agent healthy, cloud-init healthy, and a VM. Any one missing and it will not appear here.',
   'ai.targetBoth': 'host + in-VM',
   'ai.targetHostOnly': 'host commands only',
   'ai.targetHostOnlyHint':
-    'This machine is not registered as a VM (or is not running), so only host commands are available — in-VM access is not.',
-  'ai.pickHostTitle': 'Pick the host to inspect first',
+    'The VM behind this machine cannot be entered right now (not running, Guest Agent not responding, or cloud-init incomplete), so only host commands are available.',
+  'ai.pickHostTitle': 'Pick a machine first',
   'ai.pickHostHint':
-    'The AI signs in to that host to read logs and run commands, so the target must be chosen by you — the panel never preselects one, because inspecting the wrong machine is far worse than one extra click.',
+    'The AI signs in to this machine to run commands, so nothing is preselected — that avoids inspecting the wrong host.',
+  'ai.probingTitle': 'Checking {n} candidate hosts…',
+  'ai.probingHint':
+    'Only VMs that are running, managed, cloud-init ready and have a live Guest Agent can be inspected; they appear here as soon as the check finishes.',
+  'ai.scanPveDownTitle': '{n} PVE connection(s) cannot be read right now',
+  'ai.scanPveDownHint':
+    'Hosts on those connections are treated as unavailable — if the VM state cannot be read, nothing can be run on it either. Re-run the check once PVE is back, or verify the address and credentials under Settings → PVE connections.',
   'ai.noHostTitle': 'No managed host yet',
   'ai.noHostHint':
-    'Inspection only works on servers registered under “SSH security → Managed hosts”. Add the machine you want to inspect first; then it shows up here.',
+    'The AI can only inspect servers registered under “SSH security → Managed hosts”. Add the machine first, then it shows up here.',
+  'ai.noEligibleHostTitle': 'No eligible host yet',
+  'ai.noEligibleHostHint':
+    'No managed host meets all five conditions. Start the target VM, make sure qemu-guest-agent is installed and running inside the guest with agent enabled in the VM config, and check the cloud-init drive.',
+  'ai.targetFilterTitle': 'Why only these machines?',
+  'ai.targetFilterHint':
+    'The AI runs commands on the host and reads logs inside the VM. If any condition below fails, the inspection cannot work — so the machine is left out.',
+  'ai.targetFilterExcluded': '{n} more not listed',
+  'ai.condRunning': 'running',
+  'ai.condManaged': 'onboarded',
+  'ai.condAgent': 'Guest Agent online',
+  'ai.condCloudinit': 'cloud-init complete',
+  'ai.condVm': 'a VM',
+  'ai.excludeSeparator': ', ',
+  'ai.excludeNotVm': '{n} not a VM',
+  'ai.excludeStopped': '{n} not running',
+  'ai.excludeCloudinit': '{n} with incomplete cloud-init',
+  'ai.excludeAgent': '{n} with no Guest Agent response',
+  'ai.excludeUnreachable': '{n} whose state could not be read',
+  'ai.excludeReason.not_vm': 'no linked VM',
+  'ai.excludeReason.stopped': 'VM not running',
+  'ai.excludeReason.cloudinit': 'cloud-init incomplete',
+  'ai.excludeReason.agent': 'Guest Agent not responding',
+  'ai.excludeReason.unreachable': 'state could not be read',
+  'ai.excludeFix': 'Fix',
   'ai.notConfigured': 'No model configured yet',
   'ai.notConfiguredHint':
     'The assistant needs an LLM. External APIs (DeepSeek / OpenAI / …) and self-hosted models (vLLM / Ollama) are configured the same way.',
   'ai.configureNow': 'Configure',
+  'ai.disabledTitle': 'The AI assistant is turned off',
+  'ai.disabledHint':
+    'An administrator disabled the assistant, so nobody can start an inspection. Ask them to re-enable it under “Model settings”.',
+  'ai.noModelTitle': 'No usable model yet',
+  'ai.noModelHint':
+    'There is no shared model and none has been granted to you. Add your own under “My models” (you pay for it), or ask an administrator to configure a platform model.',
 
   'ai.settingsTitle': 'Model settings',
   'ai.settingsDesc': 'Applies to the whole platform; the key is encrypted on the backend and never sent to the browser',
@@ -70,6 +106,10 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.replyCharsDeep': 'Reply length — playbook (chars)',
   'ai.replyCharsDeepHint':
     'Character limit for the report produced after a playbook run; 400 by default.',
+  'ai.replyPreset': 'Reply length',
+  'ai.replyPresetTerse': 'Concise',
+  'ai.replyPresetNormal': 'Standard',
+  'ai.replyPresetDeep': 'Detailed',
 
   'ai.failed': 'Inspection failed',
   'ai.disclaimer':
@@ -80,6 +120,7 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.progressTitle': 'Progress',
   'ai.progressDone': 'Finished',
   'ai.stageCollect': 'Collecting inspection data…',
+  'ai.reportProgress': 'Writing the report ({n} characters so far)…',
   'ai.stepN': 'Analysis round {n} / {max}',
   'ai.toolStart': 'Calling {tool}{args}',
   'ai.toolDone': '{mark} {tool} finished ({ms} ms)',
@@ -98,6 +139,8 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.playbookPick': 'Run a playbook…',
   'ai.playbookPickHint':
     'Pick a preset troubleshooting playbook and work through it in order',
+  'ai.playbookFav': 'Favorite this playbook',
+  'ai.playbookUnfav': 'Remove from favorites',
   'ai.needsHostTitle': 'Pick the host to inspect first',
   'ai.needsHostHint':
     'This question came from another page, but that machine is not registered as a '
@@ -105,6 +148,7 @@ export const enAi: Partial<Record<MessageKey, string>> = {
     + 'we will not pick one for you — choose a target host above (or add the machine '
     + 'under “SSH security → Managed hosts”).',
   'ai.chatNew': 'New chat',
+  'ai.loadEarlier': 'Show {n} earlier messages',
   'ai.chatNewHint': 'Start a fresh conversation (does not reuse the current context)',
   'ai.chatHistory': 'History',
   'ai.progressHistory': 'Actions taken in this conversation',
@@ -112,11 +156,15 @@ export const enAi: Partial<Record<MessageKey, string>> = {
 
   /* 一键体检与报告卡 */
   'ai.start': 'Run health check',
-  'ai.startHint': 'Collects the check data and produces a full report. To just ask something, type in the box below.',
+  'ai.startHint': 'Collects check data and produces a full report. To just ask something, type below.',
   'ai.running': 'Running',
   'ai.quickInspect': 'Digest only',
   'ai.quickHint':
     'Reads the existing inspection results only — no host login, no tool calls. Use this with models that do not support tool calling.',
+  'ai.modelRememberHint':
+    'Remembers the model you used last time (on this device) and reuses it next time',
+  'ai.lastHost': 'Last inspected: {host}',
+  'ai.useLastHost': 'Use this host',
   'ai.summaryTitle': 'Summary',
   'ai.findingsTitle': 'Findings',
   'ai.findingsHint': 'Sorted by severity; click a title for evidence and the suggested action',
@@ -134,6 +182,9 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.hideDetails': 'Hide evidence',
   'ai.remediation.action': 'Fix it',
   'ai.reinspect': 'Re-inspect',
+  'ai.reportCopy': 'Copy Markdown',
+  'ai.reportCopied': 'Copied',
+  'ai.reportExport': 'Export Markdown',
   'ai.diffTitle': 'Compared with the previous run',
   'ai.diffAdded': '{n} new',
   'ai.diffResolved': '{n} resolved',
@@ -192,6 +243,17 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.usage.trend': 'Daily usage',
   'ai.usage.dayTip': '{day} · {n} tokens',
   'ai.usage.byModel': 'By model',
+  'ai.usage.perf': 'Performance (last {n} runs)',
+  'ai.usage.perfHint':
+    'First token = send → first token; end-to-end = send → done; queue = waiting for a slot',
+  'ai.usage.ttfbP50': 'First token p50',
+  'ai.usage.ttfbP95': 'First token p95',
+  'ai.usage.e2eP50': 'End-to-end p50',
+  'ai.usage.e2eP95': 'End-to-end p95',
+  'ai.usage.queueP95': 'Queue p95',
+  'ai.usage.llmAvg': 'Model avg',
+  'ai.usage.toolAvg': 'Tools avg',
+  'ai.usage.stepsAvg': 'Steps avg',
   'ai.usage.runsUnit': '{n} runs',
   'ai.usage.unknownModel': 'Unknown model',
   'ai.usage.noData': 'No usage data',
@@ -248,10 +310,10 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.sharedModel': 'Shared',
   'ai.capabilities': 'Capabilities',
   'ai.sectionTarget': 'Target and model',
-  'ai.sectionTargetHint': 'Pick the machine and which model handles this investigation',
+  'ai.sectionTargetHint': 'Pick a machine and model, then start',
   'ai.sectionScope': 'Access scope',
   'ai.sectionScopeHint':
-    'Two channels granted separately: the target host (this session) and VMs (time-limited tickets)',
+    'Authorize once, valid throughout: an active ops grant already covers host commands',
   'ai.execScopeName': 'Host commands',
   'ai.execScopeOn': 'This session · allowed',
   'ai.execScopeOff': 'This session · not allowed',
@@ -260,10 +322,18 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.continueHint':
     'Execution is granted. The switch applies to the next turn, so use this to pick up where the last one stopped.',
   'ai.continuePrompt': 'Please continue from the previous step — host execution is now granted.',
-  'ai.execNotGranted': 'Host execution not granted',
+  'ai.execNotGranted': 'Host commands not granted',
+  'ai.execNotGrantedHint':
+    'Host commands and the in-guest grant are separate channels: a VM grant alone lets the AI enter the guest, but it will not run commands on the host.',
   'ai.sectionConsole': 'Execution and conversation',
   'ai.sectionConsoleHint':
     'Live terminal and progress on the left, conversation and per-step approvals on the right',
+  'ai.stepNow': 'Now',
+  'ai.stepOptional': 'Optional',
+  'ai.progressCollect': 'Collecting inspection data',
+  'ai.progressAnalyze': 'Analysing and running checks',
+  'ai.progressReportHint': 'A verifiable report will appear here when the run finishes',
+  'ai.consoleResize': 'Drag to resize the panes; double-click to reset',
   'ai.allowExec': 'Let the AI run commands on the target host',
   'ai.allowExecHint':
     'Read-only diagnostics run directly (e.g. ps aux | grep nginx); commands that change the system or restart services ask for approval first and only run once you approve them, and everything is recorded.',
@@ -278,6 +348,11 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.approval.reject': 'Reject',
   'ai.approval.stale':
     'This request is no longer pending (it timed out or was already handled). Ask the AI to propose it again.',
+  'ai.approval.resume': 'Request this step again',
+  'ai.approval.expiredHint':
+    'The approval for the previous step never completed, so the AI stopped. You can re-request that step without re-running the checks before it.',
+  'ai.approval.resumePrompt':
+    'The previous command approval timed out or became invalid. Please propose that step again — same goal, and do not repeat checks that already completed.',
   'ai.approval.requiredTwo': 'Needs {n} approvals',
   'ai.approval.voted': 'Approved 1/{n}',
   'ai.approval.waitSecond':
@@ -336,6 +411,7 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.lease.rollbackFile': 'Roll back this file',
   'ai.lease.rollbackSnapshot': 'Roll back to snapshot',
   'ai.lease.revoke': 'Revoke access',
+  'ai.lease.revokeRetry': 'Retry revoke',
   'ai.lease.revoked': 'Access revoked',
   'ai.lease.revokedByUser': 'Revoked by the user',
   'ai.lease.revokedKillFailed':
@@ -500,9 +576,138 @@ export const enAi: Partial<Record<MessageKey, string>> = {
     'You can only manage your own models here; shared ones are maintained by the admin',
   'ai.selectModel': 'Model',
   'ai.selectModelHint':
-    'Applies to this inspection only; the default model set by the admin is unchanged',
+    'Applies to this run only; the default stays unchanged',
   'ai.recExport': 'Export CSV',
   'ai.recExportHint':
     'Export inspection records with tool-call details; regular users export only their own records',
   'ai.stageQueued': 'Queued — waiting for a free slot…',
+  'ai.stageQueuedAhead': 'Queued: {n} run(s) ahead (about {s}s)',
+  'ai.stageQueuedFirst': 'Queued: starts once a slot frees up (about {s}s)',
+
+  /* ---- Unified authorization card (host commands + VM lease) ---- */
+  'ai.auth.title': 'Current status',
+  'ai.auth.stateNone': 'Not authorized',
+  'ai.auth.stateRevoked': 'Revoked',
+  'ai.auth.stateHostOnly': 'Partial · host commands only',
+  'ai.auth.stateVmOnly': 'Partial · VM only',
+  'ai.auth.stateActive': 'Authorized',
+  'ai.auth.stateExpiring': 'Authorized · expiring soon',
+  'ai.auth.stateExpired': 'Partial · VM grant expired',
+  'ai.auth.stateBlocked': 'Restricted by policy',
+  'ai.auth.descNone':
+    'The AI can only read platform data right now. Authorize it to start inspecting.',
+  'ai.auth.descHostOnly': 'Host commands are on; in-guest access is not.',
+  'ai.auth.descVmOnly': 'In-guest access is on; host commands are not.',
+  'ai.auth.descActive': 'Host and in-guest access are both on. Ready to start.',
+  'ai.auth.descActiveCovered':
+    'The in-guest ops grant already covers host commands — start right away, no separate grant needed.',
+  'ai.auth.hostCovered': 'Covered by ops grant',
+  'ai.auth.hostCoveredHint':
+    'Reused automatically while the in-guest ops grant is valid; expires or stops when you switch VMs.',
+  'ai.auth.descExpiring':
+    'The VM grant expires soon. Renewing does not affect host access.',
+  'ai.auth.descExpired':
+    'The VM grant expired; host commands still work.',
+  'ai.auth.descBlocked':
+    'No authorization channel is available. Check permissions and target state.',
+  'ai.auth.primaryGrant': 'Authorize this session',
+  'ai.auth.primaryComplete': 'Complete authorization',
+  'ai.auth.primaryRenew': 'Renew',
+  'ai.auth.primaryAdjust': 'Adjust authorization',
+  'ai.auth.quickGrant': 'Quick grant (read-only)',
+  'ai.auth.revokeAll': 'Revoke all',
+  'ai.auth.hostChannel': 'Host commands',
+  'ai.auth.vmChannel': 'Inside VM',
+  'ai.auth.sessionScope': 'This session',
+  'ai.auth.hostOn': 'Authorized',
+  'ai.auth.hostOff': 'Off',
+  'ai.auth.hostRead': 'Valid for this session · read-only commands run directly',
+  'ai.auth.hostWrite': 'Valid for this session · writes need per-command approval',
+  'ai.auth.hostUnavailable': 'No execution permission',
+  'ai.auth.vmOff': 'Not authorized',
+  'ai.auth.vmExpired': 'Expired',
+  'ai.auth.vmUnavailable': 'This machine has no accessible VM',
+  'ai.auth.vmQuota': 'actions {used}/{max}',
+  'ai.auth.useThis': 'Use this one',
+  'ai.auth.revokeHost': 'Revoke host commands',
+  'ai.auth.revokeVm': 'Revoke VM grant',
+  'ai.auth.otherLeases': 'Other active grants',
+  'ai.auth.panelTitle': 'Authorize',
+  'ai.auth.panelDesc':
+    'Authorize once and it lasts: an active ops grant already covers host commands, so there is nothing to re-grant.',
+  'ai.auth.level': 'Level',
+  'ai.auth.levelRead': 'Read-only',
+  'ai.auth.levelWrite': 'Scoped changes',
+  'ai.auth.levelOps': 'Ops access',
+  'ai.auth.levelReadHint':
+    'Read-only commands and paths; no host write proposals and no in-guest writes.',
+  'ai.auth.levelWriteHint':
+    'Read-only runs directly; writes need per-command approval and stay within the selected paths and units.',
+  'ai.auth.levelOpsHint':
+    'Full shell inside the guest: install packages and edit any config; per-command approval, dangerous actions still blocked. Does not include host execution.',
+  'ai.auth.levelOpsNeedsVm': 'Ops access requires the VM channel',
+  'ai.auth.levelOpsRisk':
+    'Ops access carries the highest risk. Choose it only when necessary.',
+  'ai.auth.opsConfirm': 'I understand the risk of ops access and want to continue',
+  'ai.auth.levelsLockedWrite': 'No permission for in-guest changes',
+  'ai.auth.levelsLockedOps': 'Ops grants are disabled by the administrator',
+  'ai.auth.channels': 'Channels',
+  'ai.auth.channelHostHint':
+    'Valid for this session; a new conversation or host resets it.',
+  'ai.auth.channelVmHint': 'Issued for the selected duration; can be renewed.',
+  'ai.auth.agentChecking': 'Checking the Guest Agent…',
+  'ai.auth.agentMissing': 'Guest Agent is not responding',
+  'ai.auth.dropVmTitle': 'Clearing the VM channel revokes the current grant',
+  'ai.auth.dropVmHint':
+    'Saving voids the active VM grant on this machine. To add host commands only, leave it checked with the same level and scope — the existing grant will be reused.',
+  'ai.auth.noVm': 'The current target has no VM attached',
+  'ai.auth.noChannel': 'No authorization channel is available',
+  'ai.auth.vmScope': 'VM scope',
+  'ai.auth.minutes': 'Duration',
+  'ai.auth.minutesUnit': 'min',
+  'ai.auth.scopeWritable': 'Writable paths',
+  'ai.auth.scopeUnits': 'Restartable services',
+  'ai.auth.scopeReadOnly': 'Read-only level needs no paths or services.',
+  'ai.auth.conflict': 'An active grant already exists for this target',
+  'ai.auth.conflictHint':
+    'Its level or scope differs from this selection; the old ticket must be revoked and reissued.',
+  'ai.auth.replace': 'Revoke the old ticket and reissue',
+  'ai.auth.preview': 'What will happen',
+  'ai.auth.reason': 'Reason',
+  'ai.auth.reasonPlaceholder': 'e.g. investigating 502s on web1',
+  'ai.auth.confirm': 'Confirm authorization',
+  'ai.auth.cancel': 'Cancel',
+  'ai.auth.granted': 'Authorized: {text}',
+  'ai.auth.renewed': 'Renewed; new expiry {time}',
+  'ai.auth.revoked': 'Revoked',
+  'ai.auth.revokedReason': 'Revoked from the unified authorization card',
+  'ai.auth.revokedKillFailed':
+    'Authorization revoked, but an in-guest command may still be running',
+  'ai.auth.revokedTitleHost': 'Host commands revoked',
+  'ai.auth.revokedTitleVm': 'VM grant revoked',
+  'ai.auth.revokedTitleBoth': 'All authorization revoked',
+  'ai.auth.revokedHintHost':
+    'The AI can no longer sign in to this machine. Authorize again whenever it is needed.',
+  'ai.auth.revokedHintHostVmOn':
+    'Host commands are revoked; the VM grant is still active, so the AI can enter the guest but will not run commands on the host.',
+  'ai.auth.revokedHintVm':
+    'The VM grant is void and the AI can no longer enter the guest. Authorize again when needed.',
+  'ai.auth.revokedHintVmHostOn':
+    'The VM grant is void and the AI can no longer enter the guest; host commands are still authorized.',
+  'ai.auth.revokedHintBoth':
+    'Host commands and the VM grant are both revoked; the AI can only read platform data now.',
+  'ai.auth.revokedKillHint':
+    'A command in the guest may still be running; it will not stop with the grant. Check the terminal if needed.',
+  'ai.auth.revokedRegrant': 'Authorize again',
+  'ai.auth.revokedDismiss': 'Dismiss',
+  'ai.auth.revokeHostFailed': 'Host authorization was not revoked. Please try again.',
+  'ai.auth.revokeVmFailed': 'The VM grant was not revoked. Please try again.',
+  'ai.auth.revokeRetry': 'Retry revoke',
+  'ai.auth.hostGranted': 'host commands',
+  'ai.auth.vmGranted': 'in-guest access',
+  'ai.auth.expiredHint': 'Authorize again to continue',
+  'ai.auth.revokeConfirmTitle': 'Revoke this session’s authorization?',
+  'ai.auth.revokeConfirmMsg':
+    'Host commands and in-guest access will be revoked; a command already running in the guest may not stop immediately.',
+  'ai.auth.confirmRevoke': 'Revoke',
 };

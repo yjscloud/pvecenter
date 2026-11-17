@@ -1076,22 +1076,23 @@ fi
 VPY="$VENV/bin/python"
 
 info "安装 backend/requirements.txt（已装则跳过）"
-# pip 自身升级失败不影响后面装依赖（内网可能连不上 PyPI），所以只提示不中断。
-"$VPY" -m pip install -q --upgrade pip || warn "pip 自身升级失败，继续用现有版本"
-"$VPY" -m pip install -q -r "$ROOT/backend/requirements.txt" \
-  || {
-    # 少数架构 / 发行版上没有预编译轮子，pip 会退化成从源码编译 —— 这时缺的是
-    # 编译器而不是网络。补上 gcc 与 python 头文件再试一次，比直接报「网络问题」准确。
-    warn "依赖安装失败，尝试补装编译工具后重试（可能是缺预编译轮子的架构）"
-    if ensure_pkg build && ensure_pkg dev && \
-       "$VPY" -m pip install -q -r "$ROOT/backend/requirements.txt"; then
-      info "补装编译工具后安装成功"
-    else
-      echo "[x] $(t '后端依赖安装失败。请检查网络，或改用镜像源：')" >&2
-      echo "      $VPY -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r $ROOT/backend/requirements.txt" >&2
-      exit 1
-    fi
-  }
+# 装依赖交给 scripts/install_deps.sh：它先离线判「已经装齐了没」，齐了完全不联网 ——
+# 已部署的机器重跑部署不会再碰 PyPI，也就不会打印一串
+# `WARNING: Retrying ... SSLError(...) /simple/pip/`（那屏幕告警其实只是
+# 「这台机器连不上 PyPI」，并不代表部署失败）。pip 自我升级也挪进脚本，默认不做。
+if ! bash "$ROOT/scripts/install_deps.sh" "$VPY" "$ROOT/backend/requirements.txt" --lang "$LANG_UI"; then
+  # 少数架构 / 发行版上没有预编译轮子，pip 会退化成从源码编译 —— 这时缺的是
+  # 编译器而不是网络。补上 gcc 与 python 头文件再试一次，比直接报「网络问题」准确。
+  warn "依赖安装失败，尝试补装编译工具后重试（可能是缺预编译轮子的架构）"
+  if ensure_pkg build && ensure_pkg dev && \
+     bash "$ROOT/scripts/install_deps.sh" "$VPY" "$ROOT/backend/requirements.txt" --lang "$LANG_UI"; then
+    info "补装编译工具后安装成功"
+  else
+    echo "[x] $(t '后端依赖安装失败。请检查网络，或改用镜像源：')" >&2
+    echo "      PC_PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple ./deploy.sh" >&2
+    exit 1
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 2. 后端配置（backend/.env）

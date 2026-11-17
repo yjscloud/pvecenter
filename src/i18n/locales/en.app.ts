@@ -179,6 +179,8 @@ export const enApp: Partial<Record<MessageKey, string>> = {
   'bulk.tag': 'Tag',
   'bulk.migrate': 'Migrate',
   'bulk.snapshot': 'Snapshot',
+  'bulk.snapshot_restore': 'Restore snapshot',
+  'bulk.snapshot_delete': 'Delete snapshot',
   'bulk.assign': 'Assign owner',
   'bulk.title': 'Bulk {label} finished: {ok} succeeded, {failed} failed',
   'guestList.bulkDialog.titleMigrate': 'Migrate in bulk',

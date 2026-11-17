@@ -4285,6 +4285,21 @@ body.is-col-resizing * {
   min-width: 0;
 }
 
+/* 名称允许折成两行：长实例名（尤其容器主机名）单行省略后，扫列表只能看到
+   后半截或一个「…」。两行足以覆盖绝大多数名字；更长的仍可拖宽名称列，
+   宽度会被记住（见 Table 的 storageKey）。 */
+.vm-name-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.35;
+}
+
 /* 按钮本身不占位过度：图标 13px + 一点内边距就够了，
    名称列本来就只有 160px，别让按钮把名字挤没 */
 .vm-name-line > button {
@@ -10022,6 +10037,263 @@ button.pbs-task-row:focus-visible {
 }
 
 /* ---------------------------------------------------------------------------
+   备注弹窗里的「来源模板」选择器（components/SourceTemplatePicker）
+
+   与创建 / 重装那套模板选择器是同一套视觉语言（.os-pick：搜索 + 分类 chip +
+   分组头 + 密集行），只按这个场景改了三件事：
+
+   1. **四列**：单选点 / 系统 logo / 名称 / 节点-VMID。备注弹窗只有 460px，
+      而且这里要回答的是「哪一张」而不是「够不够用」—— 内存、磁盘两列只会
+      把名称挤成省略号；模板可能同名，所以「节点/VMID」必须留着。
+   2. **行更矮**（34px，触屏 38px）：这个弹窗是「顺手改一下」的地方，不是
+      主流程，密度可以让位给整体高度。
+   3. **两层吸顶**：「不关联」34px 常驻第一行 + 分组头，滚多远都点得到它。
+      列表没有列名行，所以分组头不能再按默认的 24px 偏移（会露一条缝）。
+
+   收起态是一行触发条，与 .select 同高同框 —— 换掉原生下拉之后，这个字段在
+   视觉上不该比旁边的「操作系统标识」更重。
+   --------------------------------------------------------------------------- */
+
+.os-pick.is-dialog {
+  --os-pin-h: 34px;
+  --os-row-cols: 15px 18px minmax(0, 1fr) minmax(44px, auto);
+  --os-row-gap: 8px;
+
+  gap: 6px;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+}
+
+.os-pick.is-dialog .os-pick-list {
+  /* 4 列的变量写在父级也要在列表上生效：.os-pick-list 自己那条 media query
+     只改列宽，这里用更高的选择器把它盖住，避免 521~840px 之间错位 */
+  --os-row-cols: 15px 18px minmax(0, 1fr) minmax(44px, auto);
+  --os-row-gap: 8px;
+
+  max-height: clamp(176px, 36vh, 268px);
+}
+
+.os-pick.is-dialog .os-row {
+  height: var(--os-pin-h);
+}
+
+/* 键盘光标：只描一圈，不改布局，也不与「已选中」的强调竖条打架 */
+.os-pick.is-dialog .os-row.is-active {
+  background: var(--bg-hover);
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+
+.os-pick.is-dialog .os-row.is-on {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.os-pick.is-dialog .os-row.is-on.is-active {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent), inset 0 0 0 1px var(--accent-border);
+}
+
+/* 「不关联」：常驻第一行。底色必须不透明 —— 它是吸顶的，行会从它下面滚过去 */
+.os-pick.is-dialog .os-row.is-pin {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.os-pick.is-dialog .os-row.is-pin.is-on {
+  background: var(--accent-dim);
+}
+
+/* 分组头吸在「不关联」下方：本列表没有列名行，默认的 24px 会露出缝隙 */
+.os-pick.is-dialog .os-pick-group-head {
+  top: var(--os-pin-h);
+}
+
+.os-pick-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: fade-in 120ms ease;
+}
+
+/* 工具条在 420px 宽里必须是一行：搜索框占满剩余宽度，「收起」贴着右边缘。
+   基础规则给的是固定 200px 宽 + margin-left:auto，在弹窗里会把「收起」挤到
+   第二行 —— 那一行是本控件最常点的按钮，不该让用户去找。 */
+.os-pick.is-dialog .os-pick-bar {
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.os-pick.is-dialog .os-pick-search {
+  flex: 1 1 120px;
+  width: auto;
+  min-width: 0;
+  margin-left: 4px;
+}
+
+/* 名称 + 「已不在列表」标签：标签不能跟着名称一起被省略号吃掉 */
+.tpl-link-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tpl-link-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tpl-link-name .os-row-tag {
+  flex: none;
+}
+
+/* 定位：节点 / VMID。模板允许同名，这一列才是「哪一张」的最终依据 */
+.tpl-link-loc {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- 收起态：一行触发条（与 .select 同高同框） ---- */
+.os-pick-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.os-pick-trigger:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  background: var(--bg-hover);
+}
+
+.os-pick-trigger:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.os-pick-trigger:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.os-pick-trigger-logo {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+}
+
+.os-pick-trigger-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.os-pick-trigger-loc {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.os-pick-trigger-none {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.os-pick-trigger-caret {
+  flex: none;
+  display: inline-flex;
+  color: var(--text-muted);
+}
+
+.os-pick-trigger:hover:not(:disabled) .os-pick-trigger-caret {
+  color: var(--text-primary);
+}
+
+/* 字段说明：与 .field-hint 同一档字号，但这里跟的是自定义控件不是原生输入框 */
+.os-pick-note {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+/* 「清除筛选」：空结果里唯一可点的东西，做成小号描边按钮 */
+.os-pick-clear {
+  flex: none;
+  height: 26px;
+  padding: 0 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.os-pick-clear:hover {
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.os-pick-clear:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* 窄屏 / 触屏：行与触发条都放到 38px，手指点得准；列表同时矮一档，
+   给弹窗底部的「取消 / 保存」留出可见空间 */
+@media (max-width: 767px) {
+  .os-pick.is-dialog {
+    --os-pin-h: 38px;
+  }
+
+  .os-pick.is-dialog .os-pick-list {
+    max-height: clamp(150px, 30vh, 220px);
+  }
+
+  .os-pick-trigger {
+    min-height: 38px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
    AI 审批卡里的变更预览（虚拟机内写文件）
 
    按行着色而不是整块染色：一条配置改动里有效行只有两三行，整块红绿底反而
@@ -10096,9 +10368,9 @@ button.pbs-task-row:focus-visible {
 
 .ai-lease-grid {
   display: grid;
-  gap: 10px;
-  margin-top: 10px;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 
 /* 目标虚拟机下方的纳管状态：运行中不代表进得去，agent 在不在线要单独说 */
@@ -10184,6 +10456,11 @@ button.pbs-task-row:focus-visible {
    ``.ai-studio``，用分隔线分节；控制台则单独成一块带标题的工具条 ——
    两层结构就够，再多又会回到「到处是框」。
    --------------------------------------------------------------------------- */
+/* AI 助手是一屏工作台，段与段之间不需要通用页面的 20px 呼吸感 */
+.ai-page {
+  --page-gap: 14px;
+}
+
 .ai-studio {
   background: var(--bg-surface);
   border: 1px solid var(--border);
@@ -10193,7 +10470,9 @@ button.pbs-task-row:focus-visible {
 }
 
 .ai-studio-section {
-  padding: 16px 18px;
+  /* 工作台要的是「一屏能看到目标、授权边界和结论」，而不是四边留白。
+     上下收 4px、左右收 2px，连续几节叠起来就是明显的一屏密度。 */
+  padding: 12px 16px;
 }
 
 .ai-studio-section + .ai-studio-section {
@@ -10203,8 +10482,8 @@ button.pbs-task-row:focus-visible {
 .ai-section-head {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  margin-bottom: 14px;
+  gap: 8px;
+  margin-bottom: 10px;
   min-width: 0;
 }
 
@@ -10246,15 +10525,381 @@ button.pbs-task-row:focus-visible {
   color: var(--text-muted);
 }
 
+/* ---- 目标与模型：一行选完；窄屏自然堆叠，不挤压输入框 ---- */
+.ai-picker {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ai-picker-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  flex: 1 1 420px;
+  min-width: 0;
+}
+
+.ai-picker-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+/* ---- 折叠说明：默认只占一行，展开才铺细节 ---- */
+.ai-note-more {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-muted);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.ai-note-more > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  list-style: none;
+}
+
+.ai-note-more > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* 用一个小三角表达「可展开」，不用额外的图标组件 */
+.ai-note-more > summary::before {
+  content: '';
+  flex: none;
+  width: 5px;
+  height: 5px;
+  margin-left: 2px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.15s ease;
+}
+
+.ai-note-more[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.ai-note-more > summary:hover {
+  color: var(--text-primary);
+}
+
+.ai-note-count {
+  color: var(--text-muted);
+}
+
+.ai-note-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding-left: 15px;
+}
+
+.ai-note-body p {
+  margin: 0;
+}
+
+.ai-note-sub {
+  color: var(--text-secondary);
+}
+
+.ai-cond-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ai-cond-list > span {
+  padding: 1px 8px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+/* 被排除的主机：点名 + 原因 + 修复入口。只列用户本来就能看到的主机 */
+.ai-excluded-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ai-excluded-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+.ai-excluded-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-excluded-reason {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.ai-excluded-row .btn {
+  flex: none;
+}
+
+/* ---- 步骤引导：当前 / 已完成 / 可跳过 ---- */
+.ai-section-num.is-active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+.ai-section-num.is-done {
+  border-color: var(--success-dim);
+  background: var(--success-dim);
+  color: var(--success);
+}
+
+.ai-step-now,
+.ai-step-optional {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 0 7px;
+  border-radius: var(--radius-pill);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.7;
+  vertical-align: middle;
+}
+
+.ai-step-now {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.ai-step-optional {
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  border: 1px solid var(--border-muted);
+}
+
+/* ---- 右栏进度气泡：体检不流式出字时的「正在做什么」 ---- */
+.ai-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ai-progress-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.ai-progress-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ai-progress-tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 8px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-progress-tool.is-ok {
+  color: var(--success);
+  border-color: var(--success-dim);
+}
+
+.ai-progress-tool.is-fail {
+  color: var(--danger);
+  border-color: var(--danger-dim);
+}
+
+.ai-progress-mark {
+  flex: none;
+}
+
+.ai-progress-hint {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* 报告骨架：体检进行中，结论区先占位 */
+.ai-report-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* 「加载更早的消息」：长会话只渲染最近 N 条，往上翻时再展开 */
+.ai-load-earlier {
+  align-self: center;
+  padding: 4px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.ai-load-earlier:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+/* 预案快捷入口：主按钮 + 收藏星标 */
+.ai-playbook-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ai-playbook-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.ai-playbook-fav {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.ai-playbook-fav:hover {
+  background: var(--bg-hover);
+  color: var(--warning);
+}
+
+.ai-playbook-fav.is-on {
+  color: var(--warning);
+}
+
+/* 回复详略档位预设 */
+.ai-reply-preset {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.ai-reply-preset-label {
+  margin-right: 4px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+/* 上次排查的主机：回显 + 一键采用 */
+.ai-last-host {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+/* 对话末尾的失败气泡 */
+.ai-chat-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger-dim);
+  border-radius: var(--radius);
+  background: var(--danger-dim);
+  color: var(--danger);
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+}
+
+/* 审批超时/失效后的续跑入口 */
+.ai-approval-expired {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--warning-dim);
+  border-radius: var(--radius);
+  background: var(--warning-dim);
+}
+
+.ai-approval-expired-text {
+  flex: 1 1 260px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+}
+
 /* ---- 授权范围：主机命令与虚拟机票据并排成两条同构的授权行 ---- */
 .ai-scope-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 .ai-scope-block {
-  padding: 12px 14px;
+  padding: 10px 12px;
   border: 1px solid var(--border-muted);
   border-radius: var(--radius);
   background: var(--bg-elevated);
@@ -10350,17 +10995,18 @@ button.pbs-task-row:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
-  padding: 12px 16px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--border-muted);
   background: linear-gradient(180deg, var(--bg-elevated), var(--bg-surface));
 }
 
 .ai-console-shell .ai-console {
-  /* 比原来少减一点：控制台标题条替代了页面级那个页签，占位大致相当 */
-  height: clamp(420px, calc(100vh - 470px), 800px);
-  padding: 14px 16px 16px;
+  /* 上方三节收紧后，把省下来的高度让给控制台：这两块内容都是「越高越好」
+     的连续阅读区。保底 540 仍够终端铺开二十来行，上限 920 避免大屏拉成窄带。 */
+  height: clamp(540px, calc(100vh - 290px), 920px);
+  padding: 12px 14px 14px;
   gap: 0;
   margin: 0;
 }
@@ -10377,27 +11023,36 @@ button.pbs-task-row:focus-visible {
   display: none;
 }
 
-/* 分隔线不加额外内边距：两栏卡片本身各有 18px 内边距，再加一层会左右不对称 */
-.ai-console-shell .ai-console > * + * {
-  border-left: 1px solid var(--border-muted);
-}
-
 @media (max-width: 768px) {
   .ai-studio-section {
     padding: 14px;
+  }
+
+  /* 手机上两个下拉各占一行：并排会把「目标机器」压到只剩几个字 */
+  .ai-picker-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .ai-picker-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .ai-note-body {
+    padding-left: 0;
   }
 
   .ai-console-shell .ai-console {
     height: auto;
     padding: 12px;
   }
+}
 
-  /* 单列堆叠时竖线要改成横线，否则会变成两条并排的栏 */
-  .ai-console-shell .ai-console > * + * {
-    border-left: 0;
-    border-top: 1px solid var(--border-muted);
-    margin-top: 12px;
-    padding-top: 12px;
+/* 两栏并排在 900px 以下已经没有意义（各剩不到 300px），由 layout.css 负责堆叠；
+   这里只把外壳的留白一起收紧 */
+@media (max-width: 900px) {
+  .ai-console-shell-head {
+    padding: 10px 14px;
   }
 }
 
@@ -10585,4 +11240,322 @@ button.pbs-task-row:focus-visible {
   font-size: 11.5px;
   line-height: 1.55;
   color: var(--text-secondary);
+}
+
+/* ---- 统一授权卡：总状态 + 两条通道 + 一个入口 ---- */
+.ai-auth-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+.ai-auth-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.ai-auth-head-main {
+  display: flex;
+  flex: 1 1 420px;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ai-auth-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ai-auth-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ai-auth-desc {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+/* ---- 撤销后的原地确认：滑入一次 + 卡片描边脉冲，之后静止不再打扰 ---- */
+.ai-auth-card.is-revoked {
+  animation: ai-revoke-ring 1.2s ease-out;
+}
+
+.ai-auth-revoked {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid rgba(227, 115, 24, 0.32);
+  border-left: 3px solid var(--warning);
+  border-radius: var(--radius);
+  background: var(--warning-dim);
+  animation: ai-revoke-in 0.24s ease-out;
+}
+
+.ai-auth-revoked-mark {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--warning);
+  color: #fff;
+}
+
+.ai-auth-revoked-body {
+  display: flex;
+  flex: 1 1 240px;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ai-auth-revoked-title {
+  font-size: 12px;
+  font-weight: 600;
+  /* 小字号下橙色正文对比度偏低：强调交给左侧色条与对勾，文字回到主色 */
+  color: var(--text-primary);
+}
+
+.ai-auth-revoked-hint {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.ai-auth-revoked-close {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.ai-auth-revoked-close:hover {
+  background: rgba(227, 115, 24, 0.12);
+  color: var(--text-primary);
+}
+
+/* 刚撤掉的那条通道轻微闪一下就停，用来把视线引到状态徽标上 */
+.ai-auth-channel.is-revoked {
+  animation: ai-revoke-flash 1.4s ease-out;
+}
+
+@keyframes ai-revoke-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes ai-revoke-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(227, 115, 24, 0.35);
+  }
+
+  100% {
+    box-shadow: 0 0 0 10px rgba(227, 115, 24, 0);
+  }
+}
+
+@keyframes ai-revoke-flash {
+  0% {
+    background: var(--warning-dim);
+    border-color: rgba(227, 115, 24, 0.4);
+  }
+
+  100% {
+    background: var(--bg-surface);
+    border-color: var(--border-muted);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-auth-card.is-revoked,
+  .ai-auth-revoked,
+  .ai-auth-channel.is-revoked {
+    animation: none;
+  }
+}
+
+.ai-auth-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ai-auth-channels {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ai-auth-channel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  flex-wrap: wrap;
+}
+
+.ai-auth-channel-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.ai-auth-channel-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ai-auth-channel-hint {
+  flex: 1 1 260px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.ai-auth-channel-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.ai-auth-details {
+  padding-top: 2px;
+}
+
+.ai-auth-other {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-muted);
+}
+
+.ai-auth-other-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.ai-auth-other-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+}
+
+.ai-auth-continue {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ai-auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ai-auth-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ai-auth-section-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.ai-auth-levels {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ai-auth-level {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ai-auth-level.is-on {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.ai-auth-level:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.ai-auth-level-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ai-auth-level-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.ai-auth-switches {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (max-width: 720px) {
+  .ai-auth-levels,
+  .ai-auth-switches {
+    grid-template-columns: 1fr;
+  }
 }

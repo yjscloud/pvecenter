@@ -1693,6 +1693,13 @@ export type BulkAction =
   | 'migrate'
   | 'balloon'
   | 'snapshot'
+  /** 还原到指定名称的快照（每台都必须有同名快照） */
+  | 'snapshot_restore'
+  /**
+   * 批量删除快照（全局快照页）。与其它动作不同，它走 ``/snapshots/bulk-delete``：
+   * 目标是「某一份快照」而不是整台机器，每条的 name 各不相同。
+   */
+  | 'snapshot_delete'
   /** 指派归属（管理员）：一台一次改归属，整批只失效一次缓存 */
   | 'assign';
 
@@ -2539,10 +2546,20 @@ export interface VmMetaEntry {
   /**
    * 面板侧记录的操作系统家族 key（如 `tencent` / `openwrt`，见 utils/osFamily）。
    *
-   * 列表的「操作系统」列先读它，读不到再从来源模板名推断。
-   * 这一项目前只由后端直接写入（没有编辑入口），空串等价于没记录。
+   * 列表的「操作系统」列先读它，读不到再从来源模板名推断。运维可以在「备注」
+   * 弹窗里纠正（PVE 的 ostype 对导入 / 手工建的机器经常是错的）；空串等价于
+   * 没记录。它**不会**写回 PVE 的 ostype。
    */
   os?: string;
+  /**
+   * 手工关联的「来源模板」。
+   *
+   * 面板对系统的另一条证据是「从哪张模板克隆的」，但那是从审计里推出来的 ——
+   * 恢复备份、在 PVE 界面克隆、装 ISO 建的机器根本没有这条记录。手工关联一张
+   * 模板相当于把线索补上：列表的系统徽标、模板名回填与重装推荐都会用它。
+   * `name` 只是关联当时的存档，模板被改名 / 删除后仍然显示「当初关联的是哪张」。
+   */
+  template?: { node: string; vmid: number; name: string };
   /** 填写人；普通用户只拿得到自己填的条目 */
   by?: string;
   /** 填写时间（秒） */
@@ -2988,6 +3005,34 @@ export interface SnapshotCreateRequest {
   name: string;
   description?: string;
   vmstate?: boolean;
+}
+
+/**
+ * 批量删除快照的一条目标（全局快照页）。
+ *
+ * 与 :interface:`BulkTarget` 不同，这里定位的是**某一份快照**，所以必须带
+ * ``name``；``type`` 决定走后端虚拟机的 ``vm.snapshot`` 还是容器的
+ * ``ct.snapshot``（两套 PVE 端点与权限点）。
+ */
+export interface SnapshotBulkDeleteItem {
+  node: string;
+  vmid: number;
+  type: 'qemu' | 'lxc';
+  name: string;
+}
+
+/**
+ * 批量还原的一台目标：某台机器回到**它自己**的某一快照。
+ *
+ * 与 `SnapshotBulkDeleteItem` 形状相同、语义相反（那条是「删掉这份快照」）。
+ * `name` 必填且逐台不同 —— 各自机器的快照链互相独立，同名也只是巧合。
+ */
+export interface SnapshotBulkRestoreItem {
+  node: string;
+  vmid: number;
+  type: 'qemu' | 'lxc';
+  /** 目标快照名（不能是 `current`，那是 PVE 的伪条目） */
+  name: string;
 }
 
 /* ---------------------------------------------------------------------------
@@ -5403,6 +5448,31 @@ export interface AiUsageStats {
   total: AiUsageTotals;
   by_model: AiUsageByModel[];
   daily: AiUsageDaily[];
+  /** 最近若干轮的分段耗时（毫秒）。老数据没有 metrics，只贡献端到端 */
+  perf?: AiUsagePerf;
+}
+
+/**
+ * 性能分栏：把「慢」拆成能动手的几段。
+ *
+ * 只有一个「平均耗时」时，看到 18s 也不知道该动模型、工具还是前端；分成
+ * 首字 / 端到端 / 排队三段并给 p95，才看得出是长尾尖刺还是整体偏慢。
+ */
+export interface AiUsagePerf {
+  /** 参与统计的会话数（后端最多取最近 500 轮） */
+  samples: number;
+  /** 发送 → 首个 token（不排队） */
+  ttfb_p50: number;
+  ttfb_p95: number;
+  /** 发送 → done */
+  e2e_p50: number;
+  e2e_p95: number;
+  /** 进闸门 → 真正开始 */
+  queue_p50: number;
+  queue_p95: number;
+  llm_avg_ms: number;
+  tool_avg_ms: number;
+  steps_avg: number;
 }
 
 /** 助手可用状态：让页面区分「还没配模型」与「可以排查」 */
@@ -5411,6 +5481,71 @@ export interface AiStatus {
   ready: boolean;
   provider: string;
   provider_kind: string;
+}
+
+/**
+ * 被准入条件排除的一台主机（`GET /api/ai/targets` 的 `excluded.items`）。
+ *
+ * 只包含当前用户**本来就能看到**的受管主机（后端已按可见范围过滤），因此
+ * 可以点名到机器并给出修复入口，不构成新的资产泄露。
+ */
+export interface AiTargetExclusionItem {
+  id: string;
+  name: string;
+  /** 原因码：not_vm / stopped / cloudinit / agent / unreachable */
+  reason: string;
+  node?: string;
+  vmid?: number | null;
+  conn_id?: string;
+}
+
+/**
+ * 被准入条件排除的主机（`GET /api/ai/targets`）。
+ *
+ * `total` 与各原因计数用于一句话概括，`items` 用于点名到具体机器 + 原因 +
+ * 修复入口。页面用它解释「为什么这里比受管主机少」，并让人能直接去修。
+ */
+export interface AiTargetExclusion {
+  total: number;
+  /** 没有关联虚拟机（容器 / 模板 / 手工主机） */
+  not_vm?: number;
+  /** 虚拟机未开机运行 */
+  stopped?: number;
+  /** cloud-init 配置不完整 */
+  cloudinit?: number;
+  /** Guest Agent 未响应 */
+  agent?: number;
+  /** PVE 不可达或权限不足 */
+  unreachable?: number;
+  /** 被排除主机的明细（后端按用户可见范围过滤后给出） */
+  items?: AiTargetExclusionItem[];
+}
+
+/** 一轮目标扫描的自述：探了几台、花了多久、有几条 PVE 连接读不到 */
+export interface AiScanStats {
+  total?: number;
+  probed?: number;
+  pending?: number;
+  /** 本轮探活失败（整条连接不可达）的 PVE 条数 */
+  pve_down?: number;
+  elapsed_ms?: number;
+  /** 本轮实际使用的并发上限（来自后端配置，排障时用来确认改配置生效了） */
+  concurrency?: number;
+  cache_ttl?: number;
+}
+
+/** 可排查的目标主机清单 + 助手状态 + 被排除计数 */
+export interface AiTargetsResponse {
+  hosts: BaselineHost[];
+  status: AiStatus;
+  excluded?: AiTargetExclusion;
+  /**
+   * 还没探完的候选台数。候选多时后端先回列表（状态整批取、每台一轮往返），
+   * 大于 0 时前端从 0.5 秒起退避轮询，列表于是「先出来、很快就补齐」。
+   */
+  pending_total?: number;
+  /** 本轮扫描的统计（进度展示与排障用） */
+  scan?: AiScanStats;
 }
 
 /* ---------------------------------------------------------------- 统一处置 */
@@ -5551,6 +5686,8 @@ export interface AiConversation {
   report?: string | null;
   /** 会话级「允许上机执行」授权：刷新后据此恢复开关（1 / 0） */
   allow_exec?: number;
+  /** 主机命令授权级别：read 只读 / write 允许提议写命令 */
+  exec_access?: 'read' | 'write' | string;
   /** 这条会话跑过多少轮（列表接口附带，用于记录页） */
   runs?: number;
   created: number;
@@ -5583,7 +5720,14 @@ export interface AiConversationDetail {
  * ``report``（首轮产出的报告）；``done`` 也不再携带整份结果（结果已经落库）。
  */
 export type AiChatStreamEvent =
-  | { type: 'stage'; stage: string }
+  | {
+      type: 'stage';
+      stage: string;
+      /** 排队中：前面还有几轮（不含正在跑的） */
+      ahead?: number;
+      /** 排队中：粗估还要等多少秒 */
+      eta_s?: number;
+    }
   | { type: 'thinking'; step: number; max_steps: number }
   | {
       type: 'tool_start';
@@ -5624,6 +5768,11 @@ export type AiChatStreamEvent =
   | { type: 'token_reset' }
   /** 回复文本的流式增量（打字机效果） */
   | { type: 'token'; text: string }
+  /**
+   * 报告模式（体检）生成进度：正文不推（半截 JSON 没法看），只报已生成字数。
+   * 体检生成要几十秒，没有这个事件用户只能对着转圈猜是不是卡死了。
+   */
+  | { type: 'report_progress'; chars: number }
   /** 本轮回复文本（已落库） */
   | { type: 'assistant'; message_id: string; content: string }
   /** 首轮体检产出的报告 */
@@ -5634,7 +5783,14 @@ export type AiChatStreamEvent =
 
 /** SSE 事件（排查过程的实时推送） */
 export type AiStreamEvent =
-  | { type: 'stage'; stage: string }
+  | {
+      type: 'stage';
+      stage: string;
+      /** 排队中：前面还有几轮（不含正在跑的） */
+      ahead?: number;
+      /** 排队中：粗估还要等多少秒 */
+      eta_s?: number;
+    }
   | { type: 'thinking'; step: number; max_steps: number }
   /** 提议执行写命令：排查在这条挂起，等用户点批准 / 拒绝 */
   | {

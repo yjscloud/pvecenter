@@ -540,7 +540,7 @@ ZH_EN: Dict[str, str] = {
         "View baseline reports and scores. Administrators only by default: once granted, a regular user only sees the hosts they added, and the panel host stays closed",
     "一键修复 SSH / 内核参数 / 口令策略等基线项（改动面板所在主机）":
         "Fix baseline items such as SSH / kernel parameters / password policy in one click (modifies the panel host)",
-    "AI 排查助手": "AI troubleshooting assistant",
+    "AI 助手": "AI assistant",
     "上机执行": "Run on host",
     "允许 AI 在目标主机上执行命令：只读诊断命令（白名单限制）可直接执行，"
     "改动系统的命令需你逐条批准。全程记入审计。默认仅管理员":

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import database
 
@@ -148,3 +148,98 @@ async def delete(username: str, key: str) -> bool:
         )
         await db.commit()
         return int(cursor.rowcount or 0) > 0
+
+
+# ---------------------------------------------------------------------------
+# 机器回收后的置顶 / 收藏清理
+#
+# guest_pins 里的键是 ``<连接 id>:<节点>/<vmid>``（与前端 useGuestPins 一致），
+# 里面**没有**任何能区分「第几代」机器的信息。PVE 分配新机器时用的是最小空闲
+# VMID，所以一台机器被删掉、下一台机器拿到同一个号之后，旧键会原样命中新机器，
+# 表现为「刚下发的新机器莫名其妙带着星标和置顶」。
+#
+# 结论：机器被回收时必须把它的键从所有用户偏好里删掉；建机时再兜底删一次，
+# 覆盖「在面板外删的机器」这种走不到删除接口的情况。
+# ---------------------------------------------------------------------------
+
+
+def guest_pin_refs(connection_id: str, node: str, vmid: Any) -> List[str]:
+    """一台机器在 guest_pins 里可能出现的全部写法。
+
+    正常写法是 ``<连接 id>:<节点>/<vmid>``；空连接、历史上不带连接前缀、
+    以及早期把缺省连接写成 ``-`` 的几种变体一并列出。多删一条不存在的键没有
+    副作用，漏删一条就会让同号的新机器继承旧状态，权衡很明确。
+    """
+    conn = str(connection_id or "").strip()
+    node = str(node or "").strip()
+    vm = str(vmid).strip()
+    refs = [
+        f"{conn}:{node}/{vm}",
+        f":{node}/{vm}",
+        f"-:{node}/{vm}",
+        f"{node}/{vm}",
+    ]
+    return list(dict.fromkeys(refs))
+
+
+def _drop_pin_refs(pins: Dict[str, Any], refs: Set[str]) -> Tuple[Dict[str, Any], bool]:
+    """从一份 guest_pins 里摘掉这些键，返回 (新值, 是否改动)。"""
+    result = dict(pins)
+    changed = False
+    for field in ("pinned", "starred"):
+        values = pins.get(field)
+        if not isinstance(values, list):
+            continue
+        kept = [item for item in values if not (isinstance(item, str) and item in refs)]
+        if len(kept) != len(values):
+            changed = True
+            result[field] = kept
+    return result, changed
+
+
+async def forget_guest_refs(connection_id: str, node: str, vmid: Any) -> int:
+    """把一台机器从**所有用户**的置顶 / 收藏里移除，返回被改动的用户数。
+
+    失败只记日志、不抛给调用方：资源已经删掉了，清理偏好是善后工作，
+    不该反过来把「删除成功」变成 500。残留的键会在下一次建机兜底清理时消失。
+    """
+    # 注意别写成 set(...)：本模块有一个同名的 set() 用于保存偏好，会被遮蔽
+    refs = {ref for ref in guest_pin_refs(connection_id, node, vmid)}
+    changed = 0
+    try:
+        async with database.connect() as db:
+            cursor = await db.execute(
+                "SELECT username, value FROM user_prefs"
+                " WHERE `key` = ? FOR UPDATE",
+                (PREF_GUEST_PINS,),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                stored = _decode(row[1], None)
+                if not isinstance(stored, dict):
+                    continue
+                trimmed, hit = _drop_pin_refs(stored, refs)
+                if not hit:
+                    continue
+                await db.execute(
+                    "UPDATE user_prefs SET value = ?, updated = ?"
+                    " WHERE username = ? AND `key` = ?",
+                    (
+                        json.dumps(trimmed, ensure_ascii=False),
+                        time.time(),
+                        row[0],
+                        PREF_GUEST_PINS,
+                    ),
+                )
+                changed += 1
+            await db.commit()
+    except Exception:  # noqa: BLE001 - 见上面的说明：清理失败不阻断删除
+        logger.warning(
+            "清理 %s/%s 的置顶与收藏失败", node, vmid, exc_info=True
+        )
+        return 0
+    if changed:
+        logger.info(
+            "%s/%s 已回收，清掉了 %d 个用户的置顶/收藏", node, vmid, changed
+        )
+    return changed

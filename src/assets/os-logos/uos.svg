@@ -1,0 +1,20 @@
+
+<!-- 统信 UOS：官方标识（「UOS」三字母，蓝 #1a6bf2 → 青绿 #12e0b6 横向渐变，
+     等宽圆头笔画）。按官方视觉重绘：字形与渐变逐条对照官方标，不是随手画的三
+     个字母。画布是横排的 2.3:1 —— 它本来就没有方形徽标，按 contain 缩放即可，
+     与 CentOS / Debian 的横竖比例差异同等对待（压成方形等于换了一个标）。
+     商标归统信软件技术有限公司。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="30 20 308 132" role="img">
+  <defs>
+    <linearGradient id="uos" x1="42" y1="86" x2="325" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1a6bf2"/>
+      <stop offset=".39" stop-color="#0da8ee"/>
+      <stop offset="1" stop-color="#12e0b6"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#uos)" stroke-width="23" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M54 44v52c0 17.7 14.3 32 32 32s32-14.3 32-32V44"/>
+    <circle cx="197" cy="86" r="42"/>
+    <path d="M305 44h-25c-12 4-12 38 0 42h22c12 4 12 38 0 42h-31"/>
+  </g>
+</svg>

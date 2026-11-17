@@ -224,6 +224,7 @@ export function AiUsageModal({
   const empty = !total || runs === 0;
   const models = stats?.by_model ?? [];
   const daily = stats?.daily ?? [];
+  const perf = stats?.perf;
   const peakModel = Math.max(1, ...models.map((row) => row.total_tokens));
   const windowDays = stats?.days ?? Number(days);
 
@@ -330,6 +331,53 @@ export function AiUsageModal({
               label={t('ai.usage.avgDuration')}
             />
           </div>
+
+          {perf && perf.samples > 0 ? (
+            <section className="ai-usage-section">
+              <header className="ai-usage-section-head">
+                <span className="ai-usage-section-title">
+                  {t('ai.usage.perf', { n: perf.samples })}
+                </span>
+                <span className="fs-xs text-muted">{t('ai.usage.perfHint')}</span>
+              </header>
+              <div className="ai-usage-stats">
+                <UsageStat
+                  value={msText(perf.ttfb_p50)}
+                  label={t('ai.usage.ttfbP50')}
+                />
+                <UsageStat
+                  value={msText(perf.ttfb_p95)}
+                  label={t('ai.usage.ttfbP95')}
+                />
+                <UsageStat
+                  value={msText(perf.e2e_p50)}
+                  label={t('ai.usage.e2eP50')}
+                />
+                <UsageStat
+                  value={msText(perf.e2e_p95)}
+                  label={t('ai.usage.e2eP95')}
+                />
+              </div>
+              <div className="ai-usage-stats">
+                <UsageStat
+                  value={msText(perf.queue_p95)}
+                  label={t('ai.usage.queueP95')}
+                />
+                <UsageStat
+                  value={msText(perf.llm_avg_ms)}
+                  label={t('ai.usage.llmAvg')}
+                />
+                <UsageStat
+                  value={msText(perf.tool_avg_ms)}
+                  label={t('ai.usage.toolAvg')}
+                />
+                <UsageStat
+                  value={String(perf.steps_avg)}
+                  label={t('ai.usage.stepsAvg')}
+                />
+              </div>
+            </section>
+          ) : null}
 
           {daily.length > 1 ? (
             <section className="ai-usage-section">

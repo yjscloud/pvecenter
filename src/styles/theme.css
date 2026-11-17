@@ -1,6 +1,6 @@
 /* ==========================================================================
    pvecenter — 主题令牌
-   浅色（腾讯云控制台设计语言），面板只有这一套主题。
+   浅色（腾讯云控制台设计语言）+ 深色两套，靠 <html data-theme> 切换。
    所有颜色都走 CSS 变量，组件样式不写死色值。
    ========================================================================== */
 
@@ -83,4 +83,54 @@
   color-scheme: light;
   scrollbar-color: #c9cdd4 transparent;
   scrollbar-width: thin;
+}
+
+/* ==========================================================================
+   深色主题
+   同一套语义令牌，只换取值：底更深、面板抬升、文字反相、品牌蓝提亮。
+   组件样式不需要知道深浅，照常引用 var() 即可。
+   ========================================================================== */
+:root[data-theme='dark'] {
+  --bg-base:#0e1116;
+  --bg-surface:#161a20;
+  --bg-elevated:#1c222a;
+  --bg-hover:#242c36;
+
+  --border:#2b333d; --border-muted:#222932;
+
+  --text-primary:#e6e9ee; --text-secondary:#a6afba; --text-muted:#6f7986;
+
+  --accent:#4c8dff; --accent-hover:#78a9ff; --accent-dim:rgba(76,141,255,.14); --accent-border:rgba(76,141,255,.4);
+  --accent-2:#33d6ff; --accent-2-dim:rgba(51,214,255,.12);
+
+  --success:#3ecf8e; --success-dim:rgba(62,207,142,.14);
+  --warning:#ffab3d; --warning-dim:rgba(255,171,61,.14);
+  --danger:#ff6b63; --danger-dim:rgba(255,107,99,.14);
+  --info:#4c8dff; --info-dim:rgba(76,141,255,.14);
+  --usage-low:#4c8dff; --usage-mid:#ffab3d; --usage-high:#ff6b63;
+
+  --chart-accent:#4c8dff; --chart-success:#3ecf8e; --chart-warning:#ffab3d; --chart-danger:#ff6b63;
+  --chart-purple:#9b8cff; --chart-cyan:#33d6ff; --chart-grey:#6b7683;
+  --chart-axis:#8a94a1; --chart-grid:rgba(255,255,255,.08);
+
+  --glow-accent:0 4px 16px -6px rgba(76,141,255,.5);
+  --glow-success:0 4px 16px -6px rgba(62,207,142,.5);
+  --glow-warning:0 4px 16px -6px rgba(255,171,61,.5);
+  --glow-danger:0 4px 16px -6px rgba(255,107,99,.5);
+
+  --grad-accent:linear-gradient(135deg,#4c8dff,#33d6ff);
+  --grad-hairline:linear-gradient(90deg,rgba(76,141,255,.7),rgba(51,214,255,.22) 62%,transparent);
+  --grad-panel:linear-gradient(160deg,rgba(76,141,255,.06),rgba(51,214,255,.03) 44%,transparent 80%);
+  --grid-line:rgba(76,141,255,.07);
+
+  --glass-bg:rgba(18,22,28,.82);
+
+  --shadow-sm:0 1px 2px rgba(0,0,0,.35);
+  --shadow-md:0 4px 14px rgba(0,0,0,.45);
+  --shadow-lg:0 10px 30px rgba(0,0,0,.55);
+
+  --stripe:rgba(255,255,255,.02); --overlay:rgba(0,0,0,.62); --focus-ring:rgba(76,141,255,.25);
+
+  color-scheme: dark;
+  scrollbar-color: #3a434e transparent;
 }

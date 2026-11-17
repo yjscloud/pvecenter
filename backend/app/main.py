@@ -89,6 +89,7 @@ from .routers import (
 )
 from . import aichat
 from . import aiaudit
+from . import ai_scope
 from . import aivm
 # 远程终端：进程退出时要主动断开挂着的 SSH 交互会话（见 lifespan）
 from . import aiterm
@@ -156,6 +157,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await security.refresh_session_policy()
     # AI 排查助手：谁在什么时候让 AI 在哪台机器上跑了什么命令，必须可追溯
     await aiaudit.init_table()
+    # AI 候选目标的跨 worker 探测缓存（多 worker 时避免把每台机器重复探 N 遍）
+    await ai_scope.init_table()
     # AI 会话：把「一次性排查」升级成可追问的对话（对话线程 + 消息）
     await aichat.init_table()
     # AI 虚拟机内取证：授权租约 + 动作流水（谁、对哪台、改了什么、能不能回滚）

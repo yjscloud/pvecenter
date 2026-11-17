@@ -17,8 +17,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
-from typing import Any, Dict, List, Optional
+from collections import deque
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import (
     APIRouter,
@@ -36,7 +39,9 @@ from .. import (
     ai_approval,
     aichat,
     aiaudit,
+    aiperf,
     aiplaybooks,
+    ai_scope,
     aiterm,
     aivm,
     aivm_diagd,
@@ -48,6 +53,8 @@ from .. import (
     security,
     store,
 )
+from ..config import settings
+from . import vm_meta as vm_meta_router
 
 logger = logging.getLogger(__name__)
 
@@ -58,19 +65,107 @@ VIEW = security.require_permission("baseline.view")
 # 也就等于 users.manage —— 勾了用户管理的人顺带拿到了 AI 配置权）
 ADMIN = security.require_permission("settings.manage")
 
+def _env_limit(name: str, default: int) -> int:
+    """读并发上限环境变量，非法值/越界一律回落到默认值（不能因为写错就崩）。"""
+    try:
+        value = int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(128, value))
+
+
 # 同时进行的排查上限。一次 L2 排查要 SSH 到目标主机跑多轮命令、再调七八次模型；
 # 多用户并发时既可能压垮被排查的机器，也可能瞬间打爆模型额度（花的是配 key 那位的钱）。
 # 超出上限的排在后面等，不直接拒绝 —— 排队比失败更符合预期。
-MAX_CONCURRENT_INSPECTIONS = 4
-_INSPECT_SEM: Optional[asyncio.Semaphore] = None
+#
+# 数值做成环境变量：不同 provider 的限速差一个数量级（本地 Ollama 能跑几十路，
+# 企业版 key 可能只给 5 RPM），写死一个数总有一边不对。改这里不用改代码：
+#   PVECENTER_AI_CONCURRENCY        全局总闸（默认 16）
+#   PVECENTER_AI_LANE_CONCURRENCY   单个 provider 子闸（默认 6）
+MAX_CONCURRENT_TOTAL = _env_limit("PVECENTER_AI_CONCURRENCY", 16)
+#: 每个 provider 一条子闸：真正稀缺的是那把共用的 API key，不是面板的线程。
+MAX_CONCURRENT_LANE = _env_limit("PVECENTER_AI_LANE_CONCURRENCY", 6)
+#: 兼容旧名字：体检链路历史上按「同时排查数」命名，语义等同 lane 闸。
+MAX_CONCURRENT_INSPECTIONS = MAX_CONCURRENT_LANE
+#: 排队时对「每一次前面还有多久」的兜底粗估（秒）。有本 provider 的真实历史
+#: 耗时就用实测均值，没有（刚启动 / 这个 key 第一次用）才退回它。
+QUEUE_ETA_SECONDS = 45
+
+_GLOBAL_SEM: Optional[asyncio.Semaphore] = None
+_LANE_SEMS: Dict[str, asyncio.Semaphore] = {}
+_LANE_WAITING: Dict[str, int] = {}
+#: 每个 provider 最近 N 轮的实际耗时（毫秒）。只留窗口，避免某一次异常慢
+#: 把 ETA 永久带偏；排队提示是「量级」，不是承诺。
+_LANE_DURATIONS: Dict[str, deque] = {}
+_ETA_WINDOW = 20
+
+
+def _global_semaphore() -> asyncio.Semaphore:
+    """全局总闸。懒建是为了不绑定到 import 时可能还不存在的事件循环。"""
+    global _GLOBAL_SEM
+    if _GLOBAL_SEM is None:
+        _GLOBAL_SEM = asyncio.Semaphore(MAX_CONCURRENT_TOTAL)
+    return _GLOBAL_SEM
 
 
 def _inspect_semaphore() -> asyncio.Semaphore:
-    """排查并发闸门。懒建是为了不绑定到 import 时可能还不存在的事件循环。"""
-    global _INSPECT_SEM
-    if _INSPECT_SEM is None:
-        _INSPECT_SEM = asyncio.Semaphore(MAX_CONCURRENT_INSPECTIONS)
-    return _INSPECT_SEM
+    """兼容旧的调用点（配置连通性测试等）：它们只关心「全局有没有满」。"""
+    return _global_semaphore()
+
+
+def _lane_for(provider_id: str) -> str:
+    """并发分组按**模型配置**而不是按用户：真正稀缺的是那把共用的 API key。"""
+    return str(provider_id or "default")
+
+
+def _lane_semaphore(lane: str) -> asyncio.Semaphore:
+    sem = _LANE_SEMS.get(lane)
+    if sem is None:
+        sem = asyncio.Semaphore(MAX_CONCURRENT_LANE)
+        _LANE_SEMS[lane] = sem
+    return sem
+
+
+@asynccontextmanager
+async def _turn_lane(lane: str) -> AsyncIterator[None]:
+    """先过全局总闸、再过 provider 子闸。两层都是「排队不拒绝」。"""
+    async with _global_semaphore():
+        async with _lane_semaphore(lane):
+            yield
+
+
+def _queued_event(lane: str = "default") -> Dict[str, Any]:
+    """进入队列时下发的位置与等待估计。
+
+    ``ahead`` 是同一 provider 队列里排在前面的人数（不含正在跑的那几轮）；
+    ``eta_s`` 用该 provider 最近若干轮的实际耗时均值推算，第一次用这个 key 时
+    才退回固定粗估值。
+    """
+    ahead = _LANE_WAITING.get(lane, 0)
+    _LANE_WAITING[lane] = ahead + 1
+    durations = list(_LANE_DURATIONS.get(lane, ()))
+    if durations:
+        average_s = sum(durations) / len(durations) / 1000
+        # 排队 + 自己这一轮，按最近实测均值估；夹一下，避免极端值吓得人不敢用
+        eta = max(5, min(300, int(average_s * (ahead + 1))))
+    else:
+        eta = (ahead + 1) * QUEUE_ETA_SECONDS
+    return {
+        "type": "stage",
+        "stage": "queued",
+        "ahead": ahead,
+        "eta_s": eta,
+    }
+
+
+def _leave_queue(lane: str = "default") -> None:
+    _LANE_WAITING[lane] = max(0, _LANE_WAITING.get(lane, 0) - 1)
+
+
+def _record_duration(lane: str, ms: float) -> None:
+    """记录一轮**实际执行**耗时（不含排队），供下一次排队估计使用。"""
+    bucket = _LANE_DURATIONS.setdefault(lane, deque(maxlen=_ETA_WINDOW))
+    bucket.append(max(0.0, float(ms)))
 
 
 @router.get("/config")
@@ -94,7 +189,7 @@ async def put_config(
         "ai.config",
         "ai",
         "success",
-        "更新 AI 排查助手配置（" + str(len(saved.get("providers") or [])) + " 个模型）",
+        "更新 AI 助手配置（" + str(len(saved.get("providers") or [])) + " 个模型）",
     )
     return saved
 
@@ -125,12 +220,41 @@ async def test_config(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _scan_inline(candidate_count: int) -> bool:
+    """候选台数是否少到值得「当场探完再回」。
+
+    阈值在 ``Settings.ai_scan_inline_max``：台数少时探测只要几百毫秒，等它比
+    多等一个轮询周期划算；台数多时先出列表更值钱。脏值 / 0 一律按「不当场探」
+    处理 —— 那正是加这个阈值之前的行为，最坏只是慢，不会把首屏挂死在探测上。
+    """
+    try:
+        limit = int(getattr(settings, "ai_scan_inline_max", 0) or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    return candidate_count <= max(0, limit)
+
+
 @router.get("/targets")
-async def targets(user: Dict[str, Any] = Depends(VIEW)) -> Dict[str, Any]:
+async def targets(
+    request: Request, user: Dict[str, Any] = Depends(VIEW)
+) -> Dict[str, Any]:
     """可排查的主机清单，附带助手当前的可用状态。
 
     状态一起回给前端，是为了让页面能区分「还没配模型」和「配好了可以排查」
     两种情形，而不是让用户点一下才被告知没配置。
+
+    候选按五条件与运算筛过（运行中、已安全纳管、Guest Agent 正常、cloud-init
+    正常、是虚拟机），并带回被排除的原因计数；规则见 ``ai_scope``。
+
+    **候选很少时当场探完**：探测本身只有两次 PVE 往返，而「先回列表、后台补探」
+    要等前端下一次轮询才有结论 —— 两三台机器上，那一个轮询周期才是用户看到的
+    「慢」。阈值见 ``Settings.ai_scan_inline_max``（默认 8，设 0 = 一律不当场探）。
+
+    **候选很多时默认不等探测**：每台机器两次 PVE 往返，几十台就能把首屏拖到
+    十几秒。先回已经有结论的，没结论的排后台，``pending_total`` 大于 0 时前端
+    隔两秒再问一次，于是「列表先出来、状态逐渐补齐」。``?refresh=1`` 则等全部
+    探测完成（页面上「重新检测」这类显式动作、脚本与测试用）；它同样受
+    ``ai_scan_budget`` 上限约束，到点先回已探完的。
     """
     allowed = await hostscope.allowed_host_ids(user)
     cfg = await ai.load_config()
@@ -142,11 +266,44 @@ async def targets(user: Dict[str, Any] = Depends(VIEW)) -> Dict[str, Any]:
         username=str(user.get("username") or ""),
         is_admin=_is_admin(user),
     )
+    # 候选必须是「这一轮确实做得到」的机器：五条件为与关系，任一不满足就排除
+    # （详见 ai_scope 模块头）。这里不放宽到「先列出来、点进去再报错」——
+    # 用户会以为那台机器能查，而实际上第一条命令就会失败。
+    candidates = ai.ai_targets(await baseline.targets(allowed))
+    wait = str(request.query_params.get("refresh") or "") in ("1", "true", "yes")
+    pending = 0
+    # 台数很少时**当场探完**再回：探测本身只有两次往返（几百毫秒），而「先出
+    # 列表、后台补探」这条要等前端下一次轮询才有结论 —— 两三台机器上，那一个
+    # 轮询周期才是用户看到的「慢」。台数一多就反过来了：先出列表更值钱。
+    inline = _scan_inline(len(candidates))
+    if wait or inline:
+        # 显式刷新 / 当场探也要有上限：全量探测动辄一两分钟，等于把请求挂在
+        # 反向代理的超时上 —— 用户看到的是转圈到断开，不是「还没探完」。
+        # 到点先回已探完的，pending 交给前端轮询补齐（它本来就会这么做）。
+        hosts, excluded, excluded_items = await ai_scope.evaluate_hosts_with_details(
+            candidates, budget_s=settings.ai_scan_budget
+        )
+        pending = int(excluded.get("pending") or 0)
+    else:
+        (
+            hosts,
+            excluded,
+            excluded_items,
+            pending,
+        ) = await ai_scope.evaluate_hosts_fast(candidates)
     return {
+        # 还有几台没探完：大于 0 时前端继续轮询，列表先出、状态后补
+        "pending_total": pending,
+        # 这一轮扫描的自述（探了几台 / 多久 / 几条 PVE 连不上）：页面上用来
+        # 显示进度，排障时用来区分「机器多」和「PVE 慢」—— 两者处理方式不同。
+        "scan": ai_scope.last_stats(),
         # 刻意**不含面板本机**（ai.ai_targets 负责剔除）：本机是跑着这个面板、
         # 握着全部受管凭据的那台机器，而助手会上机执行命令、还能开终端。
         # 本机的安全状况另有自己那几页的本机作用域，不必从这条更放权的路进来。
-        "hosts": ai.ai_targets(await baseline.targets(allowed)),
+        "hosts": hosts,
+        # 计数用于一句话概括，items 用于点名到具体机器 + 原因 + 修复入口。
+        # 明细只来自上一步已按 allowed 过滤后的主机，因此不越出用户的可见范围。
+        "excluded": {**excluded, "items": excluded_items},
         "status": {
             "enabled": bool(cfg.get("enabled")),
             "ready": bool(cfg.get("enabled") and provider),
@@ -158,6 +315,43 @@ async def targets(user: Dict[str, Any] = Depends(VIEW)) -> Dict[str, Any]:
 
 def _is_admin(user: Dict[str, Any]) -> bool:
     return str(user.get("role") or "") == "admin"
+
+
+def _exec_access(payload: Dict[str, Any], allow_exec: bool) -> str:
+    """解析主机命令授权级别。
+
+    老客户端只传 ``allow_exec``：按 write 处理，保持合并前的「可以提议写命令」。
+    新客户端显式传 ``exec_access``；未授权时一律 read，避免残留级别被误用。
+    """
+    if not allow_exec:
+        return "read"
+    level = str(payload.get("exec_access") or "").strip().lower()
+    return "read" if level == "read" else "write"
+
+
+def _lease_scope_matches(
+    lease: Dict[str, Any], *, fs_rw: List[str], units: List[str]
+) -> bool:
+    """级别之外，可写目录与可重启服务也必须一致才允许复用旧票。"""
+    return set(lease.get("fs_rw") or []) == set(fs_rw) and set(
+        lease.get("units") or []
+    ) == set(units)
+
+
+async def _active_lease_from_payload(
+    username: str, payload: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """按统一授权 payload 里的目标信息找一张生效中的租约。"""
+    node = str(payload.get("node") or "")
+    try:
+        vmid = int(payload.get("vmid") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not node or vmid <= 0:
+        return None
+    return await aivm.active_lease_for(
+        username, str(payload.get("connection_id") or ""), node, vmid
+    )
 
 
 @router.get("/models")
@@ -353,6 +547,8 @@ async def inspect_stream(
             status_code=403,
             detail=i18n.tr("没有「授权 AI 上机执行」的权限"),
         )
+    exec_access = _exec_access(payload, allow_exec)
+    allow_write = allow_exec and exec_access == "write"
     allowed = await hostscope.allowed_host_ids(user)
     username = str(user.get("username") or "")
     # 权限清单一并带进 AI 层：SSH 登录分析这类**全局**数据要据此决定给不给
@@ -360,23 +556,60 @@ async def inspect_stream(
     perms = security.effective_permissions(user)
     queue: "asyncio.Queue[Any]" = asyncio.Queue()
 
+    # 首字延迟从「请求进入端点」算起，包含排队时间 —— 这才是用户实际等到的时长
+    perf_started = time.perf_counter()
+    last_disconnect_check = 0.0
+
     async def emit(event: Dict[str, Any]) -> None:
-        # 用户关了页面或点了「终止」：连接已经断开，再往下跑只是白烧 token。
-        # 抛出去让 agent 循环停下来 —— notify 会放行这一个异常（见 StopInspection）。
-        if await request.is_disconnected():
-            raise ai.StopInspection()
+        # 用户关了页面或点了「终止」：连接已断，再往下跑只是白烧 token。
+        # is_disconnected() 是一次 ASGI receive 轮询：流式下每 token 都做，等于
+        # 每个字都多一次往返。降到 500ms 一次；结束类事件立即检查，用户点
+        # 「终止」最迟半秒生效。抛出去让 agent 循环停下（见 StopInspection）。
+        nonlocal last_disconnect_check
+        kind = str(event.get("type") or "")
+        if kind in ("done", "error", "aborted", "approval"):
+            check_now = True
+        else:
+            check_now = time.monotonic() - last_disconnect_check >= 0.5
+        if check_now:
+            last_disconnect_check = time.monotonic()
+            if await request.is_disconnected():
+                raise ai.StopInspection()
+        # 首个 token（或报告模式的第一条生成进度）进 SSE 队列的时刻 = 用户感知的「首字」
+        if kind in ("token", "report_progress"):
+            aiperf.set_once("ttfb_ms", (time.perf_counter() - perf_started) * 1000)
         await queue.put(event)
+
+    def _finish_perf(session: str, status: str) -> Dict[str, Any]:
+        """收口计时：写 ai_perf 日志并返回快照，交给 finish_session 落库。"""
+        return aiperf.log_session(
+            session,
+            status=status,
+            total_ms=(time.perf_counter() - perf_started) * 1000,
+        )
 
     async def worker() -> None:
         session_id = ""
         started = time.time()
         host_name = host_id
-        sem = _inspect_semaphore()
+        lane = _lane_for(provider_id)
+        sem = _lane_semaphore(lane)
+        reserved = False
+        # 分段秒表随 worker 这个 task 传播：emit / Agent 循环 / 会话层记的是同一份
+        aiperf.start()
+        queued_at = 0.0
+        acquired_at = 0.0
         try:
-            # 并发到顶时先告诉前端「排队中」，否则用户对着转圈会以为页面卡死
-            if sem.locked():
-                await queue.put({"type": "stage", "stage": "queued"})
-            async with sem:
+            # 并发到顶时先告诉前端「排队中 + 前面还有几次」，否则用户对着转圈会
+            # 以为页面卡死，或者不知道是「再等几秒」还是「先干别的去」
+            if sem.locked() or _global_semaphore().locked():
+                reserved = True
+                queued_at = time.perf_counter()
+                await queue.put(_queued_event(lane))
+            async with _turn_lane(lane):
+                acquired_at = time.perf_counter()
+                if queued_at:
+                    aiperf.add("queue_ms", (acquired_at - queued_at) * 1000)
                 host = await ai.resolve_host(host_id, allowed)
                 host_name = str(host.get("name") or host_id)
 
@@ -395,6 +628,7 @@ async def inspect_stream(
                     username=username,
                     is_admin=_is_admin(user),
                     allow_exec=allow_exec,
+                    allow_write=allow_write,
                     perms=perms,
                 )
 
@@ -410,6 +644,7 @@ async def inspect_stream(
                     duration_ms=int((time.time() - started) * 1000),
                     # 结论也落库：否则回看记录只有「跑了什么」，没有「结论是什么」
                     result=result.get("result"),
+                    metrics=_finish_perf(session_id, "done"),
                 )
                 await queue.put({"type": "done", "result": result, "session_id": session_id})
                 await security.audit(
@@ -432,27 +667,52 @@ async def inspect_stream(
             # 用户终止：不算失败。但会话必须收口 —— 否则排查记录里会留一条
             # 永远「进行中」的记录，事后分不清是真卡死了还是人为停掉的。
             if session_id:
-                await aiaudit.finish_session(session_id, status="cancelled")
+                await aiaudit.finish_session(
+                    session_id,
+                    status="cancelled",
+                    metrics=_finish_perf(session_id, "cancelled"),
+                )
             await queue.put({"type": "aborted"})
         except ai.AIError as exc:
             if session_id:
-                await aiaudit.finish_session(session_id, status="failed", error=str(exc))
+                await aiaudit.finish_session(
+                    session_id,
+                    status="failed",
+                    error=str(exc),
+                    metrics=_finish_perf(session_id, "failed"),
+                )
             await queue.put({"type": "error", "message": str(exc)})
         except Exception as exc:  # noqa: BLE001 - 兜底：异常也要让前端收到结束信号
             logger.exception("AI 排查异常")
             if session_id:
                 await aiaudit.finish_session(
-                    session_id, status="failed", error=str(exc)[:300]
+                    session_id,
+                    status="failed",
+                    error=str(exc)[:300],
+                    metrics=_finish_perf(session_id, "failed"),
                 )
             await queue.put({"type": "error", "message": str(exc)[:300]})
         finally:
+            if acquired_at:
+                # 只统计真正跑起来的耗时，排队时间不混进去 —— 否则别人排队久了
+                # 会把这个 provider 的 ETA 估计整体带偏
+                _record_duration(lane, (time.perf_counter() - acquired_at) * 1000)
+            if reserved:
+                _leave_queue(lane)
             await queue.put(None)  # 结束哨兵
 
     async def gen():
         task = asyncio.create_task(worker())
         try:
             while True:
-                event = await queue.get()
+                try:
+                    # 心跳：上游卡住 / 长工具执行时 SSE 也要有字节流出来，否则
+                    # nginx / 浏览器 / 前端的读超时会把它当成断线（用户只看到
+                    # 一直转圈，却没有任何错误提示）。15 秒远小于这些超时。
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
                 if event is None:
                     break
                 yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
@@ -670,17 +930,21 @@ async def vm_lease_create(
     # 否则撤销时用户不知道该撤哪一张。
     existing = await aivm.active_lease_for(username, connection_id, node, vmid)
     if existing:
-        # 级别不同的票不能「复用」：用户点的是「运维授权」，拿回一张只读票，
-        # 表现就是「授权了还是什么都不能做」。让他显式撤销旧票再签新票。
-        if str(existing.get("access") or aivm.ACCESS_WRITE) != access:
-            current = str(existing.get("access") or aivm.ACCESS_WRITE)
+        # 级别或范围不同的票不能「复用」：用户点的是「运维授权」，拿回一张只读票，
+        # 表现就是「授权了还是什么都不能做」；范围不同更危险 —— 用户以为新加了
+        # /etc，实际拿回的是旧票的 /tmp。两种情况都必须显式撤销旧票再签新票。
+        current = str(existing.get("access") or aivm.ACCESS_WRITE)
+        if current != access or not _lease_scope_matches(
+            existing, fs_rw=fs_rw, units=units
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=i18n.pick(
                     f"这台机器已有一张「{aivm.ACCESS_LABELS.get(current, current)}」级别的授权，"
-                    "请先在「生效中的授权」列表里撤销它，再签发新授权",
+                    "范围和本次选择不一致。请先在「生效中的授权」列表里撤销它，再签发新授权",
                     f"This VM already has a “{aivm.ACCESS_LABELS_EN.get(current, current)}” "
-                    "grant. Revoke it in the “Active grants” list first, then issue the new one.",
+                    "grant whose scope differs from this request. Revoke it in the "
+                    "“Active grants” list first, then issue the new one.",
                 ),
             )
         return {"lease": aivm.public_lease(existing), "reused": True}
@@ -712,6 +976,12 @@ async def vm_lease_create(
     # 客户机是 Linux 还是 Windows、带了什么标签 —— 这两项决定路径语义、命令白名单
     # 与策略（prod 标签禁写）。取不到就按 Linux + 无标签处理（见 describe_guest）。
     info = await aivm.describe_guest(node, vmid, guest_type)
+    # 面板侧的人工标注优先：导入 / 手工建的机器常把 PVE 的 ostype 停在 win*，
+    # 运维在「备注」里确认过的系统比它可信。只映射大类 —— 发行版细节不影响
+    # 这里的路径语义与命令白名单。
+    meta_os = await vm_meta_router.os_of(node, vmid, connection_id or None)
+    if meta_os:
+        info["os_type"] = "windows" if meta_os == "windows" else "linux"
     # 沙箱模式在签发时探测一次并固化：中途装上/卸掉 diagd 不该让同一次排查的
     # 隔离等级悄悄变化。
     probe = {
@@ -811,6 +1081,247 @@ async def vm_lease_revoke(
         # 兼容模式下没有终止开关，前端要如实告诉用户「那条命令会自己跑完」
         "kill": outcome.get("kill") or {},
     }
+
+
+@router.post("/authorization/grant")
+async def authorization_grant(
+    payload: Dict[str, Any],
+    request: Request,
+    user: Dict[str, Any] = Depends(VIEW),
+) -> Dict[str, Any]:
+    """统一授权：一次确认同时处理主机命令与虚拟机票据。
+
+    主机是会话级布尔值，虚拟机是限时票据；两者生命周期不同，但用户决定只做一次。
+    这里先校验、再签票、最后落主机标志；主机标志写失败时补偿撤销刚新建的票，
+    避免留下「有票但页面不知道」的半成品。
+    """
+    username = str(user.get("username") or "")
+    is_admin = _is_admin(user)
+    want_host = bool(payload.get("host"))
+    want_vm = bool(payload.get("vm"))
+    exec_access = _exec_access(payload, want_host)
+    host_id = str(payload.get("host_id") or "")
+    vm_payload = payload.get("vm_grant")
+    if not isinstance(vm_payload, dict):
+        vm_payload = {}
+
+    if want_host:
+        if not security.has_user_permission(user, "ai.exec"):
+            raise HTTPException(
+                status_code=403,
+                detail=i18n.tr("没有「授权 AI 上机执行」的权限"),
+            )
+        if not host_id:
+            raise HTTPException(status_code=400, detail=i18n.tr("缺少目标主机"))
+        try:
+            await ai.resolve_host(host_id, await hostscope.allowed_host_ids(user))
+        except ai.AIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    conversation_id = str(payload.get("conversation_id") or "")
+    if conversation_id:
+        conv = await aichat.get_conversation(conversation_id)
+        if not conv or not aichat.owns(conv, username, is_admin):
+            raise HTTPException(status_code=404, detail=i18n.tr("找不到这条会话"))
+    else:
+        host_name = str(payload.get("host_name") or host_id)
+        if not host_name:
+            raise HTTPException(
+                status_code=400, detail=i18n.tr("缺少目标主机或虚拟机")
+            )
+        conv = await aichat.create_conversation(
+            username=username,
+            host_id=host_id,
+            host_name=host_name,
+            allow_exec=want_host,
+            exec_access=exec_access,
+        )
+        conversation_id = str(conv.get("id") or "")
+
+    lease: Optional[Dict[str, Any]] = None
+    reused = False
+    replaced: Optional[Dict[str, Any]] = None
+    revoked: Optional[Dict[str, Any]] = None
+    warnings: List[str] = []
+
+    def _remember_kill(outcome: Dict[str, Any]) -> None:
+        kill = outcome.get("kill") or {}
+        if kill and not kill.get("ok") and kill.get("output"):
+            warnings.append(str(kill.get("output")))
+
+    if want_vm:
+        if not vm_payload:
+            raise HTTPException(status_code=400, detail=i18n.tr("缺少虚拟机授权参数"))
+        try:
+            result = await vm_lease_create(vm_payload, request, user)
+        except HTTPException as exc:
+            # 已有不同级别 / 不同范围的票：统一面板已经让用户选过「撤销并重签」，
+            # 这里按一次确认执行，不再把 409 丢回页面让用户点第二次。
+            if exc.status_code == 409 and bool(payload.get("replace_existing")):
+                existing = await _active_lease_from_payload(username, vm_payload)
+                if existing:
+                    _remember_kill(
+                        await aivm.revoke_lease(
+                            str(existing["id"]),
+                            reason=i18n.tr("统一授权调整级别 / 范围，撤销旧票据"),
+                        )
+                    )
+                    refreshed = await aivm.get_lease(str(existing["id"]))
+                    replaced = aivm.public_lease(refreshed or existing)
+                result = await vm_lease_create(vm_payload, request, user)
+            else:
+                raise
+        lease = result.get("lease")
+        reused = bool(result.get("reused"))
+    elif vm_payload:
+        # 用户在新面板里取消了虚拟机通道：撤销该目标上仍生效的票，避免「页面
+        # 显示未授权、AI 还能拿旧 lease_id 进去」。
+        existing = await _active_lease_from_payload(username, vm_payload)
+        if existing:
+            _remember_kill(
+                await aivm.revoke_lease(
+                    str(existing["id"]),
+                    reason=i18n.tr("统一授权调整为不启用虚拟机通道"),
+                )
+            )
+            refreshed = await aivm.get_lease(str(existing["id"]))
+            revoked = aivm.public_lease(refreshed or existing)
+
+    if not await aichat.set_allow_exec(
+        conversation_id, want_host, exec_access=exec_access
+    ):
+        # 主机标志落库失败：把刚新建的票撤掉，保持两条通道一致；复用旧票不能撤。
+        if lease and not reused:
+            await aivm.revoke_lease(
+                str(lease.get("id") or ""),
+                reason=i18n.tr("主机授权落库失败，回滚新建票据"),
+            )
+        raise HTTPException(
+            status_code=500, detail=i18n.tr("授权状态保存失败，请重试")
+        )
+
+    channels = []
+    if want_host:
+        channels.append("主机命令(" + exec_access + ")")
+    if want_vm and lease:
+        channels.append("虚拟机内(" + str(lease.get("access") or "read") + ")")
+    if not want_vm and revoked:
+        channels.append("撤销虚拟机内")
+    detail = "统一授权：" + ("、".join(channels) if channels else "仅更新状态")
+    await security.audit(
+        request,
+        user,
+        "ai.authorization.grant",
+        target=conversation_id,
+        result="success",
+        detail=detail,
+    )
+    refreshed_conv = await aichat.get_conversation(conversation_id)
+    return {
+        "conversation": refreshed_conv or conv,
+        "host": {
+            "authorized": want_host,
+            "scope": "session",
+            "access": exec_access,
+        },
+        "lease": lease,
+        "reused": reused,
+        "replaced": replaced,
+        "revoked": revoked,
+        "warnings": warnings,
+    }
+
+
+@router.post("/authorization/renew")
+async def authorization_renew(
+    payload: Dict[str, Any],
+    request: Request,
+    user: Dict[str, Any] = Depends(VIEW),
+) -> Dict[str, Any]:
+    """续期虚拟机票据：只延长时间，不改变级别、范围与已用动作数。"""
+    lease_id = str(payload.get("lease_id") or "")
+    if not lease_id:
+        raise HTTPException(status_code=400, detail=i18n.tr("缺少授权标识"))
+    lease = await _require_own_lease(lease_id, user)
+    try:
+        minutes = int(payload.get("minutes") or aivm.DEFAULT_MINUTES)
+    except (TypeError, ValueError):
+        minutes = aivm.DEFAULT_MINUTES
+    renewed = await aivm.renew_lease(
+        lease_id,
+        minutes=minutes,
+        username=str(user.get("username") or ""),
+        is_admin=_is_admin(user),
+    )
+    if renewed is None:
+        raise HTTPException(
+            status_code=409,
+            detail=i18n.tr("这条虚拟机授权已过期或已撤销，请重新授权"),
+        )
+    await security.audit(
+        request,
+        user,
+        "ai.authorization.renew",
+        target=f"{lease.get('node')}/{lease.get('vmid')}",
+        result="success",
+        detail=f"续期 AI 虚拟机授权（{lease.get('vm_name') or lease.get('vmid')}）",
+    )
+    return {"lease": aivm.public_lease(renewed)}
+
+
+@router.post("/authorization/revoke")
+async def authorization_revoke(
+    payload: Dict[str, Any],
+    request: Request,
+    user: Dict[str, Any] = Depends(VIEW),
+) -> Dict[str, Any]:
+    """撤销统一授权：主机、虚拟机可分别撤销，也可一次撤销全部。"""
+    want_host = bool(payload.get("host"))
+    want_vm = bool(payload.get("vm"))
+    conversation_id = str(payload.get("conversation_id") or "")
+    host_updated = True
+    if want_host and conversation_id:
+        conv = await aichat.get_conversation(conversation_id)
+        if not conv or not aichat.owns(
+            conv, str(user.get("username") or ""), _is_admin(user)
+        ):
+            raise HTTPException(status_code=404, detail=i18n.tr("找不到这条会话"))
+        host_updated = await aichat.set_allow_exec(conversation_id, False)
+
+    lease: Optional[Dict[str, Any]] = None
+    kill: Dict[str, Any] = {}
+    if want_vm:
+        lease_id = str(payload.get("lease_id") or "")
+        if not lease_id:
+            vm_payload = payload.get("vm_grant")
+            if not isinstance(vm_payload, dict):
+                vm_payload = payload
+            existing = await _active_lease_from_payload(
+                str(user.get("username") or ""), vm_payload
+            )
+            lease_id = str(existing.get("id") or "") if existing else ""
+        if lease_id:
+            current = await _require_own_lease(lease_id, user)
+            outcome = await aivm.revoke_lease(
+                lease_id,
+                reason=str(payload.get("reason") or i18n.tr("用户撤销统一授权")),
+            )
+            kill = outcome.get("kill") or {}
+            refreshed = await aivm.get_lease(lease_id)
+            lease = aivm.public_lease(refreshed or current)
+
+    await security.audit(
+        request,
+        user,
+        "ai.authorization.revoke",
+        target=conversation_id or (lease_id if want_vm else ""),
+        result="success" if host_updated else "partial",
+        detail="撤销统一授权："
+        + ("主机命令" if want_host else "")
+        + ("、" if want_host and want_vm else "")
+        + ("虚拟机内" if want_vm else ""),
+    )
+    return {"host_updated": host_updated, "lease": lease, "kill": kill}
 
 
 @router.post("/vm/leases/{lease_id}/kill")
@@ -1047,6 +1558,7 @@ async def create_conversation(
         host_name=str(host.get("name") or host_id),
         provider=str(payload.get("provider_id") or ""),
         allow_exec=allow_exec,
+        exec_access=_exec_access(payload, allow_exec),
     )
     await security.audit(
         request,
@@ -1062,10 +1574,13 @@ async def create_conversation(
 @router.get("/conversations/{conversation_id}")
 async def conversation_detail(
     conversation_id: str,
+    since_seq: int = Query(default=0, ge=0),
     user: Dict[str, Any] = Depends(VIEW),
 ) -> Dict[str, Any]:
-    """会话详情：元信息 + 全部消息 + 最近一次运行的元信息。
+    """会话详情：元信息 + 消息 + 最近一次运行的元信息。
 
+    ``since_seq`` 只返回 seq 更大的消息 —— 一轮结束后页面只需要新追加的那几条，
+    不必把整条会话重新拉一遍（长会话那一下会被用户直接感觉到）。
     越权按 404 处理（而不是 403）—— 不向非本人确认这条会话是否存在。
     """
     conv = await aichat.get_conversation(conversation_id)
@@ -1078,9 +1593,47 @@ async def conversation_detail(
     hostscope.apply_display_names([conv], await hostscope.current_display_names())
     return {
         "conversation": conv,
-        "messages": await aichat.list_messages(conversation_id),
+        "messages": await aichat.list_messages(
+            conversation_id, after_seq=int(since_seq or 0)
+        ),
         # 报告页要显示「模型 / 耗时 / token / 工具数」，这些记在运行上
         "session": await aiaudit.latest_session_for_conversation(conversation_id),
+    }
+
+
+@router.post("/conversations/{conversation_id}/exec-authorization")
+async def set_exec_authorization(
+    conversation_id: str,
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(VIEW),
+) -> Dict[str, Any]:
+    """同步会话的主机授权状态（不跑模型、不写审计）。
+
+    用于两处：切换主机自动接续旧会话时**关闭**旧授权；统一面板已经写过的状态
+    在页面恢复时对齐。真正的授权动作走 ``/authorization/grant`` 并写审计。
+    """
+    conv = await aichat.get_conversation(conversation_id)
+    if not conv or not aichat.owns(
+        conv, str(user.get("username") or ""), _is_admin(user)
+    ):
+        raise HTTPException(status_code=404, detail=i18n.tr("找不到这条会话"))
+    enabled = bool(payload.get("enabled"))
+    if enabled and not security.has_user_permission(user, "ai.exec"):
+        raise HTTPException(
+            status_code=403,
+            detail=i18n.tr("没有「授权 AI 上机执行」的权限"),
+        )
+    access = _exec_access(payload, enabled)
+    if not await aichat.set_allow_exec(
+        conversation_id, enabled, exec_access=access
+    ):
+        raise HTTPException(
+            status_code=500, detail=i18n.tr("授权状态保存失败，请重试")
+        )
+    return {
+        "conversation_id": conversation_id,
+        "allow_exec": 1 if enabled else 0,
+        "exec_access": access,
     }
 
 
@@ -1110,6 +1663,8 @@ async def conversation_stream(
             status_code=403,
             detail=i18n.tr("没有「授权 AI 上机执行」的权限"),
         )
+    exec_access = _exec_access(payload, allow_exec)
+    allow_write = allow_exec and exec_access == "write"
 
     # 虚拟机授权：带上租约 id 才会启用进虚拟机的那几个工具。租约必须属于本人、
     # 未过期、未撤销；权限位在创建租约时校验过，这里再查一次 —— 权限可能在
@@ -1139,20 +1694,50 @@ async def conversation_stream(
     allowed = await hostscope.allowed_host_ids(user)
     queue: "asyncio.Queue[Any]" = asyncio.Queue()
 
+    perf_started = time.perf_counter()
+    last_disconnect_check = 0.0
+
     async def emit(event: Dict[str, Any]) -> None:
-        # 用户关了页面或点了「终止」：连接已断，再往下跑只是白烧 token。
-        if await request.is_disconnected():
-            raise ai.StopInspection()
+        # 同上：断连检查降频到 500ms，结束类事件仍立即检查（否则「终止」会延迟）
+        nonlocal last_disconnect_check
+        kind = str(event.get("type") or "")
+        if kind in ("done", "error", "aborted", "approval"):
+            check_now = True
+        else:
+            check_now = time.monotonic() - last_disconnect_check >= 0.5
+        if check_now:
+            last_disconnect_check = time.monotonic()
+            if await request.is_disconnected():
+                raise ai.StopInspection()
+        if kind in ("token", "report_progress"):
+            aiperf.set_once("ttfb_ms", (time.perf_counter() - perf_started) * 1000)
         await queue.put(event)
+
+    def _finish_perf(session: str, status: str) -> Dict[str, Any]:
+        return aiperf.log_session(
+            session,
+            status=status,
+            total_ms=(time.perf_counter() - perf_started) * 1000,
+        )
 
     async def worker() -> None:
         session_id = ""
         started = time.time()
-        sem = _inspect_semaphore()
+        lane = _lane_for(provider_id)
+        sem = _lane_semaphore(lane)
+        reserved = False
+        aiperf.start()
+        queued_at = 0.0
+        acquired_at = 0.0
         try:
-            if sem.locked():
-                await queue.put({"type": "stage", "stage": "queued"})
-            async with sem:
+            if sem.locked() or _global_semaphore().locked():
+                reserved = True
+                queued_at = time.perf_counter()
+                await queue.put(_queued_event(lane))
+            async with _turn_lane(lane):
+                acquired_at = time.perf_counter()
+                if queued_at:
+                    aiperf.add("queue_ms", (acquired_at - queued_at) * 1000)
                 session_id = await aiaudit.open_session(
                     username=username,
                     host_id=str(conv.get("host_id") or ""),
@@ -1175,6 +1760,8 @@ async def conversation_stream(
                         username=username,
                         is_admin=is_admin,
                         allow_exec=allow_exec,
+                        allow_write=allow_write,
+                        exec_access=exec_access,
                         perms=perms,
                     )
                 calls = result.get("tool_calls") or []
@@ -1188,6 +1775,7 @@ async def conversation_stream(
                     usage=result.get("usage") or {},
                     duration_ms=int((time.time() - started) * 1000),
                     result=result.get("report"),
+                    metrics=_finish_perf(session_id, "done"),
                 )
                 await queue.put(
                     {
@@ -1211,27 +1799,50 @@ async def conversation_stream(
         except ai.StopInspection:
             # 用户终止不算失败，但会话必须收口，否则记录里会留一条永远「进行中」
             if session_id:
-                await aiaudit.finish_session(session_id, status="cancelled")
+                await aiaudit.finish_session(
+                    session_id,
+                    status="cancelled",
+                    metrics=_finish_perf(session_id, "cancelled"),
+                )
             await queue.put({"type": "aborted"})
         except ai.AIError as exc:
             if session_id:
-                await aiaudit.finish_session(session_id, status="failed", error=str(exc))
+                await aiaudit.finish_session(
+                    session_id,
+                    status="failed",
+                    error=str(exc),
+                    metrics=_finish_perf(session_id, "failed"),
+                )
             await queue.put({"type": "error", "message": str(exc)})
         except Exception as exc:  # noqa: BLE001 - 兜底：异常也要让前端收到结束信号
             logger.exception("AI 会话异常")
             if session_id:
                 await aiaudit.finish_session(
-                    session_id, status="failed", error=str(exc)[:300]
+                    session_id,
+                    status="failed",
+                    error=str(exc)[:300],
+                    metrics=_finish_perf(session_id, "failed"),
                 )
             await queue.put({"type": "error", "message": str(exc)[:300]})
         finally:
+            if acquired_at:
+                _record_duration(lane, (time.perf_counter() - acquired_at) * 1000)
+            if reserved:
+                _leave_queue(lane)
             await queue.put(None)  # 结束哨兵
 
     async def gen():
         task = asyncio.create_task(worker())
         try:
             while True:
-                event = await queue.get()
+                try:
+                    # 心跳：上游卡住 / 长工具执行时 SSE 也要有字节流出来，否则
+                    # nginx / 浏览器 / 前端的读超时会把它当成断线（用户只看到
+                    # 一直转圈，却没有任何错误提示）。15 秒远小于这些超时。
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
                 if event is None:
                     break
                 yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"

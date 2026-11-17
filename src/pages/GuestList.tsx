@@ -33,12 +33,17 @@ import {
   nodesApi,
   quotaApi,
   sshFleetApi,
+  templatesApi,
   vmMetaApi,
   vmMetaKey,
   vmsApi,
 } from '../api/endpoints';
 import { guestPath, guestPower, guestsApi, guestTypeOf } from '../api/guests';
 import { BulkResultNotice, bulkActionKey } from '../components/BulkResultNotice';
+import {
+  BulkSnapshotRestoreDialog,
+  type RestoreCandidate,
+} from '../components/BulkSnapshotRestoreDialog';
 import { errorMessage } from '../api/client';
 import { PageShell } from '../components/Layout';
 import { Badge } from '../components/ui/Badge';
@@ -79,7 +84,12 @@ import {
 } from '../components/VmReinstallWizard';
 import { ResetGuestPasswordDialog } from '../components/ResetGuestPasswordDialog';
 import { OsLogo } from '../components/OsLogo';
-import { familyByKey, osFamilyLabel, templateFamily } from '../utils/osFamily';
+import {
+  allFamilies,
+  familyByKey,
+  osFamilyLabel,
+  templateFamily,
+} from '../utils/osFamily';
 import {
   IconBox,
   IconVm,
@@ -135,6 +145,10 @@ import type {
   BulkResponse,
   VmSummary,
 } from '../api/types';
+import {
+  SourceTemplatePicker,
+  type SourceTemplateOption,
+} from '../components/SourceTemplatePicker';
 import { Modal } from '../components/ui/Modal';
 
 type StatusFilter = 'all' | 'running' | 'stopped' | 'template';
@@ -214,6 +228,8 @@ interface RowMenuProps {
   onReinstall: () => void;
   onAssign: () => void;
   onResetPassword: () => void;
+  /** 打开「备注」：面板侧的手动 IP + 系统标识（不写回 PVE） */
+  onMeta: () => void;
   onExport: () => void;
   onDelete: () => void;
   disabled: boolean;
@@ -221,6 +237,8 @@ interface RowMenuProps {
   canAssign: boolean;
   /** 是否显示「重置用户口令」（需要 vm.config） */
   canResetPassword: boolean;
+  /** 是否显示「备注」（需要对应类型的 vm.config / ct.config） */
+  canMeta: boolean;
   /** 是否显示「导出」（仅虚拟机，且需要 vm.backup） */
   canExport: boolean;
   /**
@@ -245,11 +263,13 @@ function RowMenu({
   onReinstall,
   onAssign,
   onResetPassword,
+  onMeta,
   onExport,
   onDelete,
   disabled,
   canAssign,
   canResetPassword,
+  canMeta,
   canExport,
   askHostId,
   pinned,
@@ -473,7 +493,7 @@ function RowMenu({
           {/* 置顶 / 收藏是纯个人偏好：不写 PVE、不改机器状态，所以走
               readonlyItem —— 机器正在忙、或账号只有只读权限时照样能标（这恰恰
               是最想收藏几台常看的机器的场景）。也因此它们排在分隔线之上，
-              分隔线以下只有「删除」这种不可逆动作。 */}
+              分隔线以下是「删除」这类不可逆动作与收尾用的「备注」。 */}
           {readonlyItem(
             pinned ? t('guestList.unpin') : t('guestList.pin'),
             <IconPin size={15} />,
@@ -487,6 +507,13 @@ function RowMenu({
           <div className="user-dropdown-divider" />
           {canDeleteRow
             ? item(t('guestList.deleteTitle', { noun: L.noun }), <IconTrash size={15} />, onDelete, true)
+            : null}
+          {/* 备注排在「删除」下面。它是**面板侧**记录（手动 IP + 系统标识），
+              不写 PVE、也不看机器是否在忙，所以走 readonlyItem（不吃 disabled）。
+              以前它只藏在「IP 列的小铅笔」后面，而那支铅笔只在平台识别不到地址
+              时才出现 —— 有 Agent 的机器等于没有入口，只能去翻接口。 */}
+          {canMeta
+            ? readonlyItem(t('guestList.metaMenu'), <IconEdit size={15} />, onMeta)
             : null}
         </div>
       ) : null}
@@ -513,7 +540,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   const queryClient = useQueryClient();
   const toast = useToast();
   const runner = useTaskRunner();
-  const { isAdmin, hasPermission } = useAuth();
+  const { user, isAdmin, hasPermission } = useAuth();
   /* 权限点随类型走：虚拟机是 vm.*、容器是 ct.* —— 后端也是两套接口分别校验
      （routers/vms.py 用 vm.*，routers/lxc.py 用 ct.*）。 */
   const permPrefix = isLxc ? 'ct' : 'vm';
@@ -636,9 +663,15 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   /* 关机 / 停止 / 重启前弹一次确认（见 utils/powerConfirm）：这三件事都会让机器上
      的服务中断，而它们在列表里只是三个挨着的图标按钮 */
   const [powerConfirmEl, confirmPower] = useConfirm();
-  /* 手动填写 IP：平台识别不到时才开放（见 IP 列） */
+  /* 备注弹窗：平台识别不到 IP 时手工填；系统标识也能在这里纠正 */
   const [ipTarget, setIpTarget] = useState<VmSummary | null>(null);
   const [ipDraft, setIpDraft] = useState('');
+  /* 系统家族 key；空串 = 自动（按来源模板 + ostype 推断） */
+  const [osDraft, setOsDraft] = useState('');
+  /* 手工关联的来源模板，值为 `节点|VMID`；空串 = 不关联（继续用克隆记录推断）。
+     恢复备份、在 PVE 界面克隆、装 ISO 建的机器审计里没有克隆记录，靠这一条把
+     「这台是从哪张模板来的」补上；它同时决定列表的系统徽标与重装推荐。 */
+  const [templateDraft, setTemplateDraft] = useState('');
   const [ipBusy, setIpBusy] = useState(false);
   /* 列表内改名（虚拟机的 name / 容器的主机名） */
   const [renameTarget, setRenameTarget] = useState<VmSummary | null>(null);
@@ -646,6 +679,9 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   const [renameBusy, setRenameBusy] = useState(false);
   /* 批量：需要额外参数的动作先弹窗收集；结果逐台回报，失败的可原地重试 */
   const [bulkDialog, setBulkDialog] = useState<BulkAction | null>(null);
+  /* 批量还原快照：弹窗打开时把勾选的机器**定格**下来，之后再改列表勾选也不影响
+     这张表（提交的必须就是用户刚才看到并逐台选过目标的那一批） */
+  const [restoreGuests, setRestoreGuests] = useState<RestoreCandidate[] | null>(null);
   const [bulkResult, setBulkResult] = useState<BulkResponse | null>(null);
   /** 上一次批量用的参数 —— "仅重试失败的" 要带着它重放 */
   const lastBulkParams = useRef<BulkParams | undefined>(undefined);
@@ -804,6 +840,48 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       familyByKey(metaItems[vmMetaKey(vm.connection_id, vm.node, vm.vmid)]?.os),
     [metaItems],
   );
+  /* 面板侧手工关联的来源模板（备注弹窗里选的那张）。与 `vm.source_template`
+     不是一回事：那份来自审计里真实的克隆记录，这份是运维补的线索。 */
+  const metaTemplateOf = useCallback(
+    (vm: VmSummary) =>
+      metaItems[vmMetaKey(vm.connection_id, vm.node, vm.vmid)]?.template ?? null,
+    [metaItems],
+  );
+  /* 「备注」弹窗的系统标识候选：与列表列读的是同一张家族表，"自动" 用空串 */
+  const osOptions = useMemo(
+    () =>
+      allFamilies().map((family) => ({
+        value: family.key,
+        label: osFamilyLabel(family, t),
+      })),
+    [t],
+  );
+  /* 可关联的模板：只列同类（虚拟机模板给虚拟机、容器模板给容器）。
+     弹窗打开时才拉 —— 模板页另有一份缓存，这里的键与它不同但同属 `['templates']`
+     前缀，任何一处转换 / 删除模板都会让两边一起失效。 */
+  const templateChoicesQuery = useQuery({
+    queryKey: ['templates', 'meta-pick', isLxc ? 'lxc' : 'qemu'],
+    queryFn: () => templatesApi.list(undefined, isLxc ? 'lxc' : 'qemu'),
+    enabled: Boolean(ipTarget),
+    staleTime: 60_000,
+    retry: false,
+  });
+  /* 选择器的候选：只换形状，不排序 —— 分组与排序交给选择器（按系统家族分组，
+     组内按名称自然序），列表页这边不再维护第二套顺序。 */
+  const templateOptions = useMemo<SourceTemplateOption[]>(
+    () =>
+      (templateChoicesQuery.data ?? []).map((item) => ({
+        value: `${item.node}|${item.vmid}`,
+        name: item.name?.trim() || `#${item.vmid}`,
+        node: item.node,
+        vmid: item.vmid,
+      })),
+    [templateChoicesQuery.data],
+  );
+  /* 存档里那张模板可能已经被删、或已被改回普通机器（不在模板清单里了）。
+     仍要把它交给选择器显示成一行（带「已不在列表」标记），否则打开弹窗时草稿
+     落不到任何选项上，看起来像「关联凭空消失」，一保存就真丢了。 */
+  const archivedTemplate = ipTarget ? metaTemplateOf(ipTarget) : null;
 
   /* 连接点（来源 PVE）选项：只有一条连接时这一层没有意义，整只下拉不渲染
      （见工具栏），省掉一个恒为「全部连接」的占位控件。 */
@@ -1116,6 +1194,9 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
           );
         }
         invalidateGuests();
+        /* 删除会连同这些机器的置顶 / 收藏一起清掉（见后端 prefs.forget_guest_refs）。
+           本页内存里那份偏好还在，不重读的话，紧接着新建的同号机器会「自带星标」。 */
+        if (action === 'delete' && result.ok > 0) void pins.reload();
         /* 逐台任务是异步的：让列表在这几十秒里跟着进度动（见 startBurst） */
         startBurst();
       } catch (err) {
@@ -1127,7 +1208,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         setPendingAction(false);
       }
     },
-    [selectedGuests, invalidateGuests, startBurst, toast, t, L.unit],
+    [selectedGuests, invalidateGuests, startBurst, toast, t, L.unit, pins.reload],
   );
 
   /* 批量电源操作前的确认：一次点击打的是勾选里的每一台，代价比单台大得多，
@@ -1233,10 +1314,13 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
     }
   };
 
-  /* ---- 手动 IP ---- */
+  /* ---- 备注（手动 IP + 系统标识 + 来源模板） ---- */
   const openIpEditor = (vm: VmSummary) => {
     setIpTarget(vm);
     setIpDraft(manualIpOf(vm));
+    setOsDraft(metaOsOf(vm)?.key ?? '');
+    const linked = metaTemplateOf(vm);
+    setTemplateDraft(linked ? `${linked.node}|${linked.vmid}` : '');
   };
 
   const saveManualIp = async () => {
@@ -1249,17 +1333,33 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       toast.warning(t('guestList.ipInvalid'), t('guestList.ipInvalidHint'));
       return;
     }
+    /* 来源模板：弹窗里没选（草稿为空）= 解除关联，所以三个字段总是显式传。
+       后端把「节点 + VMID」当作定位依据，名字只是存档 —— 模板日后改名 / 删除，
+       这里仍然显示当初关联的是哪一张。存档里那张不在当前清单里时（模板已删）
+       从 archivedTemplate 取名字，不能因为查不到就把它抹掉。 */
+    const picked =
+      templateOptions.find((c) => c.value === templateDraft) ??
+      (archivedTemplate &&
+      templateDraft === `${archivedTemplate.node}|${archivedTemplate.vmid}`
+        ? archivedTemplate
+        : null);
     setIpBusy(true);
     try {
       await vmMetaApi.save({
         node: vm.node,
         vmid: vm.vmid,
         connection_id: vm.connection_id ?? null,
+        // 容器的归属与权限都在 ct 侧，后端靠这个字段选对那一套
+        type: isLxc ? 'lxc' : 'qemu',
         ip,
+        os: osDraft,
+        template_node: picked?.node ?? '',
+        template_vmid: picked?.vmid ?? null,
+        template_name: picked?.name ?? '',
       });
       await queryClient.invalidateQueries({ queryKey: ['vm-meta'] });
       toast.success(
-        ip ? t('guestList.ipSaved') : t('guestList.ipCleared'),
+        t('guestList.metaSaved'),
         ip ? `${vm.name || vm.vmid} → ${ip}` : t('guestList.ipFallback'),
       );
       setIpTarget(null);
@@ -1327,7 +1427,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
               </span>
             ) : null}
             <span
-              className="fw-500 truncate"
+              className="fw-500 vm-name-text"
               title={vm.name || `${meta.codePrefix} ${vm.vmid}`}
             >
               {vm.name || `${meta.codePrefix} ${vm.vmid}`}
@@ -1622,13 +1722,26 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       width: 96,
       className: 'col-source-template',
       render: (vm) => {
-        const source = vm.source_template;
+        /* 两级「来源模板」证据：
+           1. `vm.source_template` —— 后端从审计里推出来的真实克隆来源；
+           2. `vm_meta.template` —— 备注里手工关联的那张（恢复备份、在 PVE 界面
+              克隆、装 ISO 建的机器没有克隆记录，只有这一条）。
+           审计那份优先，但它常常只剩个 VMID（模板被改名 / 删除），这时手工
+           关联的名字反而更完整，所以名字为空也让它接管。 */
+        const auditSource = vm.source_template;
+        const linked = metaTemplateOf(vm);
+        const source =
+          auditSource && auditSource.name?.trim()
+            ? auditSource
+            : linked ?? auditSource;
+        const fromLinked = Boolean(linked) && source === linked;
         const name = source?.name?.trim() ?? '';
         /* 两级来源：
            1. 面板侧记录的系统家族（`vm_meta` 的 `os`）—— 人工确认过，最可信；
            2. 来源模板名推断（克隆 / 重装的出处）—— 没有记录时的回落。
            两者都没有才是「真不知道」，退回 `#VMID` / 「—」。 */
-        const family = metaOsOf(vm) ?? (name ? templateFamily({ name }) : null);
+        const metaFamily = metaOsOf(vm);
+        const family = metaFamily ?? (name ? templateFamily({ name }) : null);
 
         /* 名字取不到（来源模板被改名 / 被删，或不在当前这一页的清单里）时退回
            `#VMID` —— VMID 是来源里唯一不会变的部分，比「—」有用得多。
@@ -1645,17 +1758,28 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         /* 认不出的系统（`other`）不在这一步特判：OsLogo 会退成统一的「···」
            字母块，比随便挑一个发行版 logo 诚实。 */
         const label = osFamilyLabel(family, t);
-        /* 列里只留图标，悬停给**模板名**：图标已经说明是哪套系统，而「具体是
-           这张模板的哪一份」（同版本可能有多张）只有名字说得清 —— 那正是这一
-           列改成图标后丢掉的信息。没有来源模板时退回系统名，别悬停出空白。
-           读屏走 aria-label，把系统名与模板名一起念出来（图标对读屏不可见）。 */
+        /* 列里只留图标，悬停说清「这个图标凭什么判出来的」：
+           手动标注（vm_meta.os）与来源模板推断是两条不同的证据 —— 只写模板名的
+           话，一台被手工标成 Windows 的 TencentOS 悬停出来仍是「TencentOS4」，
+           用户根本没法解释「系统明明是对的，徽标为什么错」。哪条证据胜出必须
+           能看见，否则这一类问题只能靠翻库排查。 */
+        const basis = metaFamily
+          ? name
+            ? `${t('guestList.osFromMeta')} · ${name}`
+            : t('guestList.osFromMeta')
+          : name
+            ? fromLinked
+              ? t('guestList.osFromLinkedTemplate', { name })
+              : t('guestList.osFromTemplate', { name })
+            : label;
+        /* 读屏把系统名与判定依据一起念出来（图标对读屏不可见） */
         return (
           <span
             className="os-tag source-os"
             data-os={family.key}
             role="img"
-            aria-label={name ? `${label} · ${name}` : label}
-            title={name || label}
+            aria-label={`${label} · ${basis}`}
+            title={basis}
           >
             <span className="os-tag-mark">
               <OsLogo family={family} size="table" />
@@ -1796,6 +1920,8 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
               canAssign={canAssign}
               onResetPassword={() => setPasswordTarget(vm)}
               canResetPassword={canConfig}
+              onMeta={() => openIpEditor(vm)}
+              canMeta={canConfig}
               onExport={() => setExportTarget(vm)}
               canExport={canExport}
               onDelete={() => setDeleteTarget(vm)}
@@ -1996,7 +2122,24 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
                 value=""
                 onChange={(e) => {
                   const action = e.target.value as BulkAction;
-                  if (action) setBulkDialog(action);
+                  if (!action) return;
+                  /* 批量还原要**逐台**指定目标快照：各机器的快照链互相独立，
+                     「一个名字套全批」在真实环境里不成立。这里单独弹一个窗，
+                     把那批机器的快照清单逐行列出来让人各自选，勾选上下文不丢。 */
+                  if (action === 'snapshot_restore') {
+                    setRestoreGuests(
+                      selectedGuests.map((vm) => ({
+                        type: guestTypeOf(vm),
+                        node: vm.node,
+                        vmid: vm.vmid,
+                        name: vm.name,
+                        status: String(vm.status ?? ''),
+                        template: Boolean(vm.template),
+                      })),
+                    );
+                    return;
+                  }
+                  setBulkDialog(action);
                 }}
                 disabled={pendingAction}
                 options={[
@@ -2015,7 +2158,13 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
                     ? [{ label: t('guestList.bulkMigrate'), value: 'migrate' as BulkAction }]
                     : []),
                   ...(canSnapshot
-                    ? [{ label: t('guestList.bulkSnapshot'), value: 'snapshot' as BulkAction }]
+                    ? [
+                        { label: t('guestList.bulkSnapshot'), value: 'snapshot' as BulkAction },
+                        {
+                          label: t('guestList.bulkSnapshotRestore'),
+                          value: 'snapshot_restore' as BulkAction,
+                        },
+                      ]
                     : []),
                 ]}
                 aria-label={t('guestList.bulkMoreAria')}
@@ -2197,6 +2346,9 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             columns={cols.columns}
             rows={guestPage.rows}
             rowKey={rowKeyOf}
+            /* 列宽按「账号 + 资源类型」记住：虚拟机与容器各存一份，
+               切页 / 刷新后拖过的宽度不会被重置 */
+            storageKey={`${user?.username || 'anonymous'}:guest-list:${kind}`}
             loading={guestsQuery.isLoading}
             caption={t('guestList.caption', { noun: L.noun })}
             sort={sort}
@@ -2282,13 +2434,14 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         />
       </Modal>
 
-      {/* ---- 手动填写 IP ----
-          面板侧保存，用于补齐「Guest Agent 没开 / 容器走 DHCP」时看不到地址的场景。
-          它不会写回 PVE 的网络配置 —— 只是给运维一个能记事的字段。 */}
+      {/* ---- 备注：手动 IP + 系统标识 ----
+          面板侧保存，用于补齐「Guest Agent 没开 / 容器走 DHCP」时看不到地址的场景；
+          系统标识则用来纠正 PVE ostype 不正确（导入 / 手工建的机器常停在 win*）
+          导致的徽标错误。两者都不会写回 PVE 配置 —— 只是给运维一个能记事的字段。 */}
       <Modal
         open={Boolean(ipTarget)}
         onClose={() => setIpTarget(null)}
-        title={t('guestList.ipTitle')}
+        title={t('guestList.metaTitle')}
         description={
           ipTarget
             ? `${ipTarget.name || `${meta.codePrefix} ${ipTarget.vmid}`} · ${ipTarget.node}`
@@ -2324,6 +2477,32 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             autoFocus
             hint={t('guestList.ipHint')}
           />
+          <Select
+            label={t('guestList.osLabel')}
+            value={osDraft}
+            onChange={(e) => setOsDraft(e.target.value)}
+            placeholder={t('guestList.osAuto')}
+            options={osOptions}
+            hint={t('guestList.osHint')}
+          />
+          <span className="fs-xs text-muted">{t('guestList.osNotice')}</span>
+          {/* 来源模板：恢复备份 / 在 PVE 界面克隆 / 装 ISO 建的机器审计里没有
+              克隆记录，列表认不出系统。手工指一张模板等于把那条线索补上。
+              模板可能上百张，所以不用原生 <select>：收起态只占一行，展开后
+              搜索 + 按系统分组，见 components/SourceTemplatePicker。 */}
+          <SourceTemplatePicker
+            options={templateOptions}
+            value={templateDraft}
+            onChange={setTemplateDraft}
+            archived={archivedTemplate}
+            loading={templateChoicesQuery.isFetching}
+            error={
+              templateChoicesQuery.error
+                ? errorMessage(templateChoicesQuery.error)
+                : null
+            }
+            hint={t('guestList.templateHint')}
+          />
         </div>
       </Modal>
 
@@ -2334,7 +2513,11 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         <LxcCreateWizard
           open={createOpen}
           onClose={() => setCreateOpen(false)}
-          onCreated={() => invalidateGuests()}
+          onCreated={() => {
+            invalidateGuests();
+            // 新容器可能用的是回收来的 vmid：重读偏好，别让旧键把它标成收藏
+            void pins.reload();
+          }}
         />
       ) : (
         <VmCreateWizard
@@ -2343,6 +2526,8 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
           onCreated={() => {
             invalidateGuests();
             invalidateSecurityViews();
+            // 同上：同号的新机器必须从「未收藏、未置顶」开始
+            void pins.reload();
           }}
         />
       )}
@@ -2357,6 +2542,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             onCreated={() => {
               invalidateGuests();
               invalidateSecurityViews();
+              void pins.reload();
             }}
           />
           <VmExportDialog
@@ -2540,6 +2726,18 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
           const action = bulkDialog;
           setBulkDialog(null);
           if (action) void runBulk(action, params);
+        }}
+      />
+
+      {/* 批量还原快照：一行一台机器，逐台选它自己的快照，一次提交 */}
+      <BulkSnapshotRestoreDialog
+        open={Boolean(restoreGuests)}
+        guests={restoreGuests ?? []}
+        onClose={() => setRestoreGuests(null)}
+        onDone={(response) => {
+          invalidateGuests();
+          /* 全部成功的机器已被回滚，列表里的勾选没有意义；有失败的留着让人核对 */
+          if (response.failed === 0) setSelected(new Set());
         }}
       />
     </PageShell>
@@ -3058,6 +3256,7 @@ function BulkParamsDialog({
     setTagMode('append');
     setTarget('');
     setOnline(true);
+    // 创建快照给一个当场可用的时间戳名字（批量还原不在这张弹窗里做，见菜单里的跳转）
     setSnapName(`snap-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}`);
     setSnapDesc('');
     setVmstate(false);
@@ -3067,8 +3266,10 @@ function BulkParamsDialog({
   }, [action]);
 
   const nodeOptions = nodes.map((n) => ({ label: n, value: n }));
+  // 名字格式只约束「新建」：还原的目标是 PVE 里已有的快照，用是否真的存在
+  // 来判定（后端逐台核对），前端不该拿创建规则把合法旧名字挡在门外。
   const snapNameError =
-    snapName && !/^[A-Za-z][A-Za-z0-9_-]*$/.test(snapName)
+    action === 'snapshot' && snapName && !/^[A-Za-z][A-Za-z0-9_-]*$/.test(snapName)
       ? t('guestList.snap.nameError')
       : undefined;
 
@@ -3106,6 +3307,8 @@ function BulkParamsDialog({
     else onSubmit({ name: snapName, description: snapDesc, vmstate });
   };
 
+  /* 批量还原不在这张弹窗里做（它要逐台选快照，见上面的跳转），所以这里没有它的
+     标题 / 说明；留着会让「打开一个没有输入框、Run 永远灰着」的老毛病再回来。 */
   const titles: Record<string, MessageKey> = {
     tag: 'guestList.bulkTag',
     migrate: 'guestList.bulkDialog.titleMigrate',
@@ -3273,6 +3476,7 @@ function BulkParamsDialog({
           )}
         </div>
       ) : null}
+
     </Modal>
   );
 }

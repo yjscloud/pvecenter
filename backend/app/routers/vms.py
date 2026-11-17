@@ -23,6 +23,7 @@ from .. import (
     ownership,
     panelkey,
     pvecache,
+    prefs,
     quota,
     security,
     sshremote,
@@ -39,7 +40,7 @@ from ..formatters import (
     pve_flag,
 )
 from ..vm_scope import bind_vm_connection
-from .vm_meta import manual_ip_index
+from .vm_meta import drop_entry as drop_vm_meta, manual_ip_index
 from ..pve import (
     ProxmoxError,
     client_for_connection,
@@ -61,6 +62,8 @@ from ..schemas import (
     MoveDiskRequest,
     PowerRequest,
     ResizeRequest,
+    SnapshotBulkDelete,
+    SnapshotBulkRestore,
     SnapshotCreate,
     VmAddDisk,
     VmAddNetwork,
@@ -1332,12 +1335,11 @@ async def _create_vm_core(
         # 面板重启之类会留下），列表会把上一台机器的地址贴到这台新机器上。
         # 非克隆分支在建机末尾已经清过一次，这条路一直漏着 —— 而快速部署走的
         # 正是克隆。克隆可以落到 target_node，缓存键带节点，必须按实际落点清。
-        await guestip.forget(
-            _op_connection(),
-            payload.clone_from.target_node or payload.clone_from.node,
-            vmid,
-            "qemu",
-        )
+        clone_node = payload.clone_from.target_node or payload.clone_from.node
+        await guestip.forget(_op_connection(), clone_node, vmid, "qemu")
+        # 置顶 / 收藏与 IP 缓存同理：都是按 vmid 记账。上一台同号机器若是面板外
+        # 删掉的就走不到删除接口，这里兜底清一次，新克隆体从默认状态开始。
+        await prefs.forget_guest_refs(_op_connection(), clone_node, vmid)
         return result
 
     # --- build config -------------------------------------------------
@@ -1433,6 +1435,9 @@ async def _create_vm_core(
     # 之类会留下），会贴到这台新机器上。清一次，让列表从这台机器自己的配置 /
     # Agent 重新解析 —— 否则「刚建出来的机器显示着别人的地址」。
     await guestip.forget(_op_connection(), payload.node, vmid, "qemu")
+    # 置顶 / 收藏同样是按 vmid 记账的：上一台同号机器可能是在面板外回收的，
+    # 走不到删除接口，这里兜底清掉，保证新机器默认未收藏、未置顶。
+    await prefs.forget_guest_refs(_op_connection(), payload.node, vmid)
 
     # 下发通知：把「怎么连上它」告诉创建者（站内消息 + 他开了邮箱提醒就发邮件）。
     # **丢到后台**：邮件走同步 SMTP，最慢能拖上几秒，而它原来串在创建响应里 ——
@@ -1703,7 +1708,9 @@ async def _create_from_clone(
             await client.qemu_set_config(target_node, vmid, overrides)
         except ProxmoxError as exc:
             await security.audit(
-                request, user, "vm.clone", target=f"{target_node}/{vmid}",
+                request, user, "vm.clone",
+                # 机器已经建出来了，来源信息照写：这条记录是列表徽标唯一的依据
+                target=f"{clone.node}/{clone.vmid} -> {target_node}/{vmid}",
                 result="partial", detail=f"克隆成功但应用配置失败: {exc.message}",
             )
             raise HTTPException(
@@ -1915,6 +1922,12 @@ async def delete_vm(
     # PVE 又把最小的空闲 VMID 分给新机器 —— 旧记录撞上同号的新机器，那台机器
     # 就被算到旧用户名下（见 ownership.forget_guest 的说明）。
     await ownership.forget_guest(_op_connection(), node, vmid)
+    # 置顶与收藏记的同样是 VMID（<连接>:<节点>/<vmid>），也会被同号的新机器命中。
+    # 回收时一并清掉所有用户这两项，新机器才能从「未收藏、未置顶」开始。
+    await prefs.forget_guest_refs(_op_connection(), node, vmid)
+    # 面板备注（手动 IP / 系统标识）同样是按 vmid 记账的：不清的话，同号的新机器
+    # 会显示上一台的系统 logo（例如刚下发的 TencentOS 顶着 Windows 的图标）。
+    await drop_vm_meta(_op_connection(), node, vmid)
     # 读数缓存里还留着这台机器，主动作废掉 —— 否则删除后的几秒内
     # 「我的额度」仍旧显示旧用量，看起来就像额度没恢复。
     quota.invalidate()
@@ -2424,6 +2437,12 @@ async def clone_vm(
 
     task = result if isinstance(result, str) else (result or {}).get("task", "")
 
+    # 新号可能是回收来的：置顶 / 收藏都按 vmid 记账，先清掉上一个占用者留下的
+    # 状态，克隆体才不会带着别人的星标出现（放在这里，下面两条返回路径都覆盖到）。
+    await prefs.forget_guest_refs(
+        _op_connection(), payload.target_node or node, payload.newid
+    )
+
     # 克隆体继承母机的机型，而母机上可能是「默认机型的旧写法」（面板早期写成 pc）
     # —— 那个名字在另一版本的 PVE 上不存在，新机器就带着一个不认的机型。
     # 要改机型就得等克隆落定（克隆是异步任务，早改的配置会被覆盖），所以这里等
@@ -2448,13 +2467,17 @@ async def clone_vm(
             # 机器已经建好了，机型没纠成不该让整个请求失败 —— 如实带出来即可
             await security.audit(
                 request, user, "vm.clone",
-                target=f"{target_node}/{payload.newid}",
+                # 同上：配置没纠成不代表来源不成立
+                target=f"{node}/{vmid} -> {target_node}/{payload.newid}",
                 result="partial", detail=f"克隆成功但机型纠正失败: {exc.message}",
             )
             return {"task": task, "vmid": payload.newid, "warning": exc.message}
 
     await security.audit(
-        request, user, "vm.clone", target=f"{node}/{vmid} -> {payload.newid}",
+        request, user, "vm.clone",
+        # 目标段必须带节点：来源解析按 `节点/VMID` 精确匹配 target_guest，
+        # 只写 `-> 104` 时归一化出来是 `104`，这台机器就永远查不到来源，列表徽标是「—」。
+        target=f"{node}/{vmid} -> {target_node}/{payload.newid}",
         detail={"name": payload.name, "full": payload.full},
     )
     return {"task": task, "vmid": payload.newid}
@@ -2712,6 +2735,387 @@ async def delete_snapshot(
     # 任务结束后再清一次：否则「任务受理时那次刷新」会把删除前的列表写回缓存
     _invalidate_snapshots_after_task(str(task or ""))
     return {"task": task}
+
+
+def _invalidate_snapshots_after_tasks(tasks: List[str]) -> None:
+    """等**一批**快照删除任务结束后再统一作废一次快照缓存。
+
+    口径与 :func:`_invalidate_snapshots_after_task` 相同（原因见那里），区别只在
+    这里是批量：逐条起一个后台等待任务的话，200 条就是 200 个协程各自每秒打一次
+    PVE。改成一条协程、每轮按并发 4 轮询，全部结束（或超时）后作废一次。
+    """
+    pending = list(dict.fromkeys(str(task) for task in tasks if task))
+    if not pending:
+        return
+
+    async def _wait() -> None:
+        deadline = time.monotonic() + 300.0
+        remaining = pending
+        try:
+            client = get_client()
+            while remaining and time.monotonic() < deadline:
+                await asyncio.sleep(2.0)
+
+                async def _running(task: str) -> bool:
+                    try:
+                        status = await client.task_status(task)
+                    except Exception:  # noqa: BLE001 - 任务被清理 / 查不到就别再等
+                        return False
+                    return str(status.get("status") or "") == "running"
+
+                flags = await parallel([_running(task) for task in remaining], limit=4)
+                remaining = [task for task, alive in zip(remaining, flags) if alive is True]
+        finally:
+            # 无论成功、失败还是超时都清一次：真实状态该由 PVE 说了算
+            pvecache.invalidate("snapshots:")
+
+    try:
+        asyncio.create_task(_wait())
+    except RuntimeError:  # pragma: no cover - 没有事件循环时退回同步清理
+        pvecache.invalidate("snapshots:")
+
+
+@router.post("/snapshots/bulk-delete")
+async def bulk_delete_snapshots(
+    payload: SnapshotBulkDelete,
+    request: Request,
+    # 整批门槛：虚拟机 / 容器任一快照权限；逐条的真实权限与快照级隔离在下面各判一次
+    user: Dict[str, Any] = Depends(
+        security.require_any_permission("vm.snapshot", "ct.snapshot")
+    ),
+) -> Dict[str, Any]:
+    """批量删除快照：逐条执行、逐条回报（HTTP 200 只表示请求合法）。
+
+    「快照记录」页勾选多条后走这里，而不是前端循环发 N 个单条删除：
+
+    * 快照级用户隔离只能在服务端判（前端既拿不到、也不该拿到归属表）；
+    * N 次往返在客户端很容易撞上每 IP 每分钟 300 次的限流，中途失败也说不清
+      到底删掉了几条；
+    * 逐条结果里带回 UPID，进度交给任务队列，前端不必为每一条等一次任务。
+
+    返回形状与 ``/vms/bulk`` 一致（``{action,total,ok,failed,results[]}``），
+    前端「批量结果」组件可以直接复用。
+    """
+    client = get_client()
+
+    async def _one(item: Any) -> Dict[str, Any]:
+        node, vmid, name = item.node, int(item.vmid), item.name
+        is_lxc = item.type == "lxc"
+        record: Dict[str, Any] = {
+            "node": node,
+            "vmid": vmid,
+            # 这里的 name 是**快照名**（批量结果显示里的「名称」列就是它）
+            "name": name,
+            "type": "lxc" if is_lxc else "qemu",
+            "ok": False,
+            "task": None,
+            "error": None,
+        }
+        permission = "ct.snapshot" if is_lxc else "vm.snapshot"
+        target = f"{node}/{vmid}/{name}"
+
+        if not security.has_user_permission(user, permission):
+            record["error"] = f"没有删除快照的权限（需要 {permission}）"
+            await security.audit(
+                request, user, "snapshot.delete", target=target,
+                result="denied", detail={"bulk": True, "error": record["error"]},
+            )
+            return record
+
+        try:
+            # 快照级隔离：普通用户只能删自己的 / 自己名下机器上的快照
+            await _require_snapshot_access(
+                user,
+                node,
+                vmid,
+                name,
+                ownership.KIND_CT if is_lxc else ownership.KIND_VM,
+            )
+            delete = (
+                client.lxc_snapshot_delete if is_lxc else client.qemu_snapshot_delete
+            )
+            result = await delete(node, vmid, name)
+            task = result if isinstance(result, str) else (result or {}).get("task", "")
+            await ownership.delete_owner(
+                ownership.KIND_SNAPSHOT,
+                ownership.snapshot_ref(_op_connection(), node, vmid, name),
+            )
+            await security.audit(
+                request, user, "snapshot.delete", target=target,
+                detail={"bulk": True},
+            )
+            record.update(ok=True, task=task or None)
+        except HTTPException as exc:
+            # 越权 / 快照不存在（_require_snapshot_access 抛的是 403）
+            record["error"] = str(exc.detail)
+            await security.audit(
+                request, user, "snapshot.delete", target=target,
+                result="denied", detail={"bulk": True, "error": record["error"]},
+            )
+        except ProxmoxError as exc:
+            record["error"] = exc.message
+            await security.audit(
+                request, user, "snapshot.delete", target=target,
+                result="failed", detail={"bulk": True, "error": exc.message},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 单条异常不能拖垮整批
+            logger.warning("批量删除快照 %s 失败", target, exc_info=True)
+            record["error"] = str(exc) or exc.__class__.__name__
+            await security.audit(
+                request, user, "snapshot.delete", target=target,
+                result="failed", detail={"bulk": True, "error": record["error"]},
+            )
+        return record
+
+    results = await parallel(
+        [_one(item) for item in payload.items], limit=bulk.CONCURRENCY
+    )
+    # parallel 会把异常当值返回；_one 自己吞异常，理论上到不了这里，兜个底
+    cleaned: List[Dict[str, Any]] = []
+    for item, result in zip(payload.items, results):
+        if isinstance(result, dict):
+            cleaned.append(result)
+        else:
+            cleaned.append(
+                {
+                    "node": item.node,
+                    "vmid": int(item.vmid),
+                    "name": item.name,
+                    "type": item.type,
+                    "ok": False,
+                    "task": None,
+                    "error": str(result),
+                }
+            )
+
+    ok_count = sum(1 for row in cleaned if row["ok"])
+    if ok_count:
+        pvecache.invalidate("snapshots:")
+        # 任务结束后再清一次：否则「任务受理时那次刷新」会把删除前的列表写回缓存
+        _invalidate_snapshots_after_tasks(
+            [str(row["task"] or "") for row in cleaned if row["ok"]]
+        )
+
+    return {
+        "action": "snapshot_delete",
+        "total": len(cleaned),
+        "ok": ok_count,
+        "failed": len(cleaned) - ok_count,
+        "results": cleaned,
+    }
+
+
+def _discarded_snapshot_names(
+    snaps: List[Dict[str, Any]], target: str
+) -> List[str]:
+    """还原到 ``target`` 之后会被 PVE 丢掉的快照名（目标的全部后代）。
+
+    PVE 的「还原」不是轻量动作：目标快照**之后**的那些快照会被删除（快照链被截断）。
+    因此两件事都要做：
+
+    * 界面上必须提示「更晚的快照会一起消失」—— 否则用户以为只是回到过去，
+      其实还顺手删了几份快照；
+    * 服务端要把这些快照的归属记录清掉。留着的话，下次同名再建一份，归属仍记在
+      上一个创建者名下，会把新快照判成「别人的」而拒之门外。
+
+    快照清单是扁平结构 + ``parent`` 指针，沿 parent 上溯，能走到目标的就是它的后代。
+    """
+    parent_of: Dict[str, str] = {}
+    for snap in snaps or []:
+        name = str(snap.get("name") or "")
+        if name:
+            parent_of[name] = str(snap.get("parent") or "")
+
+    discarded: List[str] = []
+    for candidate in parent_of:
+        # 「current」是伪条目（表示现在），不是真快照
+        if candidate == target or candidate == "current":
+            continue
+        cursor = candidate
+        seen = set()
+        while cursor and cursor not in seen:
+            seen.add(cursor)
+            parent = parent_of.get(cursor, "")
+            if parent == target:
+                discarded.append(candidate)
+                break
+            cursor = parent
+    return discarded
+
+
+@router.post("/snapshots/bulk-restore")
+async def bulk_restore_snapshots(
+    payload: SnapshotBulkRestore,
+    request: Request,
+    # 整批门槛：虚拟机 / 容器任一快照权限；逐条的真实权限与快照级隔离在下面各判一次
+    user: Dict[str, Any] = Depends(
+        security.require_any_permission("vm.snapshot", "ct.snapshot")
+    ),
+) -> Dict[str, Any]:
+    """批量还原快照：**每台机器回到各自指定的那一份快照**。
+
+    与 ``/vms/bulk`` 的 ``snapshot_restore`` 的区别：那边全批共用一个快照名
+    （``params.name``），只适合「同一套流程在所有机器上建了同名快照」的场景；
+    真实运维里 A 机器的 ``before-upgrade`` 与 B 机器的 ``daily-1103`` 是两条完全
+    独立的链，甚至某台根本没有目标快照 —— 所以这里逐条带 ``name``。
+
+    与批量删除快照同一口径：
+
+    * **不抛整批失败**：逐条执行、逐条回报，HTTP 200 只表示请求合法；
+    * 逐条判权限（``vm.snapshot`` / ``ct.snapshot``）与**快照级隔离**，批量端点
+      没有路径参数，路由级归属守卫不生效，漏判就等于开了个后门；
+    * 执行前先在本地清单里核对快照是否真的存在，缺了的那条点名到具体机器，
+      而不是把 PVE 的英文错误原样丢给用户。
+
+    还原前不强制关机（PVE 允许对运行中的机器还原，但**当前内存与磁盘状态会丢失**），
+    界面负责把这件事说清楚，服务端只保证「按用户点的那份快照执行」。
+    """
+    client = get_client()
+
+    async def _one(item: Any) -> Dict[str, Any]:
+        node, vmid, name = item.node, int(item.vmid), item.name
+        is_lxc = item.type == "lxc"
+        record: Dict[str, Any] = {
+            "node": node,
+            "vmid": vmid,
+            # 这里的 name 是**目标快照名**：结果表里「哪台机器 → 回到了哪份快照」
+            # 一目了然，与批量删除的结果形状一致，前端组件可以直接复用。
+            "name": name,
+            "type": "lxc" if is_lxc else "qemu",
+            "ok": False,
+            "task": None,
+            "error": None,
+        }
+        permission = "ct.snapshot" if is_lxc else "vm.snapshot"
+        target = f"{node}/{vmid}/{name}"
+
+        if not security.has_user_permission(user, permission):
+            record["error"] = f"没有还原快照的权限（需要 {permission}）"
+            await security.audit(
+                request,
+                user,
+                "snapshot.rollback",
+                target=target,
+                result="denied",
+                detail={"bulk": True, "snapshot": name, "error": record["error"]},
+            )
+            return record
+
+        try:
+            await _require_snapshot_access(
+                user,
+                node,
+                vmid,
+                name,
+                ownership.KIND_CT if is_lxc else ownership.KIND_VM,
+            )
+            list_snaps = (
+                client.lxc_snapshots if is_lxc else client.qemu_snapshots
+            )
+            snaps = await list_snaps(node, vmid)
+            if not any(str(s.get("name") or "") == name for s in snaps):
+                raise ProxmoxError(
+                    f"{node}/{vmid} 上已没有名为「{name}」的快照"
+                    "（可能已被删除，或上次还原把它后面的快照丢弃了），请刷新后重选",
+                    404,
+                )
+            rollback = (
+                client.lxc_snapshot_rollback
+                if is_lxc
+                else client.qemu_snapshot_rollback
+            )
+            result = await rollback(node, vmid, name)
+            task = result if isinstance(result, str) else (result or {}).get("task", "")
+
+            # 还原会截断快照链：把被丢弃那些快照的归属记录一并清掉
+            for gone in _discarded_snapshot_names(snaps, name):
+                await ownership.delete_owner(
+                    ownership.KIND_SNAPSHOT,
+                    ownership.snapshot_ref(_op_connection(), node, vmid, gone),
+                )
+
+            await security.audit(
+                request,
+                user,
+                "snapshot.rollback",
+                target=target,
+                detail={"bulk": True, "snapshot": name},
+            )
+            record.update(ok=True, task=task or None)
+        except HTTPException as exc:
+            # 越权 / 快照不属于当前用户（_require_snapshot_access 抛 403）
+            record["error"] = str(exc.detail)
+            await security.audit(
+                request,
+                user,
+                "snapshot.rollback",
+                target=target,
+                result="denied",
+                detail={"bulk": True, "snapshot": name, "error": record["error"]},
+            )
+        except ProxmoxError as exc:
+            record["error"] = exc.message
+            await security.audit(
+                request,
+                user,
+                "snapshot.rollback",
+                target=target,
+                result="failed",
+                detail={"bulk": True, "snapshot": name, "error": exc.message},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 单条异常不能拖垮整批
+            logger.warning("批量还原快照 %s 失败", target, exc_info=True)
+            record["error"] = str(exc) or exc.__class__.__name__
+            await security.audit(
+                request,
+                user,
+                "snapshot.rollback",
+                target=target,
+                result="failed",
+                detail={"bulk": True, "snapshot": name, "error": record["error"]},
+            )
+        return record
+
+    results = await parallel(
+        [_one(item) for item in payload.items], limit=bulk.CONCURRENCY
+    )
+    cleaned: List[Dict[str, Any]] = []
+    for item, result in zip(payload.items, results):
+        if isinstance(result, dict):
+            cleaned.append(result)
+        else:
+            cleaned.append(
+                {
+                    "node": item.node,
+                    "vmid": int(item.vmid),
+                    "name": item.name,
+                    "type": item.type,
+                    "ok": False,
+                    "task": None,
+                    "error": str(result),
+                }
+            )
+
+    ok_count = sum(1 for row in cleaned if row["ok"])
+    if ok_count:
+        pvecache.invalidate("snapshots:")
+        # 还原会删掉目标之后的快照：等任务结束再清一次，否则「受理时那一刷」
+        # 会把还原前的清单写回缓存，用户看到「更晚的快照还在」。
+        _invalidate_snapshots_after_tasks(
+            [str(row["task"] or "") for row in cleaned if row["ok"]]
+        )
+
+    return {
+        "action": "snapshot_restore",
+        "total": len(cleaned),
+        "ok": ok_count,
+        "failed": len(cleaned) - ok_count,
+        "results": cleaned,
+    }
 
 
 # ============================================================== bulk

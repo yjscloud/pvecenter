@@ -1,4 +1,4 @@
-import { Fragment, useMemo, type ReactNode } from 'react';
+import { Fragment, memo, useMemo, type ReactNode } from 'react';
 
 /**
  * AI 回答的正文渲染。
@@ -128,6 +128,43 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
 }
 
 /**
+ * 一个块（段落 / 列表）的渲染。
+ *
+ * 单独抽出来加 memo 是为了**历史消息**：流式期间父组件每 70ms 重渲染一次，
+ * 而 `blocks` 只在 `text` 变化时才重建（parseBlocks 有 memo）—— 块对象引用不变，
+ * 这里的 memo 就能真正命中，不必每帧把全部历史行重新跑一遍 `renderInline`
+ * 的正则与建元素。当前正在流式那条的 text 每帧都在变，照常重算，这是必要的。
+ */
+const BlockView = memo(function BlockView({
+  block,
+  index,
+}: {
+  block: Block;
+  index: number;
+}) {
+  if (block.kind === 'ul' || block.kind === 'ol') {
+    const Tag = block.kind;
+    return (
+      <Tag>
+        {block.items.map((item, j) => (
+          <li key={j}>{renderInline(item, `${index}-${j}`)}</li>
+        ))}
+      </Tag>
+    );
+  }
+  return (
+    <p>
+      {block.lines.map((line, j) => (
+        <Fragment key={j}>
+          {j > 0 ? <br /> : null}
+          {renderInline(line, `${index}-${j}`)}
+        </Fragment>
+      ))}
+    </p>
+  );
+});
+
+/**
  * 渲染一段 AI 回答。
  *
  * 逐字流式期间也能用：未闭合的 `**` 会原样显示，闭合的那一刻自动变成粗体 ——
@@ -137,28 +174,9 @@ export function RichText({ text }: { text: string }) {
   const blocks = useMemo(() => parseBlocks(text), [text]);
   return (
     <div className="ai-rich">
-      {blocks.map((block, i) => {
-        if (block.kind === 'ul' || block.kind === 'ol') {
-          const Tag = block.kind;
-          return (
-            <Tag key={i}>
-              {block.items.map((item, j) => (
-                <li key={j}>{renderInline(item, `${i}-${j}`)}</li>
-              ))}
-            </Tag>
-          );
-        }
-        return (
-          <p key={i}>
-            {block.lines.map((line, j) => (
-              <Fragment key={j}>
-                {j > 0 ? <br /> : null}
-                {renderInline(line, `${i}-${j}`)}
-              </Fragment>
-            ))}
-          </p>
-        );
-      })}
+      {blocks.map((block, i) => (
+        <BlockView key={i} block={block} index={i} />
+      ))}
     </div>
   );
 }

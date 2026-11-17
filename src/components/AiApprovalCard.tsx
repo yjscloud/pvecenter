@@ -61,18 +61,32 @@ export function ApprovalCard({
   onDone,
 }: {
   request: ApprovalRequest;
-  /** 决策完成后回调（是否批准），调用方据此把卡片从对话流里摘掉 */
-  onDone: (approved: boolean) => void;
+  /**
+   * 决策完成后回调（是否批准 + 原因），调用方据此把卡片从对话流里摘掉。
+   * 原因区分「用户主动拒绝」与「超时/失效」—— 后两者要给一个「重新请求这一步」
+   * 的续跑入口，而不是让人重新描述问题、重跑整套检查。
+   */
+  onDone: (approved: boolean, reason?: 'timeout' | 'user' | 'stale') => void;
 }) {
   const t = useT();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  /** 后端已不在等待这个 approval_id（超时/已被处理）：给出续跑入口 */
+  const [stale, setStale] = useState(false);
   const [left, setLeft] = useState(Math.max(0, Math.floor(request.timeout)));
   /** 自己这一票已投出，但还没凑够人数（双人审批） */
   const [voted, setVoted] = useState(false);
   const required = Math.max(1, Number(request.required) || 1);
   /* 一旦做出决定（含超时）就不再重复提交 —— 倒计时与手动点击必须只生效一次 */
   const settled = useRef(false);
+
+  /**
+   * ``onDone`` 的引用会随父组件每次渲染变化（流式期间每 70ms 一次）。放进 ref 后
+   * 定时器只在挂载时建一次 —— 否则每次父组件重绘都会「清掉定时器再重建」，1 秒的
+   * 刻度永远走不完，审批卡的倒计时看起来像卡住了。
+   */
+  const doneRef = useRef(onDone);
+  doneRef.current = onDone;
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -81,7 +95,7 @@ export function ApprovalCard({
           window.clearInterval(timer);
           if (!settled.current) {
             settled.current = true;
-            onDone(false);
+            doneRef.current(false, 'timeout');
           }
           return 0;
         }
@@ -89,13 +103,14 @@ export function ApprovalCard({
       });
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [onDone]);
+  }, []);
 
   const decide = async (approved: boolean) => {
     if (settled.current) return;
     settled.current = true;
     setBusy(true);
     setError('');
+    setStale(false);
     try {
       const result = await aiApi.approve(request.approval_id, approved);
       // 后端用 ok=false 表示「这个 approval_id 已经不在等待队列里」（超时，
@@ -104,6 +119,7 @@ export function ApprovalCard({
       if (!result.ok) {
         settled.current = false;
         setBusy(false);
+        setStale(true);
         setError(t('ai.approval.stale'));
         return;
       }
@@ -115,7 +131,7 @@ export function ApprovalCard({
         setVoted(true);
         return;
       }
-      onDone(approved);
+      onDone(approved, 'user');
     } catch (err) {
       // 提交失败就把决定「撤销」，让用户能重试（否则卡片卡死在已决定状态）
       settled.current = false;
@@ -165,7 +181,17 @@ export function ApprovalCard({
 
       {error ? (
         <div className="login-error" role="alert" style={{ marginTop: 8 }}>
-          {error}
+          <div>{error}</div>
+          {stale ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              style={{ marginTop: 6 }}
+              onClick={() => onDone(false, 'stale')}
+            >
+              {t('ai.approval.resume')}
+            </Button>
+          ) : null}
         </div>
       ) : null}
 

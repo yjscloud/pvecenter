@@ -944,6 +944,38 @@ async def active_lease_for(
     return _row_to_lease(row) if row else None
 
 
+async def renew_lease(
+    lease_id: str,
+    *,
+    minutes: int,
+    username: str,
+    is_admin: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """续期一张仍生效的租约。
+
+    只延长到期时间，不改变级别、范围与已用动作数 —— 续期不是重新授权，用户
+    不该因为点了一次「续期」就悄悄拿到更大的范围。已过期 / 已撤销的票不续，
+    让用户重新走一次授权，才能重新校验目标和策略。
+    """
+    lease = await resolve_lease(lease_id, username=username, is_admin=is_admin)
+    if lease is None:
+        return None
+    now = int(time.time())
+    if int(lease.get("expires_at") or 0) <= now:
+        return None
+    pol = await policy()
+    cap = max(1, int(pol.get("max_minutes") or MAX_MINUTES))
+    mins = max(1, min(cap, int(minutes or DEFAULT_MINUTES)))
+    expires_at = now + mins * 60
+    async with database.connect() as db:
+        await db.execute(
+            "UPDATE ai_vm_leases SET expires_at=?, minutes=? WHERE id=? AND status='active'",
+            (expires_at, mins, str(lease_id)),
+        )
+        await db.commit()
+    return await get_lease(lease_id)
+
+
 async def _bump_actions(lease_id: str) -> int:
     """用一条 UPDATE 原子自增，返回本次的序号（并发下也不会两条动作共用序号）。"""
     async with database.connect() as db:
@@ -1133,6 +1165,10 @@ async def _agent_exec_inner(
 
     deadline = time.monotonic() + max(1.0, float(timeout))
     status: Dict[str, Any] = {}
+    # 退避轮询：qemu-agent 的命令大多几十毫秒就结束，首次 0.2s 就能拿到结果；
+    # 少数长命令（包管理 / 日志归档）没必要全程每 0.3s 打一次 PVE。逐次放宽到
+    # 1s 上限，既不影响短命令的响应，也少给 PVE 添负载。
+    poll_delay = 0.2
     while True:
         try:
             status = await client.qemu_agent_exec_status(node, vmid, pid)
@@ -1150,7 +1186,8 @@ async def _agent_exec_inner(
                     "(it may still be running inside the guest)",
                 )
             )
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(poll_delay)
+        poll_delay = min(1.0, poll_delay * 1.6)
 
     return {
         "exitcode": int(status.get("exitcode") or 0),

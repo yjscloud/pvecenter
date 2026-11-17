@@ -108,6 +108,33 @@ def test_long_history_keeps_the_evidence_row() -> None:
     assert any(row["role"] == "context" for row in trimmed)
 
 
+@pytest.mark.parametrize("budget", [1, 40, 120, 400, 2000])
+def test_token_budget_trimming_keeps_tool_groups_paired(budget: int) -> None:
+    """按 token 预算裁剪之后，工具调用仍然必须成对 —— 剪口照样可能落在半路。"""
+    trimmed = aichat._fit_context_tokens(_long_history(), budget)
+    _assert_paired(aichat.to_model_messages(trimmed))
+
+
+def test_token_budget_keeps_the_evidence_row() -> None:
+    """预算再小也不能把证据行裁掉：它是「这台机器当时什么样」的唯一来源。"""
+    trimmed = aichat._fit_context_tokens(_long_history(), 10)
+    assert [row["role"] for row in trimmed].count("context") == 1
+
+
+def test_token_budget_keeps_at_least_one_body_row() -> None:
+    """预算配得比单条消息还小的时候，也要留一条 —— 空上下文比超一点更糟。"""
+    trimmed = aichat._fit_context_tokens(_long_history(), 1)
+    assert any(row["role"] != "context" for row in trimmed)
+
+
+def test_token_budget_prefers_recent_messages() -> None:
+    """预算不够时先丢旧的：最后一条必须留下，最早的几条该让位。"""
+    trimmed = aichat._fit_context_tokens(_long_history(), 60)
+    ids = [str(row.get("id") or "") for row in trimmed]
+    assert "p8" in ids
+    assert "a1" not in ids
+
+
 def test_orphan_tool_is_dropped() -> None:
     """剪口落在工具响应行上：它的 assistant 已被裁走，这条 tool 必须丢掉。"""
     rows = [_tool("t1", "c1"), {"id": "a1", "role": "assistant", "content": "结论"}]
@@ -192,3 +219,75 @@ def test_context_row_is_replayed_as_user_message() -> None:
     """context 行是当初喂给模型的 ``[数据]`` 段，重建时要映射回 user。"""
     rows = [{"id": "ctx", "role": "context", "content": "[数据] 证据"}]
     assert aichat.to_model_messages(rows) == [{"role": "user", "content": "[数据] 证据"}]
+
+
+def test_summary_uses_the_helper_model_when_configured(monkeypatch) -> None:
+    """摘要不产生用户可见答案：配了便宜型号就用便宜的，复用同一把 key。"""
+    captured: Dict[str, Any] = {}
+
+    async def fake_chat(messages, **kwargs):
+        captured.update(kwargs.get("provider") or {})
+        return {"content": "要点"}
+
+    monkeypatch.setattr(aichat.ai, "chat", fake_chat)
+    monkeypatch.setattr(aichat.ai, "HELPER_MODEL", "cheap-model")
+    text = aichat.asyncio.run(
+        aichat._summarize_history(
+            "",
+            [{"role": "user", "content": "磁盘满了"}],
+            cfg={},
+            provider={"model": "big-model", "base_url": "http://stub"},
+        )
+    )
+    assert text == "要点"
+    assert captured["model"] == "cheap-model"
+    assert captured["base_url"] == "http://stub"
+
+
+def test_summary_keeps_the_main_model_by_default(monkeypatch) -> None:
+    captured: Dict[str, Any] = {}
+
+    async def fake_chat(messages, **kwargs):
+        captured.update(kwargs.get("provider") or {})
+        return {"content": "要点"}
+
+    monkeypatch.setattr(aichat.ai, "chat", fake_chat)
+    monkeypatch.setattr(aichat.ai, "HELPER_MODEL", "")
+    aichat.asyncio.run(
+        aichat._summarize_history(
+            "",
+            [{"role": "user", "content": "磁盘满了"}],
+            cfg={},
+            provider={"model": "main-model", "base_url": "http://stub"},
+        )
+    )
+    assert captured["model"] == "main-model"
+
+
+def test_only_the_latest_evidence_row_survives() -> None:
+    """反复重新体检：只带最新那份证据，旧快照别再每轮重发（还会误导模型）。"""
+    rows: List[Dict[str, Any]] = [
+        {"id": "ctx1", "seq": 1, "role": "context", "content": "[数据] 第一次体检"},
+        _user("u1", "问一句"),
+        {"id": "ctx2", "seq": 3, "role": "context", "content": "[数据] 第二次体检"},
+        _user("u2", "再问一句"),
+    ]
+    trimmed = aichat._context_rows(rows, 40)
+    contents = [row["content"] for row in trimmed if row["role"] == "context"]
+    assert contents == ["[数据] 第二次体检"]
+    # 顺序不能被打乱：留下的就是原序列里去掉旧证据
+    assert [row["id"] for row in trimmed] == [
+        row["id"] for row in rows if row["id"] != "ctx1"
+    ]
+
+
+def test_token_budget_does_not_count_stale_evidence() -> None:
+    """预算只算最新那份证据；旧快照既不该占额度，也不该被塞回去。"""
+    rows: List[Dict[str, Any]] = [
+        {"id": "ctx1", "seq": 1, "role": "context", "content": "x" * 4000},
+        {"id": "ctx2", "seq": 2, "role": "context", "content": "y" * 40},
+        _user("u1", "最近一句"),
+    ]
+    trimmed = aichat._fit_context_tokens(rows, 100)
+    contents = [row["content"] for row in trimmed if row["role"] == "context"]
+    assert contents == ["y" * 40]

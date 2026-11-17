@@ -11,6 +11,64 @@ import { useT } from '../../i18n';
 /** 拖拽列宽的下限，避免把列拖成看不见的一条缝 */
 const MIN_COLUMN_WIDTH = 64;
 
+/**
+ * 列宽持久化的键前缀。
+ *
+ * 列宽是「这台机器上看得顺眼」的偏好，与列显隐（ColumnSettings 按账号隔离）
+ * 同一性质：只存本机，不同步服务端。调用方把账号与表名拼进 storageKey，
+ * 同一浏览器换人登录互不影响。
+ */
+const WIDTH_STORAGE_PREFIX = 'pve_table_widths:';
+
+function widthStorageKey(storageKey?: string): string | null {
+  return storageKey ? `${WIDTH_STORAGE_PREFIX}${storageKey}` : null;
+}
+
+/** 读回用户拖过的列宽；脏数据 / 隐私模式一律当「没存过」 */
+function readStoredWidths(storageKey?: string): Record<string, number> | null {
+  const key = widthStorageKey(storageKey);
+  if (!key) return null;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const next: Record<string, number> = {};
+    for (const [columnKey, value] of Object.entries(
+      parsed as Record<string, unknown>,
+    )) {
+      if (
+        typeof value === 'number' &&
+        Number.isFinite(value) &&
+        value >= MIN_COLUMN_WIDTH
+      ) {
+        next[columnKey] = value;
+      }
+    }
+    return Object.keys(next).length > 0 ? next : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredWidths(
+  storageKey: string | undefined,
+  widths: Record<string, number> | null,
+): void {
+  const key = widthStorageKey(storageKey);
+  if (!key) return;
+  try {
+    if (widths && Object.keys(widths).length > 0) {
+      window.localStorage.setItem(key, JSON.stringify(widths));
+    } else {
+      // 全被双击恢复默认后清掉这条记录，下次读到的就是「没存过」
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    /* 隐私模式 / 禁用存储：本次拖拽仍然生效，只是不持久化 */
+  }
+}
+
 export interface Column<T> {
   /** 列唯一 key */
   key: string;
@@ -206,6 +264,11 @@ export interface TableProps<T> {
   /** 是否允许拖拽调整列宽（默认开启；双击把手可恢复该列默认宽度） */
   resizable?: boolean;
   /**
+   * 列宽持久化的键（同一页面用同一个键，切页 / 刷新后宽度不变）。
+   * 建议拼上账号与表名，例如 ``alice:vms``；不传则宽度只在本组件生命周期内有效。
+   */
+  storageKey?: string;
+  /**
    * 表格上方右对齐的列工具条（放「列设置」齿轮）。
    *
    * 刻意渲染在 `.table-container` **之外**：容器要横向滚动，overflow 会把
@@ -242,6 +305,7 @@ export function Table<T>({
   rowTitle,
   onRowHover,
   resizable = true,
+  storageKey,
   columnMenu,
   isRowExpanded,
   renderExpanded,
@@ -250,12 +314,28 @@ export function Table<T>({
   const tableRef = useRef<HTMLTableElement>(null);
 
   /* 用户拖拽后的列宽（像素）。null = 还没拖过，沿用各列自带的 width，
-     此时表格仍是常规自适应布局，不受影响。 */
-  const [widths, setWidths] = useState<Record<string, number> | null>(null);
+     此时表格仍是常规自适应布局，不受影响。传了 storageKey 时从 localStorage
+     读回上次的宽度 —— 切到别的页面再回来不会重置。 */
+  const [widths, setWidths] = useState<Record<string, number> | null>(() =>
+    readStoredWidths(storageKey),
+  );
   const [draggingKey, setDraggingKey] = useState<string | null>(null);
   const dragRef = useRef<{ key: string; startX: number; startW: number } | null>(
     null,
   );
+  /* 拖拽结束（pointerup）时读的是最新宽度：回调闭包里的 widths 是旧的，
+     用 ref 同步一份，避免把拖拽中途的值写进存储 */
+  const widthsRef = useRef<Record<string, number> | null>(widths);
+  useEffect(() => {
+    widthsRef.current = widths;
+  }, [widths]);
+  /* 同一个表格被复用到另一个键上（换账号 / 换资源类型）时读回对应的宽度 */
+  const lastStorageKeyRef = useRef(storageKey);
+  useEffect(() => {
+    if (lastStorageKeyRef.current === storageKey) return;
+    lastStorageKeyRef.current = storageKey;
+    setWidths(readStoredWidths(storageKey));
+  }, [storageKey]);
 
   /* 首次拖拽时把每一列的实际渲染宽度固化成像素值。
      table-layout: fixed 下未指定宽度的列会平分剩余空间，若不固化，
@@ -307,6 +387,8 @@ export function Table<T>({
     const onUp = () => {
       dragRef.current = null;
       setDraggingKey(null);
+      // 松手才落盘：拖拽过程中每移动一像素都写一次没有意义
+      writeStoredWidths(storageKey, widthsRef.current);
     };
 
     window.addEventListener('pointermove', onMove);
@@ -321,7 +403,7 @@ export function Table<T>({
       window.removeEventListener('pointercancel', onUp);
       document.body.classList.remove('is-col-resizing');
     };
-  }, [draggingKey]);
+  }, [draggingKey, storageKey]);
 
   /* 双击把手：清掉这一列的覆盖宽度，恢复它原本的默认宽度 */
   const resetColumn = useCallback((key: string) => {
@@ -329,15 +411,24 @@ export function Table<T>({
       if (!prev) return prev;
       const next = { ...prev };
       delete next[key];
+      writeStoredWidths(storageKey, next);
       return next;
     });
-  }, []);
+  }, [storageKey]);
 
-  const totalWidth = useMemo(
-    () =>
-      widths ? Object.values(widths).reduce((sum, w) => sum + w, 0) : undefined,
-    [widths],
-  );
+  /* 表宽只在「当前所有可见列都有一条像素宽度」时写死。若用户后来在列设置里
+     新打开一列、而存储里没有它的宽度，就不设表宽 —— 固定布局会把剩余空间
+     分给它，不会把它挤成一条缝。 */
+  const totalWidth = useMemo(() => {
+    if (!widths) return undefined;
+    let sum = 0;
+    for (const column of columns) {
+      const width = widths[column.key];
+      if (typeof width !== 'number') return undefined;
+      sum += width;
+    }
+    return sum > 0 ? sum : undefined;
+  }, [widths, columns]);
 
   /* ---- 排序处理 ----
      用的是与分页列表同一个 sortRows（见它的注释）：分页的页面已经先把整份数据

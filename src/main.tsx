@@ -14,6 +14,7 @@ import { StepUpProvider } from './hooks/useStepUp';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { LanguageCacheReset } from './components/LanguageCacheReset';
 import { I18nProvider, detectLang, preloadLang } from './i18n';
+import { applyTheme } from './utils/theme';
 
 import './styles/theme.css';
 import './styles/global.css';
@@ -34,6 +35,10 @@ import './styles/responsive.css';
 /* ---------------------------------------------------------------------------
    React Query 配置
    --------------------------------------------------------------------------- */
+
+/* 挂载前先把主题偏好贴上 <html>：避免首屏先闪一下浅色再切深色。
+   放在等待语言包之前 —— 拉英文词典要发请求，不能让它把主题延后。 */
+applyTheme();
 
 /* 英文界面：先把英文词典拉下来再挂载，避免首屏先闪一下中文再切成英文。
    中文界面（默认）这里是一次同步返回，不产生任何请求。 */

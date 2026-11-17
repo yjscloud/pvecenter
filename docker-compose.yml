@@ -195,6 +195,20 @@ services:
       # 打开后仍要求管理员登录。仅调试/内网排障时临时设为 true。
       API_DOCS_ENABLED: ${API_DOCS_ENABLED:-false}
 
+      # --- AI 并发（按上游 provider 的限速调）-------------------------------
+      # 不同 provider 的限速差一个数量级（本地 Ollama 能跑几十路，企业版 key
+      # 可能只给 5 RPM），所以做成变量而不是写死。超出上限的会排队，不报错。
+      #   PVECENTER_AI_CONCURRENCY       全局同时进行的轮次数
+      #   PVECENTER_AI_LANE_CONCURRENCY  单个模型配置（同一把 key）的并发
+      PVECENTER_AI_CONCURRENCY: ${PVECENTER_AI_CONCURRENCY:-16}
+      PVECENTER_AI_LANE_CONCURRENCY: ${PVECENTER_AI_LANE_CONCURRENCY:-6}
+      # 阻塞调用线程池（SSH / 本机子进程）。要比 AI 总并发略大，否则闸门放开了
+      # 命令还在池里排队。
+      PVECENTER_THREAD_POOL: ${PVECENTER_THREAD_POOL:-32}
+      # 摘要等「辅助调用」用的模型名（留空 = 与对话同模型）。同一 provider 通常
+      # 有便宜一档的型号，指过去即可，复用同一把 key 与 base_url。
+      PVECENTER_AI_HELPER_MODEL: ${PVECENTER_AI_HELPER_MODEL:-}
+
       # --- 可选：Proxmox 连接初始值（登录后也能在「设置」页在线修改）---------
       PVE_HOST: ${PVE_HOST:-}
       PVE_PORT: ${PVE_PORT:-8006}

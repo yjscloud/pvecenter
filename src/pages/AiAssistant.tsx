@@ -12,11 +12,23 @@
    用户可以自己核对，而不是只能选择信或不信。页脚也常驻一句同样的提醒。
    ========================================================================== */
 
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { aiApi, exportUrl, usersApi, type VmAiLease, type VmAiTarget } from '../api/endpoints';
 import { errorMessage } from '../api/client';
+import * as aiPerf from '../utils/aiPerf';
 import { PageShell } from '../components/Layout';
 import { RichText } from '../components/RichText';
 import { Card, CardHeader } from '../components/ui/Card';
@@ -30,7 +42,11 @@ import { Skeleton, Spinner } from '../components/ui/Spinner';
 import { Modal } from '../components/ui/Modal';
 import { RemediationDialog } from '../components/RemediationDialog';
 import { ApprovalCard, type ApprovalRequest } from '../components/AiApprovalCard';
-import { VmAiLeaseCard } from '../components/VmAiLeaseCard';
+import {
+  AiAuthorizationCard,
+  type AiAuthorizationPatch,
+} from '../components/AiAuthorizationCard';
+import { leaseForTarget } from './aiAuthorization';
 import { VmAiPolicyCard } from '../components/VmAiPolicyCard';
 import { AiTerminal } from '../components/AiTerminal';
 import { AiUsageModal } from '../components/AiUsageModal';
@@ -41,6 +57,7 @@ import {
   IconChevronDown,
   IconChevronRight,
   IconClose,
+  IconCopy,
   IconDownload,
   IconInfo,
   IconPlus,
@@ -70,6 +87,46 @@ import type {
   AiSeverity,
   BadgeVariant,
 } from '../api/types';
+
+/** 正在跑的那一轮的进度摘要：给右栏气泡用，左栏过程流水仍在「执行过程」里 */
+interface AiProgress {
+  /** 当前是排队中（并发闸门未放行） */
+  queued: boolean;
+  /** 排队时前面还有几轮（不含正在跑的） */
+  ahead: number;
+  /** 排队时的粗估等待秒数 */
+  etaS: number;
+  /** 当前第几轮分析（0 = 还没进入分析） */
+  step: number;
+  maxSteps: number;
+  /** 最近几个工具调用；ok=null 表示还在跑 */
+  tools: Array<{ tool: string; ok: boolean | null }>;
+  /** 体检报告已生成的字符数（正文不展示，只说明「还在长」） */
+  draftChars: number;
+}
+
+/**
+ * 这几个面板包一层 memo：流式期间父组件每 70ms 重渲染一次，而它们与「正在长
+ * 出来的那段文字」无关 —— 终端里跑着 xterm、执行过程在滚流水、报告卡可能有
+ * 几十条发现项，跟着每帧重绘纯属浪费（而且会抢主线程，让打字机看起来一顿一顿）。
+ * 前提是传进去的 props 引用稳定：回调一律用 useCallback / ref 兜住。
+ */
+const TerminalPane = memo(AiTerminal);
+const AuthorizationCard = memo(AiAuthorizationCard);
+const ApprovalCardMemo = memo(ApprovalCard);
+
+/** 排除原因码 → 可读文案。未知码按「读不到」处理，不编新词。 */
+const EXCLUDE_REASON_KEY: Record<string, MessageKey> = {
+  not_vm: 'ai.excludeReason.not_vm',
+  stopped: 'ai.excludeReason.stopped',
+  cloudinit: 'ai.excludeReason.cloudinit',
+  agent: 'ai.excludeReason.agent',
+  unreachable: 'ai.excludeReason.unreachable',
+};
+
+function excludeReasonKey(reason: string): MessageKey {
+  return EXCLUDE_REASON_KEY[reason] ?? 'ai.excludeReason.unreachable';
+}
 
 /** 报告卡的元信息：判断「这份结论值不值信」的参照（模型、耗时、开销、工具数） */
 interface ReportMeta {
@@ -208,10 +265,63 @@ function emptyDraft(): ProviderDraft {
   };
 }
 
+/* 控制台左右分栏：默认对半，可拖到 32%–74%（留出两边都还能读的最小宽度）。
+   对半分是因为两侧都是主要阅读区：终端看命令输出，对话看结论与审批。 */
+const SPLIT_STORE_KEY = 'ai.console.split';
+const SPLIT_DEFAULT = 50;
+const SPLIT_MIN = 32;
+const SPLIT_MAX = 74;
+
+/** 预案的收藏 / 最近使用：只存本机，属于「顺手」偏好，不同步到服务端 */
+const PLAYBOOK_FAV_KEY = 'ai.playbook.favorites';
+const PLAYBOOK_RECENT_KEY = 'ai.playbook.recent';
+const PLAYBOOK_RECENT_MAX = 5;
+
+/** 本机记住的模型与上次目标（目标只做回显，仍要用户点一下确认） */
+const DEFAULT_MODEL_KEY = 'ai.default.model';
+const LAST_HOST_KEY = 'ai.default.host';
+
+function readStoredString(key: string): string {
+  try {
+    return window.localStorage.getItem(key) || '';
+  } catch {
+    return '';
+  }
+}
+
+function writeStoredString(key: string, value: string) {
+  try {
+    if (value) window.localStorage.setItem(key, value);
+    else window.localStorage.removeItem(key);
+  } catch {
+    /* 隐私模式 / 禁用存储：本次仍生效，只是不持久化 */
+  }
+}
+
+function readStoredList(key: string): string[] {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(key) || '[]') as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeStoredList(key: string, list: string[]) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(list));
+  } catch {
+    /* 隐私模式 / 禁用存储：本次仍生效，只是不持久化 */
+  }
+}
+
 export function AiAssistant() {
   const t = useT();
   const toast = useToast();
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const { isAdmin, hasPermission } = useAuth();
 
   const [tab, setTab] = useState<'inspect' | 'records'>('inspect');
@@ -221,8 +331,34 @@ export function AiAssistant() {
    * 「这台机器现在什么情况」，而不是「AI 调了几次工具」。
    */
   const [leftTab, setLeftTab] = useState<'terminal' | 'activity'>('terminal');
+  /**
+   * 左右两栏的宽度占比（左栏百分比），可拖拽 / 键盘调整，双击复位。
+   *
+   * 只存浏览器本地：这是「看着舒服」的个人偏好，不属于会话状态，换设备没理由
+   * 跟着跑。默认 56% —— 终端是看日志的，稍微宽一点更实用。
+   */
+  const [consoleSplit, setConsoleSplit] = useState<number>(() => {
+    try {
+      const saved = Number(window.localStorage.getItem(SPLIT_STORE_KEY));
+      if (saved >= SPLIT_MIN && saved <= SPLIT_MAX) return saved;
+    } catch {
+      /* 隐私模式 / 禁用存储时会抛错，退回默认值即可 */
+    }
+    return SPLIT_DEFAULT;
+  });
+  const [resizingConsole, setResizingConsole] = useState(false);
+  const consoleRef = useRef<HTMLDivElement | null>(null);
+  /* 拖拽过程中的最新占比：只改 DOM 变量，松手才提交到 state ——
+     这一页挂着对话流与终端，每帧 setState 会让整棵子树重渲染。 */
+  const dragSplitRef = useRef(SPLIT_DEFAULT);
   const [hostId, setHostId] = useState('');
-  const [modelId, setModelId] = useState('');
+  /** 上次用过的模型：本机记住，下次打开直接沿用；失效时回落到平台默认 */
+  const [modelId, setModelId] = useState(() => readStoredString(DEFAULT_MODEL_KEY));
+  /**
+   * 上次排查过的主机。**只做回显 + 一键采用**，绝不自动选中 ——
+   * AI 会登录这台机器跑命令，默认选中等于替用户决定把哪台交出去。
+   */
+  const [lastHostId, setLastHostId] = useState(() => readStoredString(LAST_HOST_KEY));
   /**
    * 是否授权 AI 在目标主机执行只读命令。
    *
@@ -231,6 +367,13 @@ export function AiAssistant() {
    * 或开了新对话，就是一次全新的授权，不沿用旧的值。
    */
   const [allowExec, setAllowExec] = useState(false);
+  /**
+   * 主机命令级别：read 只读 / write 允许提议写命令。
+   *
+   * 与 allowExec 分开：前者是「开没开」，这个是「开到哪一档」。只读级别下不
+   * 下发写提议工具，避免「页面写着只读、模型却能提议改系统」。
+   */
+  const [execAccess, setExecAccess] = useState<'read' | 'write'>('read');
   /**
    * 刚刚（本次操作里）才把「上机执行」打开。
    *
@@ -246,9 +389,18 @@ export function AiAssistant() {
    * 不同 —— 混成一个开关，用户没法只给其中一种。
    */
   const [vmLease, setVmLease] = useState<VmAiLease | null>(null);
+  /**
+   * 已经和服务端对齐过租约的主机 id。
+   * 带参进入（预案 / 问题）时，要等这一步完成再自动跑 —— 否则第一轮会
+   * 在「运维授权明明还在」的情况下仍去要一次授权。
+   */
+  const [leaseReadyHost, setLeaseReadyHost] = useState('');
   /** 待用户批准的写命令：AI 提议后本轮挂起，等对话流里的审批卡拍板 */
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [busy, setBusy] = useState(false);
+  const [approvalExpired, setApprovalExpired] = useState(false);
+  /** 本轮是体检还是自由对话：决定「正在生成报告」的骨架要不要出现 */
+  const [runMode, setRunMode] = useState<'chat' | 'inspect' | ''>('');
   /** 正在跑那一轮的过程事件（左栏）。历史轮次从会话消息里重建 */
   const [events, setEvents] = useState<AiChatStreamEvent[]>([]);
   const [errorText, setErrorText] = useState('');
@@ -263,6 +415,15 @@ export function AiAssistant() {
   const [conversations, setConversations] = useState<AiConversation[]>([]);
   /** 当前会话的全部消息（服务端权威）。context / tool 行不直接渲染 */
   const [transcript, setTranscript] = useState<AiChatMessage[]>([]);
+  /**
+   * transcript 的实时镜像。收尾刷新要算「屏上最新一条的 seq」，而它发生在异步
+   * 流程里 —— 闭包里那份 transcript 还是点发送时的快照，会把这一轮的消息重复拉
+   * 回来（甚至覆盖乐观气泡的替换逻辑）。
+   */
+  const transcriptRef = useRef<AiChatMessage[]>([]);
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
   /** 首轮体检产出的报告；「仅解读」也会写这里 */
   const [report, setReport] = useState<AiResult | null>(null);
   const [reportMeta, setReportMeta] = useState<ReportMeta | null>(null);
@@ -275,6 +436,15 @@ export function AiAssistant() {
   const reportRef = useRef<AiResult | null>(null);
   useEffect(() => {
     reportRef.current = report;
+  }, [report]);
+  /** 报告卡锚点：体检结束后把用户带过去，免得结论在屏幕外而以为没出结果 */
+  const reportAnchorRef = useRef<HTMLDivElement | null>(null);
+  /** 只有「本次主动发起体检」才自动滚到报告；翻历史会话不抢滚动位置 */
+  const scrollToReportRef = useRef(false);
+  useEffect(() => {
+    if (!report || !scrollToReportRef.current) return;
+    scrollToReportRef.current = false;
+    reportAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, [report]);
   /** 从记录页跳进来时置位：切主机后不要再去抢「最近一条会话」，保留用户点开的那条 */
   const skipAutoSelectRef = useRef(false);
@@ -297,6 +467,8 @@ export function AiAssistant() {
 
   /** 把流式增量写进缓冲，按 ~70ms 的节奏刷到界面 —— 打字机不必逐字渲染。 */
   function pushToken(text: string) {
+    // 首字只记第一次：后面每片增量都进这里，重复打点会把 ttfb 改写成末字时间
+    aiPerf.firstToken();
     streamBufRef.current += text;
     if (streamTimerRef.current != null) return;
     streamTimerRef.current = window.setTimeout(() => {
@@ -323,7 +495,25 @@ export function AiAssistant() {
     [],
   );
 
-  const targetsQuery = useQuery({ queryKey: ['ai', 'targets'], queryFn: aiApi.targets });
+  // 「列表先出、状态后补」：后端先回已有结论的主机，剩下几台在后台探测；
+  // 只要还有 pending 就再问一次。间隔**从 0.5 秒开始退避到 15 秒**：
+  //   · 后端现在是一轮往返就能补齐一批（状态是整批取的），半秒后再问一次
+  //     正好接上 —— 首屏从「等两秒」变成「半秒补齐」，这是用户能感觉到的差别；
+  //   · 但一台装不上 agent 的机器会一直 pending，固定半秒就是一份永远不停的
+  //     请求流（几十个标签页开着时更明显）。退避之后，长时间挂着的只剩低频
+  //     轮询，用户看到的仍是「N 台检测中」。
+  // 页面在后台时停掉：看不见的列表没有「实时」价值，回来时 react-query 会
+  // 因为 stale 立刻补一次。
+  const targetsQuery = useQuery({
+    queryKey: ['ai', 'targets'],
+    queryFn: aiApi.targets,
+    refetchInterval: (query) => {
+      if (!query.state.data?.pending_total) return false;
+      if (typeof document !== 'undefined' && document.hidden) return false;
+      const rounds = query.state.dataUpdateCount ?? 0;
+      return Math.min(500 * 2 ** Math.min(Math.max(rounds - 1, 0), 5), 15000);
+    },
+  });
   /** 虚拟机授权候选：与「受管主机」是两套清单，前者是 SSH 目标，后者是 PVE 里的机器 */
   const vmTargetsQuery = useQuery({ queryKey: ['ai', 'vm', 'targets'], queryFn: aiApi.vmTargets });
   const status = targetsQuery.data?.status;
@@ -344,15 +534,45 @@ export function AiAssistant() {
   );
   /** 默认跟随管理员设的「当前使用」；用户临时改选只影响这一次排查 */
   const activeModelId = modelsQuery.data?.active_id || '';
-  const currentModelId = modelId || activeModelId;
+  // 记住的模型若已下线 / 被收回，回落到平台默认，避免下拉框显示空白
+  const currentModelId =
+    modelId && modelOptions.some((item) => item.value === modelId)
+      ? modelId
+      : activeModelId;
 
   /** 受管主机的原始记录：选择器要用它的 ``node`` / ``vmid`` 把主机与虚拟机对上 */
   const hostCards = useMemo(() => targetsQuery.data?.hosts ?? [], [targetsQuery.data]);
+  /** 还在后台探测的候选台数（>0 时列表不完整，页面据显示「检测中」并继续轮询） */
+  const pendingTotal = targetsQuery.data?.pending_total ?? 0;
+  /** 本轮探活失败的 PVE 条数：整条连接不可达，与「某台机器不可用」是两回事 */
+  const pveDown = targetsQuery.data?.scan?.pve_down ?? 0;
 
   const hostOptions = useMemo(
     () => hostCards.map((host) => ({ label: host.name || host.id, value: host.id })),
     [hostCards],
   );
+
+  /**
+   * 被准入条件排除的主机：只展示原因计数，不展示名字。
+   *
+   * 页面必须解释「为什么这里比受管主机少」——不解释的话，用户只会以为
+   * 助手漏了一台机器，然后去别处找开关。计数用于一句话概括，明细（后端已按
+   * 用户可见范围过滤）用于点名到具体机器、给出原因和修复入口。
+   */
+  const excludeInfo = targetsQuery.data?.excluded;
+  const excludedItems = excludeInfo?.items ?? [];
+  const excludedSummary = useMemo(() => {
+    const info = targetsQuery.data?.excluded;
+    if (!info?.total) return '';
+    const parts = [
+      info.not_vm ? t('ai.excludeNotVm', { n: info.not_vm }) : '',
+      info.stopped ? t('ai.excludeStopped', { n: info.stopped }) : '',
+      info.cloudinit ? t('ai.excludeCloudinit', { n: info.cloudinit }) : '',
+      info.agent ? t('ai.excludeAgent', { n: info.agent }) : '',
+      info.unreachable ? t('ai.excludeUnreachable', { n: info.unreachable }) : '',
+    ].filter(Boolean);
+    return parts.join(t('ai.excludeSeparator'));
+  }, [targetsQuery.data, t]);
 
   /**
    * 虚拟机授权目标只留**运行中**的：停着的机器连不进去，列出来只会让人签完
@@ -423,6 +643,17 @@ export function AiAssistant() {
   const selectedModelLabel =
     modelOptions.find((item) => item.value === currentModelId)?.label || currentModelId || '-';
 
+  /** 上次用过的主机（仅当它仍在候选里才回显；已被移出受管主机就静默丢弃） */
+  const lastHostHost = useMemo(
+    () => hostCards.find((host) => host.id === lastHostId) ?? null,
+    [hostCards, lastHostId],
+  );
+
+  // 记住当前使用的模型：下次打开直接沿用，减少每次重选
+  useEffect(() => {
+    if (currentModelId) writeStoredString(DEFAULT_MODEL_KEY, currentModelId);
+  }, [currentModelId]);
+
   /**
    * 排障预案（可插拔）。
    *
@@ -435,6 +666,39 @@ export function AiAssistant() {
     staleTime: 10 * 60_000,
   });
   const playbooks: AiPlaybook[] = playbooksQuery.data?.items ?? [];
+  /** 收藏的预案 key（本机偏好） */
+  const [favPlaybooks, setFavPlaybooks] = useState<string[]>(() =>
+    readStoredList(PLAYBOOK_FAV_KEY),
+  );
+  /** 最近跑过的预案 key（本机偏好，最多 5 个） */
+  const [recentPlaybooks, setRecentPlaybooks] = useState<string[]>(() =>
+    readStoredList(PLAYBOOK_RECENT_KEY),
+  );
+
+  /**
+   * 展示顺序：收藏 → 最近用过 → 其余。
+   * 不改变后端返回的清单，只影响「先看到哪几个」—— 高频预案不必每次翻找。
+   */
+  const orderedPlaybooks = useMemo(() => {
+    const rank = (key: string) => {
+      const fav = favPlaybooks.indexOf(key);
+      if (fav >= 0) return fav;
+      const recent = recentPlaybooks.indexOf(key);
+      if (recent >= 0) return 100 + recent;
+      return 1000;
+    };
+    return [...playbooks].sort((a, b) => rank(a.key) - rank(b.key));
+  }, [playbooks, favPlaybooks, recentPlaybooks]);
+
+  function toggleFavoritePlaybook(key: string) {
+    setFavPlaybooks((list) => {
+      const next = list.includes(key)
+        ? list.filter((item) => item !== key)
+        : [key, ...list];
+      writeStoredList(PLAYBOOK_FAV_KEY, next);
+      return next;
+    });
+  }
 
   // 左栏在「没有实时事件」时展示本次会话已执行过的操作（回看用）。
   // command 一并带上：回看历史时用户最想核对的就是「AI 当时在他机器上敲了什么」，
@@ -451,6 +715,57 @@ export function AiAssistant() {
     [transcript],
   );
 
+  /**
+   * 右栏气泡用的进度摘要。
+   *
+   * 左栏默认是终端，过程事件（stage / thinking / tool_*）在「执行过程」页签里，
+   * 用户盯着右栏等报告时看不到。这里把同一批事件压成一句「现在在做什么」+
+   * 最近几个工具调用，镜像到右栏，消除「转圈 = 卡住」的错觉。
+   */
+  const progress = useMemo<AiProgress | null>(() => {
+    if (!busy) return null;
+    let queued = false;
+    let ahead = 0;
+    let etaS = 0;
+    let step = 0;
+    let maxSteps = 0;
+    let draftChars = 0;
+    const tools: Array<{ tool: string; ok: boolean | null }> = [];
+    for (const event of events) {
+      if (event.type === 'stage') {
+        if (event.stage === 'queued') {
+          queued = true;
+          ahead = event.ahead ?? 0;
+          etaS = event.eta_s ?? 0;
+        }
+      } else if (event.type === 'thinking') {
+        step = event.step;
+        maxSteps = event.max_steps;
+      } else if (event.type === 'report_progress') {
+        draftChars = event.chars;
+      } else if (event.type === 'tool_start') {
+        tools.push({ tool: event.tool, ok: null });
+      } else if (event.type === 'tool_done') {
+        // 回填最近一个同名且仍在跑的工具：同一工具可能被调用多次
+        for (let i = tools.length - 1; i >= 0; i -= 1) {
+          if (tools[i].tool === event.tool && tools[i].ok === null) {
+            tools[i].ok = event.ok;
+            break;
+          }
+        }
+      }
+    }
+    return {
+      queued,
+      ahead,
+      etaS,
+      step,
+      maxSteps,
+      tools: tools.slice(-4),
+      draftChars,
+    };
+  }, [events, busy]);
+
   /** 把会话详情的各字段摊进状态（对话、报告、元信息）。 */
   function applyDetail(detail: AiConversationDetail, restoreExec = true) {
     setConvId(detail.conversation.id);
@@ -459,7 +774,16 @@ export function AiAssistant() {
     // 恢复这条会话上次的授权选择，别让刷新悄悄把「上机执行」关掉。
     // 但「切主机后自动接续最近一条会话」不算用户主动打开它 —— 那种情况传
     // restoreExec=false：刚选完主机就是一次全新的授权，不该沿用旧会话的开关。
-    setAllowExec(restoreExec ? Boolean(detail.conversation.allow_exec) : false);
+    const restoredExec = restoreExec ? Boolean(detail.conversation.allow_exec) : false;
+    setAllowExec(restoredExec);
+    // 老会话没有 exec_access：按合并前的语义当作 write，避免恢复后突然降级。
+    setExecAccess(
+      restoredExec
+        ? detail.conversation.exec_access === 'read'
+          ? 'read'
+          : 'write'
+        : 'read',
+    );
     const session = detail.session;
     setReportMeta(
       session
@@ -541,6 +865,7 @@ export function AiAssistant() {
       setErrorText('');
       // 换了一台主机就是一次全新的授权：默认关闭，不沿用上一台留下的开关。
       setAllowExec(false);
+      setExecAccess('read');
       // 自动接续最近一条会话只为「接着聊」，**不**恢复它的上机执行授权 ——
       // 否则用户刚选完主机，开关就自己亮起来，看起来像默认授权了。
       if (items.length > 0) void loadConversation(items[0].id, false, false);
@@ -551,6 +876,37 @@ export function AiAssistant() {
     // 只在切主机时重跑；convId 只用于「当前会话是否属于这台机器」的判断
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId]);
+
+  /**
+   * 切主机 / 首次进入时，把服务端仍生效的运维票对回当前目标。
+   *
+   * 页面刷新后父组件手里没有租约，若不主动对齐，第一轮会显示「主机命令未授权」，
+   * 用户就得再点一次授权 —— 这正是要消除的重复授权。
+   */
+  useEffect(() => {
+    if (!hostId) return;
+    let cancelled = false;
+    void aiApi
+      .vmLeases()
+      .then((data) => {
+        if (cancelled) return;
+        const now = Date.now() / 1000;
+        const active = data.items.filter(
+          (item) => item.status === 'active' && Number(item.expires_at || 0) > now,
+        );
+        const found = leaseForTarget(null, active, vmTarget);
+        if (found) setVmLease((prev) => (prev?.id === found.id ? prev : found));
+      })
+      .catch(() => {
+        /* 拉不到就保持现状：卡片自己的轮询还会再试 */
+      })
+      .finally(() => {
+        if (!cancelled) setLeaseReadyHost(hostId);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hostId, vmTarget]);
 
   /**
    * 从别处带参跳进来（VM / 节点 / 告警 / 基线页的「问 AI」）：
@@ -581,6 +937,8 @@ export function AiAssistant() {
           // 带着新问题进来：别让「自动接上最近一条会话」把它抢走
           skipAutoSelectRef.current = true;
           setHostId(host);
+          setLastHostId(host);
+          writeStoredString(LAST_HOST_KEY, host);
         }
         newConversation();
       } else {
@@ -603,12 +961,13 @@ export function AiAssistant() {
 
   // 预案要等主机就绪才能跑（hostId 可能正是上面刚设的，setState 还没生效）
   useEffect(() => {
-    if (!pendingPreset || !hostId) return;
+    // 等租约对齐后再自动跑：否则第一轮会漏掉仍在生效的运维授权
+    if (!pendingPreset || !hostId || leaseReadyHost !== hostId) return;
     const key = pendingPreset;
     setPendingPreset('');
     runPlaybook(key);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingPreset, hostId]);
+  }, [pendingPreset, hostId, leaseReadyHost]);
 
   /**
    * 一轮的公共骨架：清过程事件 → 跑 → 统一收尾。
@@ -623,11 +982,14 @@ export function AiAssistant() {
     setEvents([]);
     resetStream();
     setErrorText('');
+    setApprovalExpired(false);
     const controller = new AbortController();
     abortRef.current = controller;
     try {
       await work(controller, base);
     } catch (err) {
+      // 没跑出报告：清掉「结束后自动滚到报告」的意图，避免下次翻历史时误滚
+      scrollToReportRef.current = false;
       // 自己按的终止不是故障 —— 别报成失败吓人
       if (controller.signal.aborted) {
         toast.info(t('ai.abortedTitle'), t('ai.abortedHint'));
@@ -644,11 +1006,49 @@ export function AiAssistant() {
     }
   }
 
+  /**
+   * 一轮结束后的**增量**合并：只追加服务端新落库的消息。
+   *
+   * 原来是 `applyDetail` 整份替换（GET 整个会话 + 全量重解析）。会话越长，
+   * 收尾那一下越重 —— 用户感受是「答案已经出来了，界面又卡一下」。
+   */
+  function mergeDetail(detail: AiConversationDetail) {
+    setTranscript((prev) => {
+      const known = new Set(prev.map((item) => item.id));
+      // 乐观气泡（local-*）此时已被权威消息落库取代，先摘掉再追加
+      const kept = prev.filter((item) => !item.id.startsWith('local-'));
+      const extra = detail.messages.filter((item) => !known.has(item.id));
+      if (extra.length === 0 && kept.length === prev.length) return prev;
+      return [...kept, ...extra];
+    });
+    // 报告是整份的（很小），按服务端对齐；会话级授权等状态不动 —— 用户这轮
+    // 的开关选择不该被一次刷新改回去。
+    setReport(parseReport(detail.conversation.report));
+    const session = detail.session;
+    if (session) {
+      setReportMeta({
+        model: session.model,
+        ms: session.duration_ms,
+        tokens: session.total_tokens,
+        tools: session.tool_calls,
+        hostLabel: detail.conversation.host_name,
+        hostId: detail.conversation.host_id,
+        at: session.created,
+      });
+    }
+  }
+
   /** 一轮结束后把服务端的最新状态拉回来（屏上的乐观消息被权威消息替换）。 */
   async function refreshAfterTurn(conversationId: string) {
+    // 只取「比屏上最新那条更新」的消息
+    const lastSeq = transcriptRef.current.reduce(
+      (max, item) =>
+        item.id.startsWith('local-') ? max : Math.max(max, Number(item.seq) || 0),
+      0,
+    );
     try {
-      const detail = await aiApi.conversation(conversationId);
-      applyDetail(detail);
+      const detail = await aiApi.conversation(conversationId, lastSeq);
+      mergeDetail(detail);
     } catch {
       /* 拉不到就保留屏上的乐观消息 */
     }
@@ -670,7 +1070,15 @@ export function AiAssistant() {
     mode: 'chat' | 'inspect',
     preset = '',
   ) {
-    await aiApi.sendMessageStream(
+    // 本轮实际下发的主机授权：手动开通，或由当前运维授权覆盖。
+    // 只随请求下发、不写回会话 —— 覆盖随租约到期而失效，不会变成永久授权。
+    const covered = leaseCoversHostNow();
+    const turnAllowExec = allowExec || covered;
+    const turnExecAccess: 'read' | 'write' = covered ? 'write' : execAccess;
+    // 前端秒表：首字 / 整轮 / 长任务。量的是「用户实际等多久」，与后端分段对得上
+    // 才能判断慢在哪一层（服务端 llm_ms 正常而这里 longTasks 一堆 = 渲染问题）
+    aiPerf.startTurn(mode);
+    const turn = aiApi.sendMessageStream(
       conversationId,
       text,
       (event) => {
@@ -696,6 +1104,18 @@ export function AiAssistant() {
         ) {
           setEvents((list) => [...list, event]);
         }
+        if (event.type === 'report_progress') {
+          // 只留最后一条：体检一分钟能来一百多条，全塞进数组既撑大时间线，
+          // 又让 ProgressBubble 每次都得从头扫一遍。
+          setEvents((list) =>
+            list.some((item) => item.type === 'report_progress')
+              ? list.map((item) =>
+                  item.type === 'report_progress' ? event : item,
+                )
+              : [...list, event],
+          );
+          return;
+        }
         if (event.type === 'assistant') {
           // 收尾：权威文本落地，流式缓冲功成身退
           resetStream();
@@ -717,26 +1137,33 @@ export function AiAssistant() {
           setApproval(event);
         } else if (event.type === 'done') {
           resetStream();
+          aiPerf.finishTurn('done');
           void refreshAfterTurn(conversationId);
         } else if (event.type === 'error') {
           resetStream();
+          aiPerf.finishTurn('error');
           setErrorText(event.message);
           toast.error(t('ai.failed'), event.message);
         } else if (event.type === 'aborted') {
           resetStream();
+          aiPerf.finishTurn('aborted');
           toast.info(t('ai.abortedTitle'), t('ai.abortedHint'));
           void refreshAfterTurn(conversationId);
         }
       },
       controller.signal,
       currentModelId || undefined,
-      allowExec,
+      turnAllowExec,
       mode,
       preset,
       // 授权只在**这一轮**随请求下发：没有租约 id，模型连进虚拟机的工具都拿不到，
-      // 也就谈不上「偷偷执行」。
-      vmLease?.id ?? '',
+      // 也就谈不上「偷偷执行」。只发当前目标匹配的那张，避免切机瞬间串台。
+      effectiveLease?.id ?? '',
+      turnExecAccess,
     );
+    // 正常收口由 done / error / aborted 分支负责（finishTurn 幂等）；
+    // 这里兜的是读超时、切页、连接静默断开 —— 那几种没有任何终态事件
+    await turn.finally(() => aiPerf.finishTurn('aborted'));
   }
 
   /**
@@ -746,12 +1173,15 @@ export function AiAssistant() {
    */
   function startInspection(withText = '') {
     if (!hostId || busy) return;
+    setRunMode('inspect');
+    scrollToReportRef.current = true;
     void execute(async (controller, base) => {
       setPrevFindings(base?.findings ?? null);
       const conv = await aiApi.createConversation({
         host_id: hostId,
         provider_id: currentModelId || undefined,
         allow_exec: allowExec || undefined,
+        exec_access: allowExec ? execAccess : undefined,
       });
       setConvId(conv.id);
       setTranscript([]);
@@ -763,6 +1193,34 @@ export function AiAssistant() {
       void fetchConversations(hostId);
     });
   }
+
+  /**
+   * 传给 memo 面板的回调必须是**稳定引用**，否则 memo 永远命中不了 —— 流式期间
+   * 每 70ms 渲染一次，inline 箭头函数等于把省下的重绘又全还回去。这里用 ref 兜住
+   * 真正的实现：实现每次渲染都可以换，对外暴露的引用不变。
+   */
+  const startInspectionRef = useRef(startInspection);
+  useEffect(() => {
+    startInspectionRef.current = startInspection;
+  });
+  const onRerunReport = useCallback(() => startInspectionRef.current(), []);
+
+  const patchAuth = useCallback((patch: AiAuthorizationPatch) => {
+    if (patch.conversationId) setConvId(patch.conversationId);
+    if (patch.allowExec !== undefined) setAllowExec(patch.allowExec);
+    if (patch.execAccess) setExecAccess(patch.execAccess);
+    if (patch.lease !== undefined) setVmLease(patch.lease);
+    if (patch.justGrantedHost || patch.justGrantedLease) setExecJustGranted(true);
+  }, []);
+
+  const handleApprovalDone = useCallback(
+    (_approved: boolean, reason?: 'timeout' | 'user' | 'stale') => {
+      setApproval(null);
+      // 批准/主动拒绝都不需要续跑入口；只有超时或失效才给
+      if (reason === 'timeout' || reason === 'stale') setApprovalExpired(true);
+    },
+    [],
+  );
 
   /**
    * 发送一条对话消息。
@@ -793,6 +1251,7 @@ export function AiAssistant() {
       host_id: hostId,
       provider_id: currentModelId || undefined,
       allow_exec: allowExec || undefined,
+      exec_access: allowExec ? execAccess : undefined,
     });
     setConvId(conv.id);
     setTranscript([]);
@@ -808,8 +1267,27 @@ export function AiAssistant() {
     const text = draft.trim();
     if (!text || busy || !hostId) return;
     setDraft('');
+    setRunMode('chat');
     void execute(async (controller) => {
       const target = await ensureConversation();
+      pushUserBubble(target, text);
+      await streamTurn(target, text, controller, 'chat');
+    });
+  }
+
+  /**
+   * 重新请求上一条超时/失效的写命令。
+   *
+   * 不重跑前面的工具调用：会话上下文还在服务端，这一轮只是让模型把刚被中断的
+   * 那一步重新提出来。所以用户不必重新描述问题，也不会重复烧一遍 token。
+   */
+  function resumeApproval() {
+    if (busy || !hostId) return;
+    setApprovalExpired(false);
+    setRunMode('chat');
+    void execute(async (controller) => {
+      const target = await ensureConversation();
+      const text = t('ai.approval.resumePrompt');
       pushUserBubble(target, text);
       await streamTurn(target, text, controller, 'chat');
     });
@@ -824,6 +1302,16 @@ export function AiAssistant() {
    */
   function runPlaybook(key: string) {
     if (!key || busy || !hostId) return;
+    setRunMode('chat');
+    // 记最近使用：下次打开时把常用的排到前面
+    setRecentPlaybooks((list) => {
+      const next = [key, ...list.filter((item) => item !== key)].slice(
+        0,
+        PLAYBOOK_RECENT_MAX,
+      );
+      writeStoredList(PLAYBOOK_RECENT_KEY, next);
+      return next;
+    });
     void execute(async (controller) => {
       const target = await ensureConversation();
       // 乐观气泡用预案标题，与后端落库的那条消息一致
@@ -841,8 +1329,10 @@ export function AiAssistant() {
     setPrevFindings(null);
     setEvents([]);
     setErrorText('');
+    setRunMode('');
     // 新会话默认不授权上机执行：上一条会话开过不等于这条也要开。
     setAllowExec(false);
+    setExecAccess('read');
     setExecJustGranted(false);
   }
 
@@ -865,6 +1355,8 @@ export function AiAssistant() {
    */
   function quickRun() {
     if (!hostId) return;
+    setRunMode('inspect');
+    scrollToReportRef.current = true;
     void execute(async (_controller, base) => {
       const data = await aiApi.inspect(hostId, currentModelId);
       setPrevFindings(base?.findings ?? null);
@@ -888,10 +1380,47 @@ export function AiAssistant() {
   }
 
   const ready = Boolean(status?.ready);
+  /** 管理员把 AI 助手整个关了：与「没配模型」是两件事，提示也要分开 */
+  const aiDisabled = modelsQuery.data?.enabled === false;
+  /** 这个用户名下一张可用模型都没有（不是「有但没配好」） */
+  const noModelsAtAll = (modelsQuery.data?.models.length ?? 0) === 0;
   // 有没有「授权上机执行」的权限：没有就不显示那个开关（不给点不动的控件）
   const canExec = hasPermission('ai.exec');
   // 远程终端是**另一道门**：能看 AI 的结论，不等于能亲手在这台机器上敲命令
   const canTerminal = hasPermission('ai.terminal');
+  const canVmRead = hasPermission('ai.vm.read');
+  const canVmWrite = hasPermission('ai.vm.write');
+
+  /** 当前目标上仍生效的虚拟机租约（父组件只持有一张，按目标校验） */
+  const effectiveLease = leaseForTarget(vmLease, [], vmTarget);
+
+  /**
+   * 「一次授权、全程生效」：当前虚拟机已有运维授权时，主机命令直接沿用。
+   *
+   * 只在用户本人有 ``ai.exec`` / ``ai.vm.write`` 时成立 —— 业务授权不能绕过
+   * 权限位。租约撤销、到期或切到别的虚拟机后自动失效。
+   */
+  const leaseCoversHost = Boolean(
+    canExec &&
+      canVmWrite &&
+      effectiveLease &&
+      effectiveLease.status === 'active' &&
+      effectiveLease.access === 'ops',
+  );
+
+  /** 请求时再算一次，避免页面停留过久后拿着一张已到期的票当授权用 */
+  const leaseCoversHostNow = () =>
+    Boolean(
+      canExec &&
+        canVmWrite &&
+        effectiveLease &&
+        effectiveLease.status === 'active' &&
+        effectiveLease.access === 'ops' &&
+        Number(effectiveLease.expires_at || 0) > Date.now() / 1000,
+    );
+
+  /** 授权范围是否已经动过一次（用于把 02 标成已完成） */
+  const scopeTouched = allowExec || Boolean(vmLease) || leaseCoversHost;
 
   /**
    * 上一轮停在 AI 说完话的位置、而现在已经拿到上机执行授权：可以一键续跑。
@@ -905,7 +1434,7 @@ export function AiAssistant() {
     .find((item) => item.role === 'user' || item.role === 'assistant');
   const canContinue =
     canExec &&
-    allowExec &&
+    (allowExec || leaseCoversHost) &&
     execJustGranted &&
     !busy &&
     Boolean(convId) &&
@@ -914,6 +1443,7 @@ export function AiAssistant() {
   function continueTurn() {
     if (!canContinue) return;
     setExecJustGranted(false);
+    setRunMode('chat');
     void execute(async (controller) => {
       const target = await ensureConversation();
       const text = t('ai.continuePrompt');
@@ -922,8 +1452,66 @@ export function AiAssistant() {
     });
   }
 
+  /* ---------------- 控制台分栏拖拽 ---------------- */
+
+  function clampSplit(value: number): number {
+    return Math.min(SPLIT_MAX, Math.max(SPLIT_MIN, value));
+  }
+
+  function rememberSplit(value: number) {
+    try {
+      window.localStorage.setItem(SPLIT_STORE_KEY, String(Math.round(value)));
+    } catch {
+      /* 存不了不影响本次使用 */
+    }
+  }
+
+  function startResize(event: ReactPointerEvent<HTMLDivElement>) {
+    // 拖拽期间不让浏览器顺手选中文字，否则选区和终端光标会一起跟着跑
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragSplitRef.current = consoleSplit;
+    setResizingConsole(true);
+  }
+
+  function moveResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!resizingConsole) return;
+    const rect = consoleRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0) return;
+    const next = clampSplit(((event.clientX - rect.left) / rect.width) * 100);
+    dragSplitRef.current = next;
+    consoleRef.current?.style.setProperty('--ai-split', `${next}%`);
+  }
+
+  function endResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!resizingConsole) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setResizingConsole(false);
+    setConsoleSplit(dragSplitRef.current);
+    rememberSplit(dragSplitRef.current);
+  }
+
+  function resetSplit() {
+    setConsoleSplit(SPLIT_DEFAULT);
+    rememberSplit(SPLIT_DEFAULT);
+  }
+
+  // 键盘也能调：分隔条是标准 separator，Tab 聚焦后用左右键挪
+  function onSplitKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const next = clampSplit(
+      consoleSplit + (event.key === 'ArrowLeft' ? -3 : 3),
+    );
+    setConsoleSplit(next);
+    rememberSplit(next);
+  }
+
   return (
     <PageShell
+      className="ai-page"
       title={
         <span className="flex items-center gap-8">
           <IconSparkle size={20} />
@@ -991,41 +1579,72 @@ export function AiAssistant() {
       ) : (
         <>
           {!targetsQuery.isError && !targetsQuery.isLoading && !ready ? (
-            /* 严格隔离下「没得用」有两种成因，提示必须分开：管理员是平台没配，
-               普通用户是自己没配 —— 后者给他一个入口自己配，别让他去找管理员。 */
-            <Notice
-              tone={isAdmin ? 'warning' : 'info'}
-              title={isAdmin ? t('ai.notConfigured') : t('ai.noMyModel')}
-            >
-              {isAdmin ? t('ai.notConfiguredHint') : t('ai.noMyModelHint')}
-              <div className="mt-8">
-                <Button
-                  variant="primary"
-                  icon={<IconSettings size={15} />}
-                  onClick={() => setSettingsOpen(true)}
-                >
-                  {isAdmin ? t('ai.configureNow') : t('ai.myModels')}
-                </Button>
-              </div>
-            </Notice>
-          ) : null}
-
-          {/* 目标机器必须由用户自己选：AI 会登录上去执行命令，替他顶一台上去等于
-              擅自决定动哪台机器。没选之前入口全关着（按钮 disabled、终端不开），
-              这里把原因说清楚，而不是让人对着一排灰按钮猜。 */}
-          {!hostId && !targetsQuery.isLoading ? (
-            hostCards.length === 0 ? (
-              <Notice tone="info" title={t('ai.noHostTitle')}>
-                {t('ai.noHostHint')}
+            /* 「没得用」有三成成因，提示必须分开：平台被关、管理员没配平台模型、
+               普通用户自己没有可用模型。最后一种最容易被误导成「去找管理员」，
+               其实他可以自己配 —— 两条路都写出来。 */
+            aiDisabled ? (
+              <Notice tone="info" title={t('ai.disabledTitle')}>
+                {t('ai.disabledHint')}
               </Notice>
             ) : (
               <Notice
-                tone="warning"
-                title={needsHost ? t('ai.needsHostTitle') : t('ai.pickHostTitle')}
+                tone={isAdmin ? 'warning' : 'info'}
+                title={
+                  isAdmin
+                    ? t('ai.notConfigured')
+                    : noModelsAtAll
+                      ? t('ai.noModelTitle')
+                      : t('ai.noMyModel')
+                }
               >
-                {needsHost ? t('ai.needsHostHint') : t('ai.pickHostHint')}
+                {isAdmin
+                  ? t('ai.notConfiguredHint')
+                  : noModelsAtAll
+                    ? t('ai.noModelHint')
+                    : t('ai.noMyModelHint')}
+                <div className="mt-8">
+                  <Button
+                    variant="primary"
+                    icon={<IconSettings size={15} />}
+                    onClick={() => setSettingsOpen(true)}
+                  >
+                    {isAdmin ? t('ai.configureNow') : t('ai.myModels')}
+                  </Button>
+                </div>
               </Notice>
             )
+          ) : null}
+
+          {/* 还有主机在后台探测：先说清楚「在等什么」，否则用户会以为列表就这么几台。
+              这时**不能**同时显示「没有可用主机」—— 结论还没出来。 */}
+          {pendingTotal > 0 ? (
+            <Notice tone="info" title={t('ai.probingTitle', { n: pendingTotal })}>
+              {t('ai.probingHint')}
+            </Notice>
+          ) : null}
+
+          {/* 整条 PVE 连不上：这不是「某台机器不可用」，而是这批机器全都读不到，
+              逐台列出来只会让人以为是机器的问题（同样的提示会重复十几行）。 */}
+          {pveDown > 0 ? (
+            <Notice tone="warning" title={t('ai.scanPveDownTitle', { n: pveDown })}>
+              {t('ai.scanPveDownHint')}
+            </Notice>
+          ) : null}
+
+          {/* 一台都选不出来时才占一条提示；正常的「先选机器」引导写进 01 标题旁，
+              不再用一条横贯整页的告警 —— 这一屏真正要做的只有选机器和开始。 */}
+          {!hostId &&
+          !targetsQuery.isLoading &&
+          !pendingTotal &&
+          hostCards.length === 0 ? (
+            <Notice
+              tone="info"
+              title={
+                excludeInfo?.total ? t('ai.noEligibleHostTitle') : t('ai.noHostTitle')
+              }
+            >
+              {excludeInfo?.total ? t('ai.noEligibleHostHint') : t('ai.noHostHint')}
+            </Notice>
           ) : null}
 
           {/* 工作台：把「目标与模型」「授权范围」「控制台」收进同一张面板，
@@ -1034,82 +1653,172 @@ export function AiAssistant() {
           <div className="ai-studio">
             <section className="ai-studio-section">
               <div className="ai-section-head">
-                <span className="ai-section-num">01</span>
+                <span className={`ai-section-num${!hostId ? ' is-active' : ' is-done'}`}>
+                  01
+                </span>
                 <div className="ai-section-text">
-                  <span className="ai-section-title">{t('ai.sectionTarget')}</span>
-                  <span className="ai-section-desc">{t('ai.sectionTargetHint')}</span>
+                  <span className="ai-section-title">
+                    {t('ai.sectionTarget')}
+                    {!hostId ? (
+                      <span className="ai-step-now">{t('ai.stepNow')}</span>
+                    ) : null}
+                  </span>
+                  {/* 没选前置一句为什么不能替你选；选完就回到正常的一句说明，
+                      同一位置不再叠第二条告警。 */}
+                  <span className="ai-section-desc">
+                    {!hostId && !targetsQuery.isLoading && hostCards.length > 0
+                      ? needsHost
+                        ? t('ai.needsHostHint')
+                        : t('ai.pickHostHint')
+                      : t('ai.sectionTargetHint')}
+                  </span>
                 </div>
               </div>
               {/* 左选择、右操作：主操作放最右（视线与操作的终点），次要操作降为
                   ghost 小按钮靠左 —— 两个实心按钮并排会让人分不清该点哪个。 */}
-            <div className="flex items-end justify-between gap-12 flex-wrap">
-              <div
-                className="flex items-end gap-12 flex-wrap"
-                style={{ flex: '1 1 460px' }}
-              >
-                <div style={{ flex: '1 1 190px', minWidth: 170 }}>
+              <div className="ai-picker">
+                <div className="ai-picker-fields">
                   {/* 只选一次：候选全是**受管主机**（AI 只对纳管过的机器动手），
                       选中后自动带出同一台机器上的虚拟机，两条通道一起确定。
                       没纳管的虚拟机不在这里出现 —— 它跑不了主机命令。 */}
-                  <Field label={t('ai.selectTarget')} hint={t('ai.selectTargetHint')}>
+                  <Field label={t('ai.selectTarget')}>
                     <Select
                       value={hostId}
-                      onChange={(e) => setHostId(e.target.value)}
+                      onChange={(e) => {
+                        setHostId(e.target.value);
+                        if (e.target.value) {
+                          setLastHostId(e.target.value);
+                          writeStoredString(LAST_HOST_KEY, e.target.value);
+                        }
+                      }}
                       options={targetOptions}
                       disabled={busy || hostCards.length === 0}
                     />
                   </Field>
-                </div>
-                {/* 排查因题而异：读个负载用快模型就够，真定位故障才值得上强
-                    模型。所以这里选的是「这一次用哪个」，不改管理员设的默认。 */}
-                <div style={{ flex: '1 1 220px', minWidth: 190 }}>
-                  <Field label={t('ai.selectModel')} hint={t('ai.selectModelHint')}>
+                  {/* 排查因题而异：读个负载用快模型就够，真定位故障才值得上强
+                      模型。所以这里选的是「这一次用哪个」，不改管理员设的默认；
+                     但会记住你上次的选择，下次打开直接沿用（本机记忆）。 */}
+                  <Field label={t('ai.selectModel')}>
                     <Select
                       value={currentModelId}
                       onChange={(e) => setModelId(e.target.value)}
                       options={modelOptions}
                       disabled={busy || modelOptions.length === 0}
+                      title={t('ai.modelRememberHint')}
                     />
                   </Field>
                 </div>
-              </div>
-              <div className="flex items-center gap-8">
-                {/* 排查中藏起「仅解读」：它中断不了正在跑的那次，留着只会误点 */}
-                {busy ? null : (
+                <div className="ai-picker-actions">
+                  {/* 与主操作同一行：ghost 小按钮靠左、主按钮靠右。
+                      两个实心按钮并排会分不清主次，所以「仅解读」保持 ghost。 */}
+                  {!busy ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={!ready || !hostId}
+                      onClick={() => void quickRun()}
+                      title={t('ai.quickHint')}
+                    >
+                      {t('ai.quickInspect')}
+                    </Button>
+                  ) : null}
                   <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={!ready || !hostId}
-                    onClick={() => void quickRun()}
-                    title={t('ai.quickHint')}
+                    variant="primary"
+                    icon={<IconSparkle size={15} />}
+                    loading={busy}
+                    disabled={!ready || !hostId || busy}
+                    onClick={() => startInspection()}
+                    title={t('ai.startHint')}
                   >
-                    {t('ai.quickInspect')}
+                    {busy ? t('ai.running') : t('ai.start')}
                   </Button>
-                )}
-                <Button
-                  variant="primary"
-                  icon={<IconSparkle size={15} />}
-                  loading={busy}
-                  disabled={!ready || !hostId || busy}
-                  onClick={() => startInspection()}
-                  title={t('ai.startHint')}
-                >
-                  {busy ? t('ai.running') : t('ai.start')}
-                </Button>
-                {/* 一次排查十几秒到一分钟，中途发现选错主机/模型时能停，
-                    比等它跑完再重来省事得多 */}
-                {busy ? (
-                  <Button
-                    variant="danger"
-                    icon={<IconStop size={15} />}
-                    onClick={stop}
-                  >
-                    {t('ai.stop')}
-                  </Button>
-                ) : null}
+                  {/* 一次排查十几秒到一分钟，中途发现选错主机/模型时能停，
+                      比等它跑完再重来省事得多 */}
+                  {busy ? (
+                    <Button
+                      variant="danger"
+                      icon={<IconStop size={15} />}
+                      onClick={stop}
+                    >
+                      {t('ai.stop')}
+                    </Button>
+                  ) : null}
+                </div>
               </div>
-            </div>
 
+              {/* 上次排查过的主机：只回显 + 一键采用，绝不自动选中 */}
+              {!hostId && lastHostHost ? (
+                <div className="ai-last-host">
+                  <span>{t('ai.lastHost', { host: lastHostHost.name || lastHostHost.id })}</span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setHostId(lastHostHost.id);
+                      writeStoredString(LAST_HOST_KEY, lastHostHost.id);
+                    }}
+                  >
+                    {t('ai.useLastHost')}
+                  </Button>
+                </div>
+              ) : null}
+
+              {/* 列表比「受管主机」短，必须解释原因。默认只占一行摘要，点开才
+                  看五个条件、被排除的机器名与修复入口 —— 不解释会被当成漏机器，
+                  只报台数又让人不知道是哪台、该去哪儿修。 */}
+              <details className="ai-note-more">
+                <summary>
+                  {t('ai.targetFilterTitle')}
+                  {excludeInfo?.total ? (
+                    <span className="ai-note-count">
+                      {t('ai.targetFilterExcluded', { n: excludeInfo.total })}
+                    </span>
+                  ) : null}
+                </summary>
+                <div className="ai-note-body">
+                  <p>{t('ai.targetFilterHint')}</p>
+                  <div className="ai-cond-list">
+                    {[
+                      t('ai.condRunning'),
+                      t('ai.condManaged'),
+                      t('ai.condAgent'),
+                      t('ai.condCloudinit'),
+                      t('ai.condVm'),
+                    ].map((cond) => (
+                      <span key={cond}>{cond}</span>
+                    ))}
+                  </div>
+                  {excludedItems.length > 0 ? (
+                    <ul className="ai-excluded-list">
+                      {excludedItems.map((item) => (
+                        <li key={item.id} className="ai-excluded-row">
+                          <span className="ai-excluded-name" title={item.id}>
+                            {item.name || item.id}
+                          </span>
+                          <span className="ai-excluded-reason">
+                            {t(excludeReasonKey(item.reason))}
+                          </span>
+                          {item.node && item.vmid != null ? (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() =>
+                                navigate(
+                                  `/vms/${encodeURIComponent(item.node as string)}/${item.vmid}`,
+                                )
+                              }
+                            >
+                              {t('ai.excludeFix')}
+                            </Button>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : excludedSummary ? (
+                    <p className="ai-note-sub">{excludedSummary}</p>
+                  ) : null}
+                </div>
+              </details>
             </section>
 
             {/* 授权范围紧接「在哪台机器上做」：它是这一轮的能力边界。
@@ -1117,64 +1826,44 @@ export function AiAssistant() {
                 票据）本来就是同一件事的两个面，分开摆会让人以为哪个才是总开关。 */}
             <section className="ai-studio-section">
               <div className="ai-section-head">
-                <span className="ai-section-num">02</span>
+                <span className={`ai-section-num${scopeTouched ? ' is-done' : ''}`}>02</span>
                 <div className="ai-section-text">
-                  <span className="ai-section-title">{t('ai.sectionScope')}</span>
+                  <span className="ai-section-title">
+                    {t('ai.sectionScope')}
+                    {!scopeTouched ? (
+                      <span className="ai-step-optional">{t('ai.stepOptional')}</span>
+                    ) : null}
+                  </span>
                   <span className="ai-section-desc">{t('ai.sectionScopeHint')}</span>
                 </div>
               </div>
 
               <div className="ai-scope-list">
-                {canExec ? (
-                  <div className="ai-scope-block">
-                    <div className="ai-scope-row">
-                      <div className="ai-scope-text">
-                        <span className="ai-scope-name">
-                          {t('ai.execScopeName')}
-                          <Badge variant={allowExec ? 'success' : 'neutral'} size="sm" dot>
-                            {allowExec ? t('ai.execScopeOn') : t('ai.execScopeOff')}
-                          </Badge>
-                        </span>
-                        <span className="ai-scope-hint">{t('ai.allowExecHint')}</span>
-                      </div>
-                      <Switch
-                        checked={allowExec}
-                        onChange={(next) => {
-                          setAllowExec(next);
-                          // 打开的那一刻记下来：下面据此给「继续执行」入口
-                          setExecJustGranted(next);
-                        }}
-                        disabled={busy}
-                        ariaLabel={t('ai.execScopeToggle')}
-                      />
-                    </div>
-                    {/* 开关是**下一轮**的授权，不会把刚结束的那一轮重新拉起来。
-                        用户看到 AI 说「我先看一下磁盘」然后停住、再去打开开关时，
-                        最容易以为「我批准了，它怎么不动」—— 这里给一个显式入口，
-                        不必重新打字，也不用猜是不是要再发一遍。 */}
-                    {canContinue ? (
-                      <div className="ai-scope-row" style={{ marginTop: 8 }}>
-                        <span className="ai-scope-hint">{t('ai.continueHint')}</span>
-                        <Button size="sm" variant="ghost" onClick={continueTurn}>
-                          {t('ai.continue')}
-                        </Button>
-                      </div>
-                    ) : null}
+                <AuthorizationCard
+                  conversationId={convId}
+                  hostId={hostId}
+                  hostName={selectedHost?.name || ''}
+                  allowExec={allowExec}
+                  execAccess={execAccess}
+                  lease={vmLease}
+                  target={vmTarget}
+                  canExec={canExec}
+                  canVmRead={canVmRead}
+                  canVmWrite={canVmWrite}
+                  onPatch={patchAuth}
+                />
+
+                {/* 授权是**下一轮**才生效，不会把刚结束的那一轮重新拉起来。
+                    用户看到 AI 说「我先看一下磁盘」然后停住、再去授权时，最容易
+                    以为「我批准了，它怎么不动」—— 这里给一个显式入口。 */}
+                {canContinue ? (
+                  <div className="ai-scope-block ai-auth-continue">
+                    <span className="ai-scope-hint">{t('ai.continueHint')}</span>
+                    <Button size="sm" variant="ghost" onClick={continueTurn}>
+                      {t('ai.continue')}
+                    </Button>
                   </div>
                 ) : null}
-
-                <div className="ai-scope-block">
-                  {/* 目标已在上面的 01 区块选定，这里不再重复选择：只把「这台机器
-                      能不能进机取证」说清楚，再给出发放入口。 */}
-                  {selectedHost && !vmTarget ? (
-                    <Notice tone="info">{t('ai.targetHostOnlyHint')}</Notice>
-                  ) : null}
-                  <VmAiLeaseCard
-                    lease={vmLease}
-                    onLeaseChange={setVmLease}
-                    target={vmTarget}
-                  />
-                </div>
               </div>
             </section>
           </div>
@@ -1190,17 +1879,22 @@ export function AiAssistant() {
           <div className="ai-console-shell">
             <div className="ai-console-shell-head">
               <div className="ai-section-head" style={{ marginBottom: 0 }}>
-                <span className="ai-section-num">03</span>
+                <span className={`ai-section-num${busy ? ' is-active' : convId ? ' is-done' : ''}`}>
+                  03
+                </span>
                 <div className="ai-section-text">
-                  <span className="ai-section-title">{t('ai.sectionConsole')}</span>
+                  <span className="ai-section-title">
+                    {t('ai.sectionConsole')}
+                    {busy ? <span className="ai-step-now">{t('ai.stepNow')}</span> : null}
+                  </span>
                   <span className="ai-section-desc">{t('ai.sectionConsoleHint')}</span>
                 </div>
               </div>
               <div className="ai-console-shell-tools">
                 {/* 没有上机授权时，AI 只给建议不执行 —— 这个原因必须能在控制台
                     旁边看到，否则用户只会以为「它今天不想动手」 */}
-                {canExec && !allowExec ? (
-                  <span className="ai-scope-warn">
+                {canExec && !allowExec && !leaseCoversHost ? (
+                  <span className="ai-scope-warn" title={t('ai.execNotGrantedHint')}>
                     <IconAlert size={13} />
                     {t('ai.execNotGranted')}
                   </span>
@@ -1216,66 +1910,118 @@ export function AiAssistant() {
                 />
               </div>
             </div>
-            <div className="grid grid-2 ai-console">
-            {/* 两个页签**都保持挂载**，只切换显隐：终端一旦卸载就等于断开 SSH，
-                切去看一眼「执行过程」再切回来会变成一条新连接 —— 当前目录、
-                环境变量、跑着的进程全丢，而且隐藏期间 AI 的镜像输出也收不到了。
-                隐藏时容器尺寸为 0，终端自己会跳过尺寸计算；切回来时再对齐一次
-                （见 AiTerminal 的 visible 处理）。 */}
-            <div>
+            {/* 分栏宽度写在 CSS 变量上：媒体查询可以直接把它改回单列，
+                不必在 JS 里监听断点；拖拽只更新这一个数字。 */}
+            <div
+              ref={consoleRef}
+              className={`ai-console${resizingConsole ? ' is-resizing' : ''}`}
+              style={{ '--ai-split': `${consoleSplit}%` } as CSSProperties}
+            >
+              {/* 两个页签**都保持挂载**，只切换显隐：终端一旦卸载就等于断开 SSH，
+                  切去看一眼「执行过程」再切回来会变成一条新连接 —— 当前目录、
+                  环境变量、跑着的进程全丢，而且隐藏期间 AI 的镜像输出也收不到了。
+                  隐藏时容器尺寸为 0，终端自己会跳过尺寸计算；切回来时再对齐一次
+                  （见 AiTerminal 的 visible 处理）。 */}
+              <div className="ai-console-col ai-console-col-left">
+                <div
+                  className={`ai-console-pane${leftTab === 'terminal' ? '' : ' is-hidden'}`}
+                >
+                  <TerminalPane
+                    hostId={hostId}
+                    hostName={selectedHostLabel}
+                    canUse={canTerminal}
+                    visible={leftTab === 'terminal'}
+                    fill
+                  />
+                </div>
+                <div
+                  className={`ai-console-pane${leftTab === 'activity' ? '' : ' is-hidden'}`}
+                >
+                  <ActivityPaneMemo
+                    events={events}
+                    busy={busy}
+                    history={toolHistory}
+                  />
+                </div>
+              </div>
+
               <div
-                className={`ai-console-pane${leftTab === 'terminal' ? '' : ' is-hidden'}`}
+                className={`ai-console-resizer${resizingConsole ? ' is-active' : ''}`}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label={t('ai.consoleResize')}
+                aria-valuemin={SPLIT_MIN}
+                aria-valuemax={SPLIT_MAX}
+                aria-valuenow={Math.round(consoleSplit)}
+                title={t('ai.consoleResize')}
+                tabIndex={0}
+                onPointerDown={startResize}
+                onPointerMove={moveResize}
+                onPointerUp={endResize}
+                onPointerCancel={endResize}
+                onDoubleClick={resetSplit}
+                onKeyDown={onSplitKeyDown}
               >
-                <AiTerminal
-                  hostId={hostId}
-                  hostName={selectedHostLabel}
-                  canUse={canTerminal}
-                  visible={leftTab === 'terminal'}
-                  fill
+                <span className="ai-console-resizer-grip" aria-hidden="true" />
+              </div>
+
+              <div className="ai-console-col ai-console-col-right">
+                <ChatPane
+                  conversations={conversations}
+                  convId={convId}
+                  onSelectConversation={(id) => void loadConversation(id)}
+                  onNewConversation={newConversation}
+                  hostLabel={selectedHostLabel}
+                  modelLabel={selectedModelLabel}
+                  hasHost={Boolean(hostId)}
+                  transcript={transcript}
+                  busy={busy}
+                  approval={approval}
+                  onApprovalDone={handleApprovalDone}
+                  approvalExpired={approvalExpired}
+                  onResumeApproval={resumeApproval}
+                  error={errorText}
+                  draft={draft}
+                  onDraftChange={setDraft}
+                  onSend={sendMessage}
+                  canSend={ready && Boolean(hostId) && !busy && !approval}
+                  streaming={streaming}
+                  progress={progress}
+                  playbooks={orderedPlaybooks}
+                  favorites={favPlaybooks}
+                  onToggleFavorite={toggleFavoritePlaybook}
+                  onRunPlaybook={runPlaybook}
                 />
               </div>
-              <div
-                className={`ai-console-pane${leftTab === 'activity' ? '' : ' is-hidden'}`}
-              >
-                <ActivityPane events={events} busy={busy} history={toolHistory} />
-              </div>
-            </div>
-            <ChatPane
-              conversations={conversations}
-              convId={convId}
-              onSelectConversation={(id) => void loadConversation(id)}
-              onNewConversation={newConversation}
-              hostLabel={selectedHostLabel}
-              modelLabel={selectedModelLabel}
-              hasHost={Boolean(hostId)}
-              transcript={transcript}
-              busy={busy}
-              approval={approval}
-              onApprovalDone={() => setApproval(null)}
-              draft={draft}
-              onDraftChange={setDraft}
-              onSend={sendMessage}
-              canSend={ready && Boolean(hostId) && !busy && !approval}
-              streaming={streaming}
-              playbooks={playbooks}
-              onRunPlaybook={runPlaybook}
-            />
             </div>
           </div>
 
-          {errorText ? (
-            <Notice tone="danger" title={t('ai.failed')}>
-              {errorText}
-            </Notice>
+          {/* 体检进行中：先在结论区放一块骨架，明确「报告会出现在这里」，
+              而不是让用户对着一条「正在分析…」干等 */}
+          {busy && runMode === 'inspect' && !report ? (
+            <Card>
+              <CardHeader
+                title={t('ai.summaryTitle')}
+                subtitle={t('ai.progressReportHint')}
+              />
+              <div className="ai-report-skeleton">
+                <Skeleton width="42%" height={16} />
+                <Skeleton width="88%" height={12} />
+                <Skeleton width="76%" height={12} />
+                <Skeleton width="64%" height={12} />
+              </div>
+            </Card>
           ) : null}
 
           {report ? (
-            <ReportCard
-              report={report}
-              meta={reportMeta}
-              previousFindings={prevFindings}
-              onRerun={startInspection}
-            />
+            <div ref={reportAnchorRef}>
+              <ReportCardMemo
+                report={report}
+                meta={reportMeta}
+                previousFindings={prevFindings}
+                onRerun={onRerunReport}
+              />
+            </div>
           ) : null}
 
           {report ? <Notice tone="info">{t('ai.disclaimer')}</Notice> : null}
@@ -1382,6 +2128,9 @@ function ActivityPane({
  * 继续追问。刷新或换设备都能接着聊 —— 这也是把它落库、而不是只留前端的理由。
  * 授权卡片内嵌在对话流里：授权本身就是对话中的一个动作。
  */
+/** 执行过程面板：只在事件 / 历史变化时重绘，不跟着流式帧走（见文件头的 memo 说明） */
+const ActivityPaneMemo = memo(ActivityPane);
+
 function ChatPane({
   conversations,
   convId,
@@ -1395,12 +2144,18 @@ function ChatPane({
   busy,
   approval,
   onApprovalDone,
+  approvalExpired,
+  onResumeApproval,
+  error,
   draft,
   onDraftChange,
   onSend,
   canSend,
   streaming,
+  progress,
   playbooks,
+  favorites,
+  onToggleFavorite,
   onRunPlaybook,
 }: {
   conversations: AiConversation[];
@@ -1414,40 +2169,99 @@ function ChatPane({
   transcript: AiChatMessage[];
   busy: boolean;
   approval: ApprovalRequest | null;
-  onApprovalDone: (approved: boolean) => void;
+  onApprovalDone: (
+    approved: boolean,
+    reason?: 'timeout' | 'user' | 'stale',
+  ) => void;
+  /** 上一张审批卡超时/失效，且本轮已结束：显示「重新请求这一步」 */
+  approvalExpired: boolean;
+  onResumeApproval: () => void;
+  /** 本轮失败原因：就地显示在对话末尾，而不是页脚一条容易错过的 Notice */
+  error: string;
   draft: string;
   onDraftChange: (value: string) => void;
   onSend: () => void;
   canSend: boolean;
   /** 正在流式到达的回复文本（打字机）；收尾后为空 */
   streaming: string;
-  /** 排障预案：空会话时铺成快捷入口，对话中收进标题栏的选单 */
+  /** 本轮进度摘要：镜像到右栏，免得用户只看到「转圈」 */
+  progress: AiProgress | null;
+  /** 排障预案：空会话时铺成快捷入口，对话中收进标题栏的选单（已按收藏/最近排序） */
   playbooks: AiPlaybook[];
+  /** 收藏的预案 key */
+  favorites: string[];
+  onToggleFavorite: (key: string) => void;
   onRunPlaybook: (key: string) => void;
 }) {
   const t = useT();
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  // 只渲染「人说的话」：context 是喂给模型的 [数据] 段，tool 行在左栏展示
-  const bubbles = transcript.filter(
-    (item) => item.role === 'user' || item.role === 'assistant',
+  // 只渲染「人说的话」：context 是喂给模型的 [数据] 段，tool 行在左栏展示。
+  // 缓存住：流式期间每 70ms 一次渲染，不该每次都把整条 transcript 再扫一遍。
+  const bubbles = useMemo(
+    () =>
+      transcript.filter(
+        (item) => item.role === 'user' || item.role === 'assistant',
+      ),
+    [transcript],
   );
-  const started = Boolean(convId) || bubbles.length > 0;
+  /**
+   * 长会话只渲染最近 50 条。
+   *
+   * 几百轮的会话每帧 reconcile 全量消息（每条还可能带报告卡）是「越聊越卡」的
+   * 直接原因。窗口化之后只有用户主动往上翻才展开 —— 比引一个虚拟滚动库省事，
+   * 也不会和「贴底自动滚」打架。
+   */
+  const BUBBLE_WINDOW = 50;
+  const [showAllBubbles, setShowAllBubbles] = useState(false);
+  useEffect(() => setShowAllBubbles(false), [convId]);
+  const hiddenBubbles = showAllBubbles
+    ? 0
+    : Math.max(0, bubbles.length - BUBBLE_WINDOW);
+  const visibleBubbles = hiddenBubbles ? bubbles.slice(hiddenBubbles) : bubbles;
+
+  // 失败也要算「已开始」：否则首轮就失败时错误气泡会被空状态盖住
+  const started = Boolean(convId) || bubbles.length > 0 || Boolean(error);
   const lastIsAssistant = bubbles[bubbles.length - 1]?.role === 'assistant';
 
-  // 新消息总落在底部：自动滚到底，省得手动追（流式增长时也要跟着走）
+  /**
+   * 是否「贴着底部」。用户往上翻历史时不该被流式输出不断拽回来。
+   */
+  const stickToBottomRef = useRef(true);
+
+  /**
+   * 新消息总落在底部：自动滚到底，省得手动追（流式增长时也要跟着走）。
+   *
+   * 两处收敛都是为了流式期间不掉帧：
+   *  - 合进 rAF：``streaming.length`` 每 70ms 变一次，同步 ``scrollTo`` 会和渲染
+   *    交替触发强制布局（layout thrash），一帧里读写交替最费；
+   *  - 只在贴底时跟随，见 ``stickToBottomRef``。
+   */
   useEffect(() => {
-    bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight });
+    const el = bodyRef.current;
+    if (!el || !stickToBottomRef.current) return;
+    const frame = requestAnimationFrame(() => {
+      // 只在回调里读 scrollHeight / 写 scrollTop，读写不再交替
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
   }, [bubbles.length, approval, busy, streaming.length]);
 
+  const handleBodyScroll = () => {
+    const el = bodyRef.current;
+    if (!el) return;
+    stickToBottomRef.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+
   return (
-    <Card>
+    <Card className="ai-chat-card">
       <CardHeader
+        // 同上：右侧在干什么由 03 标题条交代，标题栏只放控件
         title={t('ai.chatTitle')}
-        subtitle={t('ai.chatSubtitle')}
         actions={
-          <div className="flex items-center gap-8">
+          <div className="ai-chat-tools">
             {/* 预案在任何时候都够得着（不只是空会话）：聊到一半想换套路是常事。
                 value 固定为空 —— 它是个「动作选单」，选完就回到占位文案 */}
             {playbooks.length > 0 ? (
@@ -1460,7 +2274,8 @@ function ChatPane({
                 options={[
                   { label: t('ai.playbookPick'), value: '' },
                   ...playbooks.map((item) => ({
-                    label: item.title,
+                    // 收藏项加星标：不必展开就能看出哪几个是自己常用的
+                    label: `${favorites.includes(item.key) ? '★ ' : ''}${item.title}`,
                     value: item.key,
                   })),
                 ]}
@@ -1494,7 +2309,11 @@ function ChatPane({
           </div>
         }
       />
-      <div ref={bodyRef} className="flex flex-col gap-8 ai-console-scroll">
+      <div
+        ref={bodyRef}
+        className="flex flex-col gap-8 ai-console-scroll"
+        onScroll={handleBodyScroll}
+      >
         {!started ? (
           <>
             <ChatBubble role="assistant">{t('ai.chatIntro')}</ChatBubble>
@@ -1508,19 +2327,32 @@ function ChatPane({
             {/* 排障预案：点一下就按这套套路查。给的是**起点**，不是流程 ——
                 不想用模板的人照样可以直接在下面打字 */}
             {playbooks.length > 0 && !busy ? (
-              <div className="flex items-center gap-6 flex-wrap">
-                {playbooks.map((item) => (
-                  <Button
-                    key={item.key}
-                    variant="secondary"
-                    size="sm"
-                    title={item.hint}
-                    disabled={!hasHost}
-                    onClick={() => onRunPlaybook(item.key)}
-                  >
-                    {item.title}
-                  </Button>
-                ))}
+              <div className="ai-playbook-grid">
+                {playbooks.map((item) => {
+                  const fav = favorites.includes(item.key);
+                  return (
+                    <span key={item.key} className="ai-playbook-chip">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        title={item.hint}
+                        disabled={!hasHost}
+                        onClick={() => onRunPlaybook(item.key)}
+                      >
+                        {item.title}
+                      </Button>
+                      <button
+                        type="button"
+                        className={`ai-playbook-fav${fav ? ' is-on' : ''}`}
+                        aria-pressed={fav}
+                        title={fav ? t('ai.playbookUnfav') : t('ai.playbookFav')}
+                        onClick={() => onToggleFavorite(item.key)}
+                      >
+                        {fav ? '★' : '☆'}
+                      </button>
+                    </span>
+                  );
+                })}
               </div>
             ) : null}
           </>
@@ -1533,20 +2365,23 @@ function ChatPane({
               </ChatBubble>
             ) : null}
 
-            {bubbles.map((item) =>
-              item.role === 'user' ? (
-                <ChatBubble key={item.id} role="user">
-                  {item.content}
-                </ChatBubble>
-              ) : (
-                // 模型的回答带 Markdown 记号（`**加粗**`、列表、行内命令），交给
-                // RichText 排版。用户自己打的文字保持纯文本 —— 他要的是原样显示，
-                // 不是被解释一遍
-                <ChatBubble key={item.id} role="assistant">
-                  <RichText text={item.content} />
-                </ChatBubble>
-              ),
-            )}
+            {hiddenBubbles > 0 ? (
+              <button
+                type="button"
+                className="ai-load-earlier"
+                onClick={() => setShowAllBubbles(true)}
+              >
+                {t('ai.loadEarlier', { n: hiddenBubbles })}
+              </button>
+            ) : null}
+
+            {visibleBubbles.map((item) => (
+              <TranscriptBubble
+                key={item.id}
+                role={item.role}
+                content={item.content}
+              />
+            ))}
 
             {/* 流式增量优先：它比「分析中…」更具体，逐字长出来的感觉也更好 */}
             {streaming ? (
@@ -1554,37 +2389,56 @@ function ChatPane({
                 <RichText text={streaming} />
               </ChatBubble>
             ) : busy && !approval && !lastIsAssistant ? (
-              <ChatBubble role="assistant" pending>
-                {t('ai.chatWorking')}
+              <ChatBubble role="assistant">
+                <ProgressBubble progress={progress} />
               </ChatBubble>
             ) : null}
 
             {/* 等待审批时不显示「分析中」—— 它其实停在等你拍板 */}
 
             {approval ? (
-              <ApprovalCard request={approval} onDone={onApprovalDone} />
+              <ApprovalCardMemo request={approval} onDone={onApprovalDone} />
+            ) : null}
+
+            {/* 审批超时/失效后本轮已结束：给一个续跑入口，不让人重新描述问题 */}
+            {!busy && approvalExpired ? (
+              <div className="ai-approval-expired">
+                <span className="ai-approval-expired-text">
+                  {t('ai.approval.expiredHint')}
+                </span>
+                <Button size="sm" variant="secondary" onClick={onResumeApproval}>
+                  {t('ai.approval.resume')}
+                </Button>
+              </div>
+            ) : null}
+
+            {/* 失败原因就地出现在对话末尾：用户视线的落点在这里，而不是页脚 */}
+            {error ? (
+              <div className="ai-chat-error" role="alert">
+                <IconAlert size={14} />
+                <span>{error}</span>
+              </div>
             ) : null}
           </>
         )}
       </div>
 
-      <div className="flex items-center gap-8" style={{ marginTop: 12 }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <Input
-            ref={inputRef}
-            value={draft}
-            onChange={(e) => onDraftChange(e.target.value)}
-            placeholder={t('ai.chatPlaceholder')}
-            disabled={busy}
-            onKeyDown={(e) => {
-              // 回车发送；Shift+Enter 留给多行习惯
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                if (canSend && draft.trim()) onSend();
-              }
-            }}
-          />
-        </div>
+      {/* 输入区固定在卡片底部：对话再长也不会把输入框挤出可视区 */}
+      <div className="ai-composer">
+        <Input
+          ref={inputRef}
+          value={draft}
+          onChange={(e) => onDraftChange(e.target.value)}
+          placeholder={t('ai.chatPlaceholder')}
+          disabled={busy}
+          onKeyDown={(e) => {
+            // 回车发送；Shift+Enter 留给多行习惯
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              if (canSend && draft.trim()) onSend();
+            }
+          }}
+        />
         <Button
           variant="primary"
           size="sm"
@@ -1611,21 +2465,8 @@ function ChatBubble({
 }) {
   const isUser = role === 'user';
   return (
-    <div
-      className="flex"
-      style={{ justifyContent: isUser ? 'flex-end' : 'flex-start' }}
-    >
-      <div
-        className="fs-sm"
-        style={{
-          maxWidth: '92%',
-          padding: '8px 10px',
-          borderRadius: 8,
-          lineHeight: 1.7,
-          background: isUser ? 'var(--accent-dim)' : 'var(--bg-elevated)',
-          border: `1px solid ${isUser ? 'var(--accent-border)' : 'var(--border-muted)'}`,
-        }}
-      >
+    <div className="ai-bubble-row" data-role={isUser ? 'user' : 'assistant'}>
+      <div className="ai-bubble" data-role={isUser ? 'user' : 'assistant'}>
         {pending ? (
           <span className="flex items-center gap-6 text-muted">
             <Spinner size={12} />
@@ -1635,6 +2476,79 @@ function ChatBubble({
           children
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * 已落库的一条对话气泡。
+ *
+ * 按**基本类型**收 props 才能让 memo 真正生效：流式期间父组件每 70ms 重渲染一次，
+ * 若像以前那样把 `<RichText/>` 作为 children 传进来，元素引用每次都变，memo 永远
+ * 命中不了。现在文字没变的气泡会整条跳过（内部 RichText 再按块 memo）。
+ */
+const TranscriptBubble = memo(function TranscriptBubble({
+  role,
+  content,
+}: {
+  role: string;
+  content: string;
+}) {
+  if (role === 'user') {
+    // 用户自己打的文字保持纯文本 —— 他要的是原样显示，不是被解释一遍
+    return <ChatBubble role="user">{content}</ChatBubble>;
+  }
+  // 模型的回答带 Markdown 记号（`**加粗**`、列表、行内命令），交给 RichText 排版
+  return (
+    <ChatBubble role="assistant">
+      <RichText text={content} />
+    </ChatBubble>
+  );
+});
+
+/**
+ * 右栏的「正在做什么」气泡。
+ *
+ * 体检不流式出字（整段 JSON），所以后台跑的时候右栏只有等待。这里把左栏的
+ * 过程事件压成一句当前阶段 + 最近几个工具调用，让用户看到进展，而不是一个
+ * 转圈的「分析中」。左栏「执行过程」仍然保留完整流水。
+ */
+function ProgressBubble({ progress }: { progress: AiProgress | null }) {
+  const t = useT();
+  const tools = progress?.tools ?? [];
+  const headline = progress?.queued
+    ? progress.ahead > 0
+      ? t('ai.stageQueuedAhead', { n: progress.ahead, s: progress.etaS })
+      : t('ai.stageQueuedFirst', { s: progress.etaS })
+    : progress && progress.draftChars > 0
+      ? t('ai.reportProgress', { n: progress.draftChars })
+      : progress && progress.step > 0
+        ? t('ai.stepN', { n: progress.step, max: progress.maxSteps })
+        : t('ai.stageCollect');
+  return (
+    <div className="ai-progress">
+      <div className="ai-progress-head">
+        <Spinner size={12} />
+        <span>{headline}</span>
+      </div>
+      {tools.length > 0 ? (
+        <div className="ai-progress-tools">
+          {tools.map((item, index) => (
+            <span
+              key={`${item.tool}-${index}`}
+              className={`ai-progress-tool${
+                item.ok === false ? ' is-fail' : item.ok ? ' is-ok' : ''
+              }`}
+            >
+              <span className="ai-progress-mark">
+                {item.ok === false ? '✕' : item.ok ? '✓' : '·'}
+              </span>
+              {item.tool}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      <div className="ai-progress-hint">{t('ai.runningHint')}</div>
     </div>
   );
 }
@@ -1662,6 +2576,15 @@ const TimelineRow = memo(function TimelineRow({
       <TimelineLine
         icon={<IconSparkle size={13} />}
         text={t('ai.stepN', { n: event.step, max: event.max_steps })}
+      />
+    );
+  }
+  if (event.type === 'report_progress') {
+    // 报告正文是整段 JSON，不能边生成边给用户看 —— 只交代「还在长」
+    return (
+      <TimelineLine
+        icon={<IconSparkle size={13} />}
+        text={t('ai.reportProgress', { n: event.chars })}
       />
     );
   }
@@ -1970,6 +2893,57 @@ function ReportCard({
     return { added, resolved };
   }, [previousFindings, report.findings]);
 
+  const [copied, setCopied] = useState(false);
+
+  /** 把报告摊成 Markdown：便于贴进工单 / 聊天转交，而不是让人对着截图抄 */
+  const markdown = useMemo(() => {
+    const lines: string[] = [];
+    lines.push(`# ${t('ai.summaryTitle')}`);
+    if (meta?.hostLabel) lines.push(`- ${meta.hostLabel}`);
+    if (meta?.at) lines.push(`- ${formatDateTime(meta.at)}`);
+    if (meta?.model) lines.push(`- ${t('ai.metaModel', { model: meta.model })}`);
+    lines.push('', report.summary, '');
+    lines.push(`## ${t('ai.findingsTitle')}（${ordered.length}）`);
+    for (const finding of ordered) {
+      lines.push('', `### [${severityLabel(t, finding.severity)}] ${finding.title}`);
+      if (finding.suggestion) {
+        lines.push(`- ${t('ai.suggestion')}：${finding.suggestion}`);
+      }
+      if (finding.phenomenon) lines.push(`- ${finding.phenomenon}`);
+      if (finding.evidence.length > 0) {
+        lines.push('', '```', ...finding.evidence, '```');
+      }
+      if (finding.source_ref.length > 0) {
+        lines.push(`- ${t('ai.evidence')}：${finding.source_ref.join('、')}`);
+      }
+    }
+    if (report.data_gaps.length > 0) {
+      lines.push('', `## ${t('ai.dataGaps')}`);
+      for (const gap of report.data_gaps) lines.push(`- ${gap}`);
+    }
+    return lines.join('\n');
+  }, [report, meta, ordered, t]);
+
+  async function copyReport() {
+    try {
+      await navigator.clipboard.writeText(markdown);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* 剪贴板不可用（非 HTTPS / 无权限）时不打断用户 */
+    }
+  }
+
+  function downloadReport() {
+    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `ai-report-${meta?.hostLabel || 'host'}.md`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <>
       <Card>
@@ -1985,6 +2959,23 @@ function ReportCard({
               <Badge variant="neutral" size="sm">
                 {t('ai.confidence')}：{confidenceLabel(t, report.confidence)}
               </Badge>
+              {/* 结论要能带走：贴进工单、发给同事，而不是让人对着截图抄 */}
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={<IconCopy size={14} />}
+                onClick={() => void copyReport()}
+              >
+                {copied ? t('ai.reportCopied') : t('ai.reportCopy')}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={<IconDownload size={14} />}
+                onClick={downloadReport}
+              >
+                {t('ai.reportExport')}
+              </Button>
               {/* 重新体检 = 新开一条会话重跑一遍；这次与上次的发现逐条对比 */}
               <Button
                 variant="ghost"
@@ -2107,6 +3098,9 @@ const STATUS_BADGE: Record<string, BadgeVariant> = {
 const SESSION_STATUSES = ['done', 'failed', 'running'];
 
 /** 状态词条只覆盖已知值；库里出现别的值时原样显示，别编一个不存在的词条键 */
+/** 报告卡：内容不变就不该被流式帧反复重绘（发现项可能几十条） */
+const ReportCardMemo = memo(ReportCard);
+
 function statusLabel(t: TFunc, status: string): string {
   return SESSION_STATUSES.includes(status)
     ? t(`ai.status.${status}` as MessageKey)
@@ -3270,6 +4264,42 @@ function SettingsModal({
               **上面** —— 它们管的是整次排查而不是某一个模型。而且普通用户用的是自己
               的模型、花自己的额度（见后端 visible_providers 的说明），这些数理应由他
               自己定，不必全平台共用一个值。 */}
+          {/* 两个字数档对普通用户来说是两个数字，不好判断「多少算合适」。
+              给三档预设一键填好，想细调再改数字。 */}
+          <div className="ai-reply-preset">
+            <span className="ai-reply-preset-label">{t('ai.replyPreset')}</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                setReplyCharsTerse(100);
+                setReplyCharsDeep(250);
+              }}
+            >
+              {t('ai.replyPresetTerse')}
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                setReplyCharsTerse(150);
+                setReplyCharsDeep(400);
+              }}
+            >
+              {t('ai.replyPresetNormal')}
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                setReplyCharsTerse(300);
+                setReplyCharsDeep(800);
+              }}
+            >
+              {t('ai.replyPresetDeep')}
+            </Button>
+          </div>
+
           <div className="flex items-end gap-12 flex-wrap mt-16">
             <div style={{ maxWidth: 260, flex: '1 1 200px' }}>
               <Field label={t('ai.hours')} hint={t('ai.hoursHint')}>

@@ -19,6 +19,8 @@
 export const PERMISSION_KEYS = [
   'ai.exec',
   'ai.terminal',
+  'ai.vm.read',
+  'ai.vm.write',
   'alert.manage',
   'alert.view',
   'audit.view',

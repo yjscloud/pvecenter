@@ -55,12 +55,22 @@ function formatLeft(seconds: number) {
 export function VmAiLeaseCard({
   lease,
   onLeaseChange,
+  onRevoked,
   target,
+  embedded = false,
 }: {
   /** 当前生效的授权；为空时显示「申请」入口 */
   lease: VmAiLease | null;
   /** 签发 / 撤销 / 到期后回调，父组件据此更新传给对话的租约 id */
   onLeaseChange: (lease: VmAiLease | null) => void;
+  /**
+   * 撤销成功（服务端已确认）后回调，参数是被撤销的那张票。
+   *
+   * 只靠 ``onLeaseChange(null)`` 不够：父级手里还有一份「服务端仍生效的授权
+   * 列表」，不把那一条摘掉，下一帧算状态时又会把这张票找回来，界面看起来
+   * 像没撤成功。父级用这个回调同步列表、提示条与会话状态。
+   */
+  onRevoked?: (lease: VmAiLease, info: { killFailed: boolean }) => void;
   /**
    * 目标虚拟机由**页面顶部统一选择**后传进来。
    *
@@ -68,6 +78,11 @@ export function VmAiLeaseCard({
    * （上面选 101、下面选 103，用户往往看不出自己授权的是哪台）。
    */
   target: VmAiTarget | null;
+  /**
+   * 嵌在统一授权卡里：只保留范围、动作流水与撤销，不再重复绘制标题和申请表单。
+   * 申请入口由统一授权面板负责，避免同一页出现两套签发按钮。
+   */
+  embedded?: boolean;
 }) {
   const t = useT();
   const toast = useToast();
@@ -84,6 +99,8 @@ export function VmAiLeaseCard({
   const [activeLeases, setActiveLeases] = useState<VmAiLease[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  /** 撤销失败的那张票：让错误条旁边有个「重试」可点，而不是只留一句红字 */
+  const [failedRevoke, setFailedRevoke] = useState<VmAiLease | null>(null);
   /** diagd 安装脚本：按需拉取，展开一次就够，不占默认视野 */
   const [diagd, setDiagd] = useState<{ version: string; script: string; hint: string } | null>(
     null,
@@ -249,6 +266,7 @@ export function VmAiLeaseCard({
   const revokeLease = async (target: VmAiLease) => {
     setBusy(true);
     setError('');
+    setFailedRevoke(null);
     try {
       const data = await aiApi.vmRevoke(target.id, t('ai.lease.revokedByUser'));
       // 撤销成功 ≠ 客户机里那条命令停了：兼容模式没有终止开关，必须如实说清楚，
@@ -262,9 +280,14 @@ export function VmAiLeaseCard({
       }
       // 只有撤销的是当前选中的那张，才需要把对话里的租约 id 清掉
       if (lease && lease.id === target.id) onLeaseChange(null);
+      // 父级还要把这张票从「生效中列表」里摘掉：否则它会用旧数据把状态算回来
+      onRevoked?.(target, {
+        killFailed: Boolean(data.kill && data.kill.output && !data.kill.ok),
+      });
       await refreshLeases();
     } catch (err) {
       setError(errorMessage(err));
+      setFailedRevoke(target);
     } finally {
       setBusy(false);
     }
@@ -338,6 +361,7 @@ export function VmAiLeaseCard({
 
   /* ------------------------------------------------------------- 无授权：申请 */
   if (!lease) {
+    if (embedded) return null;
     return (
       <div className="ai-lease">
         <div className="ai-lease-head">
@@ -359,7 +383,18 @@ export function VmAiLeaseCard({
 
         {error ? (
           <div className="login-error" role="alert" style={{ marginTop: 8 }}>
-            {error}
+            <span>{error}</span>
+            {failedRevoke ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                style={{ marginLeft: 'auto', flex: 'none' }}
+                disabled={busy}
+                onClick={() => void revokeLease(failedRevoke)}
+              >
+                {t('ai.lease.revokeRetry')}
+              </Button>
+            ) : null}
           </div>
         ) : null}
 
@@ -564,6 +599,7 @@ export function VmAiLeaseCard({
   /* ------------------------------------------------------------- 有授权：状态 */
   return (
     <div className="ai-lease">
+      {embedded ? null : (
       <div className="ai-lease-head">
         <span className="ai-lease-title">
           {lease.vm_name || `VM ${lease.vmid}`}
@@ -619,10 +655,22 @@ export function VmAiLeaseCard({
           })}
         </span>
       </div>
+      )}
 
       {error ? (
         <div className="login-error" role="alert" style={{ marginTop: 8 }}>
-          {error}
+          <span>{error}</span>
+          {failedRevoke ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              style={{ marginLeft: 'auto', flex: 'none' }}
+              disabled={busy}
+              onClick={() => void revokeLease(failedRevoke)}
+            >
+              {t('ai.lease.revokeRetry')}
+            </Button>
+          ) : null}
         </div>
       ) : null}
 

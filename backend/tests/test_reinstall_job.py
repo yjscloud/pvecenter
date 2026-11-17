@@ -99,6 +99,29 @@ def test_identity_overrides_keep_identity_and_drop_disks():
     assert "vmgenid" not in kept
 
 
+def test_identity_overrides_takes_target_ostype():
+    """跨平台重装必须把 ostype 换成目标模板的值。
+
+    旧机器若被错标成 win11，只替换系统盘而不改这一个键，面板徽标、AI 的路径
+    语义与 PVE 的启动参数会一起继续按 Windows 走 —— 重装多少次都不会自愈。
+    """
+    old = {"ostype": "win11", "cores": 2, "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0"}
+
+    kept = reinstall.identity_overrides(old, target_ostype="l26")
+    assert kept["ostype"] == "l26"
+    assert kept["cores"] == 2
+    assert "net0" in kept
+
+    # 大小写不敏感：PVE 返回的值不完全可信，比较前统一小写
+    assert reinstall.identity_overrides(old, target_ostype="L26")["ostype"] == "l26"
+
+    # 读不到模板配置时保持旧值，不能把 ostype 弄丢
+    assert reinstall.identity_overrides(old)["ostype"] == "win11"
+
+    # 旧机器没写 ostype（PVE 用默认值）、模板有：补上新值
+    assert reinstall.identity_overrides({}, target_ostype="l26")["ostype"] == "l26"
+
+
 def test_firmware_overrides_rebuild_efi_and_tpm():
     """EFI 变量盘与 TPM 状态盘也是磁盘，会随机器消失，必须按原类型重开。"""
     out = reinstall.firmware_overrides(

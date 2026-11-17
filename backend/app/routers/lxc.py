@@ -34,6 +34,7 @@ from .. import (
     ippool,
     ownership,
     pvecache,
+    prefs,
     quota,
     security,
     storagecaps,
@@ -65,7 +66,7 @@ from ..schemas import (
     SnapshotCreate,
 )
 from ..vm_scope import bind_vm_connection
-from .vm_meta import manual_ip_index
+from .vm_meta import drop_entry as drop_vm_meta, manual_ip_index
 from .vms import (
     _filter_snapshots,
     _op_connection,
@@ -655,6 +656,9 @@ async def _create_lxc_core(
     # 之类会留下），会贴到这台新容器上。清一次，让列表从它自己的 netN 重新解析
     # —— 否则「刚建出来的容器显示着别人的地址」。
     await guestip.forget(_op_connection(), payload.node, vmid, "lxc")
+    # 同一个号的上一个占用者若是面板外删的，删除接口不会跑；这里兜底清一次置顶
+    # 与收藏，保证新容器默认未收藏、未置顶。
+    await prefs.forget_guest_refs(_op_connection(), payload.node, vmid)
 
     # 下发通知：容器没有 cloud-init，root 口令只在这次创建时存在 ——
     # 这条消息（以及它触发的邮件）往往就是用户拿到它的唯一机会。
@@ -806,6 +810,11 @@ async def delete_container(
     # 归属记录不删的话额度不会还给用户（见 ownership.forget_guest 的说明）；
     # 读数缓存也要主动作废，否则删除后几秒内额度读数仍是旧的。
     await ownership.forget_guest(_op_connection(), node, vmid)
+    # 置顶 / 收藏也按 vmid 记账：不清掉的话，同号的新容器会继承旧容器的
+    # 星标与置顶状态（见 prefs.forget_guest_refs 的说明）
+    await prefs.forget_guest_refs(_op_connection(), node, vmid)
+    # 面板备注同理（手动 IP / 系统标识）：同号的新容器不该继承旧容器的系统标识
+    await drop_vm_meta(_op_connection(), node, vmid)
     quota.invalidate()
     return {"task": task}
 
@@ -1322,6 +1331,8 @@ async def clone_container(
     )
     # IP 记录同理：clone 可能落到回收的 VMID，也不能沿用旧机器的地址
     await guestip.forget(_op_connection(), target_node, payload.newid, "lxc")
+    # 克隆体可能落在回收的 VMID 上：置顶 / 收藏同样不能沿用旧占用者的状态
+    await prefs.forget_guest_refs(_op_connection(), target_node, payload.newid)
     return {"task": task, "vmid": payload.newid, "node": target_node}
 
 

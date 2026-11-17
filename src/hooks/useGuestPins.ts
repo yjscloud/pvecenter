@@ -18,6 +18,21 @@
    -----------------------------------
    与列表里的 rowKeyOf 同一个格式。面板可能接多套 PVE，同一个 vmid 在两边
    撞车是常态，只用 vmid 会让「置顶 100 号机」在两套集群上同时生效。
+
+   与「资源回收」的关系（状态重置规则）
+   ----------------------------------
+   键里只有连接 / 节点 / vmid，没有「第几代」的信息，而 PVE 分配新机器用的
+   正是最小空闲 VMID。所以三件事必须配套：
+
+   * 回收：删除虚拟机 / 容器成功后，后端把该键从**所有用户**的偏好里摘掉
+     （`prefs.forget_guest_refs`），归属、IP 缓存、创建记录同一口径；
+   * 下发：新建、克隆、导入成功后后端再兜底清一次，覆盖「在面板外删掉」
+     这类走不到删除接口的旧资源；
+   * 本地：删除与新建之后调用 `reload()` 重读，避免本页内存里的旧键把同号
+     新机器误标成收藏 / 置顶。
+
+   因此同号的新资源一定以「未收藏、未置顶」出现。重装系统是对同一台机器的
+   重建（vmid 与归属都不变），不按回收处理，收藏与置顶保留。
    ========================================================================== */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -68,6 +83,13 @@ export interface GuestPinsApi {
   isStarred: (ref: string) => boolean;
   togglePin: (ref: string) => void;
   toggleStar: (ref: string) => void;
+  /**
+   * 重新读一次服务端偏好。
+   *
+   * 机器被回收 / 新建时，服务端会清掉同号旧机器的键；本地内存里的那份还留着，
+   * 不重读的话「刚下发的新机器」会被旧键命中，看起来自带星标和置顶。
+   */
+  reload: () => Promise<void>;
 }
 
 export function useGuestPins(): GuestPinsApi {
@@ -162,6 +184,8 @@ export function useGuestPins(): GuestPinsApi {
   const isPinned = useCallback((ref: string) => pinnedSet.has(ref), [pinnedSet]);
   const isStarred = useCallback((ref: string) => starredSet.has(ref), [starredSet]);
 
+  const reload = useCallback(() => load(), [load]);
+
   return {
     pinned: state.pinned,
     starred: state.starred,
@@ -172,5 +196,6 @@ export function useGuestPins(): GuestPinsApi {
     isStarred,
     togglePin,
     toggleStar,
+    reload,
   };
 }

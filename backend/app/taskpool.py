@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional, TypeVar
 
@@ -25,8 +26,8 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 #: 专用池线程数。巡检并发上限 16，本机 subprocess 与 PVE 阻塞读取再算几路，
-#: 给到 24 有一倍余量；再多只是把压力推给对端。
-MAX_WORKERS = 24
+#: 给到 32 有一倍余量；再多只是把压力推给对端。可用 ``PVECENTER_THREAD_POOL`` 覆盖。
+MAX_WORKERS = 32
 
 _pool: Optional[ThreadPoolExecutor] = None
 
@@ -35,9 +36,22 @@ def _get_pool() -> ThreadPoolExecutor:
     global _pool
     if _pool is None:
         _pool = ThreadPoolExecutor(
-            max_workers=MAX_WORKERS, thread_name_prefix="inspection"
+            max_workers=_pool_size(), thread_name_prefix="inspection"
         )
     return _pool
+
+
+def _pool_size() -> int:
+    """池大小可用 ``PVECENTER_THREAD_POOL`` 覆盖。
+
+    AI 侧的并发闸是可调的（见 ``routers/ai`` 的 ``PVECENTER_AI_CONCURRENCY``），
+    池子若还写死 24，把闸开到 20 之后每条命令仍会排在池里等 —— 优化了闸门、
+    卡在线程池，等于没优化。
+    """
+    try:
+        return max(4, min(256, int(os.environ.get("PVECENTER_THREAD_POOL") or MAX_WORKERS)))
+    except (TypeError, ValueError):
+        return MAX_WORKERS
 
 
 async def run_blocking(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:

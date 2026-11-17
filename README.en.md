@@ -609,9 +609,11 @@ cut false positives.
 
 It hands the findings the platform already has (security baseline / ports and processes / login audit /
 alerts / change log / metric history) to a large model for attribution and answers “which one do I fix
-first”. Not a one-shot summary but a conversation: pick a managed host → read platform data first, run
+first”. Not a one-shot summary but a conversation: pick an eligible target → read platform data first, run
 read-only commands when needed → answer as it goes → conclusions become a report with `source_ref` on every
-item pointing back to the original check, so you can verify them yourself.
+item pointing back to the original check, so you can verify them yourself. A target must satisfy all five
+conditions (running, securely managed, Guest Agent healthy, cloud-init healthy, and a VM); any failure keeps
+it out of the candidates, and the page explains why along with how many hosts were excluded.
 
 <!-- screenshot: docs/screenshots/ai-assistant.png -->
 ![AI operations assistant: attribution from inspection data, every command approved individually](docs/screenshots/ai-assistant.png)

@@ -2,22 +2,26 @@
    pvecenter — 全局快照视图
    ========================================================================== */
 
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { lxcApi, vmsApi } from '../api/endpoints';
 import { guestPath } from '../api/guests';
+import { errorMessage } from '../api/client';
 import { PageShell } from '../components/Layout';
 import { Card } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Button, IconButton } from '../components/ui/Button';
-import { Input, Select } from '../components/ui/Input';
+import { Checkbox, Input, Select } from '../components/ui/Input';
 import { Table, type Column } from '../components/ui/Table';
 import { Notice } from '../components/ui/EmptyState';
 import { PveQueryError } from '../components/SetupRequired';
+import { BulkResultNotice } from '../components/BulkResultNotice';
 import { usePveReady } from '../hooks/usePveStatus';
 import { PagerBar, usePaged } from '../hooks/usePaged';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
+import { useToast } from '../hooks/useToast';
+import { invalidateQuota } from '../hooks/quotaCache';
 import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import {
   IconSnapshot,
@@ -30,7 +34,7 @@ import { formatDateTime, formatRelative } from '../utils/format';
 import { useTaskRunner } from '../hooks/useTaskRunner';
 import { useAuth } from '../hooks/useAuth';
 import { useT } from '../i18n';
-import type { Snapshot } from '../api/types';
+import type { BulkResponse, Snapshot } from '../api/types';
 
 /* ---------------------------------------------------------------------------
    页面
@@ -39,9 +43,13 @@ import type { Snapshot } from '../api/types';
 /**
  * 同一台机器上可能重名（容器与虚拟机各自一套命名空间），所以 key 里要带类型。
  * 节点也要带：不同节点上的 vmid 会重号。
+ *
+ * 类型统一归一成 ``qemu`` / ``lxc``：批量删除的逐条结果里后端给的是这两个值，
+ * 归一之后「前端记的行」与「结果里的行」才能对得上（否则失败的那条会一直被
+ * 当成「还在删」藏着）。
  */
 function snapshotKey(s: Snapshot): string {
-  return `${s.node}|${s.vmid}|${s.vm_type}|${s.name}`;
+  return `${s.node}|${s.vmid}|${s.vm_type === 'lxc' ? 'lxc' : 'qemu'}|${s.name}`;
 }
 
 export function Snapshots() {
@@ -55,6 +63,7 @@ export function Snapshots() {
   const canSnapshotOf = (s: Snapshot) =>
     hasPermission(s.vm_type === 'lxc' ? 'ct.snapshot' : 'vm.snapshot');
 
+  const toast = useToast();
   const [search, setSearch] = useState('');
   const [nodeFilter, setNodeFilter] = useState('');
   const [rollbackTarget, setRollbackTarget] = useState<Snapshot | null>(null);
@@ -67,8 +76,19 @@ export function Snapshots() {
    * 快照还在 —— 用户确认删除后行仍留在原地，要再点一次才「生效」。这里先把这些
    * 行从渲染数据里摘掉，任务运行期间无论刷新多少次都不会把它放回来；失败时再放开，
    * 它会随真实数据回来（同时有失败 toast），界面始终与 PVE 一致。
+   *
+   * 单条与批量可能同时在跑（批量提交后「还在删」的那段窗口里，单条按钮又可以点），
+   * 所以真正的记账在 ref 里：任何一处增删都整份同步给上面的渲染列表，避免两边各自
+   * ``filter`` 时把对方藏着的行放出来。
    */
   const [deleting, setDeleting] = useState<string[]>([]);
+  const deletingRef = useRef<Set<string>>(new Set());
+  const syncDeleting = () => setDeleting([...deletingRef.current]);
+
+  /* 批量删除的勾选与结果（见表格下方的选择列 / 操作条） */
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [bulkResult, setBulkResult] = useState<BulkResponse | null>(null);
 
   /* 未配置连接时后端对每个请求都回 428，轮询只会刷一屏没人看的报错
      （配好之后自动恢复） */
@@ -156,8 +176,202 @@ export function Snapshots() {
     void queryClient.invalidateQueries({ queryKey: ['vms'] });
   };
 
+  /* ---- 批量删除 ---- */
+  /* 只有当前用户**能删**的行才给勾：勾上一批、点下去才被告知其中几条无权删除，
+     不如从一开始就不让勾。 */
+  const deletable = useMemo(
+    () =>
+      snapshots.filter((s) =>
+        hasPermission(s.vm_type === 'lxc' ? 'ct.snapshot' : 'vm.snapshot'),
+      ),
+    [snapshots, hasPermission],
+  );
+
+  const allSelected =
+    deletable.length > 0 && deletable.every((s) => selected.has(snapshotKey(s)));
+  const someSelected = deletable.some((s) => selected.has(snapshotKey(s)));
+
+  const toggleAll = () => {
+    setSelected(
+      allSelected ? new Set() : new Set(deletable.map(snapshotKey)),
+    );
+  };
+
+  const toggleOne = (s: Snapshot) => {
+    const key = snapshotKey(s);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  /* 勾选项按列表顺序展开成快照本身：提交时要 node/vmid/type/name */
+  const selectedRows = useMemo(
+    () => deletable.filter((s) => selected.has(snapshotKey(s))),
+    [deletable, selected],
+  );
+
+  /* 列表刷新 / 筛选变化后清掉已不在列表里的勾选：否则「已选 3」但一条都看不到，
+     点删除时删的还是旧对象 */
+  useEffect(() => {
+    const valid = new Set(deletable.map(snapshotKey));
+    setSelected((prev) => {
+      const next = new Set([...prev].filter((key) => valid.has(key)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [deletable]);
+
+  /** 把「已受理、PVE 还在删」的行继续藏着，直到列表里真的没有它们。 */
+  const holdDeleted = async (keys: string[]) => {
+    const pending = new Set(keys);
+    const deadline = Date.now() + 180_000;
+    while (pending.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      try {
+        // 不逐条轮询任务：50 个快照就是 50 个任务、每秒 50 次请求，很容易撞上
+        // 每 IP 的限流。这里只重拉**整份**快照列表（后端有缓存，删除任务结束时
+        // 会主动作废），既能拿到最终结果，代价也小得多。
+        await snapshotsQuery.refetch();
+      } catch {
+        continue;
+      }
+      const rows =
+        queryClient.getQueryData<Snapshot[]>(['snapshots', 'all']) ?? [];
+      const present = new Set(rows.map(snapshotKey));
+      let changed = false;
+      for (const key of [...pending]) {
+        if (present.has(key)) continue;
+        // 只撤这一批自己的标记：同一时间还可能有单条删除在跑
+        pending.delete(key);
+        deletingRef.current.delete(key);
+        changed = true;
+      }
+      if (changed) syncDeleting();
+    }
+    for (const key of keys) deletingRef.current.delete(key);
+    if (pending.size > 0) {
+      // 到点还没删完（或 PVE 任务失败）：放开标记，让真实列表说话
+      toast.warning(
+        t('snapshots.bulkDeletePending'),
+        t('snapshots.bulkDeletePendingBody', { count: pending.size }),
+      );
+    }
+    syncDeleting();
+  };
+
+  /**
+   * 批量删除一批快照。
+   *
+   * 走一次后端批量接口逐条受理，而不是前端循环发 N 个单条删除：快照级归属只在
+   * 服务端判，N 次往返还容易撞上限流，中途失败也说不清到底删掉了几条。
+   * 确认后这一批先**从渲染里摘掉**（与单条删除同一口径）：PVE 的删除是异步任务，
+   * 等任务跑完才消失的话，用户盯着屏幕那几秒会以为没删掉。
+   */
+  const runBulkDelete = async (rows: Snapshot[]) => {
+    const targets = rows.filter((s) => s.node && s.vmid);
+    if (targets.length === 0) return;
+
+    const keys = targets.map(snapshotKey);
+    let accepted = keys;
+    setBusy(true);
+    for (const key of keys) deletingRef.current.add(key);
+    syncDeleting();
+    try {
+      const result = await vmsApi.bulkDeleteSnapshots(
+        targets.map((s) => ({
+          node: s.node as string,
+          vmid: s.vmid as number,
+          // 容器与虚拟机是两套后端端点与权限点，类型必须带
+          type: s.vm_type === 'lxc' ? 'lxc' : 'qemu',
+          name: s.name,
+        })),
+      );
+      setBulkResult(result);
+      /* 快照额度按「名下快照条数」记账：这批删除已经落库（归属标记随请求一起清），
+         额度读数必须跟着失效，否则「删了快照额度没还回来」。批量不走 runner，
+         得在这里显式作废一次。 */
+      invalidateQuota(queryClient);
+
+      /* 没受理的（无权限 / 已被删掉 / PVE 报错）放回列表并留在勾选里，可以直接
+         重试；受理成功的继续藏到 PVE 真的删完。 */
+      const failed = new Set(
+        result.results
+          .filter((r) => !r.ok)
+          .map((r) => `${r.node}|${r.vmid}|${r.type}|${r.name}`),
+      );
+      accepted = keys.filter((key) => !failed.has(key));
+      for (const key of keys) {
+        if (failed.has(key)) deletingRef.current.delete(key);
+      }
+      syncDeleting();
+      setSelected(new Set(keys.filter((key) => failed.has(key))));
+
+      if (result.failed === 0) {
+        toast.destructive(
+          t('snapshots.bulkDeleteDone'),
+          t('snapshots.bulkDeleteProcessed', {
+            ok: result.ok,
+            failed: result.failed,
+          }),
+        );
+      } else {
+        toast.warning(
+          t('snapshots.bulkDeletePartial'),
+          t('snapshots.bulkDeleteProcessed', {
+            ok: result.ok,
+            failed: result.failed,
+          }),
+        );
+      }
+    } catch (err) {
+      for (const key of keys) deletingRef.current.delete(key);
+      syncDeleting();
+      toast.error(t('snapshots.bulkDeleteFailed'), errorMessage(err));
+      return;
+    } finally {
+      setBusy(false);
+    }
+
+    // 受理成功的那批等 PVE 任务结束再放开（进度可在任务队列里看）
+    await holdDeleted(accepted);
+    invalidate();
+  };
+
+  const retryBulkDelete = () => {
+    void runBulkDelete(selectedRows);
+  };
+
   /* ---- 表格列 ---- */
   const columns: Array<Column<Snapshot>> = [
+    {
+      /* 批量删除用的勾选列：锁定（不可隐藏、不参与拖动排序），表头是全选框 */
+      key: 'select',
+      label: t('snapshots.colSelect'),
+      locked: true,
+      header: (
+        <Checkbox
+          checked={allSelected}
+          indeterminate={!allSelected && someSelected}
+          onChange={toggleAll}
+          disabled={deletable.length === 0}
+          aria-label={t('snapshots.selectAll')}
+        />
+      ),
+      width: 44,
+      render: (s) => (
+        <span onClick={(e) => e.stopPropagation()}>
+          <Checkbox
+            checked={selected.has(snapshotKey(s))}
+            onChange={() => toggleOne(s)}
+            /* 没权限删的行不给勾：勾完点下去只会得到一条「无权删除」 */
+            disabled={!canSnapshotOf(s)}
+            aria-label={t('snapshots.selectOne', { name: s.name })}
+          />
+        </span>
+      ),
+    },
     {
       key: 'vm',
       header: t('common.vm'),
@@ -358,6 +572,44 @@ export function Snapshots() {
         </div>
       </div>
 
+      {/* ---- 批量删除结果回报 ---- */}
+      {bulkResult ? (
+        <BulkResultNotice
+          result={bulkResult}
+          retrying={busy}
+          onRetryFailed={retryBulkDelete}
+          onClose={() => setBulkResult(null)}
+        />
+      ) : null}
+
+      {/* ---- 批量操作条 ---- */}
+      {selectedRows.length > 0 ? (
+        <div className="bulk-bar">
+          <span>
+            {t('snapshots.bulkSelectedPre')}
+            <span className="bulk-bar-count">{selectedRows.length}</span>{' '}
+            {t('snapshots.bulkSelectedPost')}
+          </span>
+          <div className="flex items-center gap-8 flex-wrap">
+            <Button
+              variant="danger"
+              icon={<IconTrash size={15} />}
+              disabled={busy}
+              onClick={() => setBulkDeleteOpen(true)}
+            >
+              {t('snapshots.bulkDeleteAction')}
+            </Button>
+            <Button
+              variant="ghost"
+              disabled={busy}
+              onClick={() => setSelected(new Set())}
+            >
+              {t('snapshots.bulkClear')}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
       {snapshotsQuery.isError ? (
         <PveQueryError
           title={t('snapshots.loadErrorTitle')}
@@ -457,7 +709,8 @@ export function Snapshots() {
              另外，任务一提交 runner 就会先刷一次列表（那时快照还在），所以这里
              不只是「隐藏」——缓存里的那一行也一并删掉。 */
           setDeleteTarget(null);
-          setDeleting((list) => [...list, key]);
+          deletingRef.current.add(key);
+          syncDeleting();
           queryClient.setQueryData<Snapshot[]>(['snapshots', 'all'], (rows) =>
             rows ? rows.filter((s) => snapshotKey(s) !== key) : rows,
           );
@@ -484,7 +737,8 @@ export function Snapshots() {
             await snapshotsQuery.refetch();
             invalidate();
           } finally {
-            setDeleting((list) => list.filter((item) => item !== key));
+            deletingRef.current.delete(key);
+            syncDeleting();
             setBusy(false);
           }
         }}
@@ -497,6 +751,60 @@ export function Snapshots() {
           name: deleteTarget?.name || '',
         })}
       />
+
+      {/* ---- 批量删除确认 ---- */}
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        onCancel={() => setBulkDeleteOpen(false)}
+        onConfirm={() => {
+          /* 确认即收工：对话框先关，逐条结果交给页面上方的结果条与任务队列。
+             等整批任务跑完才返回的话，用户会盯着一个关不掉的确认框看几分钟。 */
+          setBulkDeleteOpen(false);
+          void runBulkDelete(selectedRows);
+        }}
+        title={t('snapshots.bulkDeleteTitle')}
+        danger
+        confirmText={t('snapshots.bulkDeleteConfirm', {
+          count: selectedRows.length,
+        })}
+        loading={busy}
+        message={t('snapshots.bulkDeleteMessage', {
+          count: selectedRows.length,
+          vms: new Set(selectedRows.map((s) => `${s.node}/${s.vmid}`)).size,
+        })}
+      >
+        {selectedRows.length > 0 ? (
+          <div className="bulk-detail-scroll">
+            <table className="bulk-detail-table">
+              <caption className="sr-only">
+                {t('snapshots.bulkDeleteListCaption')}
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">{t('snapshots.colName')}</th>
+                  <th scope="col">{t('common.createdAt')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {selectedRows.map((s) => (
+                  <tr key={snapshotKey(s)}>
+                    <td className="fs-sm">
+                      <span className="mono">{s.name}</span>
+                      <span className="fs-xs text-muted">
+                        {' · '}
+                        {s.vmname || `VM ${s.vmid}`} ({s.node}/{s.vmid})
+                      </span>
+                    </td>
+                    <td className="mono fs-xs text-muted">
+                      {formatDateTime(s.snaptime)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+      </ConfirmDialog>
 
     </PageShell>
   );

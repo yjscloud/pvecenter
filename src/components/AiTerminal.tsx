@@ -364,8 +364,8 @@ export function AiTerminal({
       <CardHeader
         // 为什么开不了由下面的提示块说明，标题栏只说这个卡是干什么的 ——
         // 两处都写一遍同样的句子，读起来像出了两次错。
+        // 副标题已经由控制台标题条统一说明，这里不再重复一遍
         title={t('ai.terminalTitle')}
-        subtitle={t('ai.terminalSubtitle')}
         actions={
           active ? (
             <div className="flex items-center gap-8">
@@ -390,7 +390,7 @@ export function AiTerminal({
         <>
           {/* 一句话说清这个窗口里会出现什么：用户自己敲的、AI 跑的，是同一个
               画面里的两种来源 —— 不说清楚会以为两条线串在一起了 */}
-          <div className="fs-xs text-muted" style={{ marginBottom: 8 }}>
+          <div className="ai-term-hint">
             {t('ai.terminalHint', { host: hostName || hostId })}
           </div>
           <div
@@ -400,8 +400,8 @@ export function AiTerminal({
               // 撑满时高度由 CSS 的 flex:1 决定，这里不再写死
               ...(fill ? null : { height: TERM_HEIGHT }),
               background: TERMINAL_THEME.background,
-              borderRadius: 8,
-              padding: '6px 8px',
+              borderRadius: 10,
+              padding: '8px 10px',
               overflow: 'hidden',
             }}
           />

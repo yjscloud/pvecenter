@@ -119,6 +119,132 @@ def test_latest_record_wins_for_container_sources(api) -> None:
     assert sources[("", "pve1", 106)] == {"node": "pve1", "vmid": 9000}
 
 
+def test_reinstall_updates_source_template(api) -> None:
+    """重装换了系统盘，来源模板必须跟着换。
+
+    这是「重装后列表徽标仍停在旧系统」在数据侧的回归用例：先克隆自 Windows
+    模板，再重装成 TencentOS，来源应解析为**重装用的模板**而不是旧克隆来源。
+    """
+    from app import guest_created
+
+    async def seed() -> None:
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "vm.clone",
+            target="pve1/9000 -> pve1/100",
+            result="success",
+        )
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "vm.reinstall",
+            target="pve1/9100 -> pve1/100",
+            result="success",
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [{"connection_id": "", "node": "pve1", "vmid": 100}]
+        )
+
+    sources = api.portal.call(resolve)
+    assert sources[("", "pve1", 100)] == {"node": "pve1", "vmid": 9100}
+
+
+def test_failed_reinstall_keeps_previous_source(api) -> None:
+    """失败的重装没有动过系统盘，来源必须仍是上一次成功的那张模板。
+
+    否则一次失败的任务就会把「来源」抹成那次没装成的模板 —— 用户会据此
+    误判该不该删模板。
+    """
+    from app import guest_created
+
+    async def seed() -> None:
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "vm.clone",
+            target="pve1/9000 -> pve1/100",
+            result="success",
+        )
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "vm.reinstall",
+            target="pve1/9100 -> pve1/100",
+            result="failed",
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [{"connection_id": "", "node": "pve1", "vmid": 100}]
+        )
+
+    sources = api.portal.call(resolve)
+    assert sources[("", "pve1", 100)] == {"node": "pve1", "vmid": 9000}
+
+
+def test_partial_clone_still_reports_source(api) -> None:
+    """克隆成功、后续覆盖配置失败（partial）：机器已经建出来了，来源必须能查到。
+
+    漏掉这条记录，这类机器在列表里的「系统」列就是「—」—— 徽标缺失，而不是错标。
+    """
+    from app import guest_created
+
+    async def seed() -> None:
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "vm.clone",
+            target="pve1/9000 -> pve1/108",
+            result="partial",
+            detail="克隆成功但应用配置失败: timeout",
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [{"connection_id": "", "node": "pve1", "vmid": 108}]
+        )
+
+    sources = api.portal.call(resolve)
+    assert sources[("", "pve1", 108)] == {"node": "pve1", "vmid": 9000}
+
+
+def test_legacy_clone_target_without_node_is_not_self_source(api) -> None:
+    """旧格式的克隆记录只写了目标机器（`… -> 109`）：不能把它自己当来源。
+
+    解析出来 ``origin`` 会是 ``109``，若不拦，列表会显示「来源：109」这种自指，
+    比「—」更难发现。
+    """
+    from app import guest_created
+
+    async def seed() -> None:
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "vm.clone",
+            target="pve1/9000 -> 109",
+            result="success",
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [{"connection_id": "", "node": "pve1", "vmid": 109}]
+        )
+
+    sources = api.portal.call(resolve)
+    assert ("", "pve1", 109) not in sources
+
+
 def test_template_file_name_strips_storage_and_query() -> None:
     from app import guest_created
 
@@ -132,3 +258,72 @@ def test_template_file_name_strips_storage_and_query() -> None:
         == "alpine-3.20.tar.zst"
     )
     assert guest_created.template_file_name("") == ""
+
+
+def test_reused_vmid_does_not_inherit_deleted_machines_source(api) -> None:
+    """VMID 回收：同号机器删了又建，旧克隆记录不能算成新机器的来源。
+
+    新机器可能是「恢复备份 / PVE 界面克隆 / ISO 安装」建出来的，这些路都不写
+    「来源」审计；不设下界的话，列表会把上一台机器的来源贴上来 —— 一面是刚装好
+    的 TencentOS，另一面却顶着上一台 Windows 机器的徽标。
+    """
+    from app import guest_created
+
+    async def seed() -> None:
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "vm.clone",
+            target="pve1/9000 -> pve1/120",
+            result="success",
+        )
+        # 这台机器随后被删掉了；同号的新机器不是面板克隆出来的
+        await security.audit(
+            None, {"username": "admin"}, "vm.delete", target="pve1/120"
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [{"connection_id": "", "node": "pve1", "vmid": 120}]
+        )
+
+    assert api.portal.call(resolve) == {}
+
+
+def test_clone_after_recreate_still_reports_source(api) -> None:
+    """删除之后**又**克隆出来的同号机器，来源是新的那次（下界不能把新记录也挡掉）。
+
+    同一秒内的三条记录靠 ``id`` 分先后；这里也顺带锁住这条排序口径。
+    """
+    from app import guest_created
+
+    async def seed() -> None:
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "vm.clone",
+            target="pve1/9000 -> pve1/121",
+            result="success",
+        )
+        await security.audit(
+            None, {"username": "admin"}, "vm.delete", target="pve1/121"
+        )
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "vm.clone",
+            target="pve1/9100 -> pve1/121",
+            result="success",
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [{"connection_id": "", "node": "pve1", "vmid": 121}]
+        )
+
+    sources = api.portal.call(resolve)
+    assert sources[("", "pve1", 121)] == {"node": "pve1", "vmid": 9100}

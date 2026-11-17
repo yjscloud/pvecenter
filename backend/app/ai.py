@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -36,6 +37,8 @@ import httpx
 
 from . import (
     ai_approval,
+    ai_scope,
+    aiperf,
     aiterm,
     aitools,
     aivm,
@@ -73,6 +76,41 @@ DEFAULT_REPLY_CHARS_DEEP = 400
 # 上游限流 / 网关抖动值得重试的状态码；其余 4xx 是请求本身的问题，重试没有意义。
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAX_CHAT_RETRIES = 2
+
+#: 「辅助调用」用的模型名（会话摘要等）。留空 = 与对话用同一个模型。
+#:
+#: 摘要、标题这类调用不产出用户可见答案，用旗舰模型纯属浪费。同一家 provider
+#: 通常有便宜一档的型号（deepseek-chat / gpt-4o-mini / qwen-turbo …），用
+#: ``PVECENTER_AI_HELPER_MODEL`` 指过去即可 —— 复用同一把 key 与 base_url，
+#: 不需要改配置结构，也就不会因为「多一个字段」让老配置校验失败。
+HELPER_MODEL = (os.environ.get("PVECENTER_AI_HELPER_MODEL") or "").strip()
+
+#: 连接阶段单独限时（秒）。
+#:
+#: 只给一个总超时的时候，**连不上**和**回答太长**是同一个秒数：上游地址写错 / 网络
+#: 不通，用户要对着转圈等满 90 秒才看到「连接失败」；而长回答又在同一个 90 秒里
+#: 被整体掐断后重试。拆开之后：连接 10 秒内没建好就是不通（该报错就报错），
+#: 读取阶段仍按用户配置的总时长算 —— 长回答是「一直有数据在回流」，不该被掐。
+CONNECT_TIMEOUT = 10.0
+
+
+def httpx_timeout(total: Any) -> "httpx.Timeout":
+    """把「总超时」拆成连接 / 读写 / 取连接池三段。
+
+    读取用总时长而不是更短的值：流式回答的间隔本来就可能有几秒（模型在思考），
+    掐得太紧会把正常回答判成超时。真正的静默挂起由前端读超时 + SSE 心跳兜住。
+    """
+    try:
+        seconds = float(total or 90)
+    except (TypeError, ValueError):
+        seconds = 90.0
+    seconds = max(5.0, seconds)
+    return httpx.Timeout(
+        connect=min(CONNECT_TIMEOUT, seconds),
+        read=seconds,
+        write=min(30.0, seconds),
+        pool=5.0,
+    )
 
 DEFAULT_PROVIDER: Dict[str, Any] = {
     "id": "",
@@ -399,7 +437,10 @@ def capabilities(perms: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """
     tools: List[Dict[str, Any]] = []
     for kind, catalog in (
-        ("host", aitools.HOST_TOOLS),
+        # 说明页与模型看到的函数表必须是同一份：这里列出来的才叫「能做」。
+        # 被分组合并掉的原子工具仍可执行（历史会话会引用），但把它们也列出来
+        # 会让「能做什么」比实际下发的还多，用户对不上号。
+        ("host", aitools.HOST_SPECS),
         ("internal", aitools.INTERNAL_TOOLS),
         # 虚拟机内动作：只有在**签发租约后**才会下发给模型，但说明页必须如实列出 ——
         # 「说明书里没有、实际能跑」比多写一行说明危险得多。
@@ -928,7 +969,7 @@ async def chat(
     async def _post(body: Dict[str, Any]) -> httpx.Response:
         if client is not None:
             return await client.post(endpoint, json=body, headers=headers)
-        async with httpx.AsyncClient(timeout=timeout) as own:
+        async with httpx.AsyncClient(timeout=httpx_timeout(timeout)) as own:
             return await own.post(endpoint, json=body, headers=headers)
 
     async def _post_retry(body: Dict[str, Any]) -> httpx.Response:
@@ -1167,7 +1208,7 @@ async def _chat_stream(
     if json_mode:
         body["response_format"] = {"type": "json_object"}
 
-    active = client or httpx.AsyncClient(timeout=timeout)
+    active = client or httpx.AsyncClient(timeout=httpx_timeout(timeout))
     owned = client is None
     dropped_options = False
     dropped_format = False
@@ -1665,8 +1706,23 @@ async def resolve_host(
     for item in known or []:
         # targets() 给的是 BaselineHost（字段 id）；fleet 给的是 host_id，
         # 两种都认一下，免得以后换了来源又要改这里
-        if str(item.get("id") or item.get("host_id")) == str(host_id):
-            return item
+        if str(item.get("id") or item.get("host_id")) != str(host_id):
+            continue
+        # 候选清单与发起入口共用同一套准入规则：只在页面上过滤会留下
+        # 「手工构造 host_id 仍能发起排查」的缝。这里再判一次，同时覆盖
+        # 「列表加载后机器被关机 / agent 掉线」的时间差。
+        ok, reason = await ai_scope.check_host(item)
+        if not ok:
+            name = str(item.get("name") or host_id)
+            raise AIError(
+                i18n.pick(
+                    f"目标主机「{name}」当前不满足 AI 排查条件：{ai_scope.describe(reason)}。"
+                    "请先把它恢复到可用状态，再重新发起。",
+                    f"The target host “{name}” is not eligible right now: "
+                    f"{ai_scope.describe(reason)}. Bring it back to a usable state and retry.",
+                )
+            )
+        return item
     raise AIError(
         i18n.pick(
             "找不到这台主机，或你没有查看权限",
@@ -1690,7 +1746,7 @@ async def inspect(
     """
     cfg = await load_config(username)
     if not cfg.get("enabled"):
-        raise AIError(i18n.tr("AI 排查助手未启用，请先在设置里配置并启用大模型"))
+        raise AIError(i18n.tr("AI 助手未启用，请先在设置里配置并启用大模型"))
     provider = pick_provider(
         cfg, provider_id, username=username, is_admin=is_admin
     )
@@ -1707,7 +1763,7 @@ async def inspect(
     collect_ms = int((time.time() - started) * 1000)
 
     messages = build_messages(host, evidence)
-    async with httpx.AsyncClient(timeout=cfg.get("timeout") or 90) as client:
+    async with httpx.AsyncClient(timeout=httpx_timeout(cfg.get("timeout") or 90)) as client:
         reply = await chat(messages, cfg=cfg, provider=provider, client=client)
     result = parse_reply(reply["content"])
     usage = reply.get("usage") or {}
@@ -1756,6 +1812,11 @@ _SCOPE_READONLY = (
     "- 所有工具都是**只读**的，你也只能做只读分析；不要给出需要立即执行的破坏性操作\n"
     "  （删除、重启、格式化等），你的产出是判断与建议；"
 )
+_SCOPE_EXEC_READONLY = (
+    "- 只读诊断命令可以直接调用；需要**改动系统**的命令（重启服务、改配置、删文件等）\n"
+    "  当前未获授权，不要调用 host_propose_command，也不要绕开审批去执行；如果确实需要，\n"
+    "  请明确告诉用户「需要把本次会话的授权级别提升到受限变更」，由用户决定；"
+)
 _SCOPE_EXEC = (
     "- 只读诊断命令可以直接调用；需要**改动系统**的命令（重启服务、改配置、删文件等）\n"
     "  必须先调用 host_propose_command 提议，由用户逐条批准后才会执行。它不是「已经生效\n"
@@ -1764,9 +1825,11 @@ _SCOPE_EXEC = (
 )
 
 
-def scope_for(allow_exec: bool) -> str:
+def scope_for(allow_exec: bool, allow_write: bool = True) -> str:
     """取「这一轮能做什么」那一段（理由见 :data:`_SCOPE_READONLY`）。"""
-    return _SCOPE_EXEC if allow_exec else _SCOPE_READONLY
+    if not allow_exec:
+        return _SCOPE_READONLY
+    return _SCOPE_EXEC if allow_write else _SCOPE_EXEC_READONLY
 
 
 AGENT_SYSTEM_PROMPT = """你是一名资深的 Linux 与虚拟化运维工程师，正在排查一台主机的问题。
@@ -1810,7 +1873,7 @@ AGENT_SYSTEM_PROMPT = """你是一名资深的 Linux 与虚拟化运维工程师
       "phenomenon": "现象描述",
       "evidence": ["引用的具体数据点", "..."],
       "suggestion": "建议动作，尽量指向平台里的具体功能页",
-      "source_ref": ["baseline:检查项 key", "tool:host_disk_usage"]
+      "source_ref": ["baseline:检查项 key", "tool:host_system_overview"]
     }
   ],
   "data_gaps": ["还需要哪些信息才能进一步判断"],
@@ -1820,14 +1883,18 @@ AGENT_SYSTEM_PROMPT = """你是一名资深的 Linux 与虚拟化运维工程师
 所有面向用户的文字用{language}书写。"""
 
 
-def report_system_prompt(*, allow_exec: bool = False) -> str:
+def report_system_prompt(
+    *, allow_exec: bool = False, allow_write: bool = True
+) -> str:
     """排查（报告）模式的 system 提示词：产出固定结构的 findings JSON。
 
     ``allow_exec`` 决定「能做什么」那一段（见 :func:`scope_for`）—— 报告模式同样
     可能开着授权跑（体检轮也能提议写命令），不能只按对话轮处理。
     """
     return render_prompt(
-        AGENT_SYSTEM_PROMPT, steps=str(MAX_STEPS), scope=scope_for(allow_exec)
+        AGENT_SYSTEM_PROMPT,
+        steps=str(MAX_STEPS),
+        scope=scope_for(allow_exec, allow_write),
     )
 
 
@@ -1921,7 +1988,11 @@ CHAT_SYSTEM_PROMPT = """你是一名资深的 Linux 与虚拟化运维工程师�
 
 
 def chat_system_prompt(
-    steps: int = MAX_STEPS, *, length: str = LENGTH_TERSE, allow_exec: bool = False
+    steps: int = MAX_STEPS,
+    *,
+    length: str = LENGTH_TERSE,
+    allow_exec: bool = False,
+    allow_write: bool = True,
 ) -> str:
     """自由对话模式的 system 提示词：自然语言回答，不强制 JSON、不预采集证据。
 
@@ -1936,7 +2007,7 @@ def chat_system_prompt(
         CHAT_SYSTEM_PROMPT,
         steps=str(steps),
         length=length,
-        scope=scope_for(allow_exec),
+        scope=scope_for(allow_exec, allow_write),
     )
 
 
@@ -1956,16 +2027,28 @@ def evidence_user_content(host: Dict[str, Any], evidence: Dict[str, Any]) -> str
         f"backups 是备份核对，changes 是最近的集群变更记录。"
         f"需要更多细节时可以调用工具。"
     )
-    body = json.dumps(evidence, ensure_ascii=False, indent=1)
+    # 紧凑序列化（不带 indent）：这段证据会作为一条消息**每一轮、每一步**重新
+    # 发给模型，缩进产生的空白字符也是要付钱的输入 token。可读性靠键名本身够了 ——
+    # 需要看格式的是模型，不是人。
+    body = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
     return f"{header}\n\n[数据]\n{body}\n[/数据]"
 
 
 def build_agent_messages(
-    host: Dict[str, Any], evidence: Dict[str, Any], *, allow_exec: bool = False
+    host: Dict[str, Any],
+    evidence: Dict[str, Any],
+    *,
+    allow_exec: bool = False,
+    allow_write: bool = True,
 ) -> List[Dict[str, Any]]:
     """L2 的开场消息：摘要 + 可调用工具（工具 schema 由 tools 参数单独传）。"""
     return [
-        {"role": "system", "content": report_system_prompt(allow_exec=allow_exec)},
+        {
+            "role": "system",
+            "content": report_system_prompt(
+                allow_exec=allow_exec, allow_write=allow_write
+            ),
+        },
         {"role": "user", "content": evidence_user_content(host, evidence)},
     ]
 
@@ -2239,6 +2322,104 @@ def _step_limit_nudge(json_mode: bool) -> str:
     )
 
 
+class _JsonSummaryStream:
+    """从流式 JSON 里把 ``summary`` 字段的正文抽出来，边到边推给前端。
+
+    报告模式要的是整段 JSON，但让用户对着转圈等二十秒是另一种「慢」。报告的
+    schema 里 ``summary`` 本来就是**第一个**字段，于是可以一边生成一边把这段
+    结论当成叙述流出去：用户先看到结论逐字长出来，结构化部分留在结尾一次性落地。
+
+    只做「取一个 JSON 字符串值」这一件事，不引 JSON 解析器：半截的 JSON 本来
+    就解析不了；这里按字符扫，遇到未转义的引号就收工，跨 chunk 的转义序列先
+    攒着等下一片。
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._started = False
+        self._done = False
+
+    def reset(self) -> None:
+        self._buf = ""
+        self._started = False
+        self._done = False
+
+    def feed(self, piece: str) -> str:
+        """吃一段增量，返回这段里可以立刻显示的正文（可能是空串）。"""
+        if self._done or not piece:
+            return ""
+        self._buf += piece
+        if not self._started:
+            marker = '"summary"'
+            index = self._buf.find(marker)
+            if index < 0:
+                # 标记本身可能被切在两片之间：只保留尾部，避免无限增长
+                self._buf = self._buf[-len(marker):]
+                return ""
+            rest = self._buf[index + len(marker):]
+            colon = rest.find(":")
+            if colon < 0:
+                return ""
+            rest = rest[colon + 1:].lstrip()
+            if not rest:
+                return ""
+            if not rest.startswith('"'):
+                # summary 不是字符串（null / 数字）：放弃抽取，按普通状态处理
+                self._done = True
+                return ""
+            self._started = True
+            self._buf = rest[1:]
+
+        out: List[str] = []
+        data = self._buf
+        index = 0
+        while index < len(data):
+            char = data[index]
+            if char == "\\":
+                if index + 1 >= len(data):
+                    break  # 半个转义，等下一片再拼
+                nxt = data[index + 1]
+                if nxt == "u":
+                    if index + 6 > len(data):
+                        break
+                    try:
+                        out.append(chr(int(data[index + 2:index + 6], 16)))
+                    except ValueError:
+                        pass
+                    index += 6
+                    continue
+                out.append({"n": "\n", "t": "\t", "r": "\r"}.get(nxt, nxt))
+                index += 2
+                continue
+            if char == '"':
+                self._done = True
+                index += 1
+                break
+            out.append(char)
+            index += 1
+        self._buf = data[index:]
+        return "".join(out)
+
+
+def _insert_system_note(messages: List[Dict[str, Any]], note: str) -> None:
+    """把**随轮次变化**的补充说明插到最后一条 user 消息之前。
+
+    为什么不拼进第一条 system：system 位于 prompt 最前面，改一个字符，它后面的
+    全部内容都不再命中上游的 prefix cache。而 tools + system 恰恰是一轮里最贵的
+    固定块（34 个工具的 JSON 约 8KB，每一步都要重发一次）。动态内容挪到最后一条
+    提问之前，前缀就逐字节稳定 —— 命中缓存时这部分只按缓存价计费、prefill 也快。
+    """
+    text = str(note or "").strip()
+    if not text:
+        return
+    index = len(messages)
+    for i in range(len(messages) - 1, -1, -1):
+        if str(messages[i].get("role") or "") == "user":
+            index = i
+            break
+    messages.insert(index, {"role": "system", "content": text})
+
+
 async def run_tool_loop(
     messages: List[Dict[str, Any]],
     *,
@@ -2257,7 +2438,11 @@ async def run_tool_loop(
     max_steps: int = MAX_STEPS,
     finalize_json_mode: bool = True,
     stream_tokens: bool = False,
+    report_progress: bool = False,
     on_message: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    on_messages: Optional[
+        Callable[[List[Dict[str, Any]]], Awaitable[None]]
+    ] = None,
 ) -> Dict[str, Any]:
     """Agent 工具循环：L2 一次性排查与会话追问共用同一份实现。
 
@@ -2266,7 +2451,13 @@ async def run_tool_loop(
     当成回复文本。
 
     ``on_message`` 在循环里每产出一条协议消息（assistant / tool）时回调，用来把
-    对话落库 —— 中途被用户终止，也能留下已经发生的那部分。
+    对话落库 —— 中途被用户终止，也能留下已经发生的那部分。``on_messages`` 是它的
+    批量版本：一轮里并行的多条工具结果只开一次事务（见 :func:`aichat.append_messages`），
+    单步少几次 SELECT MAX + INSERT + UPDATE + commit。
+
+    ``report_progress=True`` 时，报告模式的最终 JSON 也走流式：内容不推给前端
+    （半截 JSON 没法看），但按字数回一个 ``report_progress`` 事件 —— 体检要生成
+    几十秒，用户至少能看到「还在长」，而不是对着转圈猜是死是活。
 
     循环内写命令与只读工具的执行策略、防死循环判重、步数 / 超时 / token 预算三道
     刹车都与原 L2 一致，抽出来只是为了不再复制一遍。
@@ -2282,12 +2473,9 @@ async def run_tool_loop(
         # 工具说明随票面级别变化：只读票说「只读」，运维票说「可装包改配置」。
         # 说明写死会让模型在运维授权下依然只给建议。
         specs = list(specs) + aivm.tool_specs(lease)
-        hint = aivm.prompt_hint(lease)
-        if hint and messages and messages[0].get("role") == "system":
-            messages[0] = {
-                **messages[0],
-                "content": str(messages[0].get("content") or "") + hint,
-            }
+        # 票面提示随轮次变（租约可能这一轮才生效），所以不拼进 system —— 拼进去
+        # 会让 tools + system 这一段前缀在授权切换时全部失效（见 _insert_system_note）
+        _insert_system_note(messages, aivm.prompt_hint(lease))
     seen: Dict[str, int] = {}
     calls: List[Dict[str, Any]] = []
     usage: Dict[str, int] = {}
@@ -2315,16 +2503,85 @@ async def run_tool_loop(
             return usage
         return {"total_tokens": estimated, "estimated": True}
 
+    def _stamp_perf(step_no: int) -> None:
+        """把步数与 token 一并记进本轮秒表：用量页的「性能」分栏要用它们算均值。"""
+        aiperf.set_value("steps", int(step_no))
+        final = _final_usage()
+        aiperf.set_value("tokens_in", int(final.get("prompt_tokens") or 0))
+        aiperf.set_value("tokens_out", int(final.get("completion_tokens") or 0))
+
     async def _persist(msg: Dict[str, Any]) -> None:
         if on_message is not None:
-            await on_message(msg)
+            # 会话层每条消息都要 SELECT MAX(seq)+INSERT+UPDATE+commit，多步排查
+            # 累计起来并不小；单独计时才能知道「慢在模型还是慢在落库」
+            with aiperf.timing("db_ms"):
+                await on_message(msg)
+
+    async def _persist_many(rows: List[Dict[str, Any]]) -> None:
+        """一次事务写完一组消息（同一轮的多个工具结果是并行的，逐条写纯属浪费）。"""
+        if not rows:
+            return
+        if on_messages is not None:
+            with aiperf.timing("db_ms"):
+                await on_messages(rows)
+            return
+        for row in rows:
+            await _persist(row)
 
     async def _on_delta(piece: str) -> None:
         # 文本增量逐片推给前端，做打字机效果。报告模式不推 —— 那是半截 JSON。
         await notify_fn({"type": "token", "text": piece})
 
+    # 报告模式：整段 JSON 不往外推，但把 summary 抽出来当叙述流，另按字数回进度。
+    # 体检生成本来就是「长时间无输出」—— 结论先逐字长出来，用户就不必对着转圈猜。
+    progress_state = {"chars": 0, "sent_at": 0.0}
+    summary_stream = _JsonSummaryStream()
+
+    async def _on_report_delta(piece: str) -> None:
+        progress_state["chars"] += len(piece)
+        visible = summary_stream.feed(piece)
+        if visible:
+            await notify_fn({"type": "token", "text": visible})
+        now = time.monotonic()
+        if now - progress_state["sent_at"] < 0.5:
+            return
+        progress_state["sent_at"] = now
+        await notify_fn(
+            {"type": "report_progress", "chars": progress_state["chars"]}
+        )
+
+    async def _stream_call(call_messages: List[Dict[str, Any]], **kwargs: Any) -> Dict[str, Any]:
+        """报告模式也走流式：为了进度与结论流，也为了不让长连接静默到被判超时。
+
+        只有**最终那段 JSON**（``json_mode=True``）才抽取 summary 往外推；循环里
+        的工具调用步仍走非流式 —— 它们要么没有正文，要么是「让我查一下」这种
+        过程话，推出去只会干扰阅读。
+        """
+        final_json = bool(kwargs.get("json_mode"))
+        if report_progress and not stream_tokens and final_json:
+            summary_stream.reset()
+            await notify_fn({"type": "token_reset"})
+            return await chat(
+                call_messages,
+                cfg=cfg,
+                provider=provider,
+                client=client,
+                stream=True,
+                on_delta=_on_report_delta,
+                **kwargs,
+            )
+        return await chat(
+            call_messages,
+            cfg=cfg,
+            provider=provider,
+            client=client,
+            stream=stream_tokens,
+            on_delta=_on_delta,
+            **kwargs,
+        )
+
     # 整个循环复用同一个连接池：一轮最多调七八次模型，每次重建连接是浪费
-    async with httpx.AsyncClient(timeout=cfg.get("timeout") or 90) as client:
+    async with httpx.AsyncClient(timeout=httpx_timeout(cfg.get("timeout") or 90)) as client:
         for step in range(1, max_steps + 1):
             if time.time() - started > AGENT_TOTAL_TIMEOUT:
                 logger.warning("AI 工具循环超时（%.0fs），提前收口", time.time() - started)
@@ -2344,15 +2601,9 @@ async def run_tool_loop(
                 # 再调工具，不重置的话它会被拼进最终回答里。那一句本身已经落库，
                 # 刷新后会作为独立的 assistant 气泡出现，不会丢。
                 await notify_fn({"type": "token_reset"})
-            reply = await chat(
-                messages,
-                cfg=cfg,
-                provider=provider,
-                tools=specs,
-                client=client,
-                stream=stream_tokens,
-                on_delta=_on_delta,
-            )
+            aiperf.bump("llm_calls")
+            with aiperf.timing("llm_ms"):
+                reply = await _stream_call(messages, tools=specs)
             _merge_usage(usage, reply.get("usage") or {})
             # 每轮按「本轮发出的完整 messages + 本轮输出」估一次再累加：口径与真实
             # usage 一致（那一轮的 prompt_tokens 同样包含当时完整的输入）。
@@ -2363,6 +2614,7 @@ async def run_tool_loop(
             tool_calls = reply.get("tool_calls") or []
 
             if not tool_calls:
+                _stamp_perf(step)
                 return {
                     "content": str(reply.get("content") or ""),
                     "reply": reply,
@@ -2450,6 +2702,7 @@ async def run_tool_loop(
             writes = [(i, it) for i, it in keyed if _is_write_tool(it["name"])]
 
             outcomes: Dict[int, Dict[str, Any]] = {}
+            tool_started = time.perf_counter()
             if concurrent:
                 results = await asyncio.gather(
                     *[_run(it) for _, it in concurrent], return_exceptions=True
@@ -2463,8 +2716,11 @@ async def run_tool_loop(
                         outcomes[index] = out
             for index, item in writes:
                 outcomes[index] = await _run(item)
+            aiperf.add("tool_ms", (time.perf_counter() - tool_started) * 1000)
 
             # 按模型给出的顺序回填结果（协议上顺序无所谓，读起来顺一点）
+            persisted: List[Dict[str, Any]] = []
+            notices: List[Dict[str, Any]] = []
             for index, item in enumerate(parsed):
                 outcome = outcomes.get(index) or {"ok": False, "output": ""}
                 # 实际执行的那条命令优先（执行层会把它带回来，含逐段 quote 之后的
@@ -2484,7 +2740,7 @@ async def run_tool_loop(
                         "elapsed_ms": outcome.get("elapsed_ms"),
                     }
                 )
-                await notify_fn(
+                notices.append(
                     {
                         "type": "tool_done",
                         "tool": item["name"],
@@ -2503,7 +2759,7 @@ async def run_tool_loop(
                 messages.append(tool_msg)
                 # 落库时额外带上工具名与成败 —— 协议消息本身不含这两个字段，
                 # 但在记录里它们才是「这步干了什么、成没成」的关键。
-                await _persist(
+                persisted.append(
                     {
                         **tool_msg,
                         "tool_name": item["name"],
@@ -2513,21 +2769,22 @@ async def run_tool_loop(
                         "ok": bool(outcome.get("ok")),
                     }
                 )
+            # 先落库再推事件：用户点「终止」时 notify 会抛 StopInspection，
+            # 反过来的话这一轮已经跑完的工具结果会全部丢掉（assistant 行还在，
+            # 重建上下文时整组会被判成半截调用而丢弃）。
+            # 同一轮的工具结果一起写：并行的 4 条工具原来是 4 次事务，
+            # 现在一次 executemany + 一次 commit。
+            await _persist_many(persisted)
+            for notice in notices:
+                await notify_fn(notice)
 
         # 步数用尽 / 超时 / 预算到顶：让它基于已有信息收口，别把已花的 token 全废掉
         messages.append({"role": "user", "content": _step_limit_nudge(finalize_json_mode)})
         if stream_tokens:
             await notify_fn({"type": "token_reset"})
-        reply = await chat(
-            messages,
-            cfg=cfg,
-            provider=provider,
-            json_mode=finalize_json_mode,
-            client=client,
-            stream=stream_tokens,
-            on_delta=_on_delta,
-        )
+        reply = await _stream_call(messages, json_mode=finalize_json_mode)
         _merge_usage(usage, reply.get("usage") or {})
+        _stamp_perf(step)
         return {
             "content": str(reply.get("content") or ""),
             "reply": reply,
@@ -2546,6 +2803,7 @@ async def inspect_agent(
     username: str = "",
     is_admin: bool = False,
     allow_exec: bool = False,
+    allow_write: bool = True,
     perms: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """L2：带工具调用的排查。
@@ -2555,7 +2813,7 @@ async def inspect_agent(
     """
     cfg = await load_config(username)
     if not cfg.get("enabled"):
-        raise AIError(i18n.tr("AI 排查助手未启用，请先在设置里配置并启用大模型"))
+        raise AIError(i18n.tr("AI 助手未启用，请先在设置里配置并启用大模型"))
     provider = pick_provider(
         cfg, provider_id, username=username, is_admin=is_admin
     )
@@ -2576,9 +2834,14 @@ async def inspect_agent(
     )
     collect_ms = int((time.time() - started) * 1000)
 
-    messages = build_agent_messages(host, evidence, allow_exec=allow_exec)
-    # 只有本次排查获得授权，才把「模型自拼只读命令」这把工具交出去
-    specs = aitools.openai_tools(include_exec=allow_exec)
+    messages = build_agent_messages(
+        host, evidence, allow_exec=allow_exec, allow_write=allow_write
+    )
+    # 只有本次排查获得授权，才把「模型自拼只读命令」这把工具交出去；
+    # 只读级别只给读命令，写提议工具不下发，避免提示词与工具表自相矛盾。
+    specs = aitools.openai_tools(
+        include_exec=allow_exec, include_write=allow_write, mode="inspect"
+    )
     loop = await run_tool_loop(
         messages,
         cfg=cfg,
@@ -2595,6 +2858,8 @@ async def inspect_agent(
         perms=perms,
         max_steps=MAX_STEPS,
         finalize_json_mode=True,
+        # 报告是整段 JSON，不能直接给用户看半截括号；但生成过程要能看到在动
+        report_progress=True,
     )
     result = parse_reply(loop["content"])
     return _agent_result(

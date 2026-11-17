@@ -858,6 +858,133 @@ class SnapshotCreate(BaseModel):
         return cleaned
 
 
+class SnapshotBulkDeleteItem(BaseModel):
+    """批量删除快照的一条目标。
+
+    与 :class:`BulkTarget` 不同，这里定位的是**某一份快照**，所以必须带 ``name``；
+    ``type`` 决定走虚拟机的 ``vm.snapshot`` 还是容器的 ``ct.snapshot`` —— 两边是
+    两套 PVE 端点、两套权限点，光有 VMID 分不出来。
+    """
+
+    node: str
+    vmid: int
+    type: str = "qemu"
+    name: str
+
+    @field_validator("type")
+    @classmethod
+    def _type_valid(cls, value: str) -> str:
+        cleaned = (value or "qemu").strip()
+        if cleaned not in ("qemu", "lxc"):
+            raise ValueError("客户机类型只能是 qemu 或 lxc")
+        return cleaned
+
+    @field_validator("name")
+    @classmethod
+    def _name_valid(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise ValueError("快照名称不能为空")
+        return cleaned
+
+
+class SnapshotBulkDelete(BaseModel):
+    """批量删除一批快照。
+
+    与 :class:`BulkRequest` 同一口径：接口**不抛整批失败**，逐条执行、逐条回报，
+    HTTP 200 只表示请求本身合法，成败看 ``results`` 里每一项的 ``ok``。
+    """
+
+    items: List[SnapshotBulkDeleteItem]
+
+    @field_validator("items")
+    @classmethod
+    def _items_valid(
+        cls, value: List[SnapshotBulkDeleteItem]
+    ) -> List[SnapshotBulkDeleteItem]:
+        if not value:
+            raise ValueError("请至少选择一个快照")
+        if len(value) > 200:
+            raise ValueError("单次最多删除 200 个快照，请分批执行")
+        seen = set()
+        for item in value:
+            key = (item.node, item.vmid, item.name)
+            if key in seen:
+                # 同一条点两次会让 PVE 收到两次删除，第二次必然报「快照不存在」
+                raise ValueError(f"目标重复：{item.node}/{item.vmid}/{item.name}")
+            seen.add(key)
+        return value
+
+
+class SnapshotBulkRestoreItem(BaseModel):
+    """批量还原的一条目标：把**这一台**机器回滚到**它自己的**某一快照。
+
+    与 :class:`SnapshotBulkDeleteItem` 形状相同，但语义完全不同（那条是「删掉这
+    一份快照」，这条是「这台机器回到哪个时间点」），所以刻意分成两个模型：两者的
+    权限判定、错误文案、失败后要不要补偿都不一样，合并会在提示里把「删除」写进
+    「还原」。
+
+    ``name`` 必填：批量还原**不是**「全批用同一个快照名」—— 每台机器的快照链各自
+    独立，A 机器上的 ``before-upgrade`` 与 B 机器上的同名快照没有关系，甚至可能
+    只有 A 有。逐条带名字，才能让用户在界面上逐台核对。
+    """
+
+    node: str
+    vmid: int
+    type: str = "qemu"
+    name: str
+
+    @field_validator("type")
+    @classmethod
+    def _type_valid(cls, value: str) -> str:
+        cleaned = (value or "qemu").strip()
+        if cleaned not in ("qemu", "lxc"):
+            raise ValueError("客户机类型只能是 qemu 或 lxc")
+        return cleaned
+
+    @field_validator("name")
+    @classmethod
+    def _name_valid(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise ValueError("请选择要还原到的快照")
+        # 「current」是 PVE 快照清单里的伪条目（表示「现在」），不是可回滚的目标
+        if cleaned.lower() == "current":
+            raise ValueError("「current」不是可还原的快照，请选择具体快照")
+        return cleaned
+
+
+class SnapshotBulkRestore(BaseModel):
+    """批量还原一批机器到各自的指定快照。
+
+    与 :class:`BulkRequest` 同一口径：接口**不抛整批失败**，逐条执行、逐条回报，
+    HTTP 200 只表示请求本身合法，成败看 ``results`` 里每一项的 ``ok``。
+    """
+
+    items: List[SnapshotBulkRestoreItem]
+
+    @field_validator("items")
+    @classmethod
+    def _items_valid(
+        cls, value: List[SnapshotBulkRestoreItem]
+    ) -> List[SnapshotBulkRestoreItem]:
+        if not value:
+            raise ValueError("请至少选择一台虚拟机或容器")
+        if len(value) > 200:
+            raise ValueError("单次最多还原 200 台机器，请分批执行")
+        seen = set()
+        for item in value:
+            # 同一台机器出现两条 = 两个目标快照，先回滚哪一个都不对：
+            # 后一条会在前一条刚回滚完的链上执行，用户看到的结果无法预期。
+            key = (item.node, item.vmid, item.type)
+            if key in seen:
+                raise ValueError(
+                    f"同一台机器只能指定一个快照：{item.node}/{item.vmid}"
+                )
+            seen.add(key)
+        return value
+
+
 # ------------------------------------------------------------------ bulk ops
 class BulkTarget(BaseModel):
     """批量操作的一台目标机器。"""

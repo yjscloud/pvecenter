@@ -41,6 +41,7 @@ import { IconAlert } from './Icons';
 import { ReinstallTemplatePicker } from './ReinstallTemplatePicker';
 import { formatBytes } from '../utils/format';
 import {
+  familyByKey,
   findOriginalTemplate,
   osFamilyOf,
   recommendTemplate,
@@ -237,12 +238,30 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
   const selected = templates.find((item) => String(item.vmid) === templateId);
   const templateStorage = selected?.disk ? String(selected.disk).split(':')[0] : '';
 
-  /* 原机器是什么系统：来源模板名最可信（重装 / 克隆时记下来的），其次机器名，
-     最后才是 PVE 的 ostype —— 它对 Linux 一律 l26，只够分 Windows / Linux */
-  const originalFamily = useMemo(
-    () => osFamilyOf([vm?.source_template?.name, vm?.name], netQuery.data?.ostype),
-    [vm?.source_template?.name, vm?.name, netQuery.data?.ostype],
-  );
+  /* 原机器是什么系统，按可信度从高到低：
+     1. 面板侧人工标注（``vm_meta.os``）—— 运维确认过，最可信；
+     2. 来源模板名（重装 / 克隆时记下来的）；
+     3. 机器名；
+     4. PVE 的 ostype —— 对 Linux 一律 l26，导入 / 手工建的机器还可能停在 win*。 */
+  const originalFamily = useMemo(() => {
+    const recorded = vm
+      ? familyByKey(
+          metaQuery.data?.items?.[
+            vmMetaKey(vm.connection_id, vm.node, vm.vmid)
+          ]?.os,
+        )
+      : null;
+    return (
+      recorded ??
+      osFamilyOf([vm?.source_template?.name, vm?.name], netQuery.data?.ostype)
+    );
+  }, [
+    metaQuery.data,
+    vm,
+    vm?.source_template?.name,
+    vm?.name,
+    netQuery.data?.ostype,
+  ]);
 
   /* 同平台模板：Windows 与 Linux 不能互相重装；发行版之间都属于 Linux，可以换 */
   const compatibleTemplates = useMemo(() => {
@@ -284,8 +303,15 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
         visibleTemplates,
         [vm?.source_template?.name, vm?.name],
         netQuery.data?.ostype,
+        originalFamily,
       ),
-    [visibleTemplates, vm?.source_template?.name, vm?.name, netQuery.data?.ostype],
+    [
+      visibleTemplates,
+      vm?.source_template?.name,
+      vm?.name,
+      netQuery.data?.ostype,
+      originalFamily,
+    ],
   );
   /* 面板侧记录的手动 IP：**只在 PVE 里读不到网络配置时**才拿它兜底 ——
      它是人手填的，可能带掩码也可能不带，不如 ipconfigN 可靠。 */

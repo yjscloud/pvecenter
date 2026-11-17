@@ -22,8 +22,19 @@ export type OsFamilyKey =
   | 'rocky'
   | 'alma'
   | 'fedora'
+  /* 国产发行版：各自有官方标识，且模板名里的写法千差万别，必须单独成组 ——
+     混进通用 Linux 会让一排木箱里分不出哪台是麒麟、哪台是统信。 */
+  | 'kylin'
+  | 'uos'
+  | 'openeuler'
+  | 'anolis'
   | 'tencent'
   | 'opencloudos'
+  | 'deepin'
+  | 'alios'
+  | 'redflag'
+  /* Proxmox 自家的模板 /  appliances（PBS、PMG 等）也常被当成"系统"出现在列表里 */
+  | 'proxmox'
   | 'suse'
   | 'coreos'
   | 'openwrt'
@@ -58,19 +69,26 @@ const FAMILIES: Record<OsFamilyKey, OsFamily> = {
   rocky: { key: 'rocky', label: 'Rocky Linux', rank: 5 },
   alma: { key: 'alma', label: 'AlmaLinux', rank: 6 },
   fedora: { key: 'fedora', label: 'Fedora', rank: 7 },
-  /* 腾讯的 TencentOS Server（原 tlinux）单独成组：它有自己的官方标识，与
-     「认得出是 Linux 但没有单独 logo」的那批（openEuler / 麒麟）不同，
-     混进通用 Linux 组会让一排 Tux 里分不出哪台是它。 */
-  tencent: { key: 'tencent', label: 'TencentOS', rank: 8 },
-  opencloudos: { key: 'opencloudos', label: 'openCloudOS', rank: 9 },
-  suse: { key: 'suse', label: 'openSUSE', rank: 10 },
-  coreos: { key: 'coreos', label: 'CoreOS', rank: 11 },
-  openwrt: { key: 'openwrt', label: 'OpenWrt', rank: 12 },
-  fnos: { key: 'fnos', label: 'fnOS', rank: 13 },
-  alpine: { key: 'alpine', label: 'Alpine', rank: 14 },
-  arch: { key: 'arch', label: 'Arch Linux', rank: 15 },
-  linux: { key: 'linux', label: 'Linux', rank: 16 },
-  other: { key: 'other', label: 'Other', rank: 17 },
+  /* 国产发行版集中排在 RHEL 系之后：这是运维挑模板时的实际顺序 —— 先看通用
+     发行版，再在国产替代里按「麒麟 / 统信 / 欧拉 / 龙蜥 / 腾讯系」找。 */
+  kylin: { key: 'kylin', label: 'Kylin', rank: 8 },
+  uos: { key: 'uos', label: 'UOS', rank: 9 },
+  openeuler: { key: 'openeuler', label: 'openEuler', rank: 10 },
+  anolis: { key: 'anolis', label: 'Anolis OS', rank: 11 },
+  tencent: { key: 'tencent', label: 'TencentOS', rank: 12 },
+  opencloudos: { key: 'opencloudos', label: 'openCloudOS', rank: 13 },
+  deepin: { key: 'deepin', label: 'deepin', rank: 14 },
+  alios: { key: 'alios', label: 'Alibaba Cloud Linux', rank: 15 },
+  redflag: { key: 'redflag', label: 'Red Flag', rank: 16 },
+  proxmox: { key: 'proxmox', label: 'Proxmox', rank: 17 },
+  suse: { key: 'suse', label: 'openSUSE', rank: 18 },
+  coreos: { key: 'coreos', label: 'CoreOS', rank: 19 },
+  openwrt: { key: 'openwrt', label: 'OpenWrt', rank: 20 },
+  fnos: { key: 'fnos', label: 'fnOS', rank: 21 },
+  alpine: { key: 'alpine', label: 'Alpine', rank: 22 },
+  arch: { key: 'arch', label: 'Arch Linux', rank: 23 },
+  linux: { key: 'linux', label: 'Linux', rank: 24 },
+  other: { key: 'other', label: 'Other', rank: 25 },
 };
 
 /** 名称 → 家族。顺序有意义：更具体的词排在更宽泛的前面。 */
@@ -95,6 +113,21 @@ const NAME_RULES: Array<[RegExp, OsFamilyKey]> = [
      tenc-**entos**，按 centos 先匹配会把这张模板整个分进 CentOS 组（实测过）。
      它有自己的官方标识，也不该落进下面那条通用的 Tux 兜底。 */
   [/tencent\s*os|\btlinux/i, 'tencent'],
+  /* 国产发行版：都排在上面的通用兜底之前，否则会被 `/euler|kylin|deepin/` 那条
+     一网打进 Linux 组。写法按实际模板名收录 —— PVE 里常见 `Kylin-Server-V10`、
+     `UOS-20`、`openEuler-22.03`、`AnolisOS-8`、`aliyun_3`、`RedFlag-8`。
+     `NeoKylin`（中标麒麟）含 kylin，自然归到麒麟组。 */
+  [/kylin|麒麟/i, 'kylin'],
+  [/union\s*tech|\buos\b|统信/i, 'uos'],
+  [/open\s*euler|\beuler/i, 'openeuler'],
+  [/anolis|龙蜥/i, 'anolis'],
+  [/deepin/i, 'deepin'],
+  /* 阿里云系的三种写法都见过：`alibaba-cloud-linux-3`（全称带连字符）、
+     `aliyun_3`（镜像站的卷名）与 `alinux3`（内部简称，数字直接粘着）——
+     所以不做词尾边界，只卡词首。 */
+  [/alibaba[\s-]*cloud[\s-]*linux|\baliyun|\balinux|\balios\b/i, 'alios'],
+  [/red\s*flag|asianux|红旗/i, 'redflag'],
+  [/proxmox/i, 'proxmox'],
   [/centos/i, 'centos'],
   [/fedora/i, 'fedora'],
   /* 腾讯参与的国产服务器发行版，名字里没有能误伤别人的词，但同样要有自己的组。 */
@@ -108,10 +141,10 @@ const NAME_RULES: Array<[RegExp, OsFamilyKey]> = [
   [/alpine/i, 'alpine'],
   [/\barch(?:linux)?\b/i, 'arch'],
   /* 认得出是 Linux、但没有（也不需要）单独 logo 的发行版：Oracle Linux /
-     Amazon Linux 与国产发行版。落到通用的 Tux，比扔进「认不出」诚实 ——
+     Amazon Linux 等。落到通用的 Tux，比扔进「认不出」诚实 ——
      列表里一排「···」会让人以为面板坏了。 */
   [
-    /oracle\s*linux|\bol\d|amazon\s*linux|\bamzn\b|euler|kylin|deepin|\buos\b|gentoo|slackware|nixos|void\s*linux/i,
+    /oracle\s*linux|\bol\d|amazon\s*linux|\bamzn\b|gentoo|slackware|nixos|void\s*linux/i,
     'linux',
   ],
 ];
@@ -179,6 +212,16 @@ export function familyByKey(key: string | null | undefined): OsFamily | null {
   const name = String(key ?? '').trim().toLowerCase();
   if (!name) return null;
   return (FAMILIES as Record<string, OsFamily | undefined>)[name] ?? null;
+}
+
+/**
+ * 全部家族，按 rank 排序。
+ *
+ * 给「修正系统标识」的下拉用：这里列的是面板认得的全部 key，与
+ * :func:`familyByKey` 读取的映射是同一份，新增发行版只需要改上面那张表。
+ */
+export function allFamilies(): OsFamily[] {
+  return Object.values(FAMILIES).sort((a, b) => a.rank - b.rank);
 }
 
 /**
@@ -300,8 +343,16 @@ const MARKS: Record<OsFamilyKey, string> = {
   rocky: 'RCK',
   alma: 'ALM',
   fedora: 'FED',
+  kylin: 'KYL',
+  uos: 'UOS',
+  openeuler: 'EUL',
+  anolis: 'ANO',
   tencent: 'TOS',
   opencloudos: 'OCO',
+  deepin: 'DEE',
+  alios: 'ALI',
+  redflag: 'RFL',
+  proxmox: 'PVE',
   suse: 'SUS',
   coreos: 'COS',
   openwrt: 'WRT',
@@ -352,9 +403,16 @@ export function recommendTemplate<T extends OsLabeled>(
   templates: T[],
   names: Array<string | null | undefined>,
   ostype?: string | null,
+  /**
+   * 已经确定的家族（例如面板侧人工标注的 ``vm_meta.os``）。
+   *
+   * 传了就不再从名字 / ostype 推断：否则清单按「人工确认的系统」过滤，
+   * 默认选中项却按错误的 ostype 推荐，两个结论在同一个弹窗里打架。
+   */
+  knownFamily?: OsFamily | null,
 ): T | null {
   if (!templates.length) return null;
-  const family = osFamilyOf(names, ostype);
+  const family = knownFamily ?? osFamilyOf(names, ostype);
   const familyOf = (item: T) => templateFamily(item);
 
   const sameFamily = templates.filter((item) => familyOf(item).key === family.key);

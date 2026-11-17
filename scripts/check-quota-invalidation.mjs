@@ -73,6 +73,10 @@ const QUOTA_MUTATING = [
   'guestsApi.createSnapshot',
   'guestsApi.deleteSnapshot',
   'guestsApi.rollbackSnapshot',
+  // 全局快照页的批量删除（一次请求删多条，同样减快照额度）
+  'vmsApi.bulkDeleteSnapshots',
+  // 批量还原会截断快照链（目标之后的快照被丢弃），快照读数同样要重算
+  'vmsApi.bulkRestoreSnapshots',
   // 归属（决定算在谁头上）
   'vmsApi.assignOwner',
   'lxcApi.assignOwner',

@@ -65,7 +65,8 @@ echo "[1/3] 准备虚拟环境 $VENV ..."
 VPY="$VENV/bin/python"
 
 echo "[2/3] 安装后端依赖..."
-"$VPY" -m pip install -q -r "$ROOT/backend/requirements.txt"
+# 已装齐时不联网（详见 scripts/install_deps.sh）：生产机重启脚本不该依赖 PyPI 可达
+bash "$ROOT/scripts/install_deps.sh" "$VPY" "$ROOT/backend/requirements.txt"
 
 # --- 3. 生成 .env（首次运行）------------------------------------------------
 if [ ! -f "$ROOT/backend/.env" ]; then

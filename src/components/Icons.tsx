@@ -40,6 +40,21 @@ export const IconGlobe = (p: IconProps) => (
   </Icon>
 );
 
+/** 太阳：切到浅色 / 当前是浅色 */
+export const IconSun = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="12" cy="12" r="4" />
+    <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+  </Icon>
+);
+
+/** 月亮：切到深色 / 当前是深色 */
+export const IconMoon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M20.5 14.3A8.5 8.5 0 0 1 9.7 3.5a8.5 8.5 0 1 0 10.8 10.8z" />
+  </Icon>
+);
+
 export const IconDashboard = (p: IconProps) => (
   <Icon {...p}>
     <rect x="3" y="3" width="7.5" height="7.5" rx="1.5" />

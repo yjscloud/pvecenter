@@ -161,6 +161,8 @@ export const zhApp = {
   'bulk.tag': '打标签',
   'bulk.migrate': '迁移',
   'bulk.snapshot': '创建快照',
+  'bulk.snapshot_restore': '还原快照',
+  'bulk.snapshot_delete': '删除快照',
   'bulk.assign': '指派归属',
   'bulk.title': '批量{label}完成：成功 {ok} 台，失败 {failed} 台',
 

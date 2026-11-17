@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS ai_sessions (
     duration_ms       INT          NOT NULL DEFAULT 0,
     error             VARCHAR(512) NOT NULL DEFAULT '',
     result            MEDIUMTEXT,
+    -- 分段耗时（JSON 字符串）。**不能带 DEFAULT**：MySQL 8 直接拒绝
+    -- "BLOB, TEXT, GEOMETRY or JSON column 'metrics' can't have a default value"
+    -- （MariaDB 允许，于是本地/容器里测不出来，一上 MySQL 就开不了机）。
+    -- 允许 NULL：老行为空，读取处已经按 '' 兜底。
+    metrics           TEXT,
     created           BIGINT       NOT NULL DEFAULT 0,
     finished          BIGINT       NOT NULL DEFAULT 0,
     PRIMARY KEY (id),
@@ -85,6 +90,12 @@ async def init_table() -> None:
                 "ALTER TABLE ai_sessions ADD COLUMN conversation_id VARCHAR(40)"
                 " NOT NULL DEFAULT ''"
             )
+        # 分段耗时：优化前后要能按 session_id 对比「首字 / 模型 / 工具 / 落库」
+        # 各花了多久，只有总时长是不够的（知道慢，不知道慢在哪）。存量行留空。
+        # 同样**不能带 DEFAULT**：MySQL 8 不允许 TEXT 列有默认值，而这条 ALTER
+        # 会在启动时跑，写错就是「面板起不来 + systemd 反复重启」。
+        if "metrics" not in columns:
+            await db.execute("ALTER TABLE ai_sessions ADD COLUMN metrics TEXT")
         # 工具调用补列：这条调用**实际在主机上跑的完整命令**。args 只说明「选了
         # 哪个工具、填了什么参数」（unit=sshd），命令才是用户要核对的东西
         # （journalctl -u sshd -n 60 --no-pager）。存量行留空：命令没存过，
@@ -150,6 +161,7 @@ async def finish_session(
     duration_ms: int = 0,
     error: str = "",
     result: Optional[Dict[str, Any]] = None,
+    metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
     usage = usage or {}
     # 结论以 JSON 落库；序列化失败（模型偶尔塞进不可序列化的东西）不该影响收尾，
@@ -160,12 +172,18 @@ async def finish_session(
             result_json = json.dumps(result, ensure_ascii=False)
         except (TypeError, ValueError):
             result_json = ""
+    metrics_json = ""
+    if metrics:
+        try:
+            metrics_json = json.dumps(metrics, ensure_ascii=False)
+        except (TypeError, ValueError):
+            metrics_json = ""
     try:
         async with database.connect() as db:
             await db.execute(
                 "UPDATE ai_sessions SET status=?, model=?, steps=?, tool_calls=?,"
                 " prompt_tokens=?, completion_tokens=?, total_tokens=?, duration_ms=?,"
-                " error=?, result=?, finished=? WHERE id=?",
+                " error=?, result=?, metrics=?, finished=? WHERE id=?",
                 (
                     str(status or "done"),
                     str(model or "")[:191],
@@ -177,6 +195,7 @@ async def finish_session(
                     int(duration_ms or 0),
                     str(error or "")[:500],
                     result_json,
+                    metrics_json,
                     int(time.time()),
                     session_id,
                 ),
@@ -213,16 +232,16 @@ async def record_calls(session_id: str, calls: List[Dict[str, Any]]) -> None:
         )
     try:
         async with database.connect() as db:
-            # 逐条 execute 而不是 executemany：本项目的 database 封装只有
-            # execute / executescript（见 app/database.py），没有 executemany。
-            # 一次排查也就十几条，够用。
-            for row in rows:
-                await db.execute(
-                    "INSERT INTO ai_tool_calls (id, session_id, step, tool, args,"
-                    " command, ok, output, elapsed_ms, created)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    row,
-                )
+            # database._Connection 有 executemany（会把参数攒成一个多值 INSERT）：
+            # 一次排查十几条工具调用，原来逐条 execute 是十几次数据库往返，现在
+            # 一次。收尾不在首字路径上，但省下来的时间直接缩短「答案出来后还要
+            # 转一会儿」的那段。
+            await db.executemany(
+                "INSERT INTO ai_tool_calls (id, session_id, step, tool, args,"
+                " command, ok, output, elapsed_ms, created)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
             await db.commit()
     except Exception:  # noqa: BLE001
         logger.warning("AI 工具调用落库失败", exc_info=True)
@@ -305,6 +324,28 @@ USAGE_MAX_DAYS = 365
 #: 按模型分组最多返回几条。长尾（偶发用一次的模型）没必要占位置。
 USAGE_MODEL_LIMIT = 6
 
+#: 性能分位数取多少条最近的会话。
+#:
+#: MySQL 没有 ``PERCENTILE_CONT``（8.0 也没有），与其拼窗口函数再在 SQL 里算，
+#: 不如把最近的样本拉回来算 —— 500 行只有两列（耗时 + 一小段 JSON），代价可忽略，
+#: 而「最近 500 轮的 p95」正是回答「现在慢不慢」要的口径。
+USAGE_PERF_SAMPLE = 500
+#: 分位数取值。p50 看体感，p95 看长尾尖刺。
+PERF_QUANTILES = (50, 95)
+
+
+def _percentile(values: List[float], q: int) -> int:
+    """最近秩法取分位数；空集返回 0（前端显示「—」）。"""
+    if not values:
+        return 0
+    ordered = sorted(values)
+    if q <= 0:
+        return int(round(ordered[0]))
+    if q >= 100:
+        return int(round(ordered[-1]))
+    index = int(round((q / 100) * (len(ordered) - 1)))
+    return int(round(ordered[max(0, min(len(ordered) - 1, index))]))
+
 
 async def usage_stats(
     *,
@@ -343,6 +384,7 @@ async def usage_stats(
     }
     by_model: List[Dict[str, Any]] = []
     daily: List[Dict[str, Any]] = []
+    perf_rows: List[Dict[str, Any]] = []
     try:
         async with database.connect() as db:
             # 「近 N 天」按**自然日**对齐：起点取 MySQL 时区里今天的 00:00 往前推
@@ -439,18 +481,73 @@ async def usage_stats(
                         "total_tokens": int(item.get("total_tokens") or 0),
                     }
                 )
+
+            # 性能分栏：最近若干轮的分段耗时。metrics 是 otel 之前的「本机秒表」，
+            # 老行可能没有它（或不是合法 JSON），那种行只贡献 duration_ms。
+            cursor = await db.execute(
+                "SELECT duration_ms, metrics FROM ai_sessions" + clause
+                + " ORDER BY id DESC LIMIT ?",
+                tuple([*params, USAGE_PERF_SAMPLE]),
+            )
+            perf_rows = [dict(item) for item in await cursor.fetchall()]
     except Exception:  # noqa: BLE001 - 统计失败退化成空数据，不该让卡片整块报错
         logger.warning("读取 AI 用量统计失败", exc_info=True)
 
     runs = totals["runs"]
     totals["avg_tokens"] = int(totals["total_tokens"] / runs) if runs else 0
     totals["avg_duration_ms"] = int(totals["duration_ms"] / runs) if runs else 0
+
+    # 分段耗时分位数：把「首字慢」「排队久」「模型慢」「工具慢」分开看，
+    # 否则只有一个 avg_duration_ms —— 它既掩盖长尾，也说不出该优化哪一层。
+    buckets: Dict[str, List[float]] = {
+        "ttfb_ms": [],
+        "queue_ms": [],
+        "llm_ms": [],
+        "tool_ms": [],
+        "steps": [],
+    }
+    for item in perf_rows:
+        try:
+            metrics = json.loads(str(item.get("metrics") or "") or "{}")
+        except (TypeError, ValueError):
+            metrics = {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        for key, bucket in buckets.items():
+            try:
+                value = float(metrics.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                bucket.append(value)
+    end_to_end = [
+        float(item.get("duration_ms") or 0)
+        for item in perf_rows
+        if float(item.get("duration_ms") or 0) > 0
+    ]
+
+    def _avg(values: List[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    perf = {
+        "samples": len(perf_rows),
+        "ttfb_p50": _percentile(buckets["ttfb_ms"], 50),
+        "ttfb_p95": _percentile(buckets["ttfb_ms"], 95),
+        "e2e_p50": _percentile(end_to_end, 50),
+        "e2e_p95": _percentile(end_to_end, 95),
+        "queue_p50": _percentile(buckets["queue_ms"], 50),
+        "queue_p95": _percentile(buckets["queue_ms"], 95),
+        "llm_avg_ms": int(_avg(buckets["llm_ms"])),
+        "tool_avg_ms": int(_avg(buckets["tool_ms"])),
+        "steps_avg": round(_avg(buckets["steps"]), 1),
+    }
     return {
         "days": window,
         "since": since,
         "total": totals,
         "by_model": by_model,
         "daily": daily,
+        "perf": perf,
     }
 
 

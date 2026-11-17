@@ -110,6 +110,22 @@ class FakeClient:
         self.calls.append(("lxc_snapshot_create", node, vmid, name))
         return "UPID:pve:4:4:4::snapshot:"
 
+    async def qemu_snapshots(self, node, vmid):
+        self.calls.append(("qemu_snapshots", node, vmid))
+        return [{"name": "current"}, {"name": "snap1"}]
+
+    async def lxc_snapshots(self, node, vmid):
+        self.calls.append(("lxc_snapshots", node, vmid))
+        return [{"name": "current"}, {"name": "snap1"}]
+
+    async def qemu_snapshot_rollback(self, node, vmid, name):
+        self.calls.append(("qemu_snapshot_rollback", node, vmid, name))
+        return "UPID:pve:5:5:5::rollback:"
+
+    async def lxc_snapshot_rollback(self, node, vmid, name):
+        self.calls.append(("lxc_snapshot_rollback", node, vmid, name))
+        return "UPID:pve:5:5:5::rollback:"
+
     async def storages(self, node):
         """快照前的存储能力校验会读节点存储清单。
 
@@ -186,6 +202,16 @@ class TestValidateAction:
         with pytest.raises(Exception):
             bulk.validate_action("snapshot", BulkParams(name="bad name!"))
 
+    def test_snapshot_restore_requires_name(self) -> None:
+        with pytest.raises(HTTPException) as exc:
+            bulk.validate_action("snapshot_restore", BulkParams())
+        assert "快照名称" in exc.value.detail
+
+    def test_snapshot_restore_rejects_current_pseudo_entry(self) -> None:
+        """``current`` 是快照清单里的伪条目，不是可回滚目标。"""
+        with pytest.raises(HTTPException):
+            bulk.validate_action("snapshot_restore", BulkParams(name="current"))
+
     def test_tag_requires_tags(self) -> None:
         with pytest.raises(HTTPException):
             bulk.validate_action("tag", BulkParams())
@@ -204,6 +230,8 @@ class TestPermissionMapping:
         assert bulk.permission_for("start", "lxc") == "ct.power"
         assert bulk.permission_for("delete", "lxc") == "ct.delete"
         assert bulk.permission_for("snapshot", "lxc") == "ct.snapshot"
+        assert bulk.permission_for("snapshot_restore", "qemu") == "vm.snapshot"
+        assert bulk.permission_for("snapshot_restore", "lxc") == "ct.snapshot"
         assert bulk.permission_for("tag", "qemu") == "vm.config"
         assert bulk.permission_for("tag", "lxc") == "ct.config"
         # 迁移是独立权限点（与「修改配置」分开）
@@ -372,6 +400,20 @@ class TestDelete:
     def test_stopped_guest_is_destroyed(self, monkeypatch) -> None:
         client = FakeClient(kind="qemu", status="stopped")
         _install(monkeypatch, client)
+        cleaned: list[tuple[str, str, int]] = []
+
+        async def _forget(conn_id, node, vmid):
+            cleaned.append((conn_id, node, vmid))
+            return 1
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        # 本条用例只关心「销毁后有没有连带清理」，其余落库的收尾动作不参与断言
+        monkeypatch.setattr(bulk.ownership, "forget_guest", _noop)
+        monkeypatch.setattr(bulk.ippool, "release_guest", _noop)
+        # 置顶 / 收藏的清理属于「与销毁同一笔账」，必须跟着删除一起发生
+        monkeypatch.setattr(bulk.prefs, "forget_guest_refs", _forget)
         item = run(
             bulk._run_one(
                 _request(),
@@ -383,6 +425,7 @@ class TestDelete:
         )
         assert item["ok"] is True
         assert ("qemu_destroy", "pve", 100, False) in client.calls
+        assert [(node, vmid) for _, node, vmid in cleaned] == [("pve", 100)]
 
 
 # --------------------------------------------------------------- 归属隔离
@@ -504,6 +547,62 @@ class TestRunBulk:
         )
         assert result["ok"] == 1
         assert ("lxc_snapshot_create", "pve", 100, "snap1") in client.calls
+
+    def test_snapshot_restore_rolls_back_a_vm(self, monkeypatch) -> None:
+        client = FakeClient(kind="qemu")
+        _install(monkeypatch, client)
+        result = run(
+            bulk.run_bulk(
+                _request(),
+                _user(),
+                BulkRequest(
+                    action="snapshot_restore",
+                    targets=[BulkTarget(node="pve", vmid=100, type="qemu")],
+                    params=BulkParams(name="snap1"),
+                ),
+            )
+        )
+        assert result["ok"] == 1
+        assert ("qemu_snapshot_rollback", "pve", 100, "snap1") in client.calls
+
+    def test_snapshot_restore_rolls_back_a_container(self, monkeypatch) -> None:
+        """容器走 lxc 的 rollback，不能误打到 qemu 路径。"""
+        client = FakeClient(kind="lxc")
+        _install(monkeypatch, client)
+        result = run(
+            bulk.run_bulk(
+                _request(),
+                _user(),
+                BulkRequest(
+                    action="snapshot_restore",
+                    targets=[BulkTarget(node="pve", vmid=101, type="lxc")],
+                    params=BulkParams(name="snap1"),
+                ),
+            )
+        )
+        assert result["ok"] == 1
+        assert ("lxc_snapshot_rollback", "pve", 101, "snap1") in client.calls
+        assert not any(c[0] == "qemu_snapshot_rollback" for c in client.calls)
+
+    def test_snapshot_restore_missing_snapshot_fails_per_item(self, monkeypatch) -> None:
+        """没有同名快照的那台要单独报错，且绝不调用 rollback。"""
+        client = FakeClient(kind="qemu")
+        _install(monkeypatch, client)
+        result = run(
+            bulk.run_bulk(
+                _request(),
+                _user(),
+                BulkRequest(
+                    action="snapshot_restore",
+                    targets=[BulkTarget(node="pve", vmid=100, type="qemu")],
+                    params=BulkParams(name="nope"),
+                ),
+            )
+        )
+        assert result["ok"] == 0
+        assert result["failed"] == 1
+        assert "没有名为" in result["results"][0]["error"]
+        assert not any(c[0] == "qemu_snapshot_rollback" for c in client.calls)
 
     def test_migrate_uses_target_node_and_online(self, monkeypatch) -> None:
         client = FakeClient()
