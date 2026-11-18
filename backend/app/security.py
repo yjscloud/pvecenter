@@ -403,7 +403,7 @@ PERMISSION_CATALOG: List[Dict[str, Any]] = [
     },
     {
         "key": "ports",
-        "label": "端口与进程",
+        "label": "端口进程",
         "permissions": [
             {
                 "key": "ports.view",

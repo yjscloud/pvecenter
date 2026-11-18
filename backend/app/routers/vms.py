@@ -1874,7 +1874,7 @@ async def _best_effort(label: str, action: Any) -> None:
 async def _purge_managed_vm(vmid: int, node: str = "") -> None:
     """删机后清掉面板为它登记的受管主机及其安全数据（失败落补偿队列）。
 
-    这是「资源回收 → 端口与进程里的服务器」之间唯一的实时同步点，所以：
+    这是「资源回收 → 端口进程里的服务器」之间唯一的实时同步点，所以：
 
     * 失败不能让删除接口报错（机器已经没了），但也**不能只记日志** —— 只记日志
       等于悄悄留一台僵尸主机，界面上那台服务器会一直连不上。失败时落一条补偿
@@ -1929,7 +1929,7 @@ async def delete_vm(
     task = result if isinstance(result, str) else (result or {}).get("task", "")
     await security.audit(request, user, "vm.delete", target=f"{node}/{vmid}")
     # 受管主机（勾了「接入安全管控」才会有）**紧贴 destroy 之后**清掉，连同它在
-    # 「SSH 安全 / 登录审计 / 端口与进程 / 安全基线」里的数据 —— 机器都没了，再
+    # 「SSH 安全 / 登录审计 / 端口进程 / 安全基线」里的数据 —— 机器都没了，再
     # 留着只会每轮巡检白拨一条 SSH。放在善后链的最后一行是错的：前面任何一步抛
     # 错（库抖动、超时），这一步就永远走不到，而机器已经被销毁了。
     await _purge_managed_vm(vmid, node)

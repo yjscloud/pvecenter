@@ -506,7 +506,7 @@ export function App() {
             </RequirePermission>
           }
         />
-        {/* 端口与进程：监听端口清单 + 可疑进程启发式（主机级，默认管理员） */}
+        {/* 端口进程：监听端口清单 + 可疑进程启发式（主机级，默认管理员） */}
         <Route
           path="/ports"
           element={

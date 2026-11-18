@@ -1928,7 +1928,7 @@ class PortDispositionIn(BaseModel):
 
 
 class PortPolicyIn(BaseModel):
-    """端口巡检策略：预期端口与进程白名单是压掉误报的主要手段。"""
+    """端口巡检策略：预期端口进程白名单是压掉误报的主要手段。"""
 
     enabled: bool = True
     alert_open_ports: bool = True

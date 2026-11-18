@@ -163,7 +163,7 @@ async def put_policy(
     request: Request,
     user: Dict[str, Any] = Depends(MANAGE),
 ) -> Dict[str, Any]:
-    """保存巡检策略。预期端口与进程白名单是压掉误报的主要手段。"""
+    """保存巡检策略。预期端口进程白名单是压掉误报的主要手段。"""
     policy = await portguard.save_policy(payload.model_dump())
     # 判定口径变了：缓存与落库快照里的报告已经不对，下一次必须真巡检
     await reportcache.clear()

@@ -284,7 +284,7 @@ class Settings(BaseSettings):
     metrics_retention_days: int = 30
 
     # --- 巡检快照落库 ------------------------------------------------------
-    # 「端口与进程」「安全基线」的现场巡检结果按主机落一张快照表，读接口只读
+    # 「端口进程」「安全基线」的现场巡检结果按主机落一张快照表，读接口只读
     # 快照、现场巡检交给后台作业。详见 app/inspection.py。
     # 关掉即回到改造前行为：每次打开都现场巡检（调试 / 排查时可临时关闭）。
     inspection_snapshot_enabled: bool = True

@@ -641,7 +641,7 @@ export const zhSecurity = {
   'ports.status.clean': '未发现异常',
   'ports.unknownProcess': '未知进程',
   'ports.noOpenPorts': '没有对外开放的端口',
-  'ports.viewHostAria': '查看 {name} 的端口与进程',
+  'ports.viewHostAria': '查看 {name} 的端口进程',
   'ports.noFirewallBadge': '无防火墙',
   'ports.noFirewallBadgeTitle': '这台主机没有活动防火墙，暴露的端口风险更高',
   'ports.readonlyTitle': '权限不足，看不到别人的进程与可执行文件',
@@ -676,7 +676,7 @@ export const zhSecurity = {
   'ports.hostsSubtitle': '按「最需要看的」排序：有可疑进程的最前，其次是有非预期开放端口的',
   'ports.scanningAll':
     '正在并发巡检所有服务器…（每台一条 SSH，首次要等几秒；结果会缓存 5 分钟，期间进这一页不再重扫）',
-  'ports.fleetCaption': '服务器端口与进程巡检总览',
+  'ports.fleetCaption': '服务器端口进程巡检总览',
   'ports.emptyFleetTitle': '还没有可巡检的服务器',
   'ports.emptyFleetDesc':
     '本机应该总是可用；要巡检其它服务器，先去「SSH 安全 → 受管主机」把它们加进来。',
@@ -686,7 +686,7 @@ export const zhSecurity = {
   'ports.sortByUnexpected': '按非预期开放端口数排序',
   'ports.colFirewall': '防火墙',
   'ports.firewallEnabled': '已启用',
-  'ports.dataLoading': '正在读取端口与进程…',
+  'ports.dataLoading': '正在读取端口进程…',
   'ports.reportTitle': '巡检概况',
   'ports.firewallWithManager': '防火墙：{manager}',
   'ports.noActiveFirewall': '无活动防火墙',
@@ -730,7 +730,7 @@ export const zhSecurity = {
     '确认 / 忽略 / 加白过的条目不再计入待处理与告警；撤销后下一轮巡检会重新出现',
   'ports.noteLabel': '备注：',
   'ports.policyTitle': '巡检策略',
-  'ports.policySubtitle': '预期端口与进程白名单是压掉误报的主要手段',
+  'ports.policySubtitle': '预期端口进程白名单是压掉误报的主要手段',
   'ports.savePolicy': '保存策略',
   'ports.policyEnabled': '启用定时巡检',
   'ports.policyEnabledHint': '关闭后不再自动检查与告警',
@@ -903,7 +903,7 @@ export const zhSecurity = {
   'ports.heurPerm':
     '：看不到别人的进程时（非 root），「归属进程」会显示未知、「可执行文件已删除」这类特征也拿不到 —— 报告里会标「只读巡检」，不是问题消失了。',
   'ai.askFromBaseline': '帮我看看这台机器的体检问题，按优先级说该怎么办',
-  'ai.askFromPorts': '帮我看看这台机器的端口与进程暴露面，哪些该收紧',
+  'ai.askFromPorts': '帮我看看这台机器的端口进程暴露面，哪些该收紧',
   'ai.askFromAudit': '帮我看看这台机器的登录记录，有没有异常',
   'ai.askFromSsh': '帮我看看 SSH 登录失败与封禁情况，有没有需要处理的',
 } as const;

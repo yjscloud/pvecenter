@@ -122,7 +122,7 @@ async def remove_host(
     user: Dict[str, Any] = Depends(SSH_MANAGE),
     _step_up: Dict[str, Any] = Depends(security.require_step_up()),
 ) -> Dict[str, Any]:
-    # 走 purge_host 而不是 delete_host：这台主机在「登录审计 / 端口与进程 /
+    # 走 purge_host 而不是 delete_host：这台主机在「登录审计 / 端口进程 /
     # 安全基线」里的数据（导入游标、人工处置、报告缓存与活动告警）一并清掉，
     # 否则挪到别页还能看到一台已经不存在的机器。
     removed = await sshremote.purge_host(host_id)

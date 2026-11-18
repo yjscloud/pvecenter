@@ -135,7 +135,7 @@ from . import quota
 from . import database
 from . import reqmetrics
 from . import guest_created
-# 巡检快照：把「端口与进程」「安全基线」的结果落库，读接口只读快照
+# 巡检快照：把「端口进程」「安全基线」的结果落库，读接口只读快照
 from . import inspection
 # 客户机 IP 落库缓存（虚拟机列表的 IP 列不再在请求内等 Guest Agent）
 from . import guestip
@@ -1300,7 +1300,7 @@ FRP_WATCHDOG_FIRST_DELAY = 20
 # 真正推送由告警指纹与冷却压制，同一批告警不会反复推
 ROOTCAUSE_INTERVAL = 5 * ALERT_INTERVAL
 ROOTCAUSE_FIRST_DELAY = 2 * ALERT_INTERVAL
-# 巡检快照预热：只跑**安全基线**（端口的落库由上面的「端口与进程巡检」作业顺带
+# 巡检快照预热：只跑**安全基线**（端口的落库由上面的「端口进程巡检」作业顺带
 # 完成，避免同一批主机每轮扫两遍 SSH）。间隔与端口巡检一致 —— 它决定「页面上的
 # 数据最多旧多少」，而不是响应速度。
 INSPECTION_WARM_INTERVAL = max(int(settings.inspection_warm_interval), 60)
@@ -1484,7 +1484,7 @@ def _host_sync_summary(result: Any) -> str:
     又有几台本轮没判定成（连接未记 / 清单读不到 / 缺 VMID）。
 
     后面两类的数字必须报出来：它们在外观上与「已清理」一样，实际上机器还留在
-    「端口与进程」里 —— 只报 ``无变化`` 会让人误以为一切正常。
+    「端口进程」里 —— 只报 ``无变化`` 会让人误以为一切正常。
     """
     if not isinstance(result, dict):
         return ""
@@ -1603,7 +1603,7 @@ scheduler.register(
 scheduler.register(
     _job(
         "ports",
-        "端口与进程巡检",
+        "端口进程巡检",
         "安全巡检",
         "扫描监听端口与关键进程，发现新增对外暴露的服务",
         portguard.evaluate,
@@ -1612,7 +1612,7 @@ scheduler.register(
     )
 )
 # 安全基线快照预热：把全量体检结果落库，页面读快照而不是现场 SSH（见 app.inspection）。
-# 端口那边的落库由上面那个「端口与进程巡检」作业顺带完成，两者不重复扫同一批主机。
+# 端口那边的落库由上面那个「端口进程巡检」作业顺带完成，两者不重复扫同一批主机。
 scheduler.register(
     _job(
         "inspection_warm",

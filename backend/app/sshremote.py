@@ -292,7 +292,7 @@ async def find_by_address(address: str) -> Optional[Dict[str, Any]]:
 
 
 async def _invalidate_report_cache(host_id: str = "") -> None:
-    """受管主机集合变了 → 「端口与进程 / 安全基线 / SSH 安全」的总览缓存作废。
+    """受管主机集合变了 → 「端口进程 / 安全基线 / SSH 安全」的总览缓存作废。
 
     那几页的总览是**现场采集**的结果，带 2 分钟 TTL（见 :mod:`app.reportcache`）。
     缓存的 key 只有「功能名 + 可见主机集合 + 语言」，**不含主机数量** —— 新登记
@@ -375,7 +375,7 @@ async def delete_host(host_id: str) -> int:
 # 一台受管主机（``host_id``）同时是四套安全数据的宿主：
 #   * SSH 安全     —— ``ssh_hosts`` 本身（主机的定义就在这张表里）；
 #   * 登录审计     —— ``host_audit_cursor`` 的导入进度游标；
-#   * 端口与进程   —— ``port_guard_dispositions`` 里按 host_id 分键的人工处置；
+#   * 端口进程   —— ``port_guard_dispositions`` 里按 host_id 分键的人工处置；
 #   * 安全基线     —— 与端口共用 :mod:`app.reportcache` 的巡检报告缓存。
 # 主机一没（手工移除，或它的虚拟机被删掉），这些数据就都失去了意义：
 # 留着只会让界面上还挂着一台连不上的机器，每轮巡检白拨一条 SSH。

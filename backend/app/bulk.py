@@ -319,7 +319,7 @@ async def _run_one(
             destroy = client.qemu_destroy if gtype == "qemu" else client.lxc_destroy
             result = await destroy(node, vmid, purge=params.purge)
             # 面板为这台机器登记的受管主机（勾了「接入安全管控」才会有）要**立刻**
-            # 清掉：它就是「端口与进程」页里的那台服务器。批量删除曾经漏了这一步，
+            # 清掉：它就是「端口进程」页里的那台服务器。批量删除曾经漏了这一步，
             # 只能等 host_sync 兜底 —— 而兜底只认 (连接, VMID)，PVE 又是「最小空闲
             # 号」复用，同号的新机器一出现，残留就再也认不出来（永远连不上的服务器）。
             # 延迟导入：sshremote 会反向牵到告警 / 巡检，顶层导入容易绕成环。

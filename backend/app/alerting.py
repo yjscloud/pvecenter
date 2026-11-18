@@ -582,7 +582,7 @@ NOTIFY_SOURCES: List[Dict[str, str]] = [
     },
     {
         "id": "portguard",
-        "label": "端口与进程巡检",
+        "label": "端口进程巡检",
         "description": "对外开放端口、可疑进程",
     },
     {

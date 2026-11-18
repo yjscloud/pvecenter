@@ -1057,7 +1057,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   );
 
   /* 勾了「接入安全管控」的虚拟机在**创建那一刻**就登记成了受管主机（见
-     backend/app/routers/vms._register_managed），于是「端口与进程 / 安全基线 /
+     backend/app/routers/vms._register_managed），于是「端口进程 / 安全基线 /
      SSH 安全」三页的主机清单与全平台总览都会多出一台。
 
      但那两页的总览不是现成数据：前端有 5 分钟 staleTime、后端还有 2 分钟巡检

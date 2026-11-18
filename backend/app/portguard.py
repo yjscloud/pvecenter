@@ -850,7 +850,7 @@ def assess(
     policy: Optional[Dict[str, Any]] = None,
     dispositions: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """快照 → 端口与进程的判定结果。纯函数，本机与远程共用。
+    """快照 → 端口进程的判定结果。纯函数，本机与远程共用。
 
     ``dispositions`` 是该主机的人工处置记录（``{指纹: 决定书}``）：命中了就把
     ``disposition`` 挂到条目上。处置过的条目**仍然返回**——否则用户无从撤销，
