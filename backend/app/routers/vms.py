@@ -1859,17 +1859,35 @@ async def vm_power(
     return {"task": task}
 
 
-async def _purge_managed_vm(vmid: int) -> None:
-    """删机后清掉面板为它登记的受管主机及其安全数据（失败只记日志）。
+async def _best_effort(label: str, action: Any) -> None:
+    """执行删除后的善后步骤，失败只记日志。
 
-    机器已经删掉了，这一步失败不该让删除接口报错 —— 残留会由周期作业
-    ``sshremote.reconcile_panel_hosts`` 的下一轮核对清掉（那边拿 PVE 的虚拟机
-    清单比对），只是晚几分钟。
+    机器已经删掉了：任何一步善后失败都不该把接口变成 500（调用方会以为没删掉、
+    重试一次又报「不存在」），更不该连累后面的步骤 —— 尤其是受管主机清理。
     """
     try:
-        removed = await sshremote.purge_vm_hosts(vmid, _managed_conn_id())
-    except Exception:  # noqa: BLE001 - 清理失败不影响删除结果
+        await action
+    except Exception:  # noqa: BLE001 - 善后失败不影响「删除已经成功」这个事实
+        logger.warning("删除虚拟机后清理%s失败", label, exc_info=True)
+
+
+async def _purge_managed_vm(vmid: int, node: str = "") -> None:
+    """删机后清掉面板为它登记的受管主机及其安全数据（失败落补偿队列）。
+
+    这是「资源回收 → 端口与进程里的服务器」之间唯一的实时同步点，所以：
+
+    * 失败不能让删除接口报错（机器已经没了），但也**不能只记日志** —— 只记日志
+      等于悄悄留一台僵尸主机，界面上那台服务器会一直连不上。失败时落一条补偿
+      项，由 ``host_sync`` 作业重试（见 ``sshremote.enqueue_cleanup``）。
+    * 无论删行是否成功，``purge_vm_hosts`` 都会先落「已回收」墓碑：即使 VMID
+      随后被新机器占用，对账也不会再把这条残留当成「虚拟机还在」。
+    """
+    conn_id = _managed_conn_id()
+    try:
+        removed = await sshremote.purge_vm_hosts(vmid, conn_id, node=node)
+    except Exception:  # noqa: BLE001 - 清理失败不影响删除结果，但要留补偿项
         logger.warning("清理虚拟机 %s 的受管主机登记失败", vmid, exc_info=True)
+        await sshremote.enqueue_cleanup(vmid, conn_id, node)
         return
     if removed:
         logger.info("虚拟机 %s 已删除，其受管主机登记一并移除：%s", vmid, ", ".join(removed))
@@ -1910,31 +1928,36 @@ async def delete_vm(
 
     task = result if isinstance(result, str) else (result or {}).get("task", "")
     await security.audit(request, user, "vm.delete", target=f"{node}/{vmid}")
+    # 受管主机（勾了「接入安全管控」才会有）**紧贴 destroy 之后**清掉，连同它在
+    # 「SSH 安全 / 登录审计 / 端口与进程 / 安全基线」里的数据 —— 机器都没了，再
+    # 留着只会每轮巡检白拨一条 SSH。放在善后链的最后一行是错的：前面任何一步抛
+    # 错（库抖动、超时），这一步就永远走不到，而机器已经被销毁了。
+    await _purge_managed_vm(vmid, node)
+    # 其余善后逐个隔离：机器已经删了，某一步失败不该让接口变成 500
+    conn_id = _op_connection()
     # 连同创建时间记录一起删掉：VMID 会被回收，旧记录贴到重建的同号机器上
     # 比「显示 —」更难发现。
-    await guest_created.drop_record(_op_connection(), node, vmid, "qemu")
+    await _best_effort(
+        "创建时间记录", guest_created.drop_record(conn_id, node, vmid, "qemu")
+    )
     # IP 缓存同样要清：VMID 回收后，旧地址会贴着同号的新机器显示一分钟
-    await guestip.forget(_op_connection(), node, vmid, "qemu")
+    await _best_effort("IP 缓存", guestip.forget(conn_id, node, vmid, "qemu"))
     # 从地址池分配出去的地址也一并释放：配置已经没了，登记行若还留着会白占
     # 一个地址（扫描结果接管后本来就该由删除来回收，这里只是立刻生效）
-    await ippool.release_guest(_op_connection(), node, vmid)
+    await _best_effort("地址池登记", ippool.release_guest(conn_id, node, vmid))
     # 归属记录不删的话额度不会还给用户：用量是「归属表 ∩ PVE 实时清单」，
     # PVE 又把最小的空闲 VMID 分给新机器 —— 旧记录撞上同号的新机器，那台机器
     # 就被算到旧用户名下（见 ownership.forget_guest 的说明）。
-    await ownership.forget_guest(_op_connection(), node, vmid)
+    await _best_effort("归属记录", ownership.forget_guest(conn_id, node, vmid))
     # 置顶与收藏记的同样是 VMID（<连接>:<节点>/<vmid>），也会被同号的新机器命中。
     # 回收时一并清掉所有用户这两项，新机器才能从「未收藏、未置顶」开始。
-    await prefs.forget_guest_refs(_op_connection(), node, vmid)
+    await _best_effort("置顶与收藏", prefs.forget_guest_refs(conn_id, node, vmid))
     # 面板备注（手动 IP / 系统标识）同样是按 vmid 记账的：不清的话，同号的新机器
     # 会显示上一台的系统 logo（例如刚下发的 TencentOS 顶着 Windows 的图标）。
-    await drop_vm_meta(_op_connection(), node, vmid)
+    await _best_effort("面板备注", drop_vm_meta(conn_id, node, vmid))
     # 读数缓存里还留着这台机器，主动作废掉 —— 否则删除后的几秒内
     # 「我的额度」仍旧显示旧用量，看起来就像额度没恢复。
     quota.invalidate()
-    # 面板为这台机器登记的受管主机（勾了「接入安全管控」才会有）也一并清掉，
-    # 连同它在「SSH 安全 / 登录审计 / 端口与进程 / 安全基线」里的数据 ——
-    # 机器都没了，再留着只会每轮巡检白拨一条 SSH。
-    await _purge_managed_vm(vmid)
     return {"task": task}
 
 

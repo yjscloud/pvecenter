@@ -512,6 +512,21 @@ class TestManagedHostPurge:
         monkeypatch.setattr(sshremote, "purge_host", fake_purge)
         return seen
 
+    @pytest.fixture(autouse=True)
+    def settings_store(self, monkeypatch) -> Dict[str, str]:
+        """用例不碰库：settings 换成内存字典（墓碑 / 待登记队列 / 补偿队列都在里面）。"""
+        data: Dict[str, str] = {}
+
+        async def _get(key: str, default: Any = None) -> Any:
+            return data.get(key, default)
+
+        async def _set(key: str, value: str) -> None:
+            data[key] = value
+
+        monkeypatch.setattr(sshremote.store, "get_setting", _get)
+        monkeypatch.setattr(sshremote.store, "set_setting", _set)
+        return data
+
     def _stub_hosts(self, monkeypatch, rows: List[Dict[str, Any]]) -> None:
         async def fake_list(include_disabled: bool = True) -> List[Dict[str, Any]]:
             return rows
@@ -570,6 +585,83 @@ class TestManagedHostPurge:
         assert run(sshremote.purge_vm_hosts(100, "c1")) == ["h1"]
         assert purged == ["h1"]
 
+    def test_purge_records_a_tombstone(self, monkeypatch, purged) -> None:
+        """删除时先落墓碑：VMID 被新机器复用之后，对账才认得出这是残留。"""
+        self._stub_hosts(monkeypatch, [self._row()])
+
+        run(sshremote.purge_vm_hosts(100, "c1", node="pve"))
+
+        assert run(sshremote.is_reclaimed("c1", 100)) is True
+        # 墓碑按连接分键：别的集群里的同号机器不受影响
+        assert run(sshremote.is_reclaimed("c2", 100)) is False
+
+    def test_purge_clears_the_pending_registration(self, monkeypatch, purged) -> None:
+        """待登记队列也要清：否则 VMID 被复用后会给新机器凭空登记一台服务器。"""
+        self._stub_hosts(monkeypatch, [self._row()])
+        run(
+            sshremote.remember_pending_registration(
+                {"conn_id": "c1", "node": "pve", "vmid": 100, "name": "web1"}
+            )
+        )
+        assert run(sshremote._load_pending())
+
+        run(sshremote.purge_vm_hosts(100, "c1", node="pve"))
+
+        assert run(sshremote._load_pending()) == {}
+
+    def test_registering_a_rebuilt_vm_claims_the_vmid_back(self, monkeypatch) -> None:
+        """删完重建（同号）：登记时必须撤掉墓碑。
+
+        否则对账下一轮会把刚接入的主机当成「回收后复用」的残留清掉 —— 运维看到
+        的是「刚纳管的服务器过几分钟自己消失了」。
+        """
+        from app import panelkey
+
+        async def _save(raw: Dict[str, Any], username: str = "") -> Dict[str, Any]:
+            return {**raw, "id": "h-new"}
+
+        async def _key() -> str:
+            return "PRIVATE KEY"
+
+        monkeypatch.setattr(sshremote, "save_host", _save)
+        monkeypatch.setattr(panelkey, "private_key", _key)
+        # 指纹采纳是后台任务：这里直接丢掉协程，别在 asyncio.run 收尾时留下悬挂任务
+        monkeypatch.setattr(
+            sshremote.asyncio, "create_task", lambda coro: coro.close()
+        )
+        run(sshremote.remember_reclaimed("c1", 100))
+        assert run(sshremote.is_reclaimed("c1", 100)) is True
+
+        run(
+            sshremote.register_managed_host(
+                name="web1", host="10.0.0.5", conn_id="c1", node="pve", vmid=100
+            )
+        )
+
+        assert run(sshremote.is_reclaimed("c1", 100)) is False
+
+    def test_failed_purge_is_retried_by_the_job(self, monkeypatch) -> None:
+        """清理失败要落补偿项并由作业重试 —— 只记一条 warning 等于放弃。"""
+        attempts: List[int] = []
+
+        async def flaky(vmid, conn_id="", *, node="", name=""):
+            attempts.append(int(vmid))
+            if len(attempts) == 1:
+                raise RuntimeError("库抖动")
+            return []
+
+        monkeypatch.setattr(sshremote, "purge_vm_hosts", flaky)
+        run(sshremote.enqueue_cleanup(100, "c1", "pve"))
+
+        first = run(sshremote.process_pending_cleanup())
+        assert (first["checked"], first["pending"]) == (1, 1)
+        assert run(sshremote._load_cleanup())
+
+        second = run(sshremote.process_pending_cleanup())
+        assert (second["checked"], second["pending"]) == (1, 0)
+        assert run(sshremote._load_cleanup()) == {}
+        assert attempts == [100, 100]
+
     # ---- 周期核对（虚拟机在 PVE 上被直接删掉）
     def test_reconcile_drops_hosts_whose_vm_is_gone(self, monkeypatch, purged) -> None:
         self._stub_hosts(monkeypatch, [self._row(), self._row(id="h2", vmid=101)])
@@ -587,6 +679,67 @@ class TestManagedHostPurge:
 
         assert result["removed"] == 1
         assert purged == ["h2"]
+
+    def test_reconcile_drops_hosts_even_if_the_vmid_was_reused(
+        self, monkeypatch, purged
+    ) -> None:
+        """回归：VMID 被新机器占用后，残留不能被当成「虚拟机还在」。
+
+        PVE 分配 VMID 用的是「最小的空闲号」：机器一回收，这个号往往马上被新机器
+        占走。只按「vmid 在不在」核对的话，残留会永久留在端口页里 —— 这就是
+        「资源回收后服务器未自动移除」的根因。
+        """
+        self._stub_hosts(monkeypatch, [self._row()])
+
+        class FakeClient:
+            async def cluster_resources(self, rtype=None):  # noqa: ANN001
+                return [{"node": "pve", "vmid": 100}]  # 同号的新机器
+
+        monkeypatch.setattr(
+            pve, "all_connection_clients", lambda: [({"id": "c1"}, FakeClient())]
+        )
+        monkeypatch.setattr(store, "get_connections", lambda: [{"id": "c1"}])
+        run(sshremote.remember_reclaimed("c1", 100, node="pve"))
+
+        result = run(sshremote.reconcile_panel_hosts())
+
+        assert result["removed"] == 1
+        assert result["tombstoned"] == 1
+        assert purged == ["h1"]
+
+    def test_reconcile_keeps_a_host_without_a_tombstone(
+        self, monkeypatch, purged
+    ) -> None:
+        """没有墓碑就不动：别把「正常在用的机器」当成复用后的残留。"""
+        self._stub_hosts(monkeypatch, [self._row()])
+
+        class FakeClient:
+            async def cluster_resources(self, rtype=None):  # noqa: ANN001
+                return [{"node": "pve", "vmid": 100}]
+
+        monkeypatch.setattr(
+            pve, "all_connection_clients", lambda: [({"id": "c1"}, FakeClient())]
+        )
+        monkeypatch.setattr(store, "get_connections", lambda: [{"id": "c1"}])
+
+        result = run(sshremote.reconcile_panel_hosts())
+
+        assert result["removed"] == 0
+        assert purged == []
+
+    def test_reconcile_reports_hosts_it_cannot_judge(
+        self, monkeypatch, purged
+    ) -> None:
+        """缺 VMID 关联的面板主机无从核对：不猜、不删，但要如实报出来。"""
+        self._stub_hosts(monkeypatch, [self._row(vmid=None)])
+        monkeypatch.setattr(pve, "all_connection_clients", lambda: [])
+        monkeypatch.setattr(store, "get_connections", lambda: [{"id": "c1"}])
+
+        result = run(sshremote.reconcile_panel_hosts())
+
+        assert result["removed"] == 0
+        assert result["unresolved"] == ["h1"]
+        assert purged == []
 
     def test_reconcile_keeps_hosts_when_inventory_unavailable(
         self, monkeypatch, purged
@@ -762,4 +915,33 @@ class TestReportCacheInvalidation:
 
         run(sshremote._invalidate_report_cache())
 
+        assert reportcache.peek(key) is None
+
+    def test_removing_one_host_only_purges_that_host(self, monkeypatch) -> None:
+        """只影响一台机器时别把全站快照一起清掉。
+
+        原先一律 ``reportcache.clear()``：改一台主机的端口，全站报告页下一轮都要
+        重扫 SSH；而真正该清的那台（删除时）又可能清不干净，留下幽灵卡片。
+        """
+        from app import inspection
+
+        purged: List[str] = []
+
+        async def _purge(host_id: str, namespace: Any = None) -> int:
+            purged.append(host_id)
+            return 1
+
+        async def _boom() -> None:
+            raise AssertionError("不该全量清快照")
+
+        monkeypatch.setattr(inspection, "purge_host", _purge)
+        monkeypatch.setattr(reportcache, "clear", _boom)
+
+        key = reportcache.scope_key("ports", None)
+        reportcache.store(key, {"sentinel": True})
+
+        run(sshremote._invalidate_report_cache("h1"))
+
+        assert purged == ["h1"]
+        # 内存缓存照旧整片丢：key 里带可见主机集合，没法按主机剔
         assert reportcache.peek(key) is None

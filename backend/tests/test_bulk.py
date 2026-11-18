@@ -136,6 +136,12 @@ class FakeClient:
         return []
 
 
+#: 批量删除时「清理受管主机」的调用记录（桩在 :func:`_patch` 里装）
+_PURGES: list = []
+#: 清理失败后的补偿项（应该为空 —— 桩不失败）
+_ENQUEUED: list = []
+
+
 def _request() -> SimpleNamespace:
     return SimpleNamespace(state=SimpleNamespace(session={"elevated_until": 0}))
 
@@ -167,6 +173,22 @@ def _patch(monkeypatch) -> None:
     monkeypatch.setattr(security, "check_step_up", lambda request, user: None)
     # step_up 在测试环境可能为真，这里统一关掉，单独用例再开
     monkeypatch.setattr(security.settings, "step_up_required", False)
+
+    # 删除会连带清受管主机（走 sshremote 的库）：换成记录桩，用例一律不碰库
+    from app import sshremote
+
+    _PURGES.clear()
+    _ENQUEUED.clear()
+
+    async def _purge(vmid, conn_id="", *, node="", name=""):
+        _PURGES.append((int(vmid), conn_id, node))
+        return []
+
+    async def _enqueue(vmid, conn_id="", node=""):
+        _ENQUEUED.append((int(vmid), conn_id, node))
+
+    monkeypatch.setattr(sshremote, "purge_vm_hosts", _purge)
+    monkeypatch.setattr(sshremote, "enqueue_cleanup", _enqueue)
 
 
 def _install(monkeypatch, client: FakeClient) -> None:
@@ -426,6 +448,62 @@ class TestDelete:
         assert item["ok"] is True
         assert ("qemu_destroy", "pve", 100, False) in client.calls
         assert [(node, vmid) for _, node, vmid in cleaned] == [("pve", 100)]
+
+    def test_delete_purges_the_managed_host(self, monkeypatch) -> None:
+        """回归：批量删除也要清受管主机（就是端口页里的那台服务器）。
+
+        曾经漏了这一步：只能等 ``host_sync`` 兜底，而兜底只认 ``(连接, VMID)``，
+        PVE 又是「最小空闲号」复用 —— 同号的新机器一出现，残留就永远认不出来，
+        界面上就是一台永远连不上的服务器。
+        """
+        client = FakeClient(kind="qemu", status="stopped")
+        _install(monkeypatch, client)
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(bulk.ownership, "forget_guest", _noop)
+        monkeypatch.setattr(bulk.ippool, "release_guest", _noop)
+        monkeypatch.setattr(bulk.prefs, "forget_guest_refs", _noop)
+
+        item = run(
+            bulk._run_one(
+                _request(),
+                _user(),
+                "delete",
+                BulkTarget(node="pve", vmid=100, type="qemu"),
+                BulkParams(purge=False),
+            )
+        )
+
+        assert item["ok"] is True
+        assert _PURGES == [(100, "conn-1", "pve")]
+        assert _ENQUEUED == []
+
+    def test_container_delete_does_not_touch_managed_hosts(self, monkeypatch) -> None:
+        """容器不会被登记成受管主机：别拿同号去误删虚拟机的登记。"""
+        client = FakeClient(kind="lxc", status="stopped")
+        _install(monkeypatch, client)
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(bulk.ownership, "forget_guest", _noop)
+        monkeypatch.setattr(bulk.ippool, "release_guest", _noop)
+        monkeypatch.setattr(bulk.prefs, "forget_guest_refs", _noop)
+
+        item = run(
+            bulk._run_one(
+                _request(),
+                _user(),
+                "delete",
+                BulkTarget(node="pve", vmid=101, type="lxc"),
+                BulkParams(purge=False),
+            )
+        )
+
+        assert item["ok"] is True
+        assert _PURGES == []
 
 
 # --------------------------------------------------------------- 归属隔离

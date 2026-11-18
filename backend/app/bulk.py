@@ -318,6 +318,29 @@ async def _run_one(
                 raise ProxmoxError(f"{vmid} 正在运行，请先关机后再删除", 409)
             destroy = client.qemu_destroy if gtype == "qemu" else client.lxc_destroy
             result = await destroy(node, vmid, purge=params.purge)
+            # 面板为这台机器登记的受管主机（勾了「接入安全管控」才会有）要**立刻**
+            # 清掉：它就是「端口与进程」页里的那台服务器。批量删除曾经漏了这一步，
+            # 只能等 host_sync 兜底 —— 而兜底只认 (连接, VMID)，PVE 又是「最小空闲
+            # 号」复用，同号的新机器一出现，残留就再也认不出来（永远连不上的服务器）。
+            # 延迟导入：sshremote 会反向牵到告警 / 巡检，顶层导入容易绕成环。
+            if gtype == "qemu":
+                from . import sshremote
+
+                try:
+                    removed = await sshremote.purge_vm_hosts(vmid, conn_id, node=node)
+                    if removed:
+                        logger.info(
+                            "批量删除：虚拟机 %s 的受管主机登记一并移除：%s",
+                            vmid,
+                            ", ".join(removed),
+                        )
+                except Exception:  # noqa: BLE001 - 机器已经删了，不能让这一台报失败
+                    # 不往上抛：抛了会让这一台显示「删除失败」，运维会重试并得到
+                    # 「不存在」，反而更难查。留一条补偿项，由 host_sync 重试。
+                    logger.warning(
+                        "批量删除：清理虚拟机 %s 的受管主机登记失败", vmid, exc_info=True
+                    )
+                    await sshremote.enqueue_cleanup(vmid, conn_id, node)
             # 与单机删除同一口径：归属记录要清，否则额度不会还给用户
             # （PVE 会回收空闲 VMID，旧记录会撞上重建的同号机器）。
             # 这里不吞异常 —— 批量操作本来就要逐台给出结果，清理失败同样该让

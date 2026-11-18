@@ -78,6 +78,32 @@ PENDING_TTL = 24 * 3600
 #: 队列长度上限：防脏数据无限膨胀
 PENDING_MAX = 200
 
+#: 「已回收」墓碑：虚拟机被删时按 ``(连接, VMID)`` 记一笔。
+#:
+#: 为什么非要有它：受管主机与虚拟机的关联只有 ``(conn_id, vmid)``，而 PVE 分配
+#: VMID 用的是「最小的空闲号」—— 机器一回收，这个号往往马上被新机器占用。对账
+#: 作业若只看「这个 vmid 还在不在」，残留的受管主机就会被永久误判成「虚拟机还
+#: 在」，再也不会被清掉（界面上就是一台永远连不上的服务器）。墓碑优先于清单：
+#: 这台机器被面板删过，后来者占用同号也不会让旧记录复活。
+TOMBSTONE_KEY = "managed_host_tombstones"
+#: 墓碑保鲜期：与巡检快照的保留期（7 天）一致 —— 过了这段时间，快照行本身也早被
+#: 保留清理删掉，留墓碑没有意义
+TOMBSTONE_TTL = 7 * 86_400
+#: 墓碑条数上限：这是一份「最近删过哪些机器」的短名单，不该无限膨胀
+TOMBSTONE_MAX = 500
+
+#: 删除时没清干净的受管主机补偿队列（由 ``host_sync`` 作业重试）。
+#:
+#: 删除接口里的清理是尽力而为的：数据库抖动、PVE 抖动都可能让它失败。失败时
+#: 只记一条 warning 等于「悄悄留下僵尸主机」，所以这里落一条待重试项。
+CLEANUP_KEY = "managed_host_cleanup"
+#: 补偿项保鲜期：超过就丢（正常的库抖动不会持续一天）
+CLEANUP_TTL = 24 * 3600
+#: 重试次数上限：连续失败说明不是抖动，留着也没用，报出来给人看
+CLEANUP_MAX_TRIES = 12
+#: 队列长度上限
+CLEANUP_MAX = 200
+
 # 远程命令的超时：日志可能很大，但也不该拖死面板
 DEFAULT_TIMEOUT = 20
 LOG_TIMEOUT = 30
@@ -265,19 +291,31 @@ async def find_by_address(address: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _invalidate_report_cache() -> None:
+async def _invalidate_report_cache(host_id: str = "") -> None:
     """受管主机集合变了 → 「端口与进程 / 安全基线 / SSH 安全」的总览缓存作废。
 
     那几页的总览是**现场采集**的结果，带 2 分钟 TTL（见 :mod:`app.reportcache`）。
     缓存的 key 只有「功能名 + 可见主机集合 + 语言」，**不含主机数量** —— 新登记
     或刚接入一台机器时 key 完全没变，于是它会命中那份「还不含这台机器」的旧报告，
     最长 2 分钟不出现在总览里，看起来正像「面板下发的虚拟机没被纳管」。
+
+    只影响一台机器时（新增 / 编辑 / 移除）走**精确**清理：内存整片丢（key 没法按
+    主机剔），落库快照只删这台的行。原先一律 ``reportcache.clear()`` 会把**所有**
+    机器的快照一起清掉 —— 改一台主机的端口，全站报告页下一轮都要重扫 SSH；而
+    清不掉时又会把这台机器的幽灵卡片留在清单里。
     清缓存失败不该影响登记本身，所以这里只记日志。
     """
     try:
-        from . import reportcache
-
-        await reportcache.clear()
+        from . import inspection, reportcache
+    except Exception:  # noqa: BLE001
+        logger.debug("加载巡检报告缓存模块失败", exc_info=True)
+        return
+    try:
+        if host_id:
+            reportcache.clear_memory()
+            await inspection.purge_host(host_id)
+        else:
+            await reportcache.clear()
     except Exception:  # noqa: BLE001
         logger.debug("清理巡检报告缓存失败", exc_info=True)
 
@@ -307,7 +345,7 @@ async def save_host(raw: Dict[str, Any], username: str = "") -> Dict[str, Any]:
             ownership.KIND_SSH_HOST, str(item.get("id") or ""), username
         )
     # 新建 / 编辑（含「刚接入、指纹已采纳」）之后，总览缓存里的机器清单已经过时
-    await _invalidate_report_cache()
+    await _invalidate_report_cache(str(item.get("id") or ""))
     # 地址 / 凭据可能变了：把池里的旧连接丢掉，下次用新配置重连
     forget_connection(str(item.get("id") or ""))
     return item
@@ -328,7 +366,7 @@ async def delete_host(host_id: str) -> int:
         forget_connection(host_id)
         # 汇总缓存里还挂着这台机器：不清的话它会在列表上再留 2 分钟，
         # 而且每轮都显示成「连不上」
-        await _invalidate_report_cache()
+        await _invalidate_report_cache(host_id)
     return removed
 
 
@@ -373,9 +411,22 @@ async def _drop_host_data(row: Dict[str, Any]) -> None:
             )
         except Exception:  # noqa: BLE001
             logger.warning("清理主机 %s 的活动告警失败", name, exc_info=True)
-    # 报告缓存的 key 是「功能名 + 可见主机集合 + 语言」，没法按主机精确剔除；
-    # 整体清空最省事 —— 代价只是下一次打开总览时多跑一轮巡检（TTL 只有 2 分钟）。
-    await reportcache.clear()
+    # 落库快照按 host 精确删：原先用全量 clear()，会把**别的机器**的报告一起清掉
+    # （下一次打开那几页都要重扫一轮 SSH），而清不掉时又会留下这台机器的幽灵卡片
+    # —— 端口页的「服务器」清单读的就是这份快照（见 inspection.load_reports）。
+    try:
+        from . import inspection
+
+        await inspection.purge_host(host_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("清理主机 %s 的巡检快照失败", host_id, exc_info=True)
+    # 内存缓存的 key 是「功能名 + 可见主机集合 + 语言」，没法按主机精确剔除；
+    # 只清内存（不碰别的机器的落库快照），代价只是下一次打开总览多跑一轮巡检
+    # （TTL 只有 2 分钟）。
+    try:
+        reportcache.clear_memory()
+    except Exception:  # noqa: BLE001
+        logger.warning("清理主机 %s 的巡检报告内存缓存失败", host_id, exc_info=True)
 
 
 async def purge_host(host_id: str) -> int:
@@ -417,19 +468,238 @@ def _is_vm_host(row: Dict[str, Any], vmid: int, conn_id: str = "") -> bool:
     return not (stored and asked) or stored == asked
 
 
-async def purge_vm_hosts(vmid: int, conn_id: str = "") -> List[str]:
+async def purge_vm_hosts(
+    vmid: int, conn_id: str = "", *, node: str = "", name: str = ""
+) -> List[str]:
     """虚拟机被删除后，清掉面板登记在它上面的受管主机，返回已清理的 host_id。
 
-    由 ``DELETE /api/vms/{node}/{vmid}`` 调用（见 ``routers/vms.delete_vm``）。
-    VMID 在面板之外被删掉的情况走 :func:`reconcile_panel_hosts` 兜底。
+    由 ``DELETE /api/vms/{node}/{vmid}`` 与批量删除（``app.bulk``）调用。VMID 在
+    面板之外被删掉的情况走 :func:`reconcile_panel_hosts` 兜底。
+
+    三件事的顺序是有讲究的：
+
+    1. **先落墓碑**。它是「这台机器确实被面板回收过」的唯一持久事实：清理本身
+       失败、或者 VMID 随后被新机器占用，都不会让残留复活（见 ``TOMBSTONE_KEY``）。
+       先写墓碑再删行，最坏情况是「墓碑在、行没删」，对账下一轮会清掉；反过来
+       则可能永远留一条没人认得出来的残留。
+    2. 再删主机行（连带四套安全数据）。
+    3. 最后清掉「等地址」的待登记项 —— 否则 VMID 被复用后，那份队列会给一台
+       没人勾过安全管控的新机器凭空登记出一台服务器。
     """
-    hosts = [row for row in await list_hosts() if _is_vm_host(row, vmid, conn_id)]
+    host_rows = [row for row in await list_hosts() if _is_vm_host(row, vmid, conn_id)]
+    stored_node = str(node or (host_rows[0].get("node") if host_rows else "") or "")
+    stored_host = str(host_rows[0].get("host") if host_rows else "")
+    await remember_reclaimed(
+        conn_id,
+        vmid,
+        node=stored_node,
+        host=stored_host,
+        name=str(name or (host_rows[0].get("name") if host_rows else "") or ""),
+    )
+
     removed: List[str] = []
-    for row in hosts:
+    for row in host_rows:
         host_id = str(row.get("id") or "")
         if host_id and await purge_host(host_id):
             removed.append(host_id)
+
+    await forget_pending_registration(conn_id, stored_node, vmid)
     return removed
+
+
+# ------------------------------------------------- 「已回收」墓碑与补偿队列
+#
+# 两个都是「删除事实」的持久化，分别解决两类残留：
+#   * 墓碑：VMID 被复用之后，对账作业凭什么还认得出这是残留；
+#   * 补偿队列：删除接口里的清理失败之后，谁来重试（只记 warning 等于放弃）。
+
+
+def _tomb_key(conn_id: Any, vmid: Any) -> str:
+    return f"{str(conn_id or '')}|{_as_vmid(vmid)}"
+
+
+async def load_tombstones() -> Dict[str, Dict[str, Any]]:
+    """读墓碑表（顺手丢掉过期的）。读不到就当空的 —— 只是少一层保护。"""
+    try:
+        raw = await store.get_setting(TOMBSTONE_KEY)
+        data = json.loads(raw) if raw else {}
+    except Exception:  # noqa: BLE001 - 读不出来不该让对账停下来
+        logger.warning("读取受管主机墓碑失败", exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    deadline = time.time() - TOMBSTONE_TTL
+    return {
+        str(key): value
+        for key, value in data.items()
+        if isinstance(value, dict) and float(value.get("ts") or 0) >= deadline
+    }
+
+
+async def remember_reclaimed(
+    conn_id: Any = "",
+    vmid: Any = None,
+    *,
+    node: str = "",
+    host: str = "",
+    name: str = "",
+) -> bool:
+    """记下「这台虚拟机已被回收」。返回是否写入成功（失败只记日志）。"""
+    vmid_value = _as_vmid(vmid)
+    if vmid_value is None:
+        return False
+    key = _tomb_key(conn_id, vmid_value)
+    data = await load_tombstones()
+    data[key] = {
+        "conn_id": str(conn_id or ""),
+        "vmid": vmid_value,
+        "node": str(node or "")[:64],
+        "host": str(host or "")[:128],
+        "name": str(name or "")[:128],
+        "ts": int(time.time()),
+    }
+    if len(data) > TOMBSTONE_MAX:
+        # 丢最旧的：这是一份短名单，不该无限膨胀
+        for stale in sorted(data, key=lambda k: data[k].get("ts") or 0)[
+            : len(data) - TOMBSTONE_MAX
+        ]:
+            data.pop(stale, None)
+    try:
+        await store.set_setting(TOMBSTONE_KEY, json.dumps(data, ensure_ascii=False))
+    except Exception:  # noqa: BLE001 - 落不进去只影响「VMID 复用后能否认出来」
+        logger.warning(
+            "记录已回收虚拟机墓碑失败（%s/%s）", conn_id, vmid_value, exc_info=True
+        )
+        return False
+    return True
+
+
+async def is_reclaimed(conn_id: Any, vmid: Any) -> bool:
+    """这台虚拟机是否已被面板回收过（用于判断 VMID 是否被复用）。"""
+    vmid_value = _as_vmid(vmid)
+    if vmid_value is None:
+        return False
+    return _tomb_key(conn_id, vmid_value) in await load_tombstones()
+
+
+async def forget_reclaimed(conn_id: Any = "", vmid: Any = None) -> bool:
+    """新机器接管了这个 VMID：撤掉墓碑。
+
+    删除之后又重建（或重装）一台同号机器时，登记动作必须把这个号「认领」回来
+    —— 否则对账作业会把它当成「回收后复用」的残留清掉，刚接入的服务器会莫名
+    消失。墓碑的含义是「这个号目前无人认领」，不是「这个号永远作废」。
+    """
+    vmid_value = _as_vmid(vmid)
+    if vmid_value is None:
+        return False
+    key = _tomb_key(conn_id, vmid_value)
+    data = await load_tombstones()
+    if key not in data:
+        return False
+    data.pop(key, None)
+    try:
+        await store.set_setting(TOMBSTONE_KEY, json.dumps(data, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "撤销已回收虚拟机墓碑失败（%s/%s）", conn_id, vmid_value, exc_info=True
+        )
+        return False
+    return True
+
+
+async def enqueue_cleanup(vmid: Any, conn_id: Any = "", node: str = "") -> None:
+    """记一次「删除时没清干净」的受管主机，交给 ``host_sync`` 重试。
+
+    清理失败不能只写日志：机器已经删了，面板里只剩这条记录能提醒还有活要干。
+    队列本身写不进去时同样只记日志 —— 它已经是最后一道兜底了。
+    """
+    vmid_value = _as_vmid(vmid)
+    if vmid_value is None:
+        return
+    key = _tomb_key(conn_id, vmid_value)
+    data = await _load_cleanup()
+    entry = data.get(key) or {}
+    data[key] = {
+        "conn_id": str(conn_id or ""),
+        "vmid": vmid_value,
+        "node": str(node or entry.get("node") or "")[:64],
+        "tries": int(entry.get("tries") or 0),
+        "since": int(entry.get("since") or time.time()),
+    }
+    if len(data) > CLEANUP_MAX:
+        for stale in sorted(data, key=lambda k: data[k].get("since") or 0)[
+            : len(data) - CLEANUP_MAX
+        ]:
+            data.pop(stale, None)
+    try:
+        await store.set_setting(CLEANUP_KEY, json.dumps(data, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "记录受管主机清理补偿项失败（%s/%s）", conn_id, vmid_value, exc_info=True
+        )
+
+
+async def _load_cleanup() -> Dict[str, Dict[str, Any]]:
+    """读补偿队列；顺手丢掉超期 / 试太多次的项。"""
+    try:
+        raw = await store.get_setting(CLEANUP_KEY)
+        data = json.loads(raw) if raw else {}
+    except Exception:  # noqa: BLE001 - 读不出来就当没有待重试项
+        logger.warning("读取受管主机清理补偿队列失败", exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    deadline = time.time() - CLEANUP_TTL
+    kept: Dict[str, Dict[str, Any]] = {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        if float(value.get("since") or 0) < deadline:
+            continue
+        if int(value.get("tries") or 0) >= CLEANUP_MAX_TRIES:
+            logger.warning(
+                "受管主机清理补偿放弃（%s/%s）：已重试 %d 次",
+                value.get("conn_id"),
+                value.get("vmid"),
+                int(value.get("tries") or 0),
+            )
+            continue
+        kept[str(key)] = value
+    return kept
+
+
+async def process_pending_cleanup() -> Dict[str, Any]:
+    """重试删除时没清干净的受管主机（``host_sync`` 作业调用）。"""
+    data = await _load_cleanup()
+    if not data:
+        return {"checked": 0, "removed": 0, "pending": 0}
+    removed: List[str] = []
+    kept: Dict[str, Dict[str, Any]] = {}
+    for key, item in data.items():
+        try:
+            removed.extend(
+                await purge_vm_hosts(
+                    int(item.get("vmid") or 0),
+                    str(item.get("conn_id") or ""),
+                    node=str(item.get("node") or ""),
+                )
+            )
+        except Exception:  # noqa: BLE001 - 留到下一轮再试
+            item = {**item, "tries": int(item.get("tries") or 0) + 1}
+            kept[key] = item
+            logger.warning(
+                "重试清理受管主机失败（%s/%s，第 %d 次）",
+                item.get("conn_id"),
+                item.get("vmid"),
+                item.get("tries"),
+                exc_info=True,
+            )
+    if kept != data:
+        try:
+            await store.set_setting(CLEANUP_KEY, json.dumps(kept, ensure_ascii=False))
+        except Exception:  # noqa: BLE001
+            logger.warning("回写受管主机清理补偿队列失败", exc_info=True)
+    return {"checked": len(data), "removed": len(removed), "pending": len(kept)}
 
 
 # ------------------------------------------------ 面板下发主机的自动登记
@@ -477,12 +747,31 @@ async def remember_pending_registration(item: Dict[str, Any]) -> None:
 
 
 async def forget_pending_registration(conn_id: str, node: str, vmid: Any) -> None:
-    """把一台机器移出待登记队列（已经登记好了）。"""
-    key = _pending_key(conn_id, node, vmid)
+    """把一台机器移出待登记队列（已经登记好了 / 机器已经被删了）。
+
+    ``node`` 可以为空：调用方只知道连接与 VMID 时（例如删除虚拟机时手头没有
+    节点名），按队列项里的 ``conn_id`` / ``vmid`` 逐项比对，一样能清干净。
+    删除路径必须调用它 —— 否则 VMID 被复用之后，这份队列会给一台没人勾过
+    安全管控的新机器凭空登记出一台「服务器」。
+    """
     data = await _load_pending()
-    if key not in data:
+    target_vmid = _as_vmid(vmid)
+    if not data or target_vmid is None:
         return
-    data.pop(key, None)
+    if node:
+        doomed = [_pending_key(conn_id, node, target_vmid)]
+    else:
+        doomed = [
+            key
+            for key, item in data.items()
+            if _as_vmid(item.get("vmid")) == target_vmid
+            and str(item.get("conn_id") or "") == str(conn_id or "")
+        ]
+    removed = [key for key in doomed if key in data]
+    if not removed:
+        return
+    for key in removed:
+        data.pop(key, None)
     try:
         await store.set_setting(PENDING_KEY, json.dumps(data, ensure_ascii=False))
     except Exception:  # noqa: BLE001
@@ -550,6 +839,9 @@ async def register_managed_host(
         owner,
     )
     if row:
+        # 新机器合法接管了这个 VMID：撤掉「已回收」墓碑，否则对账下一轮会把刚
+        # 登记好的主机当成「回收后复用」的残留清掉（删完重建 / 重装都会撞上）。
+        await forget_reclaimed(conn_id, vmid)
         # 机器可能刚起来，指纹还没采纳：就近重试一轮（用独立任务，不阻塞调用方）
         asyncio.create_task(adopt_new_host(str(row.get("id") or "")))
     return row
@@ -627,11 +919,17 @@ async def reconcile_panel_hosts() -> Dict[str, Any]:
     :func:`purge_vm_hosts` 根本没机会执行 —— 没有这一步，那台机器会永远留在
     四套安全数据里，每轮巡检都往一个不存在的地址拨 SSH。
 
-    两条保守原则，避免一次网络抖动变成批量误删：
+    三条判定（按优先级），避免一次网络抖动变成批量误删：
 
-    * 某条 PVE 连接的虚拟机清单读不到（PVE 挂了 / 网络不通）时，**它名下的
-      主机本轮一律不动**；
-    * 主机没记连接 id（老数据）时不猜，跳过。
+    1. **墓碑优先**：``(连接, VMID)`` 出现在墓碑里，说明面板删过这台机器 ——
+       后来者占用了同一个号也不算数，一律清掉（见 ``TOMBSTONE_KEY``）。少了这
+       一条，VMID 被复用之后残留就永远清不掉了。
+    2. 某条 PVE 连接的虚拟机清单读不到（PVE 挂了 / 网络不通 / 连接暂停）时，
+       **它名下的主机本轮一律不动**，但会记进 ``skipped`` 如实报出来。
+    3. 主机没记连接 id、或 vmid 为空（老数据）时不猜，记进 ``unresolved``。
+
+    逐台 try/except：一台清理失败不该让后面几台这一轮全都做不成（``list_hosts``
+    是 ``ORDER BY name``，同一台失败会永远排在最前面，等于整轮永久卡死）。
 
     清单取自 ``cluster_resources('vm')`` —— 与「虚拟机」列表页同一份数据。
     """
@@ -645,19 +943,54 @@ async def reconcile_panel_hosts() -> Dict[str, Any]:
     except Exception:  # noqa: BLE001 - 兜底失败不该影响本轮核对
         logger.warning("处理待登记受管主机失败", exc_info=True)
         pending = {"checked": 0, "registered": 0, "pending": 0}
+    # 再重试「删除时没清干净」的补偿项：它们同样是残留，只是来得更早
+    try:
+        retried = await process_pending_cleanup()
+    except Exception:  # noqa: BLE001
+        logger.warning("重试受管主机清理补偿队列失败", exc_info=True)
+        retried = {"checked": 0, "removed": 0, "pending": 0}
 
+    rows = await list_hosts()
     hosts = [
         row
-        for row in await list_hosts()
+        for row in rows
         if is_panel_managed(row) and _as_vmid(row.get("vmid")) is not None
     ]
+    # 关联信息不全的面板主机：无从核对，不猜也不删，但要如实报出来（否则永远隐身）
+    unresolved = [
+        str(row.get("id") or "")
+        for row in rows
+        if is_panel_managed(row) and _as_vmid(row.get("vmid")) is None
+    ]
+
+    tombs = await load_tombstones()
     if not hosts:
-        return {"checked": 0, "removed": 0, "hosts": [], "pending": pending}
+        return {
+            "checked": 0,
+            "removed": 0,
+            "hosts": [],
+            "pending": pending,
+            "retried": retried,
+            "tombstoned": 0,
+            "skipped": [],
+            "failed": [],
+            "unresolved": unresolved,
+        }
 
     known_conns = {str(item.get("id") or "") for item in get_connections()}
     if not known_conns:
         # 一条 PVE 连接都没有：无从核对，什么都不动
-        return {"checked": 0, "removed": 0, "hosts": [], "pending": pending}
+        return {
+            "checked": 0,
+            "removed": 0,
+            "hosts": [],
+            "pending": pending,
+            "retried": retried,
+            "tombstoned": 0,
+            "skipped": [],
+            "failed": [],
+            "unresolved": unresolved,
+        }
 
     inventory: Dict[str, set] = {}
     for profile, client in all_connection_clients():
@@ -675,29 +1008,66 @@ async def reconcile_panel_hosts() -> Dict[str, Any]:
         }
 
     removed: List[str] = []
+    skipped: List[str] = []
+    failed: List[str] = []
+    tombstoned = 0
     for row in hosts:
-        cid = str(row.get("conn_id") or "")
-        if not cid:
-            continue  # 不知道属于哪条连接，没有证据
-        if cid not in known_conns:
-            reason = "所属 PVE 连接已被删除"
-        elif cid in inventory:
-            if _as_vmid(row.get("vmid")) in inventory[cid]:
-                continue
-            reason = "虚拟机已不存在"
-        else:
-            continue  # 本轮没拿到这条连接的清单，不删
         host_id = str(row.get("id") or "")
-        if host_id and await purge_host(host_id):
-            removed.append(host_id)
-            logger.info(
-                "受管主机 %s 已自动移除（%s）", row.get("name") or host_id, reason
+        cid = str(row.get("conn_id") or "")
+        vmid = _as_vmid(row.get("vmid"))
+        if not cid:
+            skipped.append(host_id)
+            continue  # 不知道属于哪条连接，没有证据
+        try:
+            # 墓碑优先于清单：VMID 被新机器复用后，清单里当然「还在」
+            if _tomb_key(cid, vmid) in tombs:
+                reason = "虚拟机已被回收（VMID 已被复用）"
+                tombstoned += 1
+            elif cid not in known_conns:
+                reason = "所属 PVE 连接已被删除"
+            elif cid in inventory:
+                if vmid in inventory[cid]:
+                    continue
+                reason = "虚拟机已不存在"
+            else:
+                skipped.append(host_id)  # 本轮没拿到这条连接的清单，不删
+                continue
+            if host_id and await purge_host(host_id):
+                removed.append(host_id)
+                logger.info(
+                    "受管主机 %s 已自动移除（%s）", row.get("name") or host_id, reason
+                )
+        except Exception as exc:  # noqa: BLE001 - 单台失败不能拖垮整轮
+            failed.append(host_id)
+            logger.warning(
+                "自动移除受管主机 %s 失败（本轮跳过，下一轮再试）：%s",
+                row.get("name") or host_id,
+                exc,
+                exc_info=True,
             )
+
+    if skipped:
+        logger.info(
+            "受管主机核对：%d 台本轮无法判定（连接未记 / 清单读不到），保持不动：%s",
+            len(skipped),
+            ", ".join(skipped[:10]),
+        )
+    if unresolved:
+        logger.info(
+            "受管主机核对：%d 台面板下发主机缺少 VMID 关联，无法自动清理：%s",
+            len(unresolved),
+            ", ".join(unresolved[:10]),
+        )
     return {
         "checked": len(hosts),
         "removed": len(removed),
         "hosts": removed,
         "pending": pending,
+        "retried": retried,
+        "tombstoned": tombstoned,
+        "skipped": skipped,
+        "failed": failed,
+        "unresolved": unresolved,
     }
 
 

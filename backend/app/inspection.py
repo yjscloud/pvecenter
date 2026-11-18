@@ -39,7 +39,7 @@ import logging
 import os
 import socket
 import time
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Set, Tuple
 
 from . import database, i18n
 from .config import settings
@@ -266,6 +266,16 @@ async def load_reports(
         logger.warning("读取巡检快照失败：%s（回落到真扫）", namespace, exc_info=True)
         return []
 
+    # 管理员不传可见主机集合（``wanted is None``），这里改成与「真实存在的
+    # 主机」求交：主机被删之后（尤其是删除时清理失败、或对账还没跑到），快照行
+    # 会继续被总览读出来，端口页的「服务器」清单里就多出一台永远连不上的幽灵。
+    if wanted is None:
+        ghosts = _ghost_host_ids({str(row["host_id"]) for row in rows}, await _live_host_ids())
+        if ghosts:
+            # 顺手清掉：留着的话，面板重启 / 缓存过期时又会把它端出来
+            await _purge_hosts(ghosts, namespace)
+            rows = [row for row in rows if str(row["host_id"]) not in ghosts]
+
     reports: List[Dict[str, Any]] = []
     for row in rows:
         host_id = str(row["host_id"])
@@ -394,6 +404,86 @@ async def history(
 
 
 # --------------------------------------------------------------------- 清理
+async def _live_host_ids() -> Optional[Set[str]]:
+    """当前**真实存在**的主机 id 集合；读不出来返回 ``None``（调用方不过滤）。
+
+    只在管理员读路径（不传 ``host_ids``）用：快照表的行是按 ``host_id`` 存的，
+    主机被移除之后行还在，而 ``host_ids=None`` 原本是「不过滤」—— 于是幽灵主机
+    会被总览一直端出来（端口页的「服务器」清单尤其明显）。
+
+    读不到清单时返回 ``None`` 而不是空集合：宁可多显示一台，不能因为一次库抖动
+    把所有快照行都当成幽灵删掉。
+    """
+    try:
+        from . import localhost, sshremote
+
+        rows = await sshremote.list_hosts()
+    except Exception:  # noqa: BLE001
+        logger.warning("读取受管主机清单失败（快照本轮不做存活过滤）", exc_info=True)
+        return None
+    ids = {str(row.get("id") or "") for row in rows or []}
+    ids.discard("")
+    # 本机（local）不是 ssh_hosts 里的一行，但它同样是一台会进快照的主机。
+    # 开关读不出来时按「开着」处理，避免误删本机的快照行。
+    try:
+        local_on = await localhost.enabled()
+    except Exception:  # noqa: BLE001
+        logger.debug("读取本机巡检开关失败", exc_info=True)
+        local_on = True
+    if local_on:
+        ids.add("local")
+    return ids
+
+
+def _ghost_host_ids(present: Iterable[str], live: Optional[Set[str]]) -> Set[str]:
+    """快照里有、但主机已经不存在的那几台（幽灵）。
+
+    ``live is None`` 表示「本轮读不到真实主机清单」—— 一律不判，宁可多显示一台
+    也不能因为一次库抖动把所有人的快照都删了。
+    """
+    if live is None:
+        return set()
+    return {str(item) for item in present if str(item) not in live}
+
+
+async def purge_host(host_id: str, namespace: Optional[str] = None) -> int:
+    """按主机 id 精确删快照行（``namespace`` 为空则删它的所有功能快照）。
+
+    趋势表（``inspection_history``）不删：那是历史，保留期到了自己会走。
+    """
+    return await _purge_hosts({str(host_id or "")}, namespace)
+
+
+async def _purge_hosts(host_ids: Iterable[str], namespace: Optional[str] = None) -> int:
+    """批量按主机 id 删快照行，返回删除行数（失败只记日志，不抛）。"""
+    wanted = [str(item) for item in host_ids if str(item or "")]
+    if not wanted:
+        return 0
+    marks = ",".join("?" * len(wanted))
+    sql = f"DELETE FROM inspection_host_report WHERE host_id IN ({marks})"
+    params: List[Any] = list(wanted)
+    if namespace:
+        sql += " AND namespace = ?"
+        params.append(namespace)
+    try:
+        async with database.connect() as db:
+            cursor = await db.execute(sql, tuple(params))
+            removed = cursor.rowcount
+            await db.commit()
+    except Exception:  # noqa: BLE001 - 清快照失败不该阻断删除 / 读路径
+        logger.warning(
+            "按主机清理巡检快照失败：%s", ", ".join(wanted[:5]), exc_info=True
+        )
+        return 0
+    if removed:
+        logger.info(
+            "已清理 %d 行巡检快照（主机已不存在）：%s",
+            removed,
+            ", ".join(wanted[:10]),
+        )
+    return max(removed, 0)
+
+
 async def purge_snapshots(namespace: Optional[str] = None) -> int:
     """清空快照（``namespace`` 为空则全清）。
 

@@ -236,6 +236,19 @@ def clear_namespace(prefix: str) -> None:
         _refresh_marks.pop(key, None)
 
 
+def clear_memory() -> None:
+    """只清内存缓存，**不碰**落库快照。
+
+    用于「某一台主机被移除」这类局部变更：落库快照按 ``host_id`` 精确删
+    （见 :func:`app.inspection.purge_host`），但内存缓存的 key 是「功能名 +
+    可见主机集合 + 语言」，没法按主机剔除，只能整片丢掉内存 —— 别的机器的
+    落库快照因此得以保留，下一次打开不必全场重扫一轮。
+    """
+    _cache.clear()
+    _locks.clear()
+    _refresh_marks.clear()
+
+
 async def clear() -> None:
     """清空缓存：策略 / 处置 / 加固变了之后，旧报告的判定口径已经不对了。
 

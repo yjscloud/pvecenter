@@ -1480,11 +1480,36 @@ def _purge_summary(result: Any) -> str:
 
 
 def _host_sync_summary(result: Any) -> str:
-    """受管主机核对回的是 ``{checked, removed, hosts}``，只报清掉了几台。"""
+    """受管主机核对：清掉了几台、有几台是「被回收后 VMID 复用」认出来的、
+    又有几台本轮没判定成（连接未记 / 清单读不到 / 缺 VMID）。
+
+    后面两类的数字必须报出来：它们在外观上与「已清理」一样，实际上机器还留在
+    「端口与进程」里 —— 只报 ``无变化`` 会让人误以为一切正常。
+    """
     if not isinstance(result, dict):
         return ""
     removed = int(result.get("removed") or 0)
-    return f"清理 {removed} 台已删除主机" if removed else "无变化"
+    reused = int(result.get("tombstoned") or 0)
+    retried = int((result.get("retried") or {}).get("removed") or 0)
+    skipped = len(result.get("skipped") or [])
+    failed = len(result.get("failed") or [])
+    unresolved = len(result.get("unresolved") or [])
+    if not (removed or retried or skipped or failed or unresolved):
+        return "无变化"
+    parts = []
+    if removed:
+        parts.append(f"清理 {removed} 台已删除主机")
+    if reused:
+        parts.append(f"其中 {reused} 台因 VMID 被复用而识别")
+    if retried:
+        parts.append(f"补偿清理 {retried} 台")
+    if failed:
+        parts.append(f"{failed} 台清理失败待重试")
+    if skipped:
+        parts.append(f"{skipped} 台本轮无法判定")
+    if unresolved:
+        parts.append(f"{unresolved} 台缺 VMID 关联无法自动清理")
+    return "，".join(parts)
 
 
 def _cert_summary(result: Any) -> str:
