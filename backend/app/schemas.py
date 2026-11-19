@@ -10,6 +10,34 @@ from . import frpguard
 from .config import settings
 
 
+# ------------------------------------------------------------------- 证书
+class CertRevokeRequest(BaseModel):
+    """吊销请求：``reason`` 是 RFC 5280 的原因码，0 = 未指定。"""
+
+    reason: int = Field(default=0, ge=0, le=10)
+
+
+class CertExportRequest(BaseModel):
+    """私钥导出：格式与 PFX 口令都放在请求体里（不进 URL / 访问日志）。"""
+
+    format: Literal["pem", "pfx"] = "pem"
+    password: str = Field(default="", max_length=128)
+
+
+class CertRotateRequest(BaseModel):
+    """主动轮换：是否在签发后立即部署。"""
+
+    deploy: bool = True
+
+
+class CertBulkRequest(BaseModel):
+    """批量操作：一次最多 200 个站点，逐站点返回结果。"""
+
+    action: Literal["apply", "sync", "deploy", "rotate", "revoke"]
+    site_ids: List[str] = Field(default_factory=list, max_length=200)
+    reason: int = Field(default=0, ge=0, le=10)
+
+
 # ------------------------------------------------------------------- auth
 class LoginRequest(BaseModel):
     username: str

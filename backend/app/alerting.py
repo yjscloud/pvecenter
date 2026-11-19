@@ -12,7 +12,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import quote_plus, urlsplit
 
 import httpx
 
@@ -52,7 +52,7 @@ ALERT_EMAIL_KEY_PREFIX = "alert_email:"
 WEBHOOK_KEY_PREFIX = "alert_webhook:"
 
 # 落库前需要加密的敏感字段。
-SENSITIVE_KEYS = ("webhook", "secret")
+SENSITIVE_KEYS = ("webhook", "secret", "sign_secret")
 
 # ---------------------------------------------------------------- 通用 Webhook
 #
@@ -77,6 +77,8 @@ DEFAULT_WEBHOOK: Dict[str, Any] = {
     "template": "",
     # 额外请求头（JSON 对象文本），用于渠道特有的鉴权头
     "headers": "",
+    # 钉钉「加签」密钥：填了就按钉钉规则把 timestamp + sign 拼进 URL
+    "sign_secret": "",
 }
 
 DEFAULT_WEBHOOK_TEMPLATE = (
@@ -1302,6 +1304,9 @@ async def save_webhook(raw: Dict[str, Any], owner: str = "") -> Dict[str, Any]:
     secret = str(raw.get("secret") or "").strip()
     if not secret and not raw.get("secret_clear"):
         secret = str(current.get("secret") or "")
+    sign_secret = str(raw.get("sign_secret") or "").strip()
+    if not sign_secret and not raw.get("sign_secret_clear"):
+        sign_secret = str(current.get("sign_secret") or "")
 
     if not valid_webhook(webhook):
         raise WebhookConfigError(i18n.tr("Webhook 地址需要是完整的 http(s) 链接"))
@@ -1318,6 +1323,7 @@ async def save_webhook(raw: Dict[str, Any], owner: str = "") -> Dict[str, Any]:
     cfg = {
         "webhook": webhook,
         "secret": secret,
+        "sign_secret": sign_secret,
         "enabled": bool(raw.get("enabled", False)),
         "cooldown": max(60, cooldown),
         "template": template,
@@ -1385,6 +1391,24 @@ def webhook_signature(secret: str, ts: int, body: str) -> str:
     return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
+def dingtalk_signed_url(url: str, secret: str) -> str:
+    """按钉钉机器人「加签」规则给 Webhook URL 追加 timestamp + sign。
+
+    钉钉要求签名放在查询参数里（每请求重算），这是通用模板表达不了的部分；
+    单独抽出来，只有配置了 ``sign_secret`` 才会走到。
+    """
+    ts = str(int(time.time() * 1000))
+    sign = base64.b64encode(
+        hmac.new(
+            secret.encode("utf-8"),
+            f"{ts}\n{secret}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+    ).decode("ascii")
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}timestamp={ts}&sign={quote_plus(sign)}"
+
+
 def _parse_extra_headers(raw: str) -> Dict[str, str]:
     """自定义请求头（JSON 对象文本）→ dict；解析失败当作没有。"""
     if not raw:
@@ -1419,6 +1443,10 @@ async def send_webhook(
         return False, i18n.tr("未配置通用 Webhook 地址")
     if not valid_webhook(url):
         return False, i18n.tr("Webhook 地址不是合法的 http(s) 链接")
+
+    sign_secret = str(config.get("sign_secret") or "")
+    if sign_secret:
+        url = dingtalk_signed_url(url, sign_secret)
 
     payload = dict(context or {})
     payload.setdefault("level", "alarm")
@@ -2169,6 +2197,7 @@ async def record(
     source: str = "",
     repeat: bool = False,
     channels: Optional[Iterable[str]] = None,
+    inbox: bool = True,
 ) -> None:
     """记一条告警历史，并给这条告警的**收件人**留一条站内消息。
 
@@ -2249,7 +2278,10 @@ async def record(
         )
         await db.commit()
 
-    await notifications.push_alert(entry, created=at)
+    # 证书事件自带站内信（正文比告警模板更贴合场景），用 inbox=False 只补历史，
+    # 避免同一个事件在铃铛里出现两条。
+    if inbox:
+        await notifications.push_alert(entry, created=at)
 
 
 async def load_active() -> Dict[str, Dict[str, Any]]:

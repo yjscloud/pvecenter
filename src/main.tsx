@@ -22,6 +22,7 @@ import './styles/components.css';
 import './styles/layout.css';
 import './styles/charts.css';
 import './styles/settings.css';
+import './styles/workflow.css';
 /* 产品官网（公开首页 /）的样式。按页面自上而下拆成四块，便于单块改动与
    增量解析 —— 首页整页样式集中在一个文件里时，任何一次微调都要全量重解析。
    四块的顺序即层叠顺序：令牌 → 骨架/顶栏 → 首屏与中段 → 后段与响应式。 */

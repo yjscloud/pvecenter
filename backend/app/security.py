@@ -338,7 +338,12 @@ PERMISSION_CATALOG: List[Dict[str, Any]] = [
         "label": "证书",
         "permissions": [
             {"key": "cert.view", "label": "查看", "desc": "查看自己的证书与续期状态"},
-            {"key": "cert.manage", "label": "管理", "desc": "申请 / 部署 / 续期自己的证书"},
+            {"key": "cert.manage", "label": "管理", "desc": "申请 / 部署 / 续期 / 吊销自己的证书"},
+            {
+                "key": "cert.export",
+                "label": "导出私钥",
+                "desc": "导出证书链与私钥（PEM / PFX）。私钥等同于该域名的控制权，默认仅管理员；每次导出都会记审计",
+            },
         ],
     },
     {
@@ -1865,6 +1870,29 @@ async def audit(
         result=result,
         detail=detail,
         ip=client_ip(request),
+    )
+
+
+async def audit_system(
+    username: str,
+    action: str,
+    target: str = "",
+    result: str = "success",
+    detail: Any = "",
+) -> None:
+    """后台作业的审计入口（没有请求上下文，也就没有来源 IP）。
+
+    定时续期、自动部署这些动作此前只写证书自己的 ``cert_deploy_log``，
+    ``audit_log`` 里查不到 —— 安全事件复盘时无法回答「凌晨那次吊销/签发是谁
+    触发的」。这里统一记为 ``ip="scheduler"``，与人工操作区分开。
+    """
+    await store.add_audit(
+        username=username or "system",
+        action=action,
+        target=target,
+        result=result,
+        detail=detail,
+        ip="scheduler",
     )
 
 

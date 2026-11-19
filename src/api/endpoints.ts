@@ -244,12 +244,30 @@ import type {
   BotCommand,
   BotConfig,
   AcmeCertConfig,
+  CertBulkResult,
+  CertDetail,
   CertInventoryItem,
+  CertInventoryStats,
   CertProviderInfo,
   CertSite,
   CertTemplate,
   CertDeployLog,
+  CertFlowRun,
+  CertFlowRunDetail,
+  CertRunStreamEvent,
   CertOptions,
+  CertWorkflow,
+  CertWorkflowImportResult,
+  CertWorkflowNode,
+  CertWorkflowNodeSpec,
+  CertWorkflowRun,
+  CertWorkflowRunAction,
+  CertWorkflowRunInput,
+  CertWorkflowRunList,
+  CertWorkflowRunStatus,
+  CertWorkflowSummary,
+  CertWorkflowTemplate,
+  CertWorkflowValidation,
   RemoteCertificate,
   TencentCertConfig,
   LocalHostState,
@@ -2081,6 +2099,8 @@ export interface CertsOverview {
   providers?: CertProviderInfo[];
   /** 证书清单：按「厂商 + 证书 ID」聚合的绑定关系 */
   inventory?: CertInventoryItem[];
+  /** 证书到期分布与渠道/状态统计 */
+  inventory_stats?: CertInventoryStats;
   sites: CertSite[];
   /** 当前用户的站点模板 */
   templates: CertTemplate[];
@@ -2139,6 +2159,27 @@ export const certsApi = {
     post<{ ok: boolean; detail: string; site: CertSite }>(
       `/certs/sites/${id}/deploy`,
     ),
+  /** 主动吊销当前证书；吊销后自动续期会被关闭 */
+  revoke: (id: string, reason = 0) =>
+    post<{
+      revoked: boolean;
+      cert_id: string;
+      reason: number;
+      verified: boolean;
+      detail: string;
+      site: CertSite;
+    }>(`/certs/sites/${id}/revoke`, { reason }),
+  /** 证书详情：链、SAN、指纹、签发者与线上 TLS 体检 */
+  detail: (id: string) => get<CertDetail>(`/certs/sites/${id}/detail`),
+  /** 主动轮换：不等到期就重新签发（托管证书会被后端拒绝） */
+  rotate: (id: string, deploy = true) =>
+    post<{ rotated: boolean; deployed: boolean; detail: string; site: CertSite }>(
+      `/certs/sites/${id}/rotate`,
+      { deploy },
+    ),
+  /** 批量操作：逐站点执行并逐站点返回结果 */
+  bulk: (action: 'apply' | 'sync' | 'deploy' | 'rotate' | 'revoke', siteIds: string[], reason = 0) =>
+    post<CertBulkResult>('/certs/sites/bulk', { action, site_ids: siteIds, reason }),
   sync: (id: string) =>
     post<{ site: CertSite }>(`/certs/sites/${id}/sync`),
   bind: (id: string, certId: string, provider?: string) =>
@@ -2158,7 +2199,35 @@ export const certsApi = {
     del<{ removed: boolean }>(`/certs/templates/${id}`),
   syncAll: () => post<{ sites: CertSite[] }>("/certs/sync"),
   clearLogs: () => del<{ removed: number; detail: string }>("/certs/logs"),
+  /* ---- 流水线运行记录与步骤日志 ----
+     运行头是「可选」的：关掉新引擎时旧调度器不写 cert_flow_run，但部署日志
+     照样按 run_id/node_id 归因，所以这两个接口在两种模式下都能用。 */
+  runs: (siteId = "", limit = 20) =>
+    get<{ items: CertFlowRun[]; engine_enabled: boolean }>("/certs/runs", {
+      params: { site_id: siteId, limit },
+    }),
+  runDetail: (runId: string) => get<CertFlowRunDetail>(`/certs/runs/${runId}`),
+  /** 游标增量拉日志（SSE 不可用时的兜底）：把上次的 cursor 当 after 传回 */
+  runLogs: (runId: string, after = 0, nodeId = "") =>
+    get<{ items: CertDeployLog[]; cursor: number; node_id: string }>(
+      `/certs/runs/${runId}/logs`,
+      { params: { after, ...(nodeId ? { node_id: nodeId } : {}) } },
+    ),
+  /** 订阅某次运行的实时进度；返回的 Promise 在流关闭时 resolve */
+  streamRun: (
+    runId: string,
+    onEvent: (event: CertRunStreamEvent) => void,
+    signal?: AbortSignal,
+  ) =>
+    streamSse<CertRunStreamEvent>(
+      `/certs/runs/${runId}/stream`,
+      {},
+      onEvent,
+      signal,
+      "GET",
+    ),
   /* ---- 证书清单与多站点绑定 ---- */
+  stats: () => get<CertInventoryStats>("/certs/stats"),
   inventory: () =>
     get<{ items: CertInventoryItem[]; count: number }>("/certs/inventory"),
   bindInventory: (body: { provider: string; cert_id: string; site_ids: string[] }) =>
@@ -2170,6 +2239,109 @@ export const certsApi = {
       inventory: CertInventoryItem[];
     }>("/certs/inventory/bind", body),
 };
+
+/* ---------------------------------------------------------------------------
+   证书工作流
+   ------------------------------------------------------------------------- */
+
+/** 创建工作流时提交的定义。`origin` 只影响后端是否自动处理重名 */
+export interface CertWorkflowInput {
+  name: string;
+  description: string;
+  nodes: CertWorkflowNode[];
+  origin?: 'template' | 'blank' | 'import' | 'editor';
+}
+
+export const certWorkflowsApi = {
+  list: () =>
+    get<{ items: CertWorkflowSummary[]; count: number }>("/cert-workflows"),
+  get: (id: string) => get<{ workflow: CertWorkflow }>(`/cert-workflows/${id}`),
+  templates: () =>
+    get<{ templates: CertWorkflowTemplate[] }>("/cert-workflows/templates"),
+  nodeTypes: () =>
+    get<{ types: CertWorkflowNodeSpec[]; max_nodes: number }>(
+      "/cert-workflows/node-types",
+    ),
+  create: (body: CertWorkflowInput) =>
+    post<{ workflow: CertWorkflow }>("/cert-workflows", body),
+  update: (id: string, body: CertWorkflowInput) =>
+    put<{ workflow: CertWorkflow }>(`/cert-workflows/${id}`, body),
+  remove: (id: string) =>
+    del<{ removed: boolean }>(`/cert-workflows/${id}`),
+  validate: (body: CertWorkflowInput) =>
+    post<CertWorkflowValidation>("/cert-workflows/validate", body),
+  importFile: (filename: string, content: string) =>
+    post<CertWorkflowImportResult>("/cert-workflows/import", { filename, content }),
+  /** 导出文本：页面自己创建 blob 下载，后端只负责序列化 */
+  exportText: (id: string, format: 'yaml' | 'json') =>
+    http
+      .get<string>(`/cert-workflows/${id}/export`, {
+        params: { format },
+        responseType: 'text',
+        // axios 在 responseType=text 时可能仍按 JSON 解析：显式关掉转换
+        transformResponse: [(data) => data],
+      })
+      .then((resp) => String(resp.data ?? '')),
+};
+
+/** 工作流运行实例：发起、审批与逐步流转 */
+export const certWorkflowRunsApi = {
+  list: (params?: {
+    site_id?: string;
+    status?: CertWorkflowRunStatus | '';
+    limit?: number;
+  }) =>
+    get<CertWorkflowRunList>("/cert-workflow-runs", {
+      params: params
+        ? {
+            ...(params.site_id ? { site_id: params.site_id } : {}),
+            ...(params.status ? { status: params.status } : {}),
+            ...(params.limit ? { limit: params.limit } : {}),
+          }
+        : undefined,
+    }),
+  get: (id: string) =>
+    get<{ run: CertWorkflowRun }>(`/cert-workflow-runs/${id}`),
+  create: (body: CertWorkflowRunInput) =>
+    post<{ run: CertWorkflowRun }>("/cert-workflow-runs", body),
+  transition: (id: string, action: CertWorkflowRunAction, note = "") =>
+    post<{ run: CertWorkflowRun }>(`/cert-workflow-runs/${id}/transition`, {
+      action,
+      note,
+    }),
+};
+
+/**
+ * 下载站点证书（PEM zip / PFX）。
+ * 从响应头的 filename* 取文件名，避免中文域名被转义成乱码。
+ *
+ * 用 POST 而不是 GET：PFX 口令属于凭据，放进 URL 会落进访问日志、浏览器
+ * 历史与反向代理日志。后端对导出另有 ``cert.export`` 权限与审计。
+ */
+export async function downloadCertificate(
+  siteId: string,
+  format: "pem" | "pfx",
+  password = "",
+): Promise<void> {
+  const resp = await http.post(
+    `/certs/sites/${siteId}/export`,
+    { format, ...(password ? { password } : {}) },
+    { responseType: "blob" },
+  );
+  const disposition = String(resp.headers["content-disposition"] || "");
+  const match = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+  const filename = match
+    ? decodeURIComponent(match[1])
+    : `certificate.${format === "pem" ? "zip" : format}`;
+  const url = URL.createObjectURL(resp.data as Blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
 
 /* ---------------------------------------------------------------------------
    飞书机器人（指令控制）
@@ -2877,6 +3049,7 @@ async function streamSse<T>(
   body: Record<string, unknown>,
   onEvent: (event: T) => void,
   signal?: AbortSignal,
+  method: 'POST' | 'GET' = 'POST',
 ): Promise<void> {
   const base = import.meta.env.VITE_API_BASE || '/api';
 
@@ -2906,15 +3079,19 @@ async function streamSse<T>(
   let resp: Response;
   try {
     resp = await fetch(`${base}${path}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        // 这条是手写 fetch，不经过 axios 的请求拦截器，CSRF 头必须自己补上 ——
-        // 漏掉会被后端直接拒（"请求缺少 CSRF 校验信息"）。
-        [CSRF_HEADER]: readCsrfToken(),
-      },
+      method,
+      headers:
+        method === 'POST'
+          ? {
+              'Content-Type': 'application/json',
+              // 这条是手写 fetch，不经过 axios 的请求拦截器，CSRF 头必须自己补上 ——
+              // 漏掉会被后端直接拒（"请求缺少 CSRF 校验信息"）。
+              [CSRF_HEADER]: readCsrfToken(),
+            }
+          : {},
       credentials: 'include',
-      body: JSON.stringify(body),
+      // GET 不能带 body：某些代理会直接拒掉带正文的 GET 请求
+      ...(method === 'POST' ? { body: JSON.stringify(body) } : {}),
       signal: controller.signal,
     });
   } catch (err) {

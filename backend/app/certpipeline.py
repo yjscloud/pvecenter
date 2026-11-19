@@ -126,14 +126,29 @@ class Pipeline:
         self.name = name
         self.steps = steps
 
-    async def run(self, ctx: Context) -> RunResult:
+    async def run(
+        self,
+        ctx: Context,
+        on_step: Optional[Callable[[str, int], None]] = None,
+    ) -> RunResult:
+        """执行整条流水线。
+
+        ``on_step(name, index)`` 在**每一步开始前**回调（跳过的步骤也会回调）：
+        调用方借此把「当前步骤」写进日志归因上下文，步骤内部产生的部署日志就能
+        自动挂到正确的步骤下，而不必给每一层函数加参数。回调本身出错不影响流程。
+        """
         results: List[StepResult] = []
         started_all = time.perf_counter()
 
         def elapsed() -> int:
             return int((time.perf_counter() - started_all) * 1000)
 
-        for step in self.steps:
+        for index, step in enumerate(self.steps):
+            if on_step is not None:
+                try:
+                    on_step(step.name, index)
+                except Exception:  # 归因失败不该拦住签发
+                    pass
             if step.when is not None and not step.when(ctx):
                 results.append(
                     StepResult(step.name, STEP_SKIPPED, at=elapsed())

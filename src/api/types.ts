@@ -883,6 +883,8 @@ export interface AlertWebhookConfig {
   webhook?: string;
   /** 签名密钥：留空 = 不修改；读取时同样为空串 */
   secret?: string;
+  /** 钉钉加签密钥：留空 = 不修改；读取时同样为空串 */
+  sign_secret?: string;
   /** 冷却时间（秒） */
   cooldown: number;
   /** 请求体模板（JSON 文本，支持 {{占位符}}）；留空用内置默认体 */
@@ -3672,6 +3674,8 @@ export interface AlertsOverview {
   hook_set: boolean;
   hook_masked: string;
   hook_secret_set: boolean;
+  /** 钉钉加签密钥是否已配置 */
+  hook_sign_secret_set?: boolean;
   /** 一键填充用的请求体预设（key → 预设） */
   hook_presets: Record<string, AlertWebhookPreset>;
   /** 模板里可用的占位符名 */
@@ -3753,7 +3757,16 @@ export interface AcmeCertConfig {
 export interface CertTarget {
   id?: string;
   name?: string;
-  method?: 'local' | 'ssh' | 'agent' | 'lxc' | 'pve';
+  method?:
+    | 'local'
+    | 'ssh'
+    | 'agent'
+    | 'lxc'
+    | 'pve'
+    | 'tencent_clb'
+    | 'aliyun_slb'
+    | 'tencent_cdn'
+    | 'aliyun_cdn';
   deploy_dir?: string;
   cert_filename?: string;
   key_filename?: string;
@@ -3767,6 +3780,12 @@ export interface CertTarget {
   ssh_host_key?: string;
   agent_node?: string;
   agent_vmid?: string;
+  /** 云负载均衡 / CDN 参数 */
+  cloud_region?: string;
+  lb_id?: string;
+  listener_id?: string;
+  listener_port?: number;
+  cdn_domain?: string;
   last_error?: string;
   last_deploy_at?: number;
 }
@@ -3783,9 +3802,24 @@ export interface CertSite {
   cert_id: string;
   /** 已提交申请、等待 CA 签发的证书 ID */
   pending_cert_id: string;
-  /** local = 面板本机；ssh = 远程服务器；agent = PVE 虚拟机；lxc = PVE 容器；pve = PVE 节点证书 */
-  deploy_method: 'local' | 'ssh' | 'agent' | 'lxc' | 'pve';
+  /** local / ssh / agent / lxc / pve / 云负载均衡 / CDN */
+  deploy_method:
+    | 'local'
+    | 'ssh'
+    | 'agent'
+    | 'lxc'
+    | 'pve'
+    | 'tencent_clb'
+    | 'aliyun_slb'
+    | 'tencent_cdn'
+    | 'aliyun_cdn';
   deploy_dir: string;
+  /** 云负载均衡 / CDN 参数（站点级字段跟随第一个目标） */
+  cloud_region?: string;
+  lb_id?: string;
+  listener_id?: string;
+  listener_port?: number;
+  cdn_domain?: string;
   cert_filename: string;
   key_filename: string;
   reload_command: string;
@@ -3803,6 +3837,10 @@ export interface CertSite {
   agent_node: string;
   agent_vmid: string;
   auto_renew: boolean;
+  /** 签发后是否自动部署（关闭后只签发，等人工部署） */
+  auto_deploy?: boolean;
+  /** 是否发送 30/14/7/3 天到期提醒 */
+  notify_expiring?: boolean;
   /** 0 表示跟随全局设置 */
   renew_before_days: number;
   /** 部署成功后是否删除 CA 侧的旧证书 */
@@ -3844,6 +3882,34 @@ export interface CertSite {
   cert_status_text: string;
   cert_domain: string;
   expire_at: number;
+  /** 上一个状态与最近一次变更时间（状态机审计） */
+  status_prev?: number;
+  status_changed_at?: number;
+  /** 吊销现场：cert_id 清空后，这里保留吊销对象与 CA 侧回查结果 */
+  revoked_cert_id?: string;
+  revoked_at?: number;
+  revoke_reason?: number;
+  revoke_verified?: boolean;
+  /** 线上 TLS 体检结论：ok / warn / bad；空 = 未检查 */
+  health_status?: '' | 'ok' | 'warn' | 'bad' | 'unknown';
+  health_issues?: string[];
+  health_detail?: string;
+  health_checked_at?: number;
+  tls_protocol?: string;
+  tls_trusted?: boolean;
+  tls_hostname_ok?: boolean;
+  cert_issuer?: string;
+  cert_serial?: string;
+  cert_fingerprint?: string;
+  cert_chain_length?: number;
+  /** 环境 / 集群维度（空 = 未标注） */
+  environment?: string;
+  cluster?: string;
+  /** 主动轮换策略 */
+  auto_rotate?: boolean;
+  rotate_before_days?: number;
+  last_rotated_at?: number;
+  rotate_count?: number;
   last_deploy_at: number;
   last_check_at: number;
   last_error: string;
@@ -3855,8 +3921,83 @@ export interface CertSite {
   ssh_key_set?: boolean;
   /** 最近一次续期流水线的逐步结果（见后端 certpipeline） */
   last_run?: CertRunStep[];
+  /** 最近一次运行的 id：部署日志按它归属，页面据此拉「这一步到底打了什么日志」 */
+  last_run_id?: string;
   last_run_at?: number;
-  last_run_status?: '' | 'ok' | 'failed';
+  last_run_status?: '' | 'ok' | 'failed' | 'running';
+}
+
+/** 证书详情（链 / SAN / 指纹 / 密钥参数 + 线上体检） */
+export interface CertDetail {
+  site_id: string;
+  name: string;
+  domain: string;
+  domains: string[];
+  ca: string;
+  cert_id: string;
+  status: number;
+  status_text: string;
+  expire_at: number;
+  days_left: number | null;
+  /** cache = 站点缓存；provider = 现从 CA 取回；空 = 没有证书内容 */
+  source: string;
+  leaf: {
+    subject?: string;
+    common_name?: string;
+    issuer?: string;
+    serial?: string;
+    fingerprint_sha256?: string;
+    not_before?: number;
+    not_after?: number;
+    days_left?: number;
+    san?: string[];
+    key?: { type: string; bits: number };
+    signature_hash?: string;
+    is_ca?: boolean;
+  };
+  chain: {
+    subject: string;
+    issuer: string;
+    serial: string;
+    fingerprint_sha256: string;
+    not_before: number;
+    not_after: number;
+    is_ca: boolean;
+  }[];
+  chain_length: number;
+  health: {
+    status: string;
+    issues: string[];
+    detail: string;
+    checked_at: number;
+    protocol: string;
+    trusted: boolean;
+    hostname_ok: boolean;
+  };
+  environment: string;
+  cluster: string;
+  targets: {
+    id: string;
+    name: string;
+    method: string;
+    last_error: string;
+    last_deploy_at: number;
+  }[];
+}
+
+/** 批量操作结果：逐站点汇报，部分失败不影响其它站点 */
+export interface CertBulkResult {
+  action: string;
+  total: number;
+  ok: number;
+  failed: number;
+  results: {
+    site_id: string;
+    name?: string;
+    domain?: string;
+    ok: boolean;
+    detail: string;
+  }[];
 }
 
 /** 续期流水线的一步：guard / prepare / sync / decide / warn / issue / deploy / drop / notice */
@@ -3876,11 +4017,67 @@ export interface CertDeployLog {
   site_id: string;
   site_name: string;
   domain: string;
-  /** apply / renew / deploy / bind / sync */
+  /** apply / renew / deploy / bind / sync / import / revoke / cleanup */
   action: string;
   result: string;
   detail: string;
   ts: number;
+  /** 归因：哪次运行（为空表示手工接口 / 流水线之外的动作） */
+  run_id?: string;
+  /** 归因：哪一步（guard / prepare / sync / decide / warn / issue / deploy / drop / notice） */
+  node_id?: string;
+}
+
+/** 某次运行里的一步。字段与后端 cert_flow_step 对齐 */
+export interface CertFlowRunStep {
+  node_id: string;
+  node_type: string;
+  status: 'ok' | 'skipped' | 'failed' | 'running';
+  detail?: string;
+  ms?: number;
+  /** 相对运行开始的毫秒偏移 */
+  at_ms?: number;
+  error?: string;
+  /** 本步产生的部署日志（按 id 升序，即产生顺序） */
+  logs?: CertDeployLog[];
+}
+
+/**
+ * 运行实时流的事件。
+ *
+ * 后端是「按游标轮询数据库」的 SSE：多 worker 下跑流水的进程和接流的进程往往
+ * 不是同一个，进程内事件总线跨不过去，数据库才是唯一共享状态。
+ */
+export type CertRunStreamEvent =
+  | { type: 'snapshot'; run: CertFlowRunDetail }
+  | { type: 'logs'; items: CertDeployLog[]; cursor: number }
+  | { type: 'done'; reason: 'finished' | 'idle' | 'timeout'; status?: string };
+
+/** 运行头（列表用）。字段与后端 cert_flow_run 对齐 */
+export interface CertFlowRun {
+  id: string;
+  username?: string;
+  site_id?: string;
+  site_name?: string;
+  domain?: string;
+  pipeline?: string;
+  version?: number;
+  /** 触发来源：tick / retry / manual / legacy */
+  trigger_by?: string;
+  status: string;
+  error?: string;
+  started_at?: number;
+  finished_at?: number;
+}
+
+/** 运行详情：运行头 + 步骤 + 按步骤分组的日志 */
+export interface CertFlowRunDetail extends CertFlowRun {
+  steps: CertFlowRunStep[];
+  /** 本次运行的全部日志（按产生顺序） */
+  logs: CertDeployLog[];
+  /** 按 node_id 分组；旧路径没有运行头时前端只用这份 */
+  groups: Record<string, CertDeployLog[]>;
+  artifacts?: Array<Record<string, unknown>>;
 }
 
 export interface RemoteCertificate {
@@ -3986,6 +4183,23 @@ export interface CertInventoryItem {
   pending: boolean;
   sites: CertInventorySite[];
   site_count: number;
+}
+
+/** 证书到期分桶（统计卡与到期分布图共用） */
+export interface CertInventoryBuckets {
+  expired: number;
+  d7: number;
+  d30: number;
+  d90: number;
+  d90plus: number;
+  unknown: number;
+}
+
+export interface CertInventoryStats {
+  total: number;
+  buckets: CertInventoryBuckets;
+  by_ca: { provider: string; label: string; count: number }[];
+  by_status: { status: number; text: string; count: number }[];
 }
 
 /* ---- 飞书机器人（指令控制） ---- */
@@ -5842,4 +6056,177 @@ export interface MaintenanceState {
    * 所以这里不回填默认值 —— 否则一保存就把某一种语言写死了）。
    */
   message: string;
+}
+
+/* ---------------------------------------------------------------------------
+   证书工作流（模板 / 导入 / 可视化编排）
+   ------------------------------------------------------------------------- */
+
+/** 节点在画布上的坐标；由后端在导入缺失时补一个不重叠的初始布局 */
+export interface CertWorkflowPosition {
+  x: number;
+  y: number;
+}
+
+/**
+ * 一个节点实例。
+ *
+ * `type` 对应后端 `NODE_SCHEMAS` 的键；`options` 的字段由节点类型契约动态决定，
+ * 所以这里是 `Record<string, unknown>`，表单按 `/node-types` 的描述渲染。
+ */
+export interface CertWorkflowNode {
+  id: string;
+  type: string;
+  title: string;
+  options: Record<string, unknown>;
+  /** 依赖的上游节点 id；为空表示这是起点 */
+  needs: string[];
+  position: CertWorkflowPosition;
+}
+
+/** 节点参数描述：前端据此渲染输入框、下拉与开关 */
+export interface CertWorkflowFieldSpec {
+  key: string;
+  type: 'text' | 'number' | 'switch' | 'select' | 'stringlist' | 'multiselect';
+  label_key: string;
+  hint_key?: string;
+  placeholder?: string;
+  required?: boolean;
+  min?: number;
+  max?: number;
+  choices?: Array<{ value: string; label_key: string }>;
+  default?: unknown;
+  show_if?: { key: string; in?: string[]; contains?: string };
+  format?: string;
+}
+
+export interface CertWorkflowNodeSpec {
+  type: string;
+  label_key: string;
+  desc_key: string;
+  fields: CertWorkflowFieldSpec[];
+}
+
+/** 列表行。后端不返回节点正文，只给数量，列表接口因此很轻 */
+export interface CertWorkflowSummary {
+  id: string;
+  name: string;
+  description: string;
+  version: number;
+  /** template / blank / import / editor */
+  origin: string;
+  node_count: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CertWorkflow extends CertWorkflowSummary {
+  nodes: CertWorkflowNode[];
+}
+
+export interface CertWorkflowTemplate {
+  key: string;
+  name_key: string;
+  description_key: string;
+  /** 后端按当前请求语言附带的展示文本 */
+  name: string;
+  description: string;
+  nodes: CertWorkflowNode[];
+}
+
+/** 导入 / 校验的错误项。`path` 形如 `nodes[2].options.domain` */
+export interface CertWorkflowIssue {
+  message: string;
+  path: string;
+  line?: number;
+}
+
+export interface CertWorkflowValidation {
+  valid: boolean;
+  errors: CertWorkflowIssue[];
+  warnings: CertWorkflowIssue[];
+  definition?: {
+    name: string;
+    description: string;
+    nodes: CertWorkflowNode[];
+  } | null;
+}
+
+export interface CertWorkflowImportResult {
+  ok: boolean;
+  workflow?: CertWorkflow;
+  errors: CertWorkflowIssue[];
+  warnings: CertWorkflowIssue[];
+  format: string;
+  renamed_from?: string;
+}
+
+/* ---- 工作流运行实例：发起 / 审批 / 流转 ---- */
+
+export type CertWorkflowRunStatus =
+  | 'pending'
+  | 'running'
+  | 'succeeded'
+  | 'rejected'
+  | 'cancelled';
+
+export type CertWorkflowStepStatus = 'pending' | 'running' | 'done' | 'skipped';
+
+export type CertWorkflowRunAction = 'approve' | 'reject' | 'advance' | 'cancel';
+
+export interface CertWorkflowRunStep {
+  node_id: string;
+  type: string;
+  /** 节点自定义标题；为空时前端用节点类型的本地化名称兜底 */
+  title: string;
+  status: CertWorkflowStepStatus;
+  note: string;
+  started_at: number;
+  finished_at: number;
+}
+
+export interface CertWorkflowRun {
+  id: string;
+  workflow_id: string;
+  workflow_name: string;
+  site_id: string;
+  site_domain: string;
+  title: string;
+  status: CertWorkflowRunStatus;
+  /** 当前步骤下标；-1 表示待审批，steps.length 表示已完成 */
+  current_index: number;
+  steps: CertWorkflowRunStep[];
+  requester: string;
+  approver: string;
+  request_note: string;
+  approval_note: string;
+  created_at: number;
+  updated_at: number;
+  started_at: number;
+  finished_at: number;
+  /** 当前状态下允许的操作，由后端状态机给出 */
+  actions: CertWorkflowRunAction[];
+}
+
+export interface CertWorkflowRunStats {
+  pending: number;
+  running: number;
+  succeeded: number;
+  rejected: number;
+  cancelled: number;
+  total: number;
+  active: number;
+}
+
+export interface CertWorkflowRunList {
+  items: CertWorkflowRun[];
+  count: number;
+  stats: CertWorkflowRunStats;
+}
+
+export interface CertWorkflowRunInput {
+  workflow_id: string;
+  site_id?: string;
+  title?: string;
+  note?: string;
 }

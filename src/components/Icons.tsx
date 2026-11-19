@@ -506,6 +506,16 @@ export const IconShieldCheck = ({ size = 18, ...rest }: IconProps) => (
 
 /** 证书字形（iconfont 1024 视口）：一张带文字行的证书 + 右下角的蜡封徽章。
  *  比通用盾牌更能说明这一页管的是 HTTPS 证书的签发与续期。 */
+/** 工作流：两个节点 + 一条连线，和「编排」的语义对得上 */
+export const IconFlow = ({ size = 18, ...rest }: IconProps) => (
+  <Icon size={size} {...rest}>
+    <circle cx="6" cy="6" r="3" />
+    <circle cx="18" cy="18" r="3" />
+    <path d="M9 6h3a3 3 0 0 1 3 3v3" />
+    <path d="M18 12v3" />
+  </Icon>
+);
+
 export const IconCertificate = ({ size = 18, ...rest }: IconProps) => (
   <svg
     viewBox="0 0 1024 1024"

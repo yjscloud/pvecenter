@@ -41,14 +41,17 @@ def _masked_hook(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     url = str(cfg.get("webhook") or "")
     secret = str(cfg.get("secret") or "")
+    sign_secret = str(cfg.get("sign_secret") or "")
     safe = dict(cfg)
     safe["webhook"] = ""
     safe["secret"] = ""
+    safe["sign_secret"] = ""
     return {
         "hook": safe,
         "hook_set": bool(url),
         "hook_masked": alerting.mask_webhook(url),
         "hook_secret_set": bool(secret),
+        "hook_sign_secret_set": bool(sign_secret),
     }
 
 

@@ -78,6 +78,7 @@ export const zhCore = {
   'nav.securityBaseline': '安全基线',
   'nav.alerts': '监控告警',
   'nav.certificates': '证书管理',
+  'nav.certWorkflows': '证书工作流',
   'nav.feishuBot': '飞书 Bot',
   'nav.tasks': '任务队列',
   'nav.users': '用户管理',

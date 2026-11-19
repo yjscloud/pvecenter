@@ -78,6 +78,7 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'nav.securityBaseline': 'Security Baseline',
   'nav.alerts': 'Monitoring & Alerts',
   'nav.certificates': 'Certificates',
+  'nav.certWorkflows': 'Cert workflows',
   'nav.feishuBot': 'Feishu Bot',
   'nav.tasks': 'Task Queue',
   'nav.users': 'Users',

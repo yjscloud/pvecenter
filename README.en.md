@@ -69,7 +69,7 @@ backup.png / console.png / audit-log.png / certificates.png / users-rbac.png
 - **Internal tunneling**: a built-in frpc that maps guest ports to the internet, with port ranges, target allowlists and per-user grants
 - **Monitoring and alerting**: live metrics, RRD charts, capacity forecasting, disk SMART / ZFS; notifications over mail, Feishu, webhooks and the in-app inbox
 - **Backup and restore**: back up now or on a schedule, browse volumes, restore to a given VMID, delete protection, integrity checks and PBS verification state; optional read-only PBS access for repository usage, GC / verify tasks and disk health
-- **Certificates**: Tencent Cloud / Alibaba Cloud / Huawei Cloud / ACME / hosted certificates, auto-renewed and deployed to the local host, SSH hosts, PVE guests or nodes
+- **Certificates**: Tencent Cloud / Alibaba Cloud / Huawei Cloud / ACME (Let's Encrypt, ZeroSSL, Google Trust Services, SSL.com, Actalis, Buypass) / hosted certificates; eight DNS providers, PEM/PFX export, auto-renewed and deployed to the local host, SSH hosts, PVE guests or nodes
 - **Security operations**: SSH brute-force protection, login audit, security baseline, port and process inspection, emergency response
 - **AI assistant**: attributes findings from inspection data, read-only command allowlist, write commands approved one by one
 - **Accounts and permissions**: built-in and custom roles, per-user / per-role quotas, node visibility, two-factor auth, session management, personal API tokens
@@ -738,11 +738,21 @@ through frp should record the real source IP, see the [frp real-IP guide](docs/f
 ### Certificate management (ACME / multi-cloud / PVE nodes)
 
 Talks to Tencent Cloud, Alibaba Cloud and Huawei Cloud free certificates, your own ACME account (Let's
-Encrypt / ZeroSSL, with wildcard and multi-domain support) and manually uploaded managed certificates.
+Encrypt / ZeroSSL / Google Trust Services / SSL.com / Actalis / Buypass, with wildcard, multi-domain, IP and EAB
+support) and manually uploaded managed certificates. DNS-01 supports DNSPod, Alibaba Cloud, Huawei Cloud,
+Cloudflare, GoDaddy, AWS Route 53, Namecheap and Volcengine.
+
 Renewal happens before expiry and deploys per site to a local directory, a remote SSH server, a PVE virtual
-machine (Guest Agent), an LXC container, or the PVE node's own 8006 management certificate; a reload command
-can follow, and on PVE nodes PVE writes the file and restarts pveproxy itself. Multiple site bindings, a
-certificate inventory, expiry monitoring and failure back-off are included.
+machine (Guest Agent), an LXC container, the PVE node's own 8006 management certificate, or a cloud load balancer
+/ CDN (Tencent CLB, Alibaba SLB, Tencent CDN, Alibaba CDN); a reload command can follow, and on PVE nodes PVE
+writes the file and restarts pveproxy itself. The renewal pipeline has per-site switches: issue only without
+auto-deploy, and disable expiry reminders.
+
+Expiry reminders fire at 30/14/7/3 days, and certificates can be revoked (ACME revoke / cloud deletion).
+Certificates export as PEM (zip) or PFX, and the inventory ships with an expiry distribution. Notifications reuse
+the alert channels (inbox / email / generic webhook / Feishu); the generic webhook ships presets for WeCom,
+DingTalk (with signing) and Slack. Multiple site bindings, expiry monitoring and failure
+back-off are included.
 
 <!-- screenshot: docs/screenshots/certificates.png -->
 ![Certificate management: issuing channels, site list and automatic renewal](docs/screenshots/certificates.png)

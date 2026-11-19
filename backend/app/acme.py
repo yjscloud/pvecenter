@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
+import ipaddress
 import json
 import time
 from dataclasses import dataclass, field
@@ -30,15 +32,25 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.x509.oid import NameOID
 
-# 常见目录，界面直接给下拉，也允许自己填
+# 常见目录，界面直接给下拉，也允许自己填。
+# Google Trust Services / SSL.com / Actalis / Buypass 都要求 EAB（见 AcmeClient 的
+# eab_kid / eab_hmac_key），只填目录不填 EAB 会在注册账号时被 CA 拒绝。
 DIRECTORY_LETSENCRYPT = "https://acme-v02.api.letsencrypt.org/directory"
 DIRECTORY_STAGING = "https://acme-staging-v02.api.letsencrypt.org/directory"
 DIRECTORY_ZEROSSL = "https://acme.zerossl.com/v2/DV90"
+DIRECTORY_GOOGLE = "https://dv.acme-v02.api.pki.goog/directory"
+DIRECTORY_SSLCOM = "https://acme.ssl.com/sslcom-dv-rsa"
+DIRECTORY_ACTALIS = "https://acme.actalis.it/acme/DV"
+DIRECTORY_BUYPASS = "https://api.buypass.com/acme/directory"
 
 DIRECTORIES = (
     ("letsencrypt", DIRECTORY_LETSENCRYPT),
     ("letsencrypt_staging", DIRECTORY_STAGING),
     ("zerossl", DIRECTORY_ZEROSSL),
+    ("google", DIRECTORY_GOOGLE),
+    ("sslcom", DIRECTORY_SSLCOM),
+    ("actalis", DIRECTORY_ACTALIS),
+    ("buypass", DIRECTORY_BUYPASS),
 )
 
 #: 轮询授权 / 订单状态的节奏与上限。DNS 生效慢，给到 5 分钟。
@@ -117,6 +129,29 @@ def wildcard_of(domain: str) -> str:
     return domain[2:] if domain.startswith("*.") else domain
 
 
+def is_ip(value: str) -> bool:
+    """是不是一个 IP 地址（IPv4；IPv6 因上游会按冒号截断，这里不支持）。"""
+    try:
+        ipaddress.ip_address(str(value or "").strip().strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _identifier(domain: str) -> Dict[str, str]:
+    """ACME 订单里的 identifier：域名用 dns，IP 用 ip（RFC 8738）。"""
+    if is_ip(domain):
+        return {"type": "ip", "value": str(domain).strip().strip("[]")}
+    return {"type": "dns", "value": str(domain)}
+
+
+def _san(domain: str) -> Any:
+    """CSR 的 SAN：IP 要用 IPAddress，否则 CA 会忽略这个条目。"""
+    if is_ip(domain):
+        return x509.IPAddress(ipaddress.ip_address(str(domain).strip().strip("[]")))
+    return x509.DNSName(str(domain))
+
+
 def new_private_key(kind: str) -> Any:
     if str(kind or "").lower() in (KEY_ECC, "ecc", "ecdsa"):
         return ec.generate_private_key(ec.SECP256R1())
@@ -137,7 +172,7 @@ def build_csr(domains: List[str], key: Any) -> bytes:
         x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, wildcard_of(domains[0])[:64])])
     )
     builder = builder.add_extension(
-        x509.SubjectAlternativeName([x509.DNSName(d) for d in domains]), critical=False
+        x509.SubjectAlternativeName([_san(d) for d in domains]), critical=False
     )
     return builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.DER)
 
@@ -250,11 +285,16 @@ class AcmeClient:
         *,
         email: str = "",
         account_key_pem: str = "",
+        eab_kid: str = "",
+        eab_hmac_key: str = "",
         timeout: float = HTTP_TIMEOUT,
     ) -> None:
         self.directory_url = str(directory_url or DIRECTORY_LETSENCRYPT)
         self.email = str(email or "").strip()
         self.account_key = AccountKey.load(account_key_pem)
+        #: 外部账户绑定（RFC 8555 §7.3.4）。GTS / SSL.com / Actalis / Buypass 强制要求
+        self.eab_kid = str(eab_kid or "").strip()
+        self.eab_hmac_key = str(eab_hmac_key or "").strip()
         self.timeout = timeout
         self._directory: Dict[str, Any] = {}
         self._kid = ""
@@ -354,14 +394,48 @@ class AcmeClient:
             raise AcmeError(f"ACME 请求失败（HTTP {resp.status_code}）", problem)
         raise AcmeError("ACME 请求失败：nonce 重试后仍未成功")
 
+    def _eab_payload(self, new_account_url: str) -> Dict[str, Any]:
+        """构造 externalAccountBinding：用 CA 给的 HMAC Key 对账号公钥再做一次 JWS。
+
+        这是 RFC 8555 §7.3.4 规定的格式，只有 CA 要求 EAB 时才用得上。没配 EAB
+        就返回空 dict，调用方据此决定是否把字段塞进 newAccount。
+        """
+        if not self.eab_kid or not self.eab_hmac_key:
+            return {}
+        protected = b64(
+            json.dumps(
+                {"alg": "HS256", "kid": self.eab_kid, "url": new_account_url},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        payload = b64(
+            json.dumps(
+                self.account_key.jwk(), separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        )
+        # HMAC Key 是 base64url（无填充），补齐再解，解不开直接报可读错误
+        padded = self.eab_hmac_key + "=" * (-len(self.eab_hmac_key) % 4)
+        try:
+            key = base64.urlsafe_b64decode(padded.encode("ascii"))
+        except Exception as exc:  # noqa: BLE001 - 用户填错 base64 要给可读提示
+            raise AcmeError("EAB HMAC Key 不是合法的 base64url 字符串") from exc
+        signature = hmac.new(
+            key, (protected + "." + payload).encode("ascii"), hashlib.sha256
+        ).digest()
+        return {"protected": protected, "payload": payload, "signature": b64(signature)}
+
     async def ensure_account(self) -> str:
         """注册（或复用）账号，返回 kid。"""
         if self._kid:
             return self._kid
+        new_account_url = str((await self.directory())["newAccount"])
         payload: Dict[str, Any] = {"termsOfServiceAgreed": True}
         if self.email:
             payload["contact"] = ["mailto:" + self.email]
-        resp = await self._post(str((await self.directory())["newAccount"]), payload, use_jwk=True)
+        eab = self._eab_payload(new_account_url)
+        if eab:
+            payload["externalAccountBinding"] = eab
+        resp = await self._post(new_account_url, payload, use_jwk=True)
         self._kid = str(resp.headers.get("Location") or "")
         if not self._kid:
             raise AcmeError("CA 没有返回账号地址（Location）")
@@ -376,7 +450,7 @@ class AcmeClient:
 
     async def new_order(self, domains: List[str]) -> Dict[str, Any]:
         await self.ensure_account()
-        payload = {"identifiers": [{"type": "dns", "value": d} for d in domains]}
+        payload = {"identifiers": [_identifier(d) for d in domains]}
         resp = await self._post(str((await self.directory())["newOrder"]), payload)
         order = resp.json()
         order["_url"] = str(resp.headers.get("Location") or "")

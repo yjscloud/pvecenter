@@ -118,6 +118,18 @@
      flex-wrap: wrap;
    }
 
+   /* 工作流定义卡的操作行同理：44px 触控按钮下四个控件挤不进一行，
+      宁可折成两行，也不要把下拉压成一条缝。删除按钮的尺寸被卡片里的
+      28px 桌面规则盖住了，这里要显式抬回触控尺寸。 */
+   .wf-def-actions {
+     flex-wrap: wrap;
+   }
+
+   .wf-def-actions .btn-icon-only {
+     width: 40px;
+     height: 40px;
+   }
+
    /* 图标按钮之间留出间距，避免误触到相邻的那个 */
    .btn-group {
      gap: 6px;
@@ -958,5 +970,356 @@
 
   .tpl-card {
     padding: 14px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+/* ---------------------------------------------------------------------------
+   16. 证书管理页
+   ---------------------------------------------------------------------------
+   结构是「概览一行 + 面板一张卡（内含视图切换 / 筛选 / 表格）」。
+   窄屏要处理三件事：
+   1. 概览的格子在 700px 以下会被挤成竖排标签 → 允许换行并压小内距；
+   2. 切换器与搜索/筛选同行放不下 → 面板栏改为上下两行；
+   3. 表格五列横向溢出 → 站点列钉住，滑到右边也知道在看哪一行。 */
+@media (max-width: 1023px) {
+  .cert-stat {
+    padding: 11px 14px;
+  }
+
+  .cert-stat-value {
+    font-size: var(--font-size-md);
+  }
+
+  .cert-overview-meta {
+    padding: 0 14px;
+  }
+}
+
+@media (max-width: 767px) {
+  .cert-overview {
+    flex-wrap: wrap;
+  }
+
+  .cert-overview-stats {
+    flex: 1 1 100%;
+  }
+
+  .cert-stat {
+    flex: 1 1 33%;
+    padding: 10px 12px;
+    border-right: 0;
+  }
+
+  .cert-overview-meta {
+    width: 100%;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border-muted);
+    border-left: 0;
+  }
+
+  /* 切换器在上、搜索与筛选在下：两者同行会互相挤扁 */
+  .cert-panel-bar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 10px 12px;
+  }
+
+  .cert-panel-bar .cert-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .cert-search {
+    flex: 1 1 auto;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .cert-filters {
+    margin-left: 0;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .cert-filters::-webkit-scrollbar {
+    display: none;
+  }
+
+  .cert-filter {
+    flex: 0 0 auto;
+  }
+
+  .cert-tabs {
+    align-self: flex-start;
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .cert-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .cert-inline-stats,
+  .cert-panel-note {
+    padding: 10px 12px;
+  }
+
+  /* 表格整体缩一档：列宽让给内容，横向滚动兜底 */
+  .cert-table {
+    min-width: 680px;
+  }
+
+  .cert-table th,
+  .cert-table td {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .cert-table th.cert-col-site {
+    width: 200px;
+  }
+
+  .cert-table th.cert-col-expire {
+    width: 136px;
+  }
+
+  .cert-table th.cert-col-run {
+    width: 104px;
+  }
+
+  .cert-table th.cert-col-actions {
+    width: 116px;
+  }
+
+  /* 站点列钉在最左：横向滚动时始终知道自己在看哪一行 */
+  .cert-table th.cert-col-site,
+  .cert-table td.cert-col-site {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--bg-surface);
+    box-shadow: 1px 0 0 var(--border-muted);
+  }
+
+  .cert-table thead th.cert-col-site {
+    background: var(--bg-elevated);
+  }
+
+  .cert-empty {
+    padding: 32px 12px 28px;
+  }
+
+  .cert-skeleton-row {
+    height: 56px;
+  }
+}
+
+/* 平板与窄桌面：工具栏里除了搜索、筛选，还有一个主按钮。
+   把搜索框的基准宽度收一点，按钮才不会掉到第二行、单独浮在右边。
+   只在「横向工具栏」区间生效——≤767 时工具栏已经是纵向，flex-basis 会变成高度。 */
+@media (min-width: 768px) and (max-width: 1100px) {
+  .cert-panel-bar .cert-search {
+    flex: 0 1 200px;
+    min-width: 160px;
+  }
+}
+
+@media (max-width: 559px) {
+  .cert-stat {
+    flex: 1 1 50%;
+  }
+
+  /* 渠道行在手机上竖排：状态在上、操作换到下一行，避免名字被挤成省略号 */
+  .cert-provider-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .cert-provider-actions {
+    justify-self: start;
+    flex-wrap: wrap;
+  }
+
+  .cert-provider-pending-row {
+    flex-wrap: wrap;
+  }
+
+  .cert-provider-tagline {
+    flex-basis: 100%;
+    white-space: normal;
+  }
+
+  .cert-provider-flow {
+    gap: 6px 12px;
+  }
+
+  .cert-stat-label {
+    font-size: 11px;
+  }
+
+  /* 手机上一行铺成一张卡：站点 → 到期 → 操作，纵向读下来。
+     680px 的 min-width 在手机上只会制造横向滚动，把「先看什么」让位给布局。 */
+  .cert-table {
+    display: block;
+    min-width: 0;
+  }
+
+  .cert-table thead {
+    display: none;
+  }
+
+  .cert-table tbody,
+  .cert-table tr,
+  .cert-table td {
+    display: block;
+    width: auto;
+  }
+
+  .cert-table tr.cert-row {
+    position: relative;
+    /* 横向内距交给卡片自己的 padding：卡片式行再多缩进一层会显得空 */
+    padding: 12px 0 14px;
+    border-bottom: 1px solid var(--border-muted);
+  }
+
+  /* 纵向排列后每个 td 都是整行，表格的分隔线与内距会变成卡片里的横杠和空隙 */
+  .cert-table tbody td {
+    padding: 0;
+    border-bottom: 0;
+  }
+
+  /* 部署位置与最近运行放到展开区：手机上先把「是谁、还有多久」读完 */
+  .cert-table .cert-col-target,
+  .cert-table .cert-col-run {
+    display: none;
+  }
+
+  /* 取消 ≤767 的站点列冻结：纵向排列后它不再承担「横向滚动时的锚点」 */
+  .cert-table th.cert-col-site,
+  .cert-table td.cert-col-site {
+    position: static;
+    box-shadow: none;
+    background: transparent;
+  }
+
+  .cert-table .cert-col-site .cert-site-domain,
+  .cert-table .cert-col-site .cert-site-note {
+    margin-top: 4px;
+  }
+
+  .cert-table .cert-col-expire {
+    margin-top: 10px;
+  }
+
+  /* 到期这一格从竖排改成横排：胶囊、天数、日期同行，进度条独占下一行 */
+  .cert-table .cert-expiry {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* 顺序改成「胶囊 → 天数 → 到期日」再另起一行画进度条 */
+  .cert-table .cert-expiry-date {
+    order: 1;
+  }
+
+  .cert-table .cert-bar {
+    flex: 1 1 100%;
+    max-width: none;
+    order: 2;
+  }
+
+  .cert-table .cert-col-actions {
+    margin-top: 10px;
+  }
+
+  .cert-table .cert-actions {
+    justify-content: flex-start;
+  }
+
+  /* 卡片式行有空间了，把行内动作放回来——手机用户不必先展开再去展开区找按钮 */
+  .cert-table .cert-actions-group {
+    display: flex;
+  }
+
+  .cert-table .cert-actions-sep {
+    display: block;
+  }
+
+  .cert-table .cert-expand {
+    margin-left: auto;
+  }
+
+  .cert-detail-row > td {
+    padding: 0;
+  }
+
+  /* 清单在手机上同样铺成卡片：域名 → 渠道/到期 → 绑定情况 → 操作 */
+  .cert-inventory-table {
+    display: block;
+    min-width: 0;
+  }
+
+  .cert-inventory-table thead {
+    display: none;
+  }
+
+  .cert-inventory-table tbody,
+  .cert-inventory-table tr,
+  .cert-inventory-table td {
+    display: block;
+    width: auto;
+  }
+
+  .cert-inventory-table tr {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border-muted);
+  }
+
+  .cert-inventory-table tbody td {
+    padding: 0;
+    border-bottom: 0;
+  }
+
+  .cert-inventory-table .cert-col-cert {
+    margin-top: 6px;
+  }
+
+  .cert-inventory-table .cert-col-expire,
+  .cert-inventory-table .cert-col-sites {
+    margin-top: 8px;
+  }
+
+  .cert-inventory-table .cert-col-actions {
+    display: flex;
+    margin-top: 10px;
+  }
+
+  .cert-inventory-table .cert-inventory-sites {
+    max-width: none;
+  }
+}
+
+/* 四个标签在窄屏一行放不下：2×2 铺开，避免「工作流」被截在横向滚动区外面 */
+@media (max-width: 767px) {
+  .cert-tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-self: stretch;
+    width: 100%;
+    max-width: none;
+    gap: 3px;
+    overflow: visible;
+  }
+
+  .cert-tab {
+    justify-content: center;
+    width: 100%;
   }
 }

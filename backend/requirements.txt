@@ -21,6 +21,8 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 
 # --- Config & persistence ---
+# 证书工作流导入：YAML 与 JSON 共用一套定义结构（见 app/certworkflow.py）
+PyYAML==6.0.3
 pydantic==2.9.2
 pydantic-settings==2.5.2
 # MySQL：aiomysql 走异步连接池，PyMySQL 是它的底层驱动，

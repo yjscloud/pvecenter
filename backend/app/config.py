@@ -134,8 +134,15 @@ class Settings(BaseSettings):
     # 拒绝启动：见文件顶部 WEAK_SECRET_KEYS。随机值可用
     #   python -c "import secrets; print(secrets.token_urlsafe(48))"
     secret_key: str = "change-me-in-production-please-use-a-long-random-string"
+    # 轮换期的旧根密钥（逗号分隔）。轮换 SECRET_KEY 后，先把旧值填在这里，
+    # 让历史密文仍可解密；再用 /api/certs/keys/rewrap 重加密存量数据，
+    # 最后把这一项清空。为空表示「只认当前密钥」。
+    secret_key_previous: str = ""
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 12
+    # 审计日志保留天数。0 = 永久保留（合规场景常用）；小于 0 按 0 处理。
+    # 由后台的 audit_purge 作业每小时检查一次，超期行整批删除。
+    audit_retention_days: int = 180
 
     # Bootstrap admin account created on first run.
     # 弱默认口令不会被用来建号：首次启动会直接报错退出（见 store.init_db）。
@@ -272,6 +279,16 @@ class Settings(BaseSettings):
     # 「全量快照汇总」（/api/snapshots）的 fan-out 并发上限：每台客户机一次 PVE
     # 请求，200 台时 6 并发要跑 34 轮。小规格 PVE 或 API 限流严格的环境可下调。
     pve_snapshot_concurrency: int = 16
+
+    # --- 证书流水引擎 ------------------------------------------------------
+    # 打开后证书续期改由 app/certflow.py 的节点引擎调度，并把每次运行写进
+    # cert_flow_run / cert_flow_step / cert_flow_artifact（旁路，只写不读）。
+    # 默认关闭：关掉即完全回到 certpipeline 的固定线性步骤，行为与升级前一致，
+    # 也是出现问题时的一键回滚开关。切换前后 site["last_run"] 的投影格式不变。
+    certflow_enabled: bool = False
+    # 产物正文（证书链 / 私钥）是否一起落库。默认不落：产物表只留 kind、
+    # 指纹与大小，正文仍由站点配置与部署目标持有，避免私钥多存一份。
+    certflow_store_payload: bool = False
 
     # --- 监控历史落库 ------------------------------------------------------
     # 节点与虚拟机的资源指标按固定周期采样进 metrics_history：PVE 的 rrddata

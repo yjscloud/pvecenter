@@ -306,9 +306,11 @@ export function CertProviderDialog({
                           : t("cert.secretPlaceholder")
                       }
                       hint={
-                        active.secret_set?.[field.key]
-                          ? t("cert.providerSecretHint")
-                          : t("cert.providerSecretNewHint")
+                        field.hint_key
+                          ? t(field.hint_key as MessageKey)
+                          : active.secret_set?.[field.key]
+                            ? t("cert.providerSecretHint")
+                            : t("cert.providerSecretNewHint")
                       }
                       onChange={(e) => patchSecrets({ [field.key]: e.target.value })}
                     />
@@ -325,6 +327,7 @@ export function CertProviderDialog({
                     placeholder={field.placeholder}
                     disabled={!canManage}
                     error={error}
+                    hint={field.hint_key ? t(field.hint_key as MessageKey) : undefined}
                     onChange={(e) => patchValues({ [field.key]: e.target.value })}
                   />
                 </div>

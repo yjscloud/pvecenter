@@ -414,6 +414,207 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "environment yet — add one of those types on the node, or move the disk "
         "there and retry.",
     },
+    # ------------------------------------------------------------ 证书工作流
+    # 导入校验的错误会逐条返回给前端（见 routers/certworkflows.py），所以这里
+    # 的文案要能独立成句；节点 id / 字段名这类定位信息由 path 单独给出。
+    "workflow.error.no_owner": {
+        "zh-CN": "当前账号没有用户名，无法访问证书工作流",
+        "en": "The current account has no username and cannot access certificate workflows",
+    },
+    "workflow.error.invalid": {
+        "zh-CN": "工作流定义不合法",
+        "en": "The workflow definition is invalid",
+    },
+    "workflow.error.root_type": {
+        "zh-CN": "文件内容必须是一个对象（YAML 映射或 JSON object），不能是数组或纯文本",
+        "en": "The file must contain a mapping (YAML map or JSON object), not an array or plain text",
+    },
+    "workflow.error.name_required": {
+        "zh-CN": "缺少工作流名称：请补充 name 字段",
+        "en": "The workflow name is missing: add a name field",
+    },
+    "workflow.error.name_too_long": {
+        "zh-CN": "工作流名称不能超过 {limit} 个字符",
+        "en": "The workflow name cannot exceed {limit} characters",
+    },
+    "workflow.error.desc_too_long": {
+        "zh-CN": "工作流说明不能超过 {limit} 个字符",
+        "en": "The workflow description cannot exceed {limit} characters",
+    },
+    "workflow.error.nodes_required": {
+        "zh-CN": "工作流至少需要一个节点",
+        "en": "A workflow needs at least one node",
+    },
+    "workflow.error.nodes_type": {
+        "zh-CN": "nodes 必须是数组",
+        "en": "nodes must be an array",
+    },
+    "workflow.error.node_object": {
+        "zh-CN": "节点必须是对象",
+        "en": "Each node must be an object",
+    },
+    "workflow.error.node_type_required": {
+        "zh-CN": "节点缺少 type 字段",
+        "en": "The node is missing its type field",
+    },
+    "workflow.error.unknown_type": {
+        "zh-CN": "不支持的节点类型：{type}。可用类型：{supported}",
+        "en": "Unsupported node type: {type}. Available types: {supported}",
+    },
+    "workflow.error.id_invalid": {
+        "zh-CN": "节点 id「{id}」不合法：只能包含字母、数字、下划线、点和短横线，且以字母或数字开头",
+        "en": "Node id \"{id}\" is invalid: use letters, digits, underscores, dots and hyphens, starting with a letter or digit",
+    },
+    "workflow.error.duplicate_id": {
+        "zh-CN": "节点 id 重复：{id}",
+        "en": "Duplicate node id: {id}",
+    },
+    "workflow.error.needs_type": {
+        "zh-CN": "节点 {node} 的 needs 必须是节点 id 数组",
+        "en": "The needs field of node {node} must be an array of node ids",
+    },
+    "workflow.error.unknown_dep": {
+        "zh-CN": "节点 {node} 依赖了不存在的节点：{dep}",
+        "en": "Node {node} depends on a node that does not exist: {dep}",
+    },
+    "workflow.error.cycle": {
+        "zh-CN": "节点依赖成环：{ids}",
+        "en": "The node dependencies contain a cycle: {ids}",
+    },
+    "workflow.error.options_type": {
+        "zh-CN": "节点 {node} 的 options 必须是对象",
+        "en": "The options field of node {node} must be an object",
+    },
+    "workflow.error.option_required": {
+        "zh-CN": "节点 {node} 缺少必填参数：{field}",
+        "en": "Node {node} is missing a required option: {field}",
+    },
+    "workflow.error.option_number": {
+        "zh-CN": "节点 {node} 的参数 {field} 必须是数字",
+        "en": "The option {field} of node {node} must be a number",
+    },
+    "workflow.error.option_range": {
+        "zh-CN": "节点 {node} 的参数 {field} 应在 {min} 到 {max} 之间",
+        "en": "The option {field} of node {node} must be between {min} and {max}",
+    },
+    "workflow.error.option_list": {
+        "zh-CN": "节点 {node} 的参数 {field} 必须是数组或逗号分隔的文本",
+        "en": "The option {field} of node {node} must be an array or comma-separated text",
+    },
+    "workflow.error.option_invalid": {
+        "zh-CN": "节点 {node} 的参数 {field} 取值无效：{value}",
+        "en": "The option {field} of node {node} has an invalid value: {value}",
+    },
+    "workflow.error.domain_invalid": {
+        "zh-CN": "节点 {node} 的参数 {field} 不是合法域名：{value}",
+        "en": "The option {field} of node {node} is not a valid domain: {value}",
+    },
+    "workflow.error.email_invalid": {
+        "zh-CN": "节点 {node} 的参数 {field} 不是合法邮箱：{value}",
+        "en": "The option {field} of node {node} is not a valid email address: {value}",
+    },
+    "workflow.error.url_invalid": {
+        "zh-CN": "节点 {node} 的参数 {field} 不是合法 URL（需以 http:// 或 https:// 开头）：{value}",
+        "en": "The option {field} of node {node} is not a valid URL (must start with http:// or https://): {value}",
+    },
+    "workflow.error.file_type": {
+        "zh-CN": "仅支持导入 {extensions} 文件",
+        "en": "Only {extensions} files can be imported",
+    },
+    "workflow.error.empty_file": {
+        "zh-CN": "文件内容为空",
+        "en": "The file is empty",
+    },
+    "workflow.error.too_large": {
+        "zh-CN": "文件超过 {limit} KB，无法导入",
+        "en": "The file exceeds {limit} KB and cannot be imported",
+    },
+    "workflow.error.too_many_nodes": {
+        "zh-CN": "节点数量超过上限 {limit} 个",
+        "en": "The workflow has more than the maximum of {limit} nodes",
+    },
+    "workflow.error.json_parse": {
+        "zh-CN": "JSON 解析失败：{detail}",
+        "en": "Failed to parse JSON: {detail}",
+    },
+    "workflow.error.yaml_parse": {
+        "zh-CN": "YAML 解析失败：{detail}",
+        "en": "Failed to parse YAML: {detail}",
+    },
+    "workflow.error.yaml_unavailable": {
+        "zh-CN": "服务端缺少 YAML 解析组件，暂时无法导入 YAML 文件",
+        "en": "The server is missing the YAML parser and cannot import YAML files right now",
+    },
+    "workflow.error.multiple_docs": {
+        "zh-CN": "文件包含多个 YAML 文档，一次只能导入一个工作流",
+        "en": "The file contains multiple YAML documents; import one workflow at a time",
+    },
+    "workflow.error.name_exists": {
+        "zh-CN": "已存在同名工作流：{name}",
+        "en": "A workflow with this name already exists: {name}",
+    },
+    "workflow.error.not_found": {
+        "zh-CN": "工作流不存在或已被删除",
+        "en": "The workflow does not exist or has been deleted",
+    },
+    "workflow.warning.unknown_field": {
+        "zh-CN": "已忽略未知字段：{field}",
+        "en": "Ignored an unknown field: {field}",
+    },
+    "workflow.warning.generated_id": {
+        "zh-CN": "节点缺少 id，已自动生成：{id}",
+        "en": "The node had no id; generated one: {id}",
+    },
+    "workflow.warning.name_from_file": {
+        "zh-CN": "文件缺少 name，已使用文件名：{name}",
+        "en": "The file had no name; used the file name: {name}",
+    },
+    "workflow.warning.renamed": {
+        "zh-CN": "已存在同名工作流「{old}」，导入后名称为「{name}」",
+        "en": "A workflow named \"{old}\" already exists; the imported one was renamed to \"{name}\"",
+    },
+    "workflow.default_name": {
+        "zh-CN": "未命名工作流",
+        "en": "Untitled workflow",
+    },
+    # 内置模板的名称 / 说明：前端模板卡片直接显示接口返回值，不再二次翻译；
+    # 词条键与前端 zh-CN.settings.ts 中同名键保持一致，便于对照。
+    "workflow.template.standard.name": {
+        "zh-CN": "标准证书流程",
+        "en": "Standard certificate flow",
+    },
+    "workflow.template.standard.desc": {
+        "zh-CN": "监控域名 → 申请证书 → 部署上传 → 发送通知，覆盖一次完整的证书生命周期。",
+        "en": "Monitor the domain → issue a certificate → deploy it → send a notification, covering one full certificate lifecycle.",
+    },
+    "workflow.template.domainMonitor.name": {
+        "zh-CN": "域名证书监控",
+        "en": "Domain certificate monitoring",
+    },
+    "workflow.template.domainMonitor.desc": {
+        "zh-CN": "只监控域名证书的到期与连接状态，在临近过期或检查失败时发送通知。",
+        "en": "Only monitor domain certificate expiry and connectivity, notifying when it is about to expire or a check fails.",
+    },
+    "workflow.run.not_found": {
+        "zh-CN": "流程实例不存在或已被删除",
+        "en": "The workflow run does not exist or has been deleted",
+    },
+    "workflow.run.no_nodes": {
+        "zh-CN": "该工作流还没有节点，无法发起",
+        "en": "This workflow has no nodes and cannot be started",
+    },
+    "workflow.run.status_conflict": {
+        "zh-CN": "当前状态不允许该操作，请刷新后重试",
+        "en": "The current status does not allow this action; refresh and try again",
+    },
+    "workflow.run.invalid_action": {
+        "zh-CN": "不支持的流转操作",
+        "en": "Unsupported transition action",
+    },
+    "workflow.run.site_not_found": {
+        "zh-CN": "关联的证书站点不存在或无权访问",
+        "en": "The linked certificate site does not exist or is not accessible",
+    },
 }
 
 

@@ -26,6 +26,7 @@ export const PERMISSION_KEYS = [
   'audit.view',
   'baseline.manage',
   'baseline.view',
+  'cert.export',
   'cert.manage',
   'cert.view',
   'ct.assign',

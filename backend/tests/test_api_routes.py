@@ -3479,6 +3479,29 @@ class TestMonitoringIsolation:
             "deploy_dir": "/tmp/certs",
         }
 
+    def test_cert_site_accepts_upload_channel(self, api) -> None:
+        """``ca="upload"`` 的站点必须能建也能改。
+
+        回归：``create_site`` / ``update_site`` 无条件调 ``provider_cfg_for()``，
+        而 ``load_provider`` 只认云厂商，于是「上传第三方证书」一建站点就
+        500（「不支持的证书签发厂商：upload」），整条导入链路是死的。
+        """
+        admin = auth_headers(api)
+        payload = {**self._site_payload("托管证书", "upload.example.com"), "ca": "upload"}
+
+        created = api.post("/api/certs/sites", json=payload, headers=admin)
+        assert created.status_code == 200, created.text
+        site = created.json()["site"]
+        assert site["ca"] == "upload"
+
+        renamed = api.put(
+            f"/api/certs/sites/{site['id']}",
+            json={**payload, "name": "托管证书（改名）"},
+            headers=admin,
+        )
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json()["site"]["name"] == "托管证书（改名）"
+
     def test_cert_sites_are_per_user(self, api) -> None:
         admin = auth_headers(api)
         bob = self._new_user(api, "bob")

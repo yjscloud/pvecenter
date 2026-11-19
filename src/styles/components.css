@@ -69,6 +69,12 @@
   display: inline-flex;
   align-items: center;
   min-width: 0;
+  /* 这里必须给回一个字高的余量：.btn 上写的是 line-height: 1，标签盒的高度
+     就只剩 1em，而中文（Noto Sans CJK 的 ascent+descent 约 1.45em、微软雅黑
+     约 1.32em）的墨迹比 1em 高，叠上下面的 overflow: hidden 会把字底裁掉——
+     「返回 / 校验」这类两字按钮看起来就像在下半截被切平。1.5 是能盖住常见
+     CJK 字体的较小整值；按钮本身是固定高度 + 居中，标签盒变高不改变外观。 */
+  line-height: 1.5;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -6873,38 +6879,100 @@ body.is-col-resizing * {
 .cert-overview {
   display: flex;
   align-items: stretch;
-  gap: 16px;
-  min-height: 60px;
-  padding: 0 18px;
-  border: 1px solid var(--border-muted);
+  gap: 0;
+  min-height: 64px;
+  padding: 0;
+  border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-surface);
   background-image: var(--grad-panel);
+  /* 通栏：统计格自己撑满，右端同步时间靠边框分隔，不再用 margin-left:auto 硬顶 */
+  overflow: hidden;
 }
 
 .cert-overview-stats {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(104px, 1fr));
   align-items: stretch;
-  flex-wrap: wrap;
+  flex: 1 1 auto;
   min-width: 0;
 }
 
 .cert-stat {
+  position: relative;
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 2px;
-  min-width: 82px;
-  padding: 12px 20px;
+  gap: 3px;
+  min-width: 0;
+  padding: 13px 18px;
+  border: 0;
   border-right: 1px solid var(--border-muted);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  transition: background var(--transition-fast);
 }
 
-.cert-stat:first-child {
-  padding-left: 0;
+/* 有数量的那一格是按钮：光标 + 悬停加深，说明数字可以点 */
+button.cert-stat {
+  cursor: pointer;
+}
+
+button.cert-stat:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* 异常态自带淡底，hover 用同色加深一档，而不是换成通用灰底 */
+button.cert-stat.is-expiring.has-value:hover {
+  background: color-mix(in srgb, var(--warning) 18%, transparent);
+}
+
+button.cert-stat.is-expired.has-value:hover,
+button.cert-stat.is-failed.has-value:hover {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
+/* 2px 状态色条：比 7px 圆点更容易在余光里分辨，又不会让整格变成色块。
+   只有这一类有数量时才点亮，全 0 的概览不出现彩色。 */
+.cert-stat::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  background: var(--text-muted);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.cert-stat.has-value::before {
+  opacity: 1;
+}
+
+.cert-stat.is-valid::before { background: var(--success); }
+.cert-stat.is-expiring::before { background: var(--warning); }
+.cert-stat.is-expired::before { background: var(--danger); }
+.cert-stat.is-failed::before { background: var(--danger); }
+.cert-stat.is-paused::before { background: var(--text-muted); }
+
+.cert-stat:hover {
+  background: var(--bg-elevated);
 }
 
 .cert-stat:last-child {
   border-right: 0;
+}
+
+.cert-stat-value {
+  /* 数字是这一屏最先被读到的信息，给到 20px；标签退到 12px 弱化 */
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-semibold);
+  line-height: 1.1;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  transition: color var(--transition-fast);
 }
 
 .cert-stat-label {
@@ -6912,22 +6980,38 @@ body.is-col-resizing * {
   align-items: center;
   gap: 6px;
   font-size: var(--font-size-xs);
+  line-height: 1.3;
   color: var(--text-secondary);
   white-space: nowrap;
 }
 
-.cert-stat-value {
-  font-size: var(--font-size-lg);
-  font-weight: 600;
-  line-height: 1.15;
-  color: var(--text-primary);
-  font-variant-numeric: tabular-nums;
+/* 有值的异常态：数字着色 + 极淡底色。摘要行不再有卡片背景，靠这一层让
+   「需要人处理的那两格」自己跳出来，而不是让用户逐格去读数字。 */
+.cert-stat.is-expiring.has-value {
+  background: var(--warning-dim);
 }
+
+.cert-stat.is-expired.has-value,
+.cert-stat.is-failed.has-value {
+  background: var(--danger-dim);
+}
+
+.cert-stat.is-expiring.has-value .cert-stat-value { color: var(--warning); }
+.cert-stat.is-expired.has-value .cert-stat-value { color: var(--danger); }
+.cert-stat.is-failed.has-value .cert-stat-value { color: var(--danger); }
+
+.cert-stat.is-valid .cert-status-dot { background: var(--success); }
+.cert-stat.is-expiring .cert-status-dot { background: var(--warning); }
+.cert-stat.is-expired .cert-status-dot { background: var(--danger); }
+.cert-stat.is-failed .cert-status-dot { background: var(--danger); }
+.cert-stat.is-paused .cert-status-dot { background: var(--text-muted); }
 
 .cert-overview-meta {
   display: flex;
   align-items: center;
-  margin-left: auto;
+  gap: 6px;
+  padding: 0 18px;
+  border-left: 1px solid var(--border-muted);
   font-size: var(--font-size-xs);
   color: var(--text-muted);
   white-space: nowrap;
@@ -6945,6 +7029,314 @@ body.is-col-resizing * {
 .cert-status-dot.is-warning { background: var(--warning); }
 .cert-status-dot.is-danger { background: var(--danger); }
 .cert-status-dot.is-muted { background: var(--text-muted); }
+
+/* --- 清单分布条：7 个等宽小格 --------------------------------------------
+   原来是一排内联样式的方块（minWidth/padding/背景各写一份），换成自适应网格：
+   数量变化、窄屏换行、暗色主题都交给同一套令牌。 */
+.cert-stats-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.cert-stats-strip .cert-stat {
+  padding: 10px 12px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+/* 平铺小格各自独立成块：不需要左侧状态条，也不需要格间分隔线 */
+.cert-stats-strip .cert-stat::before {
+  display: none;
+}
+
+.cert-stats-strip .cert-stat-value {
+  font-size: var(--font-size-lg);
+}
+
+/* --- 概览收紧：横向一行，不再五个大方块 ---------------------------------
+   页面只有个位数站点时，五等分的方格每格空出两三百像素，首屏被一块「空表格」
+   占掉。改成「数字 + 标签」横排、格间细线分隔，高度降到 48px，把纵向空间还给
+   真正要看的表格。 */
+.cert-overview {
+  /* 不再自成一张卡：页面上只保留「主体卡片」一个容器，概览退化成标题下方
+     的一行摘要，用一条细线收尾。两个带边框的方块并排会读成两个模块，
+     信息层级反而变模糊。 */
+  min-height: 44px;
+  border: 0;
+  border-bottom: 1px solid var(--border-muted);
+  border-radius: 0;
+  background: transparent;
+  background-image: none;
+  overflow: visible;
+}
+
+.cert-overview-stats {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.cert-stat {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 9px;
+  padding: 12px 20px;
+}
+
+.cert-stat-value {
+  font-size: var(--font-size-lg);
+  line-height: 1.2;
+}
+
+.cert-stat-label {
+  gap: 5px;
+}
+
+/* --- 主体：一张卡 + 视图切换 ---------------------------------------------
+   以前「站点 / 清单 / 渠道」各是一张卡，各带标题栏、统计与分页，页面被切成
+   三段重复结构。现在合成一张卡：标题换成切换器，工具栏只出现一次。 */
+.cert-card-main {
+  /* 工具栏紧贴卡片顶边，需要裁掉圆角外的溢出 */
+  overflow: hidden;
+}
+
+/* 站点列收窄，把宽度还给「部署位置」——那里才是真的长文本 */
+.cert-card-main .cert-table th.cert-col-site {
+  width: 244px;
+}
+
+/* 整行可点开运行详情：指针光标是最省的说明，不必再加一行提示文案 */
+.cert-table tbody tr.cert-row {
+  cursor: pointer;
+}
+
+.cert-panel-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+/* 卡片里不再套一层带边框的表格容器：一格边框已经由卡片自己提供，
+   双层边框会让内容区看起来「陷进去」一块。 */
+.cert-card-main .table-container {
+  border: 0;
+  border-radius: 0;
+}
+
+/* 切换器沿用页面已有的「分段控件」语言，与筛选 chips 形成一强一弱的层级 */
+.cert-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+.cert-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.cert-tab:hover {
+  color: var(--text-primary);
+}
+
+.cert-tab.is-active {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-weight: var(--font-weight-medium);
+  box-shadow: var(--shadow-sm);
+}
+
+.cert-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.cert-tab-count {
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.cert-tab.is-active .cert-tab-count {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.cert-panel-bar .cert-toolbar {
+  flex: 1 1 auto;
+  justify-content: flex-end;
+  margin-bottom: 0;
+}
+
+/* 状态筛选退成 chips：一屏里只保留切换器一个「重」控件 */
+.cert-filters {
+  height: auto;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.cert-filter {
+  height: 26px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  transition: border-color var(--transition-fast), background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.cert-filter:hover {
+  background: var(--bg-hover);
+}
+
+.cert-filter.is-active {
+  border-color: var(--accent-border);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.cert-filter-count {
+  color: inherit;
+  opacity: 0.7;
+}
+
+/* --- 筛选结果行 -----------------------------------------------------------
+   只在筛选生效时出现：回答「少了几条」，并给出一步退回去的出口。
+   用一条 1px 分隔线接在面板栏下面，不额外加边框或卡片。 */
+.cert-filter-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-muted);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.cert-filter-note > svg {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.cert-filter-note-state {
+  color: var(--text-primary);
+  font-weight: var(--font-weight-medium);
+}
+
+.cert-filter-note-state::after {
+  content: "·";
+  margin-left: 8px;
+  color: var(--text-muted);
+}
+
+.cert-filter-note-text {
+  font-variant-numeric: tabular-nums;
+}
+
+.cert-filter-reset {
+  margin-left: auto;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.cert-filter-reset:hover {
+  background: var(--accent-dim);
+}
+
+.cert-filter-reset:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 清单视图的分布：一行 chips，替代原来的 7 个大色块统计条 */
+.cert-inline-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.cert-inline-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 2px 10px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.cert-inline-stat b {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.cert-inline-stat.is-strong {
+  border-color: var(--accent-border);
+  background: var(--accent-dim);
+}
+
+.cert-inline-stat.is-strong b {
+  color: var(--accent);
+}
+
+/* 渠道视图的摘要行：标题已由切换器承担，这里只留状态与入口 */
+.cert-panel-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.cert-provider-panel .cert-provider-empty,
+.cert-provider-panel .cert-provider-list,
+.cert-provider-panel .cert-provider-hint {
+  margin: 12px 16px;
+}
 
 /* --- 区块层级：主体一张卡，辅助三张卡各自成组 ---------------------------- */
 
@@ -7005,6 +7397,42 @@ body.is-col-resizing * {
 }
 
 .cert-search input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 输入框右侧的清除键：只在有内容时出现，不占位、不抢焦点 */
+.cert-search input {
+  padding-right: 30px;
+}
+
+.cert-search-clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transform: translateY(-50%);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.cert-search-clear:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.cert-search-clear:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
@@ -7094,7 +7522,109 @@ body.is-col-resizing * {
 .cert-table th.cert-col-expire { width: 148px; }
 .cert-table th.cert-col-target { width: auto; }
 .cert-table th.cert-col-run { width: 132px; }
-.cert-table th.cert-col-actions { width: 132px; text-align: right; }
+/* 操作列宽度必须容得下里面的按钮：6 个 28px 图标按钮 + 2 个分隔符（各含 8px
+   外边距）+ 展开箭头 26px + 组间 gap，内容共 228px，加左右各 12px 内距是
+   252px，再留 4px 余量给列宽的取整。表是 table-layout: fixed，列宽给窄了内容
+   不会换行，而是按 justify-content: flex-end 从左侧溢出，直接压到「最近运行」
+   那一列上 —— 状态胶囊被图标盖住，看起来就是文字重影。 */
+.cert-table th.cert-col-actions { width: 256px; text-align: right; }
+
+/* 批量选择列：只在有 cert.manage 时出现，宽度只占一个勾选框 */
+.cert-table th.cert-col-pick { width: 36px; padding-right: 0; }
+.cert-table td.cert-col-pick { padding-right: 0; }
+
+/* 批量操作条：出现在表头之上、筛选行之下，不遮挡任何列 */
+.cert-bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-muted);
+  background: var(--accent-dim);
+}
+.cert-bulk-count {
+  margin-right: auto;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-variant-numeric: tabular-nums;
+}
+.cert-bulk-count b { color: var(--text-primary); }
+
+/* 环境 / 集群两栏并排：都是短文本，单独各占一行会浪费半屏 */
+.cert-form-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+/* --- 证书详情弹窗 ------------------------------------------------------- */
+.cert-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.cert-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 18px;
+}
+.cert-detail-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.cert-detail-label {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+.cert-detail-value {
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  overflow-wrap: anywhere;
+}
+.cert-detail-section h4 {
+  margin: 0 0 8px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+.cert-detail-health {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cert-detail-issues {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.cert-detail-san {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  overflow-wrap: anywhere;
+}
+.cert-detail-chain {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border-muted);
+  font-size: var(--font-size-xs);
+  overflow-wrap: anywhere;
+}
+.cert-detail-chain:last-child { border-bottom: 0; }
+
+@media (max-width: 720px) {
+  .cert-detail-grid,
+  .cert-form-pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 
 .cert-site-head {
   display: flex;
@@ -7133,7 +7663,57 @@ body.is-col-resizing * {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  gap: 6px;
+}
+
+/* --- 状态胶囊 -------------------------------------------------------------
+   结论（状态）在上、依据（剩余天数 / 进度条 / 到期日）在下：先看到「要不管」，
+   需要时再往下确认「还有多久」。颜色只在对人有害的态上饱和，有效态用最轻的
+   一层绿，避免整列被健康站点染成绿色。 */
+.cert-state {
+  display: inline-flex;
+  align-items: center;
   gap: 5px;
+  padding: 1px 8px 1px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.7;
+  white-space: nowrap;
+}
+
+.cert-state-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.cert-state.is-valid {
+  color: var(--success);
+  background: var(--success-dim);
+  border-color: color-mix(in srgb, var(--success) 24%, transparent);
+}
+
+.cert-state.is-expiring {
+  color: var(--warning);
+  background: var(--warning-dim);
+  border-color: color-mix(in srgb, var(--warning) 28%, transparent);
+}
+
+.cert-state.is-expired,
+.cert-state.is-failed {
+  color: var(--danger);
+  background: var(--danger-dim);
+  border-color: color-mix(in srgb, var(--danger) 28%, transparent);
+}
+
+.cert-state.is-paused {
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border-color: var(--border-muted);
 }
 
 .cert-days {
@@ -7244,7 +7824,7 @@ body.is-col-resizing * {
   gap: 2px;
 }
 
-/* 一行五个动作 + 展开箭头，图标按钮压到 28px 才放得下 */
+/* 一行六个动作 + 展开箭头，图标按钮压到 28px 才放得下（列宽见 .cert-col-actions） */
 .cert-actions .btn-icon-only {
   width: 28px;
   height: 28px;
@@ -7498,14 +8078,143 @@ body.is-col-resizing * {
   color: var(--text-muted);
 }
 
+/* --- 弹窗里的步骤 + 该步日志 ---------------------------------------------
+   行内那版是 grid（阶段/状态/耗时/说明四列），这里每步下面要再挂一段日志，
+   所以把 li 改回块级，日志用左侧竖线表示「属于上一步」。 */
+.cert-runlog-steps {
+  padding: 4px 0 0;
+}
+
+.cert-runlog-steps .cert-step {
+  display: block;
+  padding: 6px 0 2px;
+}
+
+.cert-step-logs {
+  list-style: none;
+  margin: 2px 0 4px 6px;
+  padding: 2px 0 2px 12px;
+  border-left: 2px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cert-step-log {
+  display: grid;
+  /* 动作 / 说明：动作定宽对齐，说明吃掉剩余宽度且整段换行不截断 */
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 8px;
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.cert-step-log-action {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.cert-step-log-detail {
+  overflow-wrap: anywhere;
+}
+
+.cert-step-log.is-failed .cert-step-log-action,
+.cert-step-log.is-failed .cert-step-log-detail {
+  color: var(--danger);
+}
+
+.cert-step-log.is-pending .cert-step-log-detail {
+  color: var(--warning);
+}
+
+/* 实时标记：呼吸的小圆点，提示「这一轮还在跑」 */
+.cert-run-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: var(--font-size-xs);
+  color: var(--info);
+}
+
+.cert-run-live .cert-step-dot {
+  position: static;
+  background: var(--info);
+  animation: cert-live-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes cert-live-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
 /* --- 清单 / 日志 --------------------------------------------------------- */
 
-.cert-table th.cert-col-cert { width: 224px; }
-.cert-table th.cert-col-sites { width: 180px; }
+/* 清单：域名是第一身份，证书 ID 只是佐证，所以域名列吃掉剩余宽度 */
+.cert-table th.cert-col-cert { width: 236px; }
+.cert-table th.cert-col-sites { width: 168px; }
+.cert-table th.cert-col-domains { width: auto; }
 
 .cert-id {
   font-size: var(--font-size-xs);
   color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cert-inventory-domain {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cert-inventory-sites {
+  max-width: 168px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 没绑定站点的证书：虚线胶囊，提示「它还没生效」而不是报错 */
+.cert-inventory-unbound {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+/* 签发中：中性信息色，不该抢过「已过期」的红色 */
+.cert-state.is-pending {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-color: var(--accent-border);
+}
+
+/* 清单的到期格：胶囊 / 天数 / 日期一行读完，进度条压成下面一条细线。
+   站点表是竖排四行，因为那一列更宽、每行也更矮；照搬过来会把行高撑到 90px。 */
+.cert-inventory-table .cert-expiry {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 8px;
+}
+
+.cert-inventory-table .cert-expiry-date {
+  order: 1;
+}
+
+.cert-inventory-table .cert-bar {
+  order: 2;
+  flex: 1 1 100%;
+  max-width: none;
 }
 
 .cert-log-table tbody td {
@@ -7523,10 +8232,94 @@ body.is-col-resizing * {
   min-width: 260px;
 }
 
+/* 空状态：图标 → 标题 → 说明 → 主操作。以前只有一行灰字，看不出「这里本该
+   有东西」还是「加载失败了」，也没有下一步可点。 */
 .cert-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 44px 20px 40px;
+  text-align: center;
+}
+
+/* 只有一句说明、没有图标块的空状态（如清单卡片）：保持紧凑左对齐，
+   不要沿用主表格那套「居中大留白」。不支持 :has() 的环境会忽略这条，
+   退化成居中显示，不影响可读性。 */
+.cert-empty:not(:has(.cert-empty-icon)) {
+  align-items: flex-start;
   padding: 22px 4px;
-  color: var(--text-secondary);
+  text-align: left;
+}
+
+.cert-empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  margin-bottom: 2px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+}
+
+.cert-empty-title {
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.cert-empty-desc {
+  max-width: 42ch;
   font-size: var(--font-size-sm);
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.cert-empty > .btn,
+.cert-empty > .btn-primary {
+  margin-top: 8px;
+}
+
+/* --- 加载骨架 ------------------------------------------------------------
+   按真实行的节奏铺几条等高高光：比居中转圈更能说明「内容马上到」，也避免
+   数据到位时卡片高度跳变。 */
+.cert-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 2px 0;
+}
+
+.cert-skeleton-row {
+  height: 44px;
+  border-radius: var(--radius-sm);
+  background-image: linear-gradient(
+    90deg,
+    var(--bg-elevated) 0%,
+    var(--bg-hover) 42%,
+    var(--bg-elevated) 84%
+  );
+  background-size: 240% 100%;
+  animation: cert-skeleton-sweep 1.4s ease-in-out infinite;
+}
+
+.cert-skeleton-row:nth-child(2) { animation-delay: 80ms; }
+.cert-skeleton-row:nth-child(3) { animation-delay: 160ms; }
+.cert-skeleton-row:nth-child(4) { animation-delay: 240ms; }
+.cert-skeleton-row:nth-child(5) { animation-delay: 320ms; }
+
+@keyframes cert-skeleton-sweep {
+  from { background-position: 120% 0; }
+  to { background-position: -40% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cert-skeleton-row {
+    animation: none;
+  }
 }
 
 /* 破坏性动作放在辅助卡里：要看得见，但别抢过页面主操作 */
@@ -7543,7 +8336,7 @@ body.is-col-resizing * {
    优先丢「部署位置」「最近运行」这类可以在展开区看到的列，而不是把文字压
    成一列一个字；行内动作在 767 以下收进展开区，避免挤掉站点名。 */
 
-@media (max-width: 1120px) {
+@media (max-width: 1280px) {
   /* 少了列之后，展开行的 colspan 与固定列宽会互相打架（Chrome 会把剩下的
      列再压一次），自动布局按内容分配，展开前后列宽都不跳。 */
   .cert-table {
@@ -7561,7 +8354,10 @@ body.is-col-resizing * {
 
   .cert-table th.cert-col-expire { width: 132px; }
   .cert-table th.cert-col-run { width: 122px; }
-  .cert-table th.cert-col-actions { width: 210px; }
+  /* 1280 以下丢掉「部署位置」，宽度才够让操作列的 7 个按钮整排平铺；
+     阈值取 1280 而不是原来的 1120，是因为操作列加宽到 256 后，1280 以下
+     再保留部署位置列就只剩一百多像素，路径会被压成一列几个字。 */
+  .cert-table th.cert-col-actions { width: 256px; }
 }
 
 @media (max-width: 767px) {
@@ -7747,13 +8543,34 @@ body.is-col-resizing * {
   margin: 0 -8px;
 }
 
+/* 一行 = 左边身份与状态（可换行的失败原因），右边操作，不让它们挤在同一条基线上 */
 .cert-provider-row {
-  display: flex;
-  align-items: center;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
   gap: 12px;
-  padding: 9px 8px;
+  padding: 11px 8px;
   border-radius: var(--radius-sm);
   border-bottom: 1px solid var(--border-muted);
+}
+
+/* 最后一行不再画分隔线：下面「还可以接入」自己有一条上边线 */
+.cert-provider-row:last-child {
+  border-bottom: 0;
+}
+
+.cert-provider-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.cert-provider-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
 .cert-provider-row:last-child {
@@ -7774,12 +8591,86 @@ body.is-col-resizing * {
   white-space: nowrap;
 }
 
-/* 状态、AK、续期天数、操作收成一组靠右，别让它们散在整行里 */
+/* 状态徽章：可用 / 自检失败。颜色只在这两种结论上出现 */
+.cert-provider-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px 1px 6px;
+  border-radius: var(--radius-pill);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+}
+
+.cert-provider-badge.is-ready {
+  color: var(--success);
+  background: var(--success-dim);
+}
+
+.cert-provider-badge.is-failed {
+  color: var(--danger);
+  background: var(--danger-dim);
+}
+
+.cert-provider-count {
+  white-space: nowrap;
+}
+
+/* AK、续期天数、自检时间：一行里按需换行，窄屏也不会把名字挤没 */
 .cert-provider-meta {
   display: flex;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-width: 0;
+}
+
+/* 失败原因是排障起点，必须常驻并允许换行；toast 一消失就没法照着查了 */
+.cert-provider-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-dim);
+  color: var(--danger);
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.cert-provider-error > svg {
   flex: none;
+  margin-top: 2px;
+}
+
+.cert-provider-meta > svg {
+  flex: none;
+}
+
+/* 获取密钥的外链：比旁边两个按钮更轻一档，
+   否则三个同色的操作挤在一行，看不出主次 */
+.cert-provider-help {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+  text-decoration: none;
+  transition: color var(--transition-fast);
+}
+
+.cert-provider-help:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.cert-provider-help:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .cert-provider-id {
@@ -7832,6 +8723,145 @@ body.is-col-resizing * {
 .cert-provider-empty-title {
   font-size: var(--font-size-sm);
   font-weight: 600;
+}
+
+/* --- 渠道视图的摘要行、待配置渠道、签发流程 ------------------------------- */
+
+/* 摘要行：标题由切换器承担，这里只补状态与凭据说明。
+   不放按钮——未配置渠道各自有「配置」，同一个弹窗不需要第二个入口 */
+.cert-provider-note {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+/* 两段文字靠字色区分层级，不插分隔符：
+   换成「·」在窄屏换行时会留下一颗孤零零的点 */
+.cert-provider-note-summary {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.cert-provider-crednote {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+/* 无 cert.manage：说清楚「能看不能改」，而不是只把按钮置灰 */
+.cert-provider-readonly {
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--warning-dim);
+  color: var(--warning);
+  font-size: var(--font-size-xs);
+}
+
+.cert-provider-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+/* 还没配置的渠道：列出来才知道还能接什么 */
+.cert-provider-pending {
+  margin: 12px 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-muted);
+}
+
+.cert-provider-section-title {
+  margin-bottom: 4px;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  letter-spacing: 0.04em;
+}
+
+.cert-provider-pending-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.cert-provider-pending-row:hover {
+  background: var(--bg-hover);
+}
+
+.cert-provider-pending-row .cert-provider-name {
+  flex: 0 0 auto;
+}
+
+.cert-provider-tagline {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 签发流程：四步是真实顺序，编号在这里承载信息 */
+.cert-provider-flow-box {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 14px 16px 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+.cert-provider-flow-title {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+}
+
+.cert-provider-flow {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cert-provider-flow-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.cert-provider-flow-index {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* --- 添加 / 编辑厂商弹窗：左选类型，右填凭据 --- */

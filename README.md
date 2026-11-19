@@ -458,7 +458,11 @@ PVE 里把 PBS 注册成存储之后，存储页就会显示 PBS 徽标、最近
 
 ### 证书管理（ACME / 多云 / PVE 节点）
 
-对接腾讯云、阿里云、华为云免费证书、自有 ACME 账号（Let's Encrypt / ZeroSSL，支持泛域名与多域名）以及手动上传的托管证书。到期前自动续期，按站点部署到本机目录、SSH 远程服务器、PVE 虚拟机（Guest Agent）、LXC 容器或 PVE 节点自身的 8006 管理证书；部署后可执行重载命令，PVE 节点则由 PVE 自己落盘并重启 pveproxy。支持多站点绑定、证书清单、到期监控与失败退避重试。
+对接腾讯云、阿里云、华为云免费证书、自有 ACME 账号（Let's Encrypt / ZeroSSL / Google Trust Services / SSL.com / Actalis / Buypass，支持泛域名、多域名、IP 证书与 EAB 外部账户绑定）以及手动上传的托管证书。DNS-01 支持 DNSPod、阿里云、华为云、Cloudflare、GoDaddy、AWS Route 53、Namecheap、火山引擎。
+
+到期前自动续期，按站点部署到本机目录、SSH 远程服务器、PVE 虚拟机（Guest Agent）、LXC 容器、PVE 节点自身的 8006 管理证书，或云负载均衡 / CDN（腾讯云 CLB、阿里云 SLB、腾讯云 CDN、阿里云 CDN）；部署后可执行重载命令，PVE 节点则由 PVE 自己落盘并重启 pveproxy。续期流水线支持站点级开关：可只签发不自动部署、可关闭到期提醒。
+
+证书到期按 30/14/7/3 天分级预警，支持主动吊销（ACME revoke / 云厂商删除）；证书可按 PEM（zip）/ PFX 导出，证书清单带到期分布统计与库存快照。通知复用告警通道（站内信 / 邮件 / 通用 Webhook / 飞书），通用 Webhook 内置企业微信、钉钉（含加签）、Slack 预设。支持多站点绑定、到期监控与失败退避重试。
 
 <!-- 截图占位：docs/screenshots/certificates.png -->
 ![证书管理：签发渠道、站点列表与自动续期](docs/screenshots/certificates.png)

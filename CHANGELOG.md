@@ -5,6 +5,86 @@
 
 每次发布在这里按「新增 / 变更 / 修复 / 安全」分类记录。
 
+## [v0.5.9] — 2026-11-19
+
+本版把证书管理从「能续期、能部署」补齐到可交付生产：私钥出口与导出权限收口，
+吊销与状态机闭环，多副本可安全运行，并补上证书详情、主动轮换、批量操作、
+TLS 体检、Prometheus 指标与告警历史。
+
+### 新增
+
+- **证书详情**：`GET /api/certs/sites/{id}/detail` 返回叶证书主题 / 签发者 /
+  序列号 / SHA-256 指纹 / SAN / 密钥参数 / 中间链，以及线上体检结论；前端新增
+  详情弹窗，不包含任何私钥内容。
+- **主动轮换**：`POST /api/certs/sites/{id}/rotate`，不等到期即可重新签发并换新
+  私钥（托管证书明确拒绝）；站点新增 `auto_rotate` / `rotate_before_days`，
+  打开后由流水线在阈值内自动换钥。
+- **批量操作**：`POST /api/certs/sites/bulk` 支持 apply / sync / deploy / rotate /
+  revoke，逐站点返回结果；前端表格支持勾选、全选与批量条。
+- **TLS 体检**：证书监控新增 `inspect_tls`，检查协议版本、主机名匹配、链是否
+  受信任、RSA 密钥长度与签名算法；结论写入 `health_status` / `health_issues`，
+  异常时按 `health_bad` 事件告警一次。
+- **Prometheus 指标**：`GET /api/certs/metrics` 输出 `pvecenter_cert_days_left` /
+  `pvecenter_cert_expire_timestamp` / `pvecenter_cert_status` /
+  `pvecenter_cert_health_ok` / `pvecenter_certs_total` 等 gauge，标签含站点、域名、
+  渠道、环境、集群。
+- **环境 / 集群维度**：站点新增 `environment` / `cluster`，进入搜索、详情、指标
+  标签与表单。
+- **告警历史合流**：证书事件除站内信外同时写入 `alert_history`（`target_type=cert`），
+  可在监控告警页统一复盘；跳转链接指向对应站点。
+- **告警升级**：续期失败到达退避上限、部署连续失败时发送 critical 级升级通知，
+  使用独立冷却键绕过 12 小时窗口。
+- **全局密钥重加密**：`POST /api/certs/keys/rewrap` 现在会重写 settings 中所有
+  密文（PVE 连接凭据、SMTP、Webhook、TOTP 等），逐行 CAS，解不开的密文不覆盖。
+
+### 变更
+
+- **部署失败通知收敛到 `deploy_site`**：手动部署与自动部署走同一条路径，不再
+  出现「页面点了部署失败但没人收到通知」；流水线不再重复发送。
+- **审计补齐**：定时 / 补跑触发的申请、续期、部署、吊销写入 `audit_log`
+  （`ip=scheduler`，动作为 `cert.auto_*`）；新增 `AUDIT_RETENTION_DAYS`（默认 180，
+  0 = 永久）与 `audit_purge` 后台作业。
+- **接口契约**：吊销、导出、轮换、批量接口改用 Pydantic 模型校验（原因码范围、
+  导出格式、批量动作与数量上限）。
+
+### 测试
+
+- 新增 `backend/tests/test_cert_lifecycle.py`：详情、轮换（含托管拒绝）、批量、
+  指标与标签转义、健康判定、告警升级、审计保留期、本地部署回滚、部署失败通知。
+- 更新 `test_cert_pipeline.py`：部署失败通知的责任方改为 `deploy_site`。
+
+### 安全加固（P0）
+
+#### 安全
+
+- **站点接口不再回传私钥**：`/api/certs` 与各站点接口返回的 `acme_pem` /
+  `acme_key` 一律清空，只回 `acme_pem_set` / `acme_key_set`。此前任何拿到
+  `cert.view` 的账号（含 viewer）调一次列表就能拿走全部站点的明文私钥。
+- **导出私钥需要独立权限**：新增 `cert.export`，默认仅管理员；导出写审计
+  （`cert.export`，含格式与站点）。`cert.view` 不再能下载私钥。
+- **PFX 口令移出 URL**：导出改为 `POST /api/certs/sites/{id}/export`，口令放在
+  请求体；`GET /download` 只允许 PEM，并加 `Cache-Control: no-store`。
+- **吊销闭环**：原因码按 RFC 5280 校验；吊销后销毁本地证书链与私钥、清空
+  `cert_id`、记录 `revoked_cert_id` / `revoked_at` / `revoke_reason` /
+  `revoke_verified`；云厂商删除后回查账号下是否仍有该证书；成功与失败都写审计。
+- **根密钥可轮换**：新增 `SECRET_KEY_PREVIOUS`（旧密钥仅用于解密）与
+  `POST /api/certs/keys/rewrap`（管理员）。轮换不再意味着存量凭据全部失效；
+  任一段密文解不开时整体中止，不会把「解不开」写成空串。
+
+#### 变更
+
+- **证书状态守卫**：状态写入统一走 `certstatus.set_status`；已吊销的证书在
+  没有新签发材料时不能回到活动状态。站点新增 `status_prev` /
+  `status_changed_at`，界面新增「已吊销」状态。
+- **多副本安全**：后台作业增加 MySQL 租约（`job_lease`），同一作业同一时刻
+  只有一个实例执行；站点列表写入改为快照 CAS + 重试，避免两个实例用旧快照
+  互相覆盖 `pending_cert_id` / 退避计数。租约不可用时退回单机行为并只告警一次。
+
+#### 测试
+
+- 新增 `backend/tests/test_cert_p0_hardening.py`：私钥出口、导出权限与审计、
+  吊销闭环、密钥轮换、状态守卫、调度租约。
+
 ## [v0.5.8] — 2026-11-17
 
 本版把 AI 助手的「选机器 → 授权 → 执行」整条链路补齐并做快：候选主机扫描在大小规模

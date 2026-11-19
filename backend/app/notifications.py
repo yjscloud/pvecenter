@@ -269,6 +269,9 @@ def link_for_alert(entry: Dict[str, Any]) -> str:
     if target_type == "vm" and node and vmid:
         family = "lxc" if str(entry.get("guest_type") or "") == "lxc" else "vms"
         return f"/{family}/{node}/{vmid}"
+    if target_type == "cert":
+        site_id = str(entry.get("site_id") or "")
+        return f"/certs?site={site_id}" if site_id else "/certs"
     return "/alerts"
 
 

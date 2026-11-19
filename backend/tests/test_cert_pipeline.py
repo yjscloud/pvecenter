@@ -365,7 +365,11 @@ def test_deploy_failure_alerts(monkeypatch) -> None:
 
     _renew(site)
 
-    assert "notify:deploy_failed" in calls
+    # 部署失败的通知由 deploy_site 统一发出（手动/自动同一条路径），避免
+    # 手动部署失败没人收到通知；流水线这里只负责继续走失败处理。
+    # 真实 deploy_site 的通知行为见 test_cert_lifecycle.py::test_deploy_failure_notifies_once
+    assert "deploy" in calls
+    assert "notify:deploy_failed" not in calls
 
 
 def test_preflight_rejects_bad_reload_command(monkeypatch) -> None:
@@ -394,12 +398,16 @@ def test_retry_tick_only_picks_due_sites(monkeypatch) -> None:
         _site(id="due-4", next_attempt_at=now - 60),  # 超出本轮配额
     ]
     picked: List[str] = []
+    triggers: List[str] = []
 
     async def fake_load() -> List[Dict[str, Any]]:
         return sites
 
-    async def fake_run(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def fake_run(
+        batch: List[Dict[str, Any]], trigger: str = "tick"
+    ) -> List[Dict[str, Any]]:
         picked.extend(str(s["id"]) for s in batch)
+        triggers.append(trigger)
         return [{"site": s["id"]} for s in batch]
 
     monkeypatch.setattr(certs, "load_sites", fake_load)
@@ -409,6 +417,8 @@ def test_retry_tick_only_picks_due_sites(monkeypatch) -> None:
 
     assert picked == ["due-1", "due-2", "due-3"]
     assert len(result) == 3
+    # 补跑与主作业必须能在运行记录里区分开：同一张证书两条路径都可能触发
+    assert triggers == ["retry"]
 
 
 def test_retry_tick_yields_to_running_pipeline(monkeypatch) -> None:

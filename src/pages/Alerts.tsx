@@ -97,6 +97,8 @@ const INTERNAL_METRIC_LABELS: Record<string, MessageKey> = {
   pbs_health: "alerts.metric.pbsHealth",
   /* 备份盘容量越过 85 / 95 也由 pbsguard 写入，阈值固定、不可配置 */
   pbs_capacity: "alerts.metric.pbsCapacity",
+  /* 证书事件由 certnotify 写入告警历史（只补历史、不重复站内信） */
+  certificate: "alerts.metric.certificate",
 };
 
 const isStateMetric = (metric: string) => STATE_METRICS.has(metric);
@@ -266,6 +268,7 @@ export function Alerts() {
   // 通用 Webhook 的清除标记，与飞书的相互独立（两个通道各存各的）
   const [hookWebhookClear, setHookWebhookClear] = useState(false);
   const [hookSecretClear, setHookSecretClear] = useState(false);
+  const [hookSignSecretClear, setHookSignSecretClear] = useState(false);
   const [clearHistoryOpen, setClearHistoryOpen] = useState(false);
   /* 规则删除：先确认，再给一次撤销 —— 删除只改本地，保存前都还能反悔 */
   const [deleteRuleIndex, setDeleteRuleIndex] = useState<number | null>(null);
@@ -544,14 +547,16 @@ export function Alerts() {
           ...hook,
           webhook_clear: hookWebhookClear,
           secret_clear: hookSecretClear,
+          sign_secret_clear: hookSignSecretClear,
         }),
       t("alerts.hookSaved"),
     );
     if (!ok) return;
     setHookWebhookClear(false);
     setHookSecretClear(false);
+    setHookSignSecretClear(false);
     // 保存成功后清空输入框：地址与密钥只在填写时上送，后端不会回显
-    setHook((h) => (h ? { ...h, webhook: "", secret: "" } : h));
+    setHook((h) => (h ? { ...h, webhook: "", secret: "", sign_secret: "" } : h));
   }
 
   async function sendHookTest() {
@@ -593,6 +598,7 @@ export function Alerts() {
   const hookSet: boolean = !!query.data?.hook_set;
   const hookMasked: string = String(query.data?.hook_masked ?? "");
   const hookSecretSet: boolean = !!query.data?.hook_secret_set;
+  const hookSignSecretSet: boolean = !!query.data?.hook_sign_secret_set;
   /* 四个计数塞进一次遍历：原先各扫一遍 records，而这一页每几秒就拉一次历史
      （规则多、记录多时一次上千行），四遍就是白扫三遍。 */
   const { recoveryCount, alarmCount, failCount, repeatCount } = useMemo(() => {
@@ -878,7 +884,9 @@ export function Alerts() {
           <span className="truncate">
             {r.target_type === "node"
               ? t("alerts.targetNodePrefix")
-              : t("alerts.targetVmPrefix")}
+              : r.target_type === "cert"
+                ? t("alerts.targetCertPrefix")
+                : t("alerts.targetVmPrefix")}
             {r.target ?? ""}
           </span>
         ),
@@ -1642,6 +1650,46 @@ export function Alerts() {
                   ) : (
                     t("alerts.hookSignatureHint")
                   )}
+                </div>
+                <div className="field">
+                  <label className="label">{t("alerts.dingtalkSignSecret")}</label>
+                  <div className="input-with-suffix">
+                    <input
+                      className="input"
+                      type="password"
+                      value={hook.sign_secret || ""}
+                      placeholder={
+                        hookSignSecretSet
+                          ? t("alerts.secretPlaceholderSet")
+                          : t("alerts.dingtalkSignSecretHint")
+                      }
+                      onChange={(e) => {
+                        setHookSignSecretClear(false);
+                        setHook({ ...hook, sign_secret: e.target.value });
+                      }}
+                    />
+                    {hookSignSecretSet && !hookSignSecretClear ? (
+                      <span className="input-suffix">
+                        <IconButton
+                          label={t("alerts.clearSecret")}
+                          variant="danger"
+                          onClick={() => {
+                            setHookSignSecretClear(true);
+                            setHook({ ...hook, sign_secret: "" });
+                          }}
+                        >
+                          <IconTrash size={14} />
+                        </IconButton>
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="field-message">
+                    {hookSignSecretClear
+                      ? t("alerts.clearSecretWarn")
+                      : hookSignSecretSet
+                        ? t("alerts.secretHidden")
+                        : t("alerts.dingtalkSignSecretHint")}
+                  </div>
                 </div>
               </div>
 

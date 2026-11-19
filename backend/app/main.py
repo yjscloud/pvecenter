@@ -34,6 +34,10 @@ from .routers import (
     backups,
     baseline,
     certs,
+    # 用户可编辑的证书工作流（模板 / 导入 / 可视化编排）
+    certworkflows,
+    # 工作流运行实例：发起 / 审批 / 流转（与定义分开存）
+    certworkflow_runs,
     cluster,
     config,
     console,
@@ -99,6 +103,8 @@ from . import accesscontrol
 from . import apitokens
 from . import certmonitor as cert_monitor
 from . import certs as cert_manager
+from . import certworkflow_run
+from . import certworkflow_store
 from . import frp
 from . import ippool
 from . import metrics as metrics_history
@@ -165,6 +171,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await aivm.init_table()
     await alerting.init_table()
     await cert_manager.init_table()
+    # 证书工作流定义（模板 / 导入 / 画布编辑）：与证书站点同库，单独一张表
+    await certworkflow_store.init_table()
+    # 工作流运行实例：审批与步骤快照单独存，不随定义编辑而变化
+    await certworkflow_run.init_table()
     await ownership.init_table()
     # 归属代际号接进 pvecache：pvecache 是进程内缓存，改派只能清掉当前进程那份，
     # 多 worker 部署下别的进程还留着旧账。接上之后，代际号一变所有进程一起作废。
@@ -984,6 +994,8 @@ app.include_router(roles.router)
 app.include_router(audit.router)
 app.include_router(alerts.router)
 app.include_router(certs.router)
+app.include_router(certworkflows.router)
+app.include_router(certworkflow_runs.router)
 app.include_router(feishu.router)
 app.include_router(health.router)
 # 数据导出（审计日志 / 任务 / 资产清单 / 告警历史）
@@ -1471,6 +1483,11 @@ def _frp_summary(result: Any) -> str:
     return ""
 
 
+async def _purge_audit() -> int:
+    """审计日志保留清理（配置项在 Settings 里，作业只负责把天数传下去）。"""
+    return await store.purge_audit_old(int(settings.audit_retention_days or 0))
+
+
 def _purge_summary(result: Any) -> str:
     try:
         removed = int(result or 0)
@@ -1856,6 +1873,17 @@ scheduler.register(
         "数据清理",
         "清理已读且超期的站内消息",
         notifications.purge_old,
+        PURGE_INTERVAL,
+        summarize=_purge_summary,
+    )
+)
+scheduler.register(
+    _job(
+        "audit_purge",
+        "审计日志保留清理",
+        "数据清理",
+        "按 AUDIT_RETENTION_DAYS 清理超期的审计日志（0 = 永久保留）",
+        _purge_audit,
         PURGE_INTERVAL,
         summarize=_purge_summary,
     )

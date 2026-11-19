@@ -36,7 +36,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from . import i18n, store
+from . import i18n, joblease, store
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +250,18 @@ async def _execute(state: JobState, manual: bool = False) -> Dict[str, Any]:
     state.last_end = 0.0
     state.last_duration_ms = 0.0
 
+    # 跨实例租约：多副本部署时保证同一个作业只有一个进程在跑。抢不到不算
+    # 失败（别把「别人在干」记成 error 去触发告警），只记一次 skip。
+    lease_ttl = max(int(state.interval), 60) + 180
+    acquired = await joblease.acquire(job.id, lease_ttl)
+    if not acquired:
+        state.skipped += 1
+        state.last_status = previous_status
+        state.last_summary = "另一实例正在执行"
+        state.running = False
+        state.next_mono = time.monotonic() + state.interval
+        return describe(state)
+
     try:
         result = await job.run()
     except asyncio.CancelledError:
@@ -268,6 +280,8 @@ async def _execute(state: JobState, manual: bool = False) -> Dict[str, Any]:
         state.runs += 1
         state.last_status = "ok"
         state.last_summary = _summarize(job, result)
+    finally:
+        await joblease.release(job.id)
 
     ended = time.time()
     state.last_end = ended

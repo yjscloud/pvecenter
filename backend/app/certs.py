@@ -28,14 +28,31 @@ import secrets
 import shlex
 import signal
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import pkcs12
+
 
 from . import acme as acme_mod
-from . import certnotify, crypto, database, dnsproviders, formatters, i18n, store
-from .certpipeline import Context, Pipeline, RunResult, Step
+from . import (
+    certdeployers,
+    certflow,
+    certflow_store,
+    certnotify,
+    crypto,
+    database,
+    dnsproviders,
+    formatters,
+    i18n,
+    store,
+)
+from .certpipeline import Context, Pipeline, RunResult, Step, StepResult
+from .config import settings
 from .certproviders import (
     DEFAULTS as PROVIDER_DEFAULTS,
     FIELDS as PROVIDER_FIELDS,
@@ -45,6 +62,7 @@ from .certproviders import (
     build_provider,
     label as provider_label,
 )
+from .certproviders.base import STATUS_EXPIRED
 from .pve import ProxmoxError, get_client
 from .tencent_ssl import (
     STATUS_FAILED,
@@ -54,8 +72,12 @@ from .tencent_ssl import (
     parse_certificate_bundle,
     status_text,
 )
+from .certstatus import StatusTransitionError, set_status
 
 logger = logging.getLogger(__name__)
+
+#: 已吊销（与 certstatus 的统一口径一致）
+STATUS_REVOKED = 10
 
 SETTING_KEY = "cert_sites"
 # 腾讯云配置按用户存：key = "cert_tencent:<username>"
@@ -122,13 +144,27 @@ def backoff_after(attempts: int) -> int:
     return BACKOFF_STEPS[min(attempts, len(BACKOFF_STEPS)) - 1]
 
 # 支持五种部署方式
-DEPLOY_METHODS = ("local", "ssh", "agent", "lxc", "pve")
+DEPLOY_METHODS = (
+    "local",
+    "ssh",
+    "agent",
+    "lxc",
+    "pve",
+    "tencent_clb",
+    "aliyun_slb",
+    "tencent_cdn",
+    "aliyun_cdn",
+)
 DEPLOY_METHOD_LABELS = {
     "local": "本机目录（面板所在服务器）",
     "ssh": "SSH 远程服务器",
     "agent": "Proxmox 虚拟机（QEMU Guest Agent）",
     "lxc": "Proxmox 容器（经节点 SSH 执行 pct push/exec）",
     "pve": "PVE 节点（API 上传自定义证书）",
+    "tencent_clb": "腾讯云 CLB（上传并绑定 HTTPS 监听器）",
+    "aliyun_slb": "阿里云 SLB（上传并绑定 HTTPS 监听）",
+    "tencent_cdn": "腾讯云 CDN（上传并开启 HTTPS）",
+    "aliyun_cdn": "阿里云 CDN（上传并开启 HTTPS）",
 }
 
 # 站点里需要加密存储的字段（ACME 签发 / 用户上传的私钥同样不能明文落库）
@@ -159,6 +195,12 @@ DEFAULT_TARGET: Dict[str, Any] = {
     # Guest Agent / LXC
     "agent_node": "",
     "agent_vmid": "",
+    # --- 云负载均衡 / CDN ---
+    "cloud_region": "",       # 腾讯云 CLB 地域（默认 ap-guangzhou）
+    "lb_id": "",              # 负载均衡实例 ID
+    "listener_id": "",        # 腾讯云 CLB 监听器 ID
+    "listener_port": 443,     # 阿里云 SLB HTTPS 监听端口
+    "cdn_domain": "",         # CDN 加速域名（留空用站点主域名）
     # 每个目标自己的部署结果
     "last_error": "",
     "last_deploy_at": 0,
@@ -200,6 +242,9 @@ DEFAULT_SITE: Dict[str, Any] = {
     "agent_node": "",
     "agent_vmid": "",
     "auto_renew": True,
+    # 工作流开关：关闭后流水线只申请不自动部署 / 不发到期提醒，交给人工决定
+    "auto_deploy": True,
+    "notify_expiring": True,
     "renew_before_days": 0,  # 0 = 跟随全局设置
     # 签发渠道：tencent（腾讯云免费证书）/ acme（自建 ACME，支持泛域名与多域名）
     # / upload（托管用户自己上传的证书，不申请也不续期，只部署与提醒）
@@ -221,6 +266,27 @@ DEFAULT_SITE: Dict[str, Any] = {
     "monitor_checked_at": 0,
     "monitor_latency_ms": 0,
     "monitor_error": "",
+    # TLS 体检结论（certmonitor.inspect_tls）：ok / warn / bad；空 = 未检查
+    "health_status": "",
+    "health_issues": [],  # expired / expiring / weak_protocol / hostname_mismatch / chain_untrusted / weak_key / weak_signature
+    "health_detail": "",
+    "health_checked_at": 0,
+    "tls_protocol": "",
+    "tls_trusted": False,
+    "tls_hostname_ok": False,
+    # 证书静态信息（详情页展示；吊销后清空）
+    "cert_issuer": "",
+    "cert_serial": "",
+    "cert_fingerprint": "",
+    "cert_chain_length": 0,
+    # 环境 / 集群维度：用于分组、筛选与按环境授权（空 = 未标注）
+    "environment": "",
+    "cluster": "",
+    # 主动轮换：auto_rotate 打开后，剩余天数低于 rotate_before_days 就换新钥
+    "auto_rotate": False,
+    "rotate_before_days": 0,  # 0 = 关闭计划轮换
+    "last_rotated_at": 0,
+    "rotate_count": 0,
     # 部署成功后是否删除 CA 侧的旧证书（腾讯云没有吊销，只能删）
     "auto_delete_old": True,
     # 续期失败计数与下次可重试时间（指数退避，见 certs.BACKOFF_STEPS）
@@ -235,11 +301,22 @@ DEFAULT_SITE: Dict[str, Any] = {
     "cert_status_text": "",
     "cert_domain": "",
     "expire_at": 0,
+    # 状态跃迁审计：上一个状态与变更时间（见 certstatus.set_status）
+    "status_prev": -1,
+    "status_changed_at": 0,
+    # 吊销现场：cert_id 清空后，这里保留「吊销了哪一张、什么时候、为什么、
+    # CA 侧是否回查确认」，供审计与排障使用
+    "revoked_cert_id": "",
+    "revoked_at": 0,
+    "revoke_reason": 0,
+    "revoke_verified": False,
     "last_deploy_at": 0,
     "last_check_at": 0,
     "last_error": "",
     # 上一次续期流水线的逐步结果（见 certpipeline）：只保留最近一次，排障用
     "last_run": [],
+    # 上一次运行的 id：部署日志按它归属，页面据此拉「这一步到底打了什么日志」
+    "last_run_id": "",
     "last_run_at": 0,
     "last_run_status": "",
 }
@@ -291,12 +368,16 @@ def normalise_domain(raw: Any) -> str:
         return ""
     wildcard = text.startswith("*.")
     rest = text[2:] if wildcard else text
+    # IP 证书（RFC 8738）只支持 ACME + HTTP-01，这里只放行格式，
+    # 渠道/验证方式的硬约束统一在 normalise_site 里兜底
+    if acme_mod.is_ip(rest):
+        if wildcard:
+            raise CertError(i18n.pick("IP 地址不能使用泛域名", "An IP address cannot be a wildcard"))
+        return rest
     if not DOMAIN_RE.match(rest):
         raise CertError(i18n.tr("域名格式不正确：") + text)
     if len(rest) > 64:
         raise CertError("域名长度不能超过 64 个字符")
-    if re.match(r"^\d+\.\d+\.\d+\.\d+$", rest):
-        raise CertError("免费证书不支持 IP 地址")
     return ("*." + rest) if wildcard else rest
 
 
@@ -456,13 +537,14 @@ def _normalise_target(
     if method not in DEPLOY_METHODS:
         raise CertError("部署方式只能是 本机目录 / SSH 远程 / Proxmox 虚拟机 / PVE 容器 / PVE 节点")
     target["method"] = method
+    is_cloud = method in ("tencent_clb", "aliyun_slb", "tencent_cdn", "aliyun_cdn")
 
     if method == "pve":
         # 证书由 PVE 的 custom 接口落盘，目录由 PVE 固定，用户不需要填写；
         # 重载也由 restart=1 交给 pveproxy，保留一条 reload 命令只会造成误解。
         target["deploy_dir"] = PVE_CERT_DIR
         target["reload_command"] = ""
-    else:
+    elif not is_cloud:
         deploy_dir = str(item.get("deploy_dir", target.get("deploy_dir")) or "").strip()
         if not deploy_dir:
             raise CertError("请填写证书部署目录")
@@ -514,6 +596,29 @@ def _normalise_target(
         if vmid and not vmid.isdigit():
             raise CertError("虚拟机 / 容器 ID 必须是数字")
         target["agent_vmid"] = vmid
+
+    # --- 云负载均衡 / CDN 参数 ---
+    target["cloud_region"] = str(
+        item.get("cloud_region", target.get("cloud_region")) or ""
+    ).strip()
+    target["lb_id"] = str(item.get("lb_id", target.get("lb_id")) or "").strip()
+    target["listener_id"] = str(
+        item.get("listener_id", target.get("listener_id")) or ""
+    ).strip()
+    try:
+        listener_port = int(item.get("listener_port", target.get("listener_port")) or 443)
+    except (TypeError, ValueError):
+        listener_port = 443
+    target["listener_port"] = max(1, min(65535, listener_port))
+    target["cdn_domain"] = str(
+        item.get("cdn_domain", target.get("cdn_domain")) or ""
+    ).strip()
+    if method == "tencent_clb":
+        if not target["lb_id"] or not target["listener_id"]:
+            raise CertError("腾讯云 CLB 需要填写负载均衡实例 ID 与监听器 ID")
+    elif method == "aliyun_slb":
+        if not target["lb_id"]:
+            raise CertError("阿里云 SLB 需要填写负载均衡实例 ID")
 
     if method == "ssh":
         if not target["ssh_host"]:
@@ -654,14 +759,28 @@ def normalise_site(raw: Dict[str, Any], existing: Optional[Dict[str, Any]] = Non
         site[key] = str((existing or {}).get(key) or "")
 
     site["auto_renew"] = bool(item.get("auto_renew", site.get("auto_renew", True)))
+    site["auto_deploy"] = bool(item.get("auto_deploy", site.get("auto_deploy", True)))
+    site["notify_expiring"] = bool(
+        item.get("notify_expiring", site.get("notify_expiring", True))
+    )
     site["enabled"] = bool(item.get("enabled", site.get("enabled", True)))
     site["notes"] = str(item.get("notes", site.get("notes")) or "").strip()[:200]
+    # 环境 / 集群维度：只用于分组、筛选与授权范围，不参与签发逻辑
+    site["environment"] = str(item.get("environment", site.get("environment")) or "").strip()[:64]
+    site["cluster"] = str(item.get("cluster", site.get("cluster")) or "").strip()[:64]
 
     try:
         days = int(item.get("renew_before_days", site.get("renew_before_days")) or 0)
     except (TypeError, ValueError):
         days = 0
     site["renew_before_days"] = max(0, min(60, days))
+
+    site["auto_rotate"] = bool(item.get("auto_rotate", site.get("auto_rotate", False)))
+    try:
+        rotate_days = int(item.get("rotate_before_days", site.get("rotate_before_days")) or 0)
+    except (TypeError, ValueError):
+        rotate_days = 0
+    site["rotate_before_days"] = max(0, min(60, rotate_days))
 
     # --- 远程部署参数 ---
     site["ssh_host"] = str(item.get("ssh_host", site.get("ssh_host")) or "").strip()
@@ -724,14 +843,21 @@ def normalise_site(raw: Dict[str, Any], existing: Optional[Dict[str, Any]] = Non
         site["acme_key"] = ""
         site["cert_id"] = ""
         site["pending_cert_id"] = ""
-        site["cert_status"] = -1
-        site["cert_status_text"] = ""
+        set_status(site, -1, changed_at=now_ts())
         site["expire_at"] = 0
 
     # 渠道与验证方式的硬约束
     all_domains = site_domains(site)
     if not all_domains:
         raise CertError("请填写要签发证书的域名")
+    # IP 证书：ACME + HTTP-01（RFC 8738）。DNS-01 无法为 IP 建 _acme-challenge 记录
+    if any(acme_mod.is_ip(d) for d in all_domains):
+        if site["ca"] != "acme":
+            raise CertError("IP 证书只支持 ACME 渠道")
+        if site["acme_challenge"] != "http":
+            raise CertError("IP 证书只能用 HTTP-01 验证，请把验证方式改成 HTTP")
+        if not site["acme_webroot"]:
+            raise CertError("HTTP-01 需要填写站点根目录（webroot）")
     if is_cloud_provider(site["ca"]):
         # 各家的免费 DV 证书都只签单域名，且不支持泛域名：在保存时就拦住
         label = provider_label(site["ca"])
@@ -966,23 +1092,21 @@ DEFAULT_ACME: Dict[str, Any] = {
     "email": "",
     "directory": acme_mod.DIRECTORY_LETSENCRYPT,
     "encrypt_algo": "RSA",
+    #: 外部账户绑定（RFC 8555 §7.3.4）。GTS / SSL.com / Actalis / Buypass 要求
+    "eab_kid": "",
+    "eab_hmac_key": "",
     #: 账号密钥（PEM）。首次签发时生成并回写，换掉等于换一个 ACME 账号
     "account_key": "",
     "dns_provider": "",
     #: 加完 TXT 记录后等多久再让 CA 来查。各家 DNS 生效速度差很多，交给用户调
     "dns_wait": 30,
-    "dnspod": {"secret_id": "", "secret_key": ""},
-    "aliyun": {"access_key_id": "", "access_key_secret": ""},
-    "huawei": {"access_key_id": "", "access_key_secret": ""},
-    "cloudflare": {"api_token": ""},
+    # 各家 DNS 服务商的默认配置块由 dnsproviders 的 schema 派生（新增一家只改那边）
+    **dnsproviders.schema_defaults(),
 }
 
 #: 各 provider 里需要加密落库的字段
 ACME_SECRET_FIELDS = {
-    "dnspod": ("secret_key",),
-    "aliyun": ("access_key_secret",),
-    "huawei": ("access_key_secret",),
-    "cloudflare": ("api_token",),
+    kind: dnsproviders.secret_keys(kind) for kind in dnsproviders.PROVIDERS
 }
 
 
@@ -1013,6 +1137,7 @@ async def load_acme(owner: str = "") -> Dict[str, Any]:
         except ValueError:
             pass
     cfg["account_key"] = _decrypt_text(cfg.get("account_key"))
+    cfg["eab_hmac_key"] = _decrypt_text(cfg.get("eab_hmac_key"))
     for name, fields in ACME_SECRET_FIELDS.items():
         block = cfg.get(name)
         if not isinstance(block, dict):
@@ -1023,21 +1148,12 @@ async def load_acme(owner: str = "") -> Dict[str, Any]:
     return cfg
 
 
-#: 各 DNS 服务商在 ACME 配置里需要哪几个凭据字段（与 ACME_SECRET_FIELDS 互为表里）
+#: 各 DNS 服务商在 ACME 配置里需要哪几个字段（含非密文），同样由 schema 派生
 ACME_DNS_FIELDS = {
-    "dnspod": ("secret_id", "secret_key"),
-    "aliyun": ("access_key_id", "access_key_secret"),
-    "huawei": ("access_key_id", "access_key_secret"),
-    "cloudflare": ("api_token",),
+    kind: dnsproviders.field_keys(kind) for kind in dnsproviders.PROVIDERS
 }
 
-_ACME_FIELD_LABELS = {
-    "secret_id": "cert.fieldSecretId",
-    "secret_key": "cert.fieldSecretKey",
-    "access_key_id": "cert.fieldAccessKeyId",
-    "access_key_secret": "cert.fieldAccessKeySecret",
-    "api_token": "cert.fieldApiToken",
-}
+_ACME_FIELD_LABELS = dnsproviders.FIELD_LABELS
 
 
 def acme_fields() -> List[Dict[str, Any]]:
@@ -1091,16 +1207,31 @@ def acme_fields() -> List[Dict[str, Any]]:
             "max": 900,
             "hint_key": "cert.acmeWaitHint",
         },
+        {
+            "key": "eab_kid",
+            "label_key": "cert.acmeEabKid",
+            "type": "text",
+            "placeholder": "kid-xxxxxxxx",
+            "hint_key": "cert.acmeEabHint",
+        },
+        {
+            "key": "eab_hmac_key",
+            "label_key": "cert.acmeEabHmacKey",
+            "type": "password",
+            "secret": True,
+        },
     ]
-    for name, keys in ACME_DNS_FIELDS.items():
-        for key in keys:
+    for name in dnsproviders.PROVIDERS:
+        for item in dnsproviders.form_fields(name):
+            key = str(item["key"])
             fields.append(
                 {
                     "key": name + "_" + key,
-                    "label_key": _ACME_FIELD_LABELS[key],
-                    "type": "password" if key in ACME_SECRET_FIELDS.get(name, ()) else "text",
-                    "secret": key in ACME_SECRET_FIELDS.get(name, ()),
-                    "required": True,
+                    "label_key": item["label_key"],
+                    "type": "password" if item["secret"] else "text",
+                    "secret": item["secret"],
+                    # required 也来自注册表：region / username / client_ip 等可留空
+                    "required": item["required"],
                     "show_if": {"key": "dns_provider", "in": [name]},
                 }
             )
@@ -1110,9 +1241,19 @@ def acme_fields() -> List[Dict[str, Any]]:
 def acme_channel_view(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """ACME 账号按「签发渠道」的形状返回，和厂商共用列表与弹窗。"""
     values: Dict[str, Any] = {
-        key: cfg.get(key) for key in ("email", "directory", "encrypt_algo", "dns_provider", "dns_wait")
+        key: cfg.get(key)
+        for key in (
+            "email",
+            "directory",
+            "encrypt_algo",
+            "dns_provider",
+            "dns_wait",
+            "eab_kid",
+        )
     }
-    secret_set: Dict[str, bool] = {}
+    # EAB HMAC Key 是密文，只回「有没有配」，不回明文
+    values["eab_hmac_key"] = ""
+    secret_set: Dict[str, bool] = {"eab_hmac_key": bool(cfg.get("eab_hmac_key"))}
     for name, keys in ACME_DNS_FIELDS.items():
         block = cfg.get(name) if isinstance(cfg.get(name), dict) else {}
         for key in keys:
@@ -1140,7 +1281,15 @@ def acme_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     item = raw if isinstance(raw, dict) else {}
     payload: Dict[str, Any] = {
         key: item[key]
-        for key in ("email", "directory", "encrypt_algo", "dns_provider", "dns_wait")
+        for key in (
+            "email",
+            "directory",
+            "encrypt_algo",
+            "dns_provider",
+            "dns_wait",
+            "eab_kid",
+            "eab_hmac_key",
+        )
         if key in item
     }
     for name, keys in ACME_DNS_FIELDS.items():
@@ -1173,6 +1322,10 @@ async def save_acme(raw: Dict[str, Any], owner: str = "") -> Dict[str, Any]:
         "email": str(item.get("email", current.get("email")) or "").strip(),
         "directory": directory,
         "encrypt_algo": algo,
+        "eab_kid": str(item.get("eab_kid", current.get("eab_kid")) or "").strip(),
+        # HMAC Key 留空表示沿用旧值（与其它密文字段同一约定）
+        "eab_hmac_key": str(item.get("eab_hmac_key") or "")
+        or str(current.get("eab_hmac_key") or ""),
         "account_key": str(item.get("account_key", current.get("account_key")) or ""),
         "dns_provider": provider,
         "dns_wait": max(0, min(900, wait)),
@@ -1189,6 +1342,7 @@ async def save_acme(raw: Dict[str, Any], owner: str = "") -> Dict[str, Any]:
 
     stored = json.loads(json.dumps(cfg))
     stored["account_key"] = crypto.encrypt(str(cfg["account_key"]))
+    stored["eab_hmac_key"] = crypto.encrypt(str(cfg["eab_hmac_key"]))
     for name, fields in ACME_SECRET_FIELDS.items():
         for field in fields:
             stored[name][field] = crypto.encrypt(str(cfg[name].get(field) or ""))
@@ -1215,6 +1369,8 @@ TEMPLATE_FIELDS = (
     "agent_node",
     "agent_vmid",
     "auto_renew",
+    "auto_deploy",
+    "notify_expiring",
     "auto_delete_old",
     "renew_before_days",
     "ca",
@@ -1324,23 +1480,138 @@ async def _read_sites() -> List[Dict[str, Any]]:
     return sites
 
 
+def _seal_site(site: Dict[str, Any]) -> Dict[str, Any]:
+    """返回凭据字段已加密的站点副本（空值/已加密值原样保留）。"""
+    item = dict(site)
+    for key in SITE_SECRETS:
+        item[key] = crypto.encrypt(str(site.get(key) or ""))
+    targets = site.get("targets")
+    if isinstance(targets, list):
+        item["targets"] = []
+        for target in targets:
+            sealed = dict(target) if isinstance(target, dict) else {}
+            for key in TARGET_SECRETS:
+                sealed[key] = crypto.encrypt(str(sealed.get(key) or ""))
+            item["targets"].append(sealed)
+    return item
+
+
 async def _write_sites(sites: List[Dict[str, Any]]) -> None:
     """写站点列表（不加锁的版本，只在已持锁的调用点里用）。"""
-    stored: List[Dict[str, Any]] = []
-    for site in sites:
-        item = dict(site)
-        for key in SITE_SECRETS:
-            item[key] = crypto.encrypt(str(site.get(key) or ""))
-        targets = site.get("targets")
-        if isinstance(targets, list):
-            item["targets"] = []
-            for target in targets:
-                sealed = dict(target) if isinstance(target, dict) else {}
-                for key in TARGET_SECRETS:
-                    sealed[key] = crypto.encrypt(str(sealed.get(key) or ""))
-                item["targets"].append(sealed)
-        stored.append(item)
+    stored = [_seal_site(site) for site in sites]
     await store.set_setting(SETTING_KEY, json.dumps(stored, ensure_ascii=False))
+
+
+async def rewrap_secrets(owner: str = "") -> Dict[str, int]:
+    """用当前根密钥重写证书模块内的全部密文（密钥轮换的收尾步骤）。
+
+    只做「解密 → 重新加密」：``_read_sites`` 读出的是明文，``_write_sites``
+    会用当前 ``secret_key`` 重新加密，因此站点私钥、SSH 凭据、部署目标凭据
+    一次即可完成迁移。厂商配置与 ACME 账号密钥同理（load 解密 / save 加密）。
+
+    ``owner`` 为空表示处理所有用户（管理员轮换场景）；否则只处理该用户的
+    厂商配置与 ACME 配置，站点仍按其归属过滤。
+    """
+    counts = {"sites": 0, "providers": 0, "acme": 0}
+    async with _SITES_LOCK:
+        raw = await store.get_setting(SETTING_KEY)
+        try:
+            items = json.loads(raw) if raw else []
+        except ValueError:
+            items = []
+        if not isinstance(items, list):
+            items = []
+        touched = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if owner and str(item.get("username") or "") != owner:
+                continue
+            has_secret = _rewrap_fields(item, SITE_SECRETS)
+            for target in item.get("targets") or []:
+                if isinstance(target, dict):
+                    has_secret = _rewrap_fields(target, TARGET_SECRETS) or has_secret
+            if has_secret:
+                touched += 1
+        # 注意：即使 owner 指定，也整份写回（用当前密钥重加密其余站点是安全的）；
+        # 只有计数按 owner 过滤。
+        await store.set_setting(SETTING_KEY, json.dumps(items, ensure_ascii=False))
+        counts["sites"] = touched
+
+    owners = [owner]
+    if not owner:
+        try:
+            owners = [
+                str(item.get("username") or "")
+                for item in await store.list_users()
+                if str(item.get("username") or "")
+            ]
+        except Exception:  # noqa: BLE001 - 列不出用户时至少把站点处理完
+            logger.warning("轮换密钥时列举用户失败，跳过厂商/ACME 配置", exc_info=True)
+            owners = []
+    for name in owners:
+        for kind in PROVIDER_KINDS:
+            try:
+                # 腾讯云历史上用的是独立的 key（cert_tencent:<user>），其余厂商走
+                # cert_provider:<kind>:<user>。两套都要覆盖，否则腾讯密钥漏轮换。
+                setting_key = tencent_key(name) if kind == "tencent" else provider_key(kind, name)
+                if await _rewrap_setting(setting_key, PROVIDER_SECRETS.get(kind, ())):
+                    counts["providers"] += 1
+            except Exception:  # noqa: BLE001 - 单家厂商失败不阻断整轮
+                logger.warning("重写厂商凭据失败：%s / %s", name, kind, exc_info=True)
+        try:
+            acme_fields = ("account_key", "eab_hmac_key")
+            if await _rewrap_setting(acme_key(name), acme_fields, nested=True):
+                counts["acme"] += 1
+        except Exception:  # noqa: BLE001
+            logger.warning("重写 ACME 配置失败：%s", name, exc_info=True)
+    return counts
+
+
+def _rewrap_fields(item: Dict[str, Any], fields: tuple) -> bool:
+    """就地重写一个字典里的密文字段；返回是否处理过密文。
+
+    解不开的密文直接中止（抛 ``CertError``）：宁可轮换失败，也不能把
+    「解不开」写成空串，那等于静默删掉用户的私钥与凭据。
+    """
+    touched = False
+    for field in fields:
+        value = str(item.get(field) or "")
+        if not crypto.is_encrypted(value):
+            continue
+        plain = crypto.decrypt(value)
+        if not plain:
+            raise CertError(
+                i18n.pick(
+                    "有密文无法用当前/旧根密钥解开，已中止重加密：" + field,
+                    "Ciphertext cannot be decrypted with current/previous keys: " + field,
+                )
+            )
+        item[field] = crypto.encrypt(plain)
+        touched = True
+    return touched
+
+
+async def _rewrap_setting(key: str, fields: tuple, *, nested: bool = False) -> bool:
+    """重写某个 settings 条目里的密文字段（厂商配置 / ACME 配置）。"""
+    raw = await store.get_setting(key)
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    touched = _rewrap_fields(data, fields)
+    if nested:
+        for block in data.values():
+            if isinstance(block, dict):
+                touched = _rewrap_fields(block, tuple(block.keys())) or touched
+    if not touched:
+        return False
+    await store.set_setting(key, json.dumps(data, ensure_ascii=False))
+    return True
 
 
 async def load_sites() -> List[Dict[str, Any]]:
@@ -1368,28 +1639,78 @@ async def get_site(site_id: str, owner: Optional[str] = None) -> Optional[Dict[s
     return None
 
 
+#: 站点列表跨进程写入的乐观锁重试次数。冲突意味着别的实例刚写过，
+#: 重读后基于新快照再改一次即可。
+SITE_WRITE_RETRIES = 5
+
+
+def _load_site_items(raw: str) -> List[Dict[str, Any]]:
+    try:
+        items = json.loads(raw) if raw else []
+    except ValueError:
+        items = []
+    return items if isinstance(items, list) else []
+
+
 async def update_site(site: Dict[str, Any]) -> Dict[str, Any]:
-    """按 id 覆盖站点并落库，返回最新站点。"""
+    """按 id 覆盖站点并落库，返回最新站点。
+
+    多副本下不能只靠进程内锁：两个实例各自持有一份旧快照时，后写的会把
+    对方刚写入的 ``pending_cert_id`` / 退避计数盖掉。这里用「快照 CAS」——
+    库里内容与本次读到的原始 JSON 一致才写入，否则重读重试。
+    """
     async with _SITES_LOCK:
-        sites = await _read_sites()
-        for index, item in enumerate(sites):
-            if str(item.get("id")) == str(site.get("id")):
-                sites[index] = site
-                break
-        else:
-            sites.append(site)
-        await _write_sites(sites)
-    return site
+        for _ in range(SITE_WRITE_RETRIES):
+            raw = await store.get_setting(SETTING_KEY) or ""
+            items = _load_site_items(raw)
+            sealed = _seal_site(site)
+            for index, item in enumerate(items):
+                if isinstance(item, dict) and str(item.get("id")) == str(site.get("id")):
+                    items[index] = sealed
+                    break
+            else:
+                items.append(sealed)
+            payload = json.dumps(items, ensure_ascii=False)
+            if payload == raw:
+                return site
+            if not raw:
+                # 首次写入：只有真正由本次创建成功才算赢，否则重读后走 CAS
+                if await store.insert_setting_if_absent(SETTING_KEY, payload):
+                    return site
+                continue
+            if await store.compare_and_set_setting(SETTING_KEY, payload, raw):
+                return site
+    raise CertError(
+        i18n.pick(
+            "站点状态写入冲突（可能有其它实例在同时更新），请重试",
+            "Concurrent site update conflict (another instance may be writing), please retry",
+        )
+    )
 
 
 async def delete_site(site_id: str) -> bool:
     async with _SITES_LOCK:
-        sites = await _read_sites()
-        remain = [s for s in sites if str(s.get("id")) != str(site_id)]
-        if len(remain) == len(sites):
-            return False
-        await _write_sites(remain)
-    return True
+        for _ in range(SITE_WRITE_RETRIES):
+            raw = await store.get_setting(SETTING_KEY) or ""
+            items = _load_site_items(raw)
+            remain = [
+                item for item in items if str((item or {}).get("id")) != str(site_id)
+            ]
+            if len(remain) == len(items):
+                return False
+            payload = json.dumps(remain, ensure_ascii=False)
+            if not raw:
+                if await store.insert_setting_if_absent(SETTING_KEY, payload):
+                    return True
+                continue
+            if await store.compare_and_set_setting(SETTING_KEY, payload, raw):
+                return True
+    raise CertError(
+        i18n.pick(
+            "站点删除冲突（可能有其它实例在同时更新），请重试",
+            "Concurrent site deletion conflict (another instance may be writing), please retry",
+        )
+    )
 
 
 # ------------------------------------------------------------------ 部署日志
@@ -1404,9 +1725,32 @@ CREATE TABLE IF NOT EXISTS cert_deploy_log (
     result    VARCHAR(32),
     detail    TEXT,
     ts        BIGINT,
+    -- 流水线归因：哪一次运行（cert_flow_run.id）、哪一步（cert_flow_step.node_id）。
+    -- 手工触发的动作（部署 / 绑定 / 导入 / 吊销）没有运行上下文，两列为空串，
+    -- 日志仍然可查，只是不会挂到某个步骤下。
+    run_id    VARCHAR(48) NOT NULL DEFAULT '',
+    node_id   VARCHAR(32) NOT NULL DEFAULT '',
     PRIMARY KEY (id),
     KEY idx_cert_log_owner (username, ts DESC),
-    KEY idx_cert_log_ts (ts DESC)
+    KEY idx_cert_log_ts (ts DESC),
+    -- 步骤内联日志的主查询：WHERE run_id = ? AND node_id = ? ORDER BY id
+    KEY idx_cert_log_run (run_id, node_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 证书库存快照：由站点全量派生后物化（见 _rebuild_inventory_table）。
+-- 站点仍是唯一事实来源；这张表只服务于统计与到期日历，避免每次统计都重新
+-- 解析站点 JSON。每次读取清单时整体重建，所以不会出现两份数据各自漂移。
+CREATE TABLE IF NOT EXISTS cert_inventory (
+    username   VARCHAR(64)  NOT NULL DEFAULT '',
+    cert_id    VARCHAR(128) NOT NULL,
+    provider   VARCHAR(32)  NOT NULL DEFAULT '',
+    domains    TEXT,
+    status     INT          NOT NULL DEFAULT 0,
+    expire_at  BIGINT       NOT NULL DEFAULT 0,
+    days_left  INT,
+    updated_at BIGINT       NOT NULL DEFAULT 0,
+    PRIMARY KEY (username, cert_id, provider),
+    KEY idx_cert_inventory_expire (expire_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
@@ -1414,23 +1758,107 @@ CREATE TABLE IF NOT EXISTS cert_deploy_log (
 async def init_table() -> None:
     async with database.connect() as db:
         await db.executescript(SCHEMA)
-        # 旧库补列：日志按用户隔离
         columns = await database.table_columns(db, "cert_deploy_log")
+        # 旧库补列：日志按用户隔离
         if "username" not in columns:
             await db.execute(
                 "ALTER TABLE cert_deploy_log ADD COLUMN username VARCHAR(64) NOT NULL DEFAULT ''"
             )
+        # 旧库补列：日志归因到运行 / 步骤。升级前写下的日志两列为空串，
+        # 仍然照常展示，只是不会出现在某一步的「本步日志」里。
+        if "run_id" not in columns:
+            await db.execute(
+                "ALTER TABLE cert_deploy_log ADD COLUMN run_id VARCHAR(48) NOT NULL DEFAULT ''"
+            )
+        if "node_id" not in columns:
+            await db.execute(
+                "ALTER TABLE cert_deploy_log ADD COLUMN node_id VARCHAR(32) NOT NULL DEFAULT ''"
+            )
+        await db.commit()
+        await _ensure_log_index(db, "idx_cert_log_run", "(run_id, node_id, id)")
+    # 流水引擎的表与内置定义。表始终建好，与开关是否打开无关：这样「先升级建表、
+    # 再打开 certflow_enabled」不需要二次发版，回滚也只是把开关关掉。
+    await certflow_store.init_table()
+    await seed_flow_definition()
+
+
+async def _ensure_log_index(db: Any, name: str, columns: str) -> None:
+    """补建索引。``CREATE INDEX`` 没有 ``IF NOT EXISTS``，只能先查一次元数据。
+
+    只在启动时跑一次，多查一条 information_schema 的代价可以忽略；用
+    ``ALTER TABLE ... ADD INDEX`` 也能做，但重复执行同样报错，本质一样。
+    """
+    cursor = await db.execute(
+        "SELECT COUNT(*) AS n FROM information_schema.statistics"
+        " WHERE table_schema = DATABASE() AND table_name = 'cert_deploy_log'"
+        " AND index_name = ?",
+        (name,),
+    )
+    row = await cursor.fetchone()
+    if row and int(row["n"] or 0) == 0:
+        await db.execute(f"CREATE INDEX {name} ON cert_deploy_log {columns}")
         await db.commit()
 
 
+async def seed_flow_definition() -> None:
+    """把内置的续期流水定义写进定义表（按版本幂等 upsert）。
+
+    失败只记日志：定义表是旁路，建不出来不该拦住面板启动 —— 旧线性流水仍然
+    能跑完一整轮续期。
+    """
+    try:
+        await certflow_store.save_definition(RENEW_FLOW)
+    except Exception:  # noqa: BLE001 - 定义落库失败不影响签发
+        logger.debug("写入证书流水定义失败", exc_info=True)
+
+
+def log_attribution(
+    run_id: Optional[str] = None, node_id: Optional[str] = None
+) -> Tuple[str, str]:
+    """算出这条日志该归到「哪次运行的哪一步」。
+
+    显式参数优先（``None`` 才算「没指定」，空串是明确的「不属于任何运行」），
+    否则读流水线上下文。抽成独立函数是为了能直接单测这条优先级。
+
+    归因是排障用的旁路信息，任何异常都不该让它变成签发路径上的失败点，
+    所以这里不做校验、不做截断（截断在写库处统一做）。
+    """
+    resolved_run = certflow.current_run_id() if run_id is None else str(run_id)
+    resolved_node = certflow.current_node_id() if node_id is None else str(node_id)
+    return resolved_run, resolved_node
+
+
 async def record_log(
-    site: Dict[str, Any], action: str, result: str, detail: str
+    site: Dict[str, Any],
+    action: str,
+    result: str,
+    detail: str,
+    *,
+    run_id: Optional[str] = None,
+    node_id: Optional[str] = None,
 ) -> None:
+    """记一条部署日志，并尽量归因到「哪次运行的哪一步」。
+
+    归因优先级：
+
+    1. **显式传入**（``run_id`` / ``node_id`` 不为 None）—— 少数需要跨步骤归属的
+       动作，比如部署成功后对 CA 侧的收尾清理，写起来更直白；
+    2. **流水线上下文** —— ``certflow.step_scope`` 记录了运行 id，
+       ``enter_step`` 记录了当前步骤，``record_log`` 自己读。绝大多数调用点
+       （签发 / 同步 / 部署 / 清理 / 提醒）走这条，签名一行没改；
+    3. **都取不到就是空串** —— 手工接口（立即部署 / 绑定 / 导入 / 吊销）以及
+       调度器在流水线之外补记的失败日志。这类日志照常出现在「操作日志」里，
+       只是不进某一步的「本步日志」。
+
+    归因失败绝不能反过来影响签发，所以读上下文这一层不做任何校验。
+    """
+    resolved_run, resolved_node = log_attribution(run_id, node_id)
     async with database.connect() as db:
         await db.execute(
             "INSERT INTO cert_deploy_log"
-            " (username, site_id, site_name, domain, action, result, detail, ts)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            " (username, site_id, site_name, domain, action, result, detail, ts,"
+            " run_id, node_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 site_owner(site),
                 str(site.get("id") or ""),
@@ -1440,15 +1868,32 @@ async def record_log(
                 result,
                 detail[:800],
                 now_ts(),
+                resolved_run[:48],
+                resolved_node[:32],
             ),
         )
         await db.commit()
 
 
 async def logs(
-    limit: int = 80, site_id: str = "", owner: Optional[str] = None
+    limit: int = 80,
+    site_id: str = "",
+    owner: Optional[str] = None,
+    *,
+    run_id: str = "",
+    node_id: str = "",
+    after_id: int = 0,
+    ascending: bool = False,
 ) -> List[Dict[str, Any]]:
-    """部署日志：``owner=None``（管理员）返回全部，否则只看该用户的。"""
+    """部署日志查询。
+
+    ``owner=None``（管理员）返回全部，否则只看该用户的。可按运行 / 步骤过滤，
+    ``after_id`` 是做增量拉取的游标（自增主键，比时间戳更可靠 —— 同一秒里
+    可能连着写好几条）。
+
+    ``ascending=True`` 时按写入顺序返回：步骤内的日志要的是「先申请、后下载、
+    再写盘」的因果顺序，倒序读起来是反的。
+    """
     clauses: List[str] = []
     params: List[Any] = []
     if site_id:
@@ -1457,15 +1902,175 @@ async def logs(
     if owner is not None:
         clauses.append("username = ?")
         params.append(owner)
+    if run_id:
+        clauses.append("run_id = ?")
+        params.append(str(run_id))
+    if node_id:
+        clauses.append("node_id = ?")
+        params.append(str(node_id))
+    if after_id:
+        clauses.append("id > ?")
+        params.append(int(after_id))
     sql = "SELECT * FROM cert_deploy_log"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY ts DESC LIMIT ?"
+    # 同一秒内的多条日志靠 id 定序：只用 ts 排序时，同一轮的「写盘 → 重载 → 推送」
+    # 可能被排成任意顺序。
+    sql += " ORDER BY id ASC" if ascending else " ORDER BY ts DESC, id DESC"
+    sql += " LIMIT ?"
     params.append(max(1, min(500, limit)))
     async with database.connect() as db:
         cursor = await db.execute(sql, tuple(params))
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+async def run_logs(
+    run_id: str,
+    node_id: str = "",
+    after_id: int = 0,
+    limit: int = 200,
+    owner: Optional[str] = None,
+) -> Dict[str, Any]:
+    """某次运行的步骤日志（增量拉取）。
+
+    ``owner`` 透传给底层查询做归属过滤 —— 一次运行的日志本就属于同一个人，
+    但流式接口是长连接，多一层约束总比只靠调用方记着更稳妥。
+
+    ``cursor`` 是本次返回的最大主键 id，下一次把它当 ``after_id`` 传回来即可拿到
+    新增部分。用主键而不是时间戳：部署阶段「写盘 → 重载 → 推送」常常落在同一秒，
+    用秒级时间戳做游标会漏行或重复。
+    """
+    items = await logs(
+        limit=limit,
+        owner=owner,
+        run_id=run_id,
+        node_id=node_id,
+        after_id=after_id,
+        ascending=True,
+    )
+    return {
+        "items": items,
+        "cursor": int(items[-1]["id"]) if items else int(after_id or 0),
+        "node_id": node_id,
+    }
+
+
+async def run_detail(run_id: str, owner: Optional[str] = None) -> Dict[str, Any]:
+    """运行详情：运行头 + 逐步状态 + **每一步的部署日志**。
+
+    ``cert_flow_run`` 里可能没有这条运行：开关关闭时旧调度器不写运行表，但它
+    照样会把日志归因到 ``run_id``/``node_id``。所以这里把「运行头」当成可选的，
+    无论有没有，都返回同一套 ``logs`` / ``groups``，前端不必写两条分支。
+    """
+    head = await certflow_store.get_run(run_id)
+    rows = await logs(limit=500, run_id=run_id, ascending=True)
+    if owner is not None:
+        rows = [r for r in rows if str(r.get("username") or "") == owner]
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("node_id") or ""), []).append(row)
+
+    detail: Dict[str, Any] = dict(head) if head else {
+        "id": run_id,
+        "status": "",
+        "steps": [],
+        "artifacts": [],
+    }
+    for step in detail.get("steps") or []:
+        step["logs"] = grouped.get(str(step.get("node_id") or ""), [])
+    detail["logs"] = rows
+    detail["groups"] = grouped
+    return detail
+
+
+async def _finish_manual(
+    site: Dict[str, Any],
+    run_id: str,
+    node_id: str,
+    status: str,
+    detail: str,
+    error: str,
+    started: float,
+    trigger: str,
+) -> None:
+    """把手动动作的结果投影成「一步运行」并落库。
+
+    只写站点上的 ``last_run``，不写 ``cert_flow_run``：手动动作是一次同步请求，
+    前端拿到响应后刷新即可；运行表留给后台那一轮，混进手动动作反而让时间线
+    变得不好读。
+    """
+    cost = int((time.perf_counter() - started) * 1000)
+    flow = certflow.Run(
+        id=run_id,
+        pipeline="cert-manual",
+        version=RENEW_FLOW_VERSION,
+        status=status,
+        steps=[
+            certflow.RunStep(
+                node_id,
+                node_id,
+                status,
+                str(detail)[:certflow.DETAIL_LIMIT],
+                cost,
+                0,
+                str(error)[:certflow.DETAIL_LIMIT],
+            )
+        ],
+        trigger=trigger,
+        site_id=str(site.get("id") or ""),
+        owner=site_owner(site),
+        started_at=now_ts(),
+        finished_at=now_ts(),
+    )
+    certflow.project_last_run(site, flow)
+    try:
+        await update_site(site)
+    except Exception:  # noqa: BLE001 - 运行记录落库失败不该让动作本身失败
+        logger.debug("写入手动运行记录失败", exc_info=True)
+
+
+async def run_manual(
+    site: Dict[str, Any],
+    node_id: str,
+    job: Any,
+    *,
+    trigger: str = "manual",
+) -> Any:
+    """把一次手动动作（申请 / 部署 / 同步）记成「只有一步的运行」。
+
+    手动接口以前直接调底层函数，站点上不留任何运行记录 —— 用户点完「立即部署」
+    再展开「续期流水线」什么也看不到，看到的永远是上一轮定时任务的旧结果。
+    这里复用同一套归因与投影，于是**手动动作和定时续期在页面上长得一样**：
+
+    * 步骤名与 ``RENEW_FLOW`` 里的一致（issue / deploy / sync），文案表直接复用；
+    * 动作内部调用的 ``record_log`` 因为处在 ``step_scope`` 里，会自动挂到这一步；
+    * 失败时异常原样抛出，接口层原有的 ``except`` 分支不需要改。
+
+    用法::
+
+        result = await run_manual(site, "deploy", lambda: deploy_site(site, action="renew"))
+    """
+    run_id = certflow.new_run_id()
+    started = time.perf_counter()
+    with certflow.step_scope(run_id):
+        certflow.enter_step(node_id)
+        try:
+            value = await job()
+        except BaseException as exc:  # noqa: BLE001 - 失败也要留下这一步再抛
+            await _finish_manual(
+                site, run_id, node_id, certflow.NODE_FAILED, str(exc), str(exc), started, trigger
+            )
+            raise
+        if isinstance(value, dict):
+            detail = str(value.get("detail") or "")
+        else:
+            detail = value if isinstance(value, str) else ""
+        await _finish_manual(
+            site, run_id, node_id, certflow.NODE_OK, detail, "", started, trigger
+        )
+        return value
 
 
 async def clear_logs(owner: Optional[str] = None) -> int:
@@ -1514,6 +2119,23 @@ def deploy_target_text(site: Dict[str, Any]) -> str:
         )
     if method == "pve":
         return i18n.pick("PVE 节点 ", "PVE node ") + str(site.get("agent_node") or "?")
+    if method == "tencent_clb":
+        return (
+            "Tencent CLB "
+            + str(site.get("lb_id") or "?")
+            + " / "
+            + str(site.get("listener_id") or "?")
+        )
+    if method == "aliyun_slb":
+        return (
+            "Aliyun SLB "
+            + str(site.get("lb_id") or "?")
+            + ":"
+            + str(site.get("listener_port") or 443)
+        )
+    if method in ("tencent_cdn", "aliyun_cdn"):
+        prefix = "Tencent CDN " if method.startswith("tencent") else "Aliyun CDN "
+        return prefix + str(site.get("cdn_domain") or "?")
     return i18n.tr("本机 ") + directory
 
 
@@ -2430,8 +3052,7 @@ async def _push_pve_node(
 # ---------------------------------------------------------------- 证书状态同步
 def _apply_cert_meta(site: Dict[str, Any], info: Any) -> None:
     """把厂商无关的证书快照写回站点。``info`` 是 ``certproviders.CertInfo``。"""
-    site["cert_status"] = int(info.status)
-    site["cert_status_text"] = status_text(info.status)
+    set_status(site, info.status, changed_at=now_ts())
     if info.domains:
         site["cert_domain"] = info.domains[0]
     if info.expire_at:
@@ -2475,6 +3096,27 @@ async def sync_site_cert(site: Dict[str, Any], provider: Any = None) -> Dict[str
 
 
 # -------------------------------------------------------------------- 部署
+async def _push_cloud(
+    view: Dict[str, Any], bundle: Dict[str, Any], method: str
+) -> Tuple[str, str]:
+    """云负载均衡 / CDN：用站点归属者的云账号上传并绑定证书。"""
+    provider_kind = "tencent" if method.startswith("tencent") else "aliyun"
+    config = await load_provider(provider_kind, site_owner(view))
+    domain = str(view.get("domain") or "")
+    try:
+        if method == "tencent_clb":
+            detail = await certdeployers.deploy_tencent_clb(config, bundle, view, domain)
+        elif method == "aliyun_slb":
+            detail = await certdeployers.deploy_aliyun_slb(config, bundle, view, domain)
+        elif method == "tencent_cdn":
+            detail = await certdeployers.deploy_tencent_cdn(config, bundle, view, domain)
+        else:
+            detail = await certdeployers.deploy_aliyun_cdn(config, bundle, view, domain)
+    except certdeployers.DeployError as exc:
+        raise CertError(str(exc)) from exc
+    return detail, ""
+
+
 async def _push_target(view: Dict[str, Any], bundle: Dict[str, Any]) -> Tuple[str, str]:
     """按目标的方式分派到具体通道，返回 ``(detail, 主机指纹)``。"""
     method = str(view.get("deploy_method") or "local")
@@ -2486,6 +3128,8 @@ async def _push_target(view: Dict[str, Any], bundle: Dict[str, Any]) -> Tuple[st
         return await _push_lxc(view, bundle)
     if method == "pve":
         return await _push_pve_node(view, bundle)
+    if method in ("tencent_clb", "aliyun_slb", "tencent_cdn", "aliyun_cdn"):
+        return await _push_cloud(view, bundle, method)
     return await _push_local(view, bundle)
 
 
@@ -2526,6 +3170,9 @@ async def deploy_site(
 
     results: List[Dict[str, Any]] = []
     failures: List[str] = []
+    # 每个目标一条日志：部署是最需要「逐个目标看结果」的一步 —— 三个目标里挂了
+    # 一个，只看汇总那句「部署失败」根本不知道是哪个。
+    target_logs: List[Tuple[bool, str, str]] = []
     for target in targets:
         view = _target_view(site, target)
         label = str(target.get("name") or "").strip() or deploy_target_text(view)
@@ -2538,12 +3185,16 @@ async def deploy_site(
                 + i18n.pick("：证书已写入，但重载失败：", ": written, but reload failed: ")
                 + str(exc)
             )
+            target_logs.append(
+                (False, label, i18n.pick("证书已写入，但重载失败：", "written, but reload failed: ") + str(exc))
+            )
             results.append(
                 {"id": target.get("id"), "name": label, "ok": False, "written": True, "detail": str(exc)}
             )
         except CertError as exc:
             target["last_error"] = str(exc)
             failures.append(label + i18n.pick("：", ": ") + str(exc))
+            target_logs.append((False, label, str(exc)))
             results.append(
                 {"id": target.get("id"), "name": label, "ok": False, "written": False, "detail": str(exc)}
             )
@@ -2552,6 +3203,7 @@ async def deploy_site(
             target["last_deploy_at"] = now_ts()
             if fingerprint:
                 target["ssh_host_key"] = fingerprint
+            target_logs.append((True, label, detail))
             results.append(
                 {"id": target.get("id"), "name": label, "ok": True, "written": True, "detail": detail}
             )
@@ -2581,7 +3233,31 @@ async def deploy_site(
         site["last_error"] = "；".join(failures)[:500]
         detail = site["last_error"]
 
+    # 先逐目标落明细、再落汇总：步骤日志按 id 升序展示时，读到的顺序正好是
+    # 「目标 A → 目标 B → 整体结论」，符合排障时的阅读习惯。
+    for ok, label, text in target_logs:
+        await record_log(
+            site,
+            action,
+            "success" if ok else "failed",
+            i18n.pick("目标「", "Target \"") + label + i18n.pick("」：", "\": ") + text,
+        )
     await record_log(site, action, "success" if ok_all else "failed", detail)
+    if not ok_all:
+        # 部署失败统一在这里发一次：手动部署与续期部署走同一条路径，避免
+        # 「页面上点了部署失败，但没人收到通知」。第二次及以上失败升级提醒。
+        attempts = int(site.get("attempt_count") or 0)
+        await certnotify.notify(
+            site_owner(site),
+            site,
+            certnotify.EVENT_DEPLOY_FAILED,
+            i18n.pick(
+                "证书部署失败：" + str(site.get("domain") or ""),
+                "Certificate deploy failed: " + str(site.get("domain") or ""),
+            ),
+            detail,
+            escalate=attempts >= 1,
+        )
     await update_site(site)
     return {
         "ok": ok_all,
@@ -2609,6 +3285,94 @@ def _acme_bundle(site: Dict[str, Any]) -> Dict[str, Any]:
         "key_file": "ACME",
         "files": ["ACME"],
     }
+
+
+# ---------------------------------------------------------------- 证书导出
+_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _export_filename(value: str) -> str:
+    name = _FILENAME_SAFE_RE.sub("_", str(value or "")).strip("._-")
+    return name or "certificate"
+
+
+def _load_export_material(site: Dict[str, Any]) -> Dict[str, Any]:
+    """解析出导出需要的证书链与私钥对象（PEM / PFX 共用）。"""
+    bundle = _acme_bundle(site)
+    fullchain = bundle["fullchain"]
+    private_key = bundle["private_key"]
+    try:
+        key = serialization.load_pem_private_key(
+            private_key.encode("utf-8"), password=None
+        )
+    except (ValueError, TypeError) as exc:
+        raise CertError(i18n.tr("私钥无法解析（可能带密码短语）")) from exc
+    certs = [
+        x509.load_pem_x509_certificate(block.encode("utf-8"))
+        for block in acme_mod.split_chain(fullchain)
+    ]
+    if not certs:
+        raise CertError(i18n.tr("证书链解析失败"))
+    return {
+        "name": _export_filename(site.get("domain") or site.get("name") or "certificate"),
+        "fullchain": fullchain,
+        "private_key": private_key,
+        "key": key,
+        "leaf": certs[0],
+        "chain": certs[1:],
+    }
+
+
+def _pkcs12_bytes(
+    material: Dict[str, Any], password: str
+) -> bytes:
+    """生成 PKCS#12（PFX）。密码为空则不加保护，便于导入时直接用。"""
+    key = material["key"]
+    algorithm: Any = (
+        serialization.BestAvailableEncryption(password.encode("utf-8"))
+        if password
+        else serialization.NoEncryption()
+    )
+    return pkcs12.serialize_key_and_certificates(
+        name=material["name"].encode("utf-8"),
+        key=key,
+        cert=material["leaf"],
+        cas=material["chain"] or None,
+        encryption_algorithm=algorithm,
+    )
+
+
+def export_certificate(
+    site: Dict[str, Any], fmt: str = "pem", password: str = ""
+) -> Dict[str, Any]:
+    """把站点证书导出成 PEM（zip）/ PFX。
+
+    返回 ``{"filename", "content": bytes, "media_type"}``，由路由层直接回文件。
+    PEM 打成 zip（证书链 + 私钥两个文件）；PFX 是标准 PKCS#12。
+    """
+    fmt = str(fmt or "pem").strip().lower()
+    material = _load_export_material(site)
+    name = material["name"]
+
+    if fmt == "pem":
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(name + ".crt.pem", material["fullchain"])
+            archive.writestr(name + ".key.pem", material["private_key"])
+        return {
+            "filename": name + "-pem.zip",
+            "content": buffer.getvalue(),
+            "media_type": "application/zip",
+        }
+
+    if fmt == "pfx":
+        return {
+            "filename": name + ".pfx",
+            "content": _pkcs12_bytes(material, password),
+            "media_type": "application/x-pkcs12",
+        }
+
+    raise CertError(i18n.tr("不支持的导出格式：") + fmt)
 
 
 def _acme_solver(site: Dict[str, Any], cfg: Dict[str, Any]) -> Any:
@@ -2645,6 +3409,8 @@ async def _apply_acme(site: Dict[str, Any], *, renew: bool = False) -> Dict[str,
             str(cfg.get("directory") or acme_mod.DIRECTORY_LETSENCRYPT),
             email=str(cfg.get("email") or ""),
             account_key_pem=str(cfg.get("account_key") or ""),
+            eab_kid=str(cfg.get("eab_kid") or ""),
+            eab_hmac_key=str(cfg.get("eab_hmac_key") or ""),
         ) as client:
             issued = await client.issue(domains, solver, key_type=key_type)
             if not cfg.get("account_key"):
@@ -2663,8 +3429,7 @@ async def _apply_acme(site: Dict[str, Any], *, renew: bool = False) -> Dict[str,
         (issued.fullchain[:256] + str(issued.expire_at)).encode("utf-8")
     ).hexdigest()[:16]
     site["pending_cert_id"] = cert_id
-    site["cert_status"] = STATUS_ISSUED
-    site["cert_status_text"] = status_text(STATUS_ISSUED)
+    set_status(site, STATUS_ISSUED, changed_at=now_ts())
     site["cert_domain"] = domains[0]
     site["expire_at"] = issued.expire_at
     site["last_check_at"] = now_ts()
@@ -2758,8 +3523,7 @@ async def import_certificate(
     site["ca"] = "upload"
     site["cert_id"] = "upload-" + hashlib.sha256(str(pem).encode("utf-8")).hexdigest()[:16]
     site["pending_cert_id"] = ""
-    site["cert_status"] = STATUS_ISSUED
-    site["cert_status_text"] = status_text(STATUS_ISSUED)
+    set_status(site, STATUS_ISSUED, changed_at=now_ts())
     site["cert_domain"] = cert_domains[0] if cert_domains else (wanted[0] if wanted else "")
     site["expire_at"] = meta["expire_at"]
     site["last_check_at"] = now_ts()
@@ -2819,8 +3583,7 @@ async def apply_certificate(
         raise CertError(str(exc)) from exc
 
     site["pending_cert_id"] = result.cert_id
-    site["cert_status"] = int(result.status)
-    site["cert_status_text"] = status_text(result.status)
+    set_status(site, result.status, changed_at=now_ts())
     if result.expire_at:
         site["expire_at"] = int(result.expire_at)
     if result.pem:
@@ -2907,6 +3670,477 @@ async def bind_certificate(
         "detail": i18n.tr("证书已绑定"),
         "cert_status_text": site["cert_status_text"],
     }
+
+
+#: RFC 5280 / RFC 8555 允许在吊销请求里携带的 reason 码。
+#: 2（cACompromise）与 7（未使用）不在其中；非法值直接拒绝，避免把错误原因
+#: 提交给 CA 之后无法撤回。
+REVOKE_REASONS = (0, 1, 3, 4, 5, 6, 8, 9, 10)
+
+
+async def _verify_cloud_revoke(provider: Any, cert_id: str) -> bool:
+    """回查 CA 侧：证书是否已经不在账号下（或已是吊销/过期态）。
+
+    厂商的删除接口可能「返回成功但实际没删」（或反过来超时但其实删了），
+    所以吊销后必须回查一次。优先按 ID 精确查询；只有厂商没实现 ``describe``
+    时才退回列表扫描。查询失败按「未确认」处理，不把它当成吊销失败 ——
+    真正的失败在 ``remove`` 那一步已经抛出了。
+    """
+    try:
+        info = await provider.describe(cert_id)
+    except NotImplementedError:
+        try:
+            items = await provider.list_certs()
+        except Exception:  # noqa: BLE001
+            logger.warning("吊销后回查失败：cert_id=%s", cert_id, exc_info=True)
+            return False
+        return all(str(getattr(item, "cert_id", "")) != cert_id for item in items)
+    except Exception:  # noqa: BLE001 - 回查是增强项，不该掩盖已经成功的吊销
+        logger.warning("吊销后回查失败：cert_id=%s", cert_id, exc_info=True)
+        return False
+    if info is None:
+        return True
+    # 厂商把「已吊销 / 已过期」仍作为一条记录返回，也算吊销生效
+    return int(getattr(info, "status", 0) or 0) in (STATUS_EXPIRED, STATUS_REVOKED)
+
+
+async def revoke_certificate(site: Dict[str, Any], reason: int = 0) -> Dict[str, Any]:
+    """主动吊销（或删除）站点当前证书。
+
+    - ACME：走 RFC 8555 的 revokeCert，用签发时的账号密钥签名；
+    - 云厂商：调用其删除接口（免费 DV 证书一般只能删除，不能指定吊销原因），
+      删除后回查一次，确认证书确实不在账号下；
+    - 上传类证书：只存在于面板内，直接标记吊销。
+
+    吊销意味着私钥可能已经泄露，因此这里必须**闭环**：通知 CA、销毁面板内的
+    证书链与私钥、关闭自动续期、留下可审计的现场（原因 / 时间 / 回查结果）。
+    本地材料不清掉的话，「已吊销」只是一行状态，泄露的私钥仍然可用。
+    """
+    try:
+        code = int(reason or 0)
+    except (TypeError, ValueError) as exc:
+        raise CertError(i18n.pick("吊销原因码不合法", "Invalid revocation reason")) from exc
+    if code not in REVOKE_REASONS:
+        raise CertError(
+            i18n.pick(
+                "吊销原因码不合法：" + str(code),
+                "Invalid revocation reason: " + str(code),
+            )
+        )
+
+    kind = ca_kind(site)
+    cert_id = str(site.get("cert_id") or site.get("revoked_cert_id") or "")
+    verified = False
+    if kind == "acme":
+        pem = str(site.get("acme_pem") or "")
+        if "BEGIN CERTIFICATE" not in pem:
+            raise CertError(i18n.pick("该站点没有可吊销的证书", "This site has no certificate to revoke"))
+        cfg = await load_acme(site_owner(site))
+        try:
+            async with acme_mod.AcmeClient(
+                str(cfg.get("directory") or acme_mod.DIRECTORY_LETSENCRYPT),
+                email=str(cfg.get("email") or ""),
+                account_key_pem=str(cfg.get("account_key") or ""),
+                eab_kid=str(cfg.get("eab_kid") or ""),
+                eab_hmac_key=str(cfg.get("eab_hmac_key") or ""),
+            ) as client:
+                await client.revoke(pem, code)
+        except acme_mod.AcmeError as exc:
+            raise CertError(str(exc)) from exc
+        # ACME 没有「按 ID 查吊销状态」的通用接口，服务端接受 revokeCert 即视为完成
+        verified = True
+    elif kind == "upload":
+        # 本地托管：没有 CA 可通知，销毁本地材料即完成
+        verified = True
+    else:
+        if not cert_id:
+            raise CertError(i18n.pick("该站点没有可吊销的证书", "This site has no certificate to revoke"))
+        provider = await provider_for(site)
+        try:
+            await provider.remove(cert_id)
+        except Exception as exc:  # noqa: BLE001 - 各厂商异常类型不一，统一转业务错误
+            raise CertError(str(exc)) from exc
+        verified = await _verify_cloud_revoke(provider, cert_id)
+
+    now = now_ts()
+    set_status(site, STATUS_REVOKED, changed_at=now)
+    # 现场留痕：吊销后 cert_id 不再代表「可用证书」，只留作审计线索
+    site["revoked_cert_id"] = cert_id
+    site["revoked_at"] = now
+    site["revoke_reason"] = code
+    site["revoke_verified"] = bool(verified)
+    site["cert_id"] = ""
+    site["pending_cert_id"] = ""
+    site["expire_at"] = 0
+    # 私钥/证书链不留在库里：吊销的前提通常是泄露或误签发
+    site["acme_pem"] = ""
+    site["acme_key"] = ""
+    site["next_attempt_at"] = 0
+    site["auto_renew"] = False
+    site["last_error"] = ""
+    detail = i18n.pick(
+        "已吊销证书 " + (cert_id or "（本地托管）")
+        + ("" if verified else "，CA 侧回查未确认"),
+        "Certificate revoked: " + (cert_id or "(locally managed)")
+        + ("" if verified else " (CA-side verification not confirmed)"),
+    )
+    await record_log(site, "revoke", "success", detail)
+    await update_site(site)
+    return {
+        "revoked": True,
+        "cert_id": cert_id,
+        "reason": code,
+        "verified": bool(verified),
+        "detail": detail,
+    }
+
+
+# ---------------------------------------------------------------- 证书详情
+def _cert_summary(cert: Any) -> Dict[str, Any]:
+    """把一张 x509 证书压成详情页可用的字段。"""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, rsa
+    from cryptography.x509.oid import NameOID
+
+    expire = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after
+    start = getattr(cert, "not_valid_before_utc", None) or cert.not_valid_before
+    try:
+        san = list(
+            cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value.get_values_for_type(x509.DNSName)
+        )
+    except x509.ExtensionNotFound:
+        san = []
+    try:
+        is_ca = bool(
+            cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+        )
+    except x509.ExtensionNotFound:
+        is_ca = False
+
+    public_key = cert.public_key()
+    key_type = type(public_key).__name__
+    key_bits = 0
+    if isinstance(public_key, rsa.RSAPublicKey):
+        key_type, key_bits = "RSA", int(public_key.key_size)
+    elif isinstance(public_key, ec.EllipticCurvePublicKey):
+        key_type, key_bits = "EC", int(public_key.curve.key_size)
+    elif isinstance(public_key, ed25519.Ed25519PublicKey):
+        key_type = "Ed25519"
+    elif isinstance(public_key, ed448.Ed448PublicKey):
+        key_type = "Ed448"
+
+    return {
+        "subject": cert.subject.rfc4514_string(),
+        "common_name": ", ".join(
+            str(attr.value)
+            for attr in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        ),
+        "issuer": cert.issuer.rfc4514_string(),
+        "serial": format(cert.serial_number, "x"),
+        "fingerprint_sha256": cert.fingerprint(hashes.SHA256()).hex(),
+        "not_before": int(start.timestamp()),
+        "not_after": int(expire.timestamp()),
+        "days_left": int((expire.timestamp() - time.time()) // 86400),
+        "san": san,
+        "key": {"type": key_type, "bits": key_bits},
+        "signature_hash": str(cert.signature_hash_algorithm.name or ""),
+        "is_ca": is_ca,
+    }
+
+
+async def cert_detail(site: Dict[str, Any]) -> Dict[str, Any]:
+    """证书详情：链结构、SAN、指纹、签发者、密钥参数 + 线上体检结论。
+
+    ``acme/upload`` 直接用站点缓存的 PEM；云厂商在缓存为空时尝试下载一次。
+    下载失败不报错 —— 详情页至少还能显示状态、剩余天数和部署目标。
+    """
+    pem = str(site.get("acme_pem") or "").strip()
+    source = "cache" if pem else ""
+    if not pem and ca_kind(site) not in ("upload",):
+        cert_id = str(site.get("cert_id") or site.get("pending_cert_id") or "")
+        if cert_id:
+            try:
+                provider = build_provider(ca_kind(site), await provider_cfg_for(site))
+                if provider.configured:
+                    bundle = await provider.download(cert_id)
+                    pem = str(bundle.get("fullchain") or bundle.get("pem") or "")
+                    source = "provider" if pem else ""
+            except Exception:  # noqa: BLE001 - 详情页不该因为 CA 抖动打不开
+                logger.info("详情页取证书失败：%s", cert_id, exc_info=True)
+
+    chain: List[Dict[str, Any]] = []
+    leaf: Dict[str, Any] = {}
+    if pem:
+        try:
+            blocks = acme_mod.split_chain(pem)
+            certs = [x509.load_pem_x509_certificate(b.encode("utf-8")) for b in blocks]
+        except Exception:  # noqa: BLE001
+            certs = []
+        for index, cert in enumerate(certs):
+            item = _cert_summary(cert)
+            if index == 0:
+                leaf = item
+                continue
+            chain.append(
+                {
+                    "subject": item["subject"],
+                    "issuer": item["issuer"],
+                    "serial": item["serial"],
+                    "fingerprint_sha256": item["fingerprint_sha256"],
+                    "not_before": item["not_before"],
+                    "not_after": item["not_after"],
+                    "is_ca": item["is_ca"],
+                }
+            )
+
+    targets = site_targets(site)
+    return {
+        "site_id": str(site.get("id") or ""),
+        "name": str(site.get("name") or ""),
+        "domain": str(site.get("domain") or ""),
+        "domains": site_domains(site),
+        "ca": ca_kind(site),
+        "cert_id": str(site.get("cert_id") or site.get("pending_cert_id") or ""),
+        "status": int(site.get("cert_status") or -1),
+        "status_text": status_text(int(site.get("cert_status") or -1)),
+        "expire_at": int(site.get("expire_at") or 0),
+        "days_left": days_left(site),
+        "source": source,
+        "leaf": leaf,
+        "chain": chain,
+        "chain_length": len(chain) + (1 if leaf else 0),
+        # 线上体检（certmonitor 写入）：能回答「浏览器到底认不认」
+        "health": {
+            "status": str(site.get("health_status") or ""),
+            "issues": list(site.get("health_issues") or []),
+            "detail": str(site.get("health_detail") or ""),
+            "checked_at": int(site.get("health_checked_at") or 0),
+            "protocol": str(site.get("tls_protocol") or ""),
+            "trusted": bool(site.get("tls_trusted")),
+            "hostname_ok": bool(site.get("tls_hostname_ok")),
+        },
+        "environment": str(site.get("environment") or ""),
+        "cluster": str(site.get("cluster") or ""),
+        "targets": [
+            {
+                "id": str(target.get("id") or ""),
+                "name": str(target.get("name") or ""),
+                "method": str(target.get("method") or ""),
+                "last_error": str(target.get("last_error") or ""),
+                "last_deploy_at": int(target.get("last_deploy_at") or 0),
+            }
+            for target in targets
+        ],
+    }
+
+
+# ---------------------------------------------------------------- 主动轮换
+async def rotate_site(
+    site: Dict[str, Any],
+    cfg: Optional[Dict[str, Any]] = None,
+    *,
+    deploy: bool = True,
+) -> Dict[str, Any]:
+    """主动轮换：重新签发一张新证书（同时换新私钥）。
+
+    与「续期」的区别只在触发语义：续期是到期前的自动行为，轮换是「不等到期，
+    现在就换」——私钥可能泄露、员工离职、或者合规要求定期换钥时用。
+
+    * ACME / 云厂商：重新下单，CA 会生成新的密钥对；
+    * 托管证书：无法代为签发，必须重新上传（在这里明确拒绝，而不是假装成功）。
+
+    轮换成功后可选立即部署；部署失败不回滚 —— 新证书已经在 CA 侧签发，
+    回滚只会留下一张没人管的证书。
+    """
+    kind = ca_kind(site)
+    if kind == "upload":
+        raise CertError(
+            i18n.pick(
+                "托管证书不能自动轮换，请上传新的证书与私钥",
+                "Uploaded certificates cannot be rotated; upload a new certificate and key",
+            )
+        )
+    old_id = str(site.get("cert_id") or "")
+    await apply_certificate(site, cfg, renew=True)
+    site["last_rotated_at"] = now_ts()
+    site["rotate_count"] = int(site.get("rotate_count") or 0) + 1
+    await record_log(
+        site,
+        "rotate",
+        "success",
+        i18n.pick(
+            "已轮换证书：" + (old_id or "（无旧证书）") + " → " + str(site.get("pending_cert_id") or ""),
+            "Rotated certificate: "
+            + (old_id or "(none)")
+            + " -> "
+            + str(site.get("pending_cert_id") or ""),
+        ),
+    )
+    detail = i18n.pick("已提交轮换", "Rotation submitted")
+    deployed = False
+    if deploy and str(site.get("pending_cert_id") or ""):
+        # 只有同步签发的渠道（ACME）能立刻部署；云厂商还在审核中，等流水线
+        if int(site.get("cert_status") or -1) == STATUS_ISSUED and site.get("acme_pem"):
+            outcome = await deploy_site(site, cfg, action="rotate")
+            deployed = bool(outcome.get("ok"))
+            detail = str(outcome.get("detail") or detail)
+    await certnotify.notify(
+        site_owner(site),
+        site,
+        certnotify.EVENT_ROTATED,
+        i18n.pick(
+            "证书已轮换：" + str(site.get("domain") or ""),
+            "Certificate rotated: " + str(site.get("domain") or ""),
+        ),
+        detail,
+        key="rotated:" + str(site.get("cert_id") or site.get("pending_cert_id") or ""),
+    )
+    await update_site(site)
+    return {"rotated": True, "deployed": deployed, "detail": detail, "site": site}
+
+
+# ---------------------------------------------------------------- 批量操作
+#: 批量操作允许的动作。删除单独走 DELETE，不混在这里：它不可逆，需要前端二次确认。
+BULK_ACTIONS = ("apply", "sync", "deploy", "rotate", "revoke")
+
+
+async def bulk_action(
+    sites: List[Dict[str, Any]], action: str, reason: int = 0
+) -> Dict[str, Any]:
+    """对一批站点执行同一动作，逐站点返回结果（部分失败不影响其它站点）。
+
+    批量操作最容易踩的坑是「一个失败整批回滚」：20 个站点里第 3 个的 SSH 密码
+    过期了，另外 19 个明明可以正常续期。所以这里永远逐站点执行、逐站点汇报。
+    """
+    action = str(action or "").strip().lower()
+    if action not in BULK_ACTIONS:
+        raise CertError(
+            i18n.pick("不支持的批量操作：" + action, "Unsupported bulk action: " + action)
+        )
+    results: List[Dict[str, Any]] = []
+    for site in sites:
+        item: Dict[str, Any] = {
+            "site_id": str(site.get("id") or ""),
+            "name": str(site.get("name") or ""),
+            "domain": str(site.get("domain") or ""),
+            "ok": False,
+            "detail": "",
+        }
+        try:
+            if action == "apply":
+                await apply_certificate(site, None, renew=bool(site.get("cert_id")))
+                item["ok"] = True
+                item["detail"] = i18n.pick("已提交申请", "Request submitted")
+            elif action == "sync":
+                await sync_site_cert(site, None)
+                item["ok"] = True
+                item["detail"] = i18n.pick("已同步", "Synced")
+            elif action == "deploy":
+                outcome = await deploy_site(site, None, action="deploy")
+                item["ok"] = bool(outcome.get("ok"))
+                item["detail"] = str(outcome.get("detail") or "")
+            elif action == "rotate":
+                outcome = await rotate_site(site, None, deploy=True)
+                item["ok"] = True
+                item["detail"] = str(outcome.get("detail") or "")
+            else:  # revoke
+                outcome = await revoke_certificate(site, reason)
+                item["ok"] = True
+                item["detail"] = str(outcome.get("detail") or "")
+        except (CertError, ProviderError, TencentCloudError) as exc:
+            item["detail"] = str(exc)
+        results.append(item)
+    ok_count = sum(1 for row in results if row["ok"])
+    return {
+        "action": action,
+        "total": len(results),
+        "ok": ok_count,
+        "failed": len(results) - ok_count,
+        "results": results,
+    }
+
+
+# ------------------------------------------------------------ Prometheus 指标
+def _prom_label(value: Any) -> str:
+    """转义 label 值（反斜杠、双引号、换行），避免破坏 exposition 格式。"""
+    return (
+        str(value or "")
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
+
+
+def metrics_text(sites: List[Dict[str, Any]]) -> str:
+    """证书模块的 Prometheus 文本指标。
+
+    不引入 ``prometheus_client``：只需要一组 gauge，手写 exposition 更轻，
+    也不会把依赖树再撑大一层。指标以站点为粒度，另给一组按状态的汇总，
+    方便直接写「30 天内到期 == 0」这类告警规则。
+    """
+    lines: List[str] = []
+    lines.append("# HELP pvecenter_cert_days_left Days until the certificate expires")
+    lines.append("# TYPE pvecenter_cert_days_left gauge")
+    for site in sites:
+        left = days_left(site)
+        labels = (
+            f'site="{_prom_label(site.get("id"))}",'
+            f'domain="{_prom_label(site.get("domain"))}",'
+            f'ca="{_prom_label(ca_kind(site))}",'
+            f'environment="{_prom_label(site.get("environment"))}",'
+            f'cluster="{_prom_label(site.get("cluster"))}"'
+        )
+        if left is not None:
+            lines.append(f"pvecenter_cert_days_left{{{labels}}} {int(left)}")
+
+    lines.append("# HELP pvecenter_cert_expire_timestamp Certificate not-after timestamp")
+    lines.append("# TYPE pvecenter_cert_expire_timestamp gauge")
+    for site in sites:
+        expire = int(site.get("expire_at") or 0)
+        if expire:
+            labels = (
+                f'site="{_prom_label(site.get("id"))}",'
+                f'domain="{_prom_label(site.get("domain"))}"'
+            )
+            lines.append(f"pvecenter_cert_expire_timestamp{{{labels}}} {expire}")
+
+    lines.append("# HELP pvecenter_cert_status Certificate status code (see certstatus)")
+    lines.append("# TYPE pvecenter_cert_status gauge")
+    for site in sites:
+        labels = (
+            f'site="{_prom_label(site.get("id"))}",'
+            f'domain="{_prom_label(site.get("domain"))}",'
+            f'status="{int(site.get("cert_status") or -1)}"'
+        )
+        lines.append(f"pvecenter_cert_status{{{labels}}} 1")
+
+    lines.append("# HELP pvecenter_cert_health_ok TLS health verdict (1 = no issue)")
+    lines.append("# TYPE pvecenter_cert_health_ok gauge")
+    for site in sites:
+        status = str(site.get("health_status") or "")
+        if status:
+            labels = f'site="{_prom_label(site.get("id"))}",domain="{_prom_label(site.get("domain"))}"'
+            lines.append(
+                f"pvecenter_cert_health_ok{{{labels}}} {1 if status == 'ok' else 0}"
+            )
+
+    # 汇总：按状态与健康度分桶，写规则时不用逐站点过滤
+    tally: Dict[str, int] = {}
+    for site in sites:
+        key = str(site.get("health_status") or "unknown")
+        tally[key] = tally.get(key, 0) + 1
+    lines.append("# HELP pvecenter_certs_total Number of certificate sites by health")
+    lines.append("# TYPE pvecenter_certs_total gauge")
+    for key, count in sorted(tally.items()):
+        lines.append(f'pvecenter_certs_total{{health="{_prom_label(key)}"}} {count}')
+
+    failed = sum(1 for site in sites if str(site.get("last_run_status") or "") == "failed")
+    lines.append("# HELP pvecenter_cert_renew_failed_total Sites whose last renewal failed")
+    lines.append("# TYPE pvecenter_cert_renew_failed_total gauge")
+    lines.append(f"pvecenter_cert_renew_failed_total {failed}")
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------- 定时续期
@@ -3003,6 +4237,11 @@ def _decide(ctx: Context) -> str:
     left = days_left(site)
     ctx.set("left", left)
     threshold = renew_threshold(site, ctx.get("cfg"))
+    # 计划轮换：auto_rotate 打开时，轮换窗口可以早于续期阈值 —— 到期续期是
+    # 「别断」，轮换是「定期换钥」，两者共用同一条签发/部署链路。
+    rotate_days = int(site.get("rotate_before_days") or 0)
+    if site.get("auto_rotate") and rotate_days > 0:
+        threshold = max(threshold, rotate_days)
     if left is None or left > threshold:
         return "none"
     if str(site.get("ca") or "tencent") == "upload":
@@ -3121,14 +4360,7 @@ async def _step_deploy(ctx: Context) -> None:
                 "Site \"" + str(site.get("name") or "") + "\" was renewed and deployed.",
             ),
         )
-    else:
-        await certnotify.notify(
-            owner,
-            site,
-            certnotify.EVENT_DEPLOY_FAILED,
-            i18n.pick("证书部署失败：" + str(site.get("domain") or ""), "Certificate deploy failed: " + str(site.get("domain") or "")),
-            str(outcome.get("detail") or site.get("last_error") or ""),
-        )
+    # 部署失败的通知由 deploy_site 统一发出（手动与自动同一条路径），这里不再重复
     ctx.set(
         "result",
         {"site": site.get("name"), "action": "deploy", "detail": outcome.get("detail")},
@@ -3162,6 +4394,9 @@ async def _step_drop(ctx: Context) -> None:
         certnotify.EVENT_RENEW_FAILED,
         i18n.pick("证书续期失败：" + str(site.get("domain") or ""), "Certificate renewal failed: " + str(site.get("domain") or "")),
         site["last_error"],
+        # 到达退避上限后自动重试已停手：这一条必须绕过冷却再喊一次，否则
+        # 12 小时冷却会把「已经不会再有人重试了」这件事一起吞掉
+        escalate=attempts >= len(BACKOFF_STEPS),
     )
     ctx.set("result", {"site": site.get("name"), "action": "renew", "detail": site["last_error"]})
 
@@ -3187,23 +4422,41 @@ async def _step_notice(ctx: Context) -> None:
     ctx.set("result", {"site": site.get("name"), "action": "notice", "detail": site["last_error"]})
 
 
+#: 多级到期预警：剩余天数落入哪一档就按那一档发一次。按「从紧急到宽松」匹配，
+#: 因此证书一路逼近到期时会依次触发 30 → 14 → 7 → 3 天各一次，而不是只在 7 天响。
+EXPIRY_STAGES = (30, 14, 7, 3)
+
+
 async def _step_warn(ctx: Context) -> str:
-    """到期前 7 天提醒一次（按 12 小时冷却），用来兜住"续期一直没成功"。"""
+    """到期前按 30/14/7/3 天分级提醒（每档独立冷却），兜住"续期一直没成功"。"""
     site = ctx.site
     left = ctx.get("left")
-    if left is None or int(left) > 7:
+    if left is None:
+        return ""
+    days = int(left)
+    stage = next((d for d in EXPIRY_STAGES if days <= d), None)
+    if stage is None:
         return ""
     await certnotify.notify(
         site_owner(site),
         site,
         certnotify.EVENT_EXPIRING,
-        i18n.pick("证书即将到期：" + str(site.get("domain") or ""), "Certificate expiring: " + str(site.get("domain") or "")),
+        i18n.pick(
+            "证书即将到期（" + str(stage) + " 天档）：" + str(site.get("domain") or ""),
+            "Certificate expiring (" + str(stage) + "-day mark): " + str(site.get("domain") or ""),
+        ),
         i18n.pick(
             "站点「" + str(site.get("name") or "") + "」的证书剩余 " + str(left) + " 天。",
             "Site \"" + str(site.get("name") or "") + "\" expires in " + str(left) + " days.",
         ),
+        # 每档一个冷却键：发过 30 天档不影响 14 天档再发
+        key="expiring_" + str(stage),
     )
-    return i18n.pick("剩余 ", "") + str(left) + i18n.pick(" 天", " days left")
+    return (
+        i18n.pick("剩余 ", "")
+        + str(left)
+        + i18n.pick(" 天（" + str(stage) + " 天档）", " days left (" + str(stage) + "-day mark)")
+    )
 
 
 def _only(decision: str) -> Any:
@@ -3233,42 +4486,248 @@ _RENEW_PIPELINE = Pipeline(
             when=lambda ctx: ctx.get("synced", False),
             detail=lambda ctx, value: i18n.pick("决策：", "Decision: ") + str(value),
         ),
-        Step("warn", _step_warn, when=lambda ctx: ctx.get("decision") in ("due", "notice")),
+        Step(
+            "warn",
+            _step_warn,
+            when=lambda ctx: ctx.get("decision") in ("due", "notice")
+            and ctx.site.get("notify_expiring", True),
+        ),
         Step("issue", _step_issue, when=_only("due")),
-        Step("deploy", _step_deploy, when=_only("deploy")),
+        Step(
+            "deploy",
+            _step_deploy,
+            # 关掉自动部署时只签发、不写目标，等人工确认后再点「立即部署」
+            when=lambda ctx: ctx.get("decision") == "deploy"
+            and ctx.site.get("auto_deploy", True),
+        ),
         Step("drop", _step_drop, when=_only("drop")),
         Step("notice", _step_notice, when=_only("notice")),
     ],
 )
 
 
-async def renew_site(site: Dict[str, Any]) -> RunResult:
-    """跑一次单站点续期流水线，并把「最后运行结果」记到站点上。
+# ------------------------------------------------------------- 流水定义（新引擎）
+#: 定义版本。节点组合或顺序一变就必须 +1：回滚是「切回上一版定义」，
+#: 靠覆盖同一个版本号会让历史运行动态地换了含义。
+RENEW_FLOW_VERSION = 1
 
-    配置与客户端由流水线内的 ``prepare`` 按站点归属现取（见该步骤的说明），
-    调用方不必也不该传一份「全局」客户端进来。
 
-    逐步结果（``last_run``）留在站点 JSON 里而不是单独建表：一次运行最多六七
-    行、每行不到 100 字节，够排障用，也省掉一次清理与分页。
+def _same_detail(ctx: Any, value: Any) -> str:
+    """旧 Pipeline 里 ``detail=lambda ctx, value: value`` 的等价物。"""
+    return str(value)
+
+
+def _silent_detail(ctx: Any, value: Any) -> str:
+    """旧 Pipeline 没配 ``detail`` 的步骤。
+
+    ``warn`` 有返回值但旧实现同样不展示，所以这里是"显式压成空串"，而不是
+    依赖默认推断 —— 两种引擎写同一个 ``last_run``，detail 差一个字都算回归。
     """
-    ctx = Context(site=site)
-    run = await _RENEW_PIPELINE.run(ctx)
-    site["last_run"] = run.as_list()
-    site["last_run_at"] = now_ts()
-    site["last_run_status"] = run.status
+    return ""
+
+
+def _decision_detail(ctx: Any, value: Any) -> str:
+    return i18n.pick("决策：", "Decision: ") + str(value)
+
+
+def _register_renew_nodes() -> None:
+    """把续期动作登记成节点类型。
+
+    登记的就是现成的 ``_step_*`` 函数：它们只依赖 ``ctx.site`` / ``ctx.get`` /
+    ``ctx.set``，而 ``certflow.RunContext`` 提供了同样三个接口，所以新旧两个
+    调度器能共用同一份实现 —— 这是「迁移期两条路径结果等价」的前提。
+
+    用 ``replace`` 而不是 ``register``：模块被 reload（开发热重载、测试重复导入）
+    时不该因为类型已存在而炸掉。
+    """
+    specs = (
+        ("guard", _step_guard, ()),
+        ("prepare", _step_prepare, ()),
+        ("sync", _step_sync, ()),
+        ("decide", _step_decide, ()),
+        ("warn", _step_warn, ()),
+        # 签发节点是唯一真正产出证书正文的地方，显式声明产物类别，
+        # 后续「多目标分发」节点就能按 kind 找上游，而不是靠节点顺序猜。
+        ("issue", _step_issue, ("cert", "key")),
+        ("deploy", _step_deploy, ("deploy",)),
+        ("drop", _step_drop, ()),
+        ("notice", _step_notice, ()),
+    )
+    for type_name, handler, produces in specs:
+        certflow.REGISTRY.replace(
+            certflow.NodeSpec(
+                type=type_name,
+                handler=handler,
+                produces=produces,
+                description=str(getattr(handler, "__doc__", "") or "").strip().split("\n")[0],
+            )
+        )
+
+
+_register_renew_nodes()
+
+
+#: 与 ``_RENEW_PIPELINE`` 等价的节点图。区别只在三处：
+#:
+#: * 顺序由 ``needs`` 算出（拓扑排序 + 原始顺序兜底），不再靠列表位置隐含；
+#: * 依赖是**数据依赖**：``issue`` / ``deploy`` / ``drop`` / ``notice`` 都只依赖
+#:   ``decide``，而不是「上一步」—— 它们本就互斥，串成链会让一个被跳过的分支
+#:   连带跳过另一个；
+#: * 每次运行可落库（``cert_flow_*``），站点上的 ``last_run`` 退化为投影。
+RENEW_FLOW = certflow.Definition(
+    name="cert-renew",
+    version=RENEW_FLOW_VERSION,
+    description="站点证书续期：退避闸 → 取配置 → 同步 → 判定 → 提醒 → 签发 → 部署",
+    nodes=[
+        certflow.Node(
+            "guard", "guard", title="退避检查", when=_has_cert, detail=_same_detail
+        ),
+        certflow.Node(
+            "prepare",
+            "prepare",
+            title="取签发配置",
+            needs=("guard",),
+            when=lambda ctx: _has_cert(ctx) and not ctx.get("hold"),
+            detail=_same_detail,
+        ),
+        certflow.Node(
+            "sync",
+            "sync",
+            title="同步 CA 侧状态",
+            needs=("prepare",),
+            when=lambda ctx: ctx.get("configured", False),
+            detail=_silent_detail,
+        ),
+        certflow.Node(
+            "decide",
+            "decide",
+            title="判定本次动作",
+            needs=("sync",),
+            when=lambda ctx: ctx.get("synced", False),
+            detail=_decision_detail,
+        ),
+        certflow.Node(
+            "warn",
+            "warn",
+            title="到期分级提醒",
+            needs=("decide",),
+            when=lambda ctx: ctx.get("decision") in ("due", "notice")
+            and ctx.site.get("notify_expiring", True),
+            detail=_silent_detail,
+        ),
+        certflow.Node(
+            "issue",
+            "issue",
+            title="申请续期证书",
+            needs=("decide",),
+            when=_only("due"),
+            detail=_silent_detail,
+        ),
+        certflow.Node(
+            "deploy",
+            "deploy",
+            title="部署新证书",
+            needs=("decide",),
+            # 关掉自动部署时只签发、不写目标，等人工确认后再点「立即部署」
+            when=lambda ctx: ctx.get("decision") == "deploy"
+            and ctx.site.get("auto_deploy", True),
+            detail=_silent_detail,
+        ),
+        certflow.Node(
+            "drop",
+            "drop",
+            title="清理失败申请",
+            needs=("decide",),
+            when=_only("drop"),
+            detail=_silent_detail,
+        ),
+        certflow.Node(
+            "notice",
+            "notice",
+            title="托管证书到期提醒",
+            needs=("decide",),
+            when=_only("notice"),
+            detail=_silent_detail,
+        ),
+    ],
+)
+
+
+def _as_legacy_result(flow: certflow.Run) -> RunResult:
+    """把新引擎的运行结果改写成旧返回类型。
+
+    上层（``_run_sites`` / 接口）按 ``RunResult`` 消费 ``status`` / ``value`` /
+    ``exc`` / ``as_list()``。返回类型不换，「开不开新引擎」对上层的代码路径就
+    完全没有差别，出问题也能一行配置切回去。
+    """
+    return RunResult(
+        status=flow.status,
+        steps=[
+            StepResult(s.node_id, s.status, s.detail, s.ms, s.at) for s in flow.steps
+        ],
+        value=flow.value,
+        error=flow.error,
+        exc=flow.exc,
+    )
+
+
+async def renew_site(site: Dict[str, Any], trigger: str = "tick") -> RunResult:
+    """跑一次单站点续期流水线，并把「最后运行结果」投影回站点。
+
+    配置与客户端由 ``prepare`` 按站点归属现取（见该步骤的说明），调用方不必也
+    不该传一份「全局」客户端进来。
+
+    两条调度路径由 ``settings.certflow_enabled`` 决定，但**共用同一批步骤实现、
+    同一个投影出口**：站点上的 ``last_run`` 结构因此不随开关变化，切换前后前端
+    看到的字段完全一样。
+    """
+    if settings.certflow_enabled:
+        # 运行 id 与步骤上下文由 Runner 自己维护，这里不用插手
+        flow = await certflow.Runner().run(
+            RENEW_FLOW,
+            site,
+            trigger=trigger,
+            sink=certflow_store.SqlSink(site, settings.certflow_store_payload),
+        )
+    else:
+        ctx = Context(site=site)
+        # 旧调度器同样要带归因：先定好 run_id，用 step_scope 圈住执行范围、
+        # on_step 逐步骤切换上下文。于是「关掉新引擎」时部署日志照样按步骤可查，
+        # 只是没有 cert_flow_run 那张运行头（回滚语义不变：不写新表）。
+        rid = certflow.new_run_id()
+        with certflow.step_scope(rid):
+            legacy = await _RENEW_PIPELINE.run(ctx, on_step=certflow.enter_step)
+        flow = certflow.run_from_legacy(
+            legacy,
+            RENEW_FLOW.name,
+            version=RENEW_FLOW.version,
+            trigger=trigger,
+            site_id=str(site.get("id") or ""),
+            owner=site_owner(site),
+            run_id=rid,
+            state=ctx.data,
+        )
+
+    certflow.project_last_run(site, flow)
     # 取过配置或同步过的站点才落库；没证书的站点保持「不碰库」的旧行为
-    if ctx.get("prepared", False) or ctx.get("synced", False):
+    if flow.state.get("prepared", False) or flow.state.get("synced", False):
         await update_site(site)
-    return run
+    return _as_legacy_result(flow)
 
 
-async def _run_sites(sites: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """逐站点跑流水线；单站点失败登记退避后继续下一个。"""
+async def _run_sites(
+    sites: List[Dict[str, Any]], trigger: str = "tick"
+) -> List[Dict[str, Any]]:
+    """逐站点跑流水线；单站点失败登记退避后继续下一个。
+
+    ``trigger`` 只进运行记录：同一张证书可能是「6 小时主作业」「5 分钟退避补跑」
+    或人工触发，出问题时先看是哪条路径来的，比看时间戳更直接。
+    """
     results: List[Dict[str, Any]] = []
     for site in sites:
         if not site.get("enabled"):
             continue
-        run = await renew_site(site)
+        run = await renew_site(site, trigger=trigger)
         if run.exc is not None:
             # 接口抖动：记一笔就继续下一个站点，别让一个坏站点拖垮整轮；
             # 其它异常（代码 bug / 数据库）照旧往上抛，交给调度器记失败。
@@ -3288,6 +4747,21 @@ async def _run_sites(sites: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         if run.value:
             results.append(run.value)
+            # 定时/补跑触发的动作也要进 audit_log：只写 cert_deploy_log 的话，
+            # 安全复盘时「凌晨那张证书是谁签的」在审计里查不到。
+            await store.add_audit(
+                username=site_owner(site) or "system",
+                action="cert.auto_" + str(run.value.get("action") or "renew"),
+                target=str(site.get("domain") or ""),
+                result="success" if run.status == "ok" else "failed",
+                detail={
+                    "site_id": str(site.get("id") or ""),
+                    "site": str(site.get("name") or ""),
+                    "trigger": trigger,
+                    "detail": str(run.value.get("detail") or "")[:800],
+                },
+                ip="scheduler",
+            )
     return results
 
 
@@ -3325,7 +4799,7 @@ async def retry_tick() -> List[Dict[str, Any]]:
                 due.append(site)
         if not due:
             return []
-        return await _run_sites(due[:3])
+        return await _run_sites(due[:3], trigger="retry")
 
 
 async def sync_all(owner: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -3416,12 +4890,8 @@ def _cert_covered_by(info: Any, site: Dict[str, Any]) -> List[str]:
     return missing
 
 
-async def inventory(owner: Optional[str] = None) -> List[Dict[str, Any]]:
-    """站点证书清单：按「厂商 + 证书 ID」聚合，一张证书绑了几个站点一目了然。
-
-    直接从站点派生而不是另存一份：站点才是唯一事实来源，避免两处数据不同步。
-    """
-    sites = visible_sites(await load_sites(), owner)
+def _inventory_from_sites(sites: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """从站点派生证书清单（纯计算，不落库）。"""
     # key 里带上归属者：不同用户的证书 ID 来自各自账号，理论上可能撞号
     groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for site in sites:
@@ -3470,6 +4940,104 @@ async def inventory(owner: Optional[str] = None) -> List[Dict[str, Any]]:
         item["site_count"] = len(item["sites"])
         item["status_text"] = i18n.tr(item["status_text"])
     return items
+
+
+#: 快照重建是「全表删 + 全量插」，并发请求交错会让表内容错乱；串行化即可
+_INVENTORY_LOCK = asyncio.Lock()
+
+
+async def _rebuild_inventory_table(items: List[Dict[str, Any]]) -> None:
+    """把当前派生出的证书清单物化到 ``cert_inventory``（全量重建，幂等）。
+
+    物化失败只记 warning，不影响清单接口：实时数据仍然从站点派生返回，快照表
+    缺的只是统计/日历那部分。
+    """
+    try:
+        async with _INVENTORY_LOCK:
+            async with database.connect() as db:
+                await db.execute("DELETE FROM cert_inventory")
+                if items:
+                    await db.executemany(
+                        "INSERT INTO cert_inventory"
+                        " (username, cert_id, provider, domains, status, expire_at,"
+                        "  days_left, updated_at)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        [
+                            (
+                                str(item.get("username") or ""),
+                                str(item.get("cert_id") or ""),
+                                str(item.get("provider") or ""),
+                                ",".join(str(d) for d in item.get("domains") or []),
+                                int(item.get("status") or 0),
+                                int(item.get("expire_at") or 0),
+                                int(item["days_left"])
+                                if item.get("days_left") is not None
+                                else None,
+                                now_ts(),
+                            )
+                            for item in items
+                        ],
+                    )
+                await db.commit()
+    except Exception:  # noqa: BLE001 - 物化是增强能力，失败不该阻断清单
+        logger.warning("刷新证书库存快照表失败", exc_info=True)
+
+
+async def inventory(owner: Optional[str] = None) -> List[Dict[str, Any]]:
+    """站点证书清单：按「厂商 + 证书 ID」聚合，一张证书绑了几个站点一目了然。
+
+    站点是唯一事实来源：这里先全量派生，再把结果物化到 ``cert_inventory``
+    快照表供统计/日历使用；``owner`` 只影响返回结果的可见范围。
+    """
+    items = _inventory_from_sites(visible_sites(await load_sites(), None))
+    await _rebuild_inventory_table(items)
+    if owner is None:
+        return items
+    return [item for item in items if str(item.get("username") or "") == str(owner)]
+
+
+def _expiry_bucket(days: Optional[int]) -> str:
+    if days is None:
+        return "unknown"
+    if days < 0:
+        return "expired"
+    if days <= 7:
+        return "d7"
+    if days <= 30:
+        return "d30"
+    if days <= 90:
+        return "d90"
+    return "d90plus"
+
+
+def inventory_stats_from_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """从清单结果计算到期分布与渠道/状态统计（纯函数，便于复用同一份清单）。"""
+    buckets = {"expired": 0, "d7": 0, "d30": 0, "d90": 0, "d90plus": 0, "unknown": 0}
+    by_ca: Dict[str, int] = {}
+    by_status: Dict[int, int] = {}
+    for item in items:
+        buckets[_expiry_bucket(item.get("days_left"))] += 1
+        provider = str(item.get("provider") or "")
+        by_ca[provider] = by_ca.get(provider, 0) + 1
+        status = int(item.get("status") or 0)
+        by_status[status] = by_status.get(status, 0) + 1
+    return {
+        "total": len(items),
+        "buckets": buckets,
+        "by_ca": [
+            {"provider": key, "label": provider_label(key), "count": value}
+            for key, value in sorted(by_ca.items(), key=lambda pair: -pair[1])
+        ],
+        "by_status": [
+            {"status": key, "text": status_text(key), "count": value}
+            for key, value in sorted(by_status.items())
+        ],
+    }
+
+
+async def inventory_stats(owner: Optional[str] = None) -> Dict[str, Any]:
+    """证书到期分布与渠道/状态统计，供页面的统计卡与到期日历使用。"""
+    return inventory_stats_from_items(await inventory(owner))
 
 
 async def bind_to_sites(

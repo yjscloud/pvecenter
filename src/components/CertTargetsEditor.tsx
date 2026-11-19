@@ -29,7 +29,15 @@ const BLANK: CertTarget = {
   ssh_port: 22,
   ssh_user: "root",
   ssh_auth: "password",
+  listener_port: 443,
 };
+
+/** 云负载均衡 / CDN：没有本地目录，字段与 SSH/Agent 完全不同 */
+const CLOUD_METHODS = ["tencent_clb", "aliyun_slb", "tencent_cdn", "aliyun_cdn"];
+
+function isCloudMethod(method?: string): boolean {
+  return CLOUD_METHODS.includes(String(method || ""));
+}
 
 export function CertTargetsEditor({ targets, methods, disabled, onChange }: Props) {
   const t = useT();
@@ -89,7 +97,7 @@ export function CertTargetsEditor({ targets, methods, disabled, onChange }: Prop
               disabled={disabled}
               onChange={(e) => update(index, { method: e.target.value as CertTarget["method"] })}
             />
-            {target.method !== "pve" ? (
+            {target.method !== "pve" && !isCloudMethod(target.method) ? (
               <>
                 <Input
                   label={t('cert.fieldDeployDir')}
@@ -108,7 +116,7 @@ export function CertTargetsEditor({ targets, methods, disabled, onChange }: Prop
                   onChange={(e) => update(index, { reload_command: e.target.value })}
                 />
               </>
-            ) : (
+            ) : target.method === "pve" ? (
               <Input
                 label={t('cert.fieldNode')}
                 value={target.agent_node || ""}
@@ -118,7 +126,68 @@ export function CertTargetsEditor({ targets, methods, disabled, onChange }: Prop
                 hint={t('cert.pveNodeHint')}
                 onChange={(e) => update(index, { agent_node: e.target.value })}
               />
-            )}
+            ) : null}
+
+            {target.method === "tencent_clb" ? (
+              <>
+                <Input
+                  label={t('cert.fieldCloudRegion')}
+                  value={target.cloud_region || ""}
+                  placeholder="ap-guangzhou"
+                  className="mono"
+                  disabled={disabled}
+                  onChange={(e) => update(index, { cloud_region: e.target.value })}
+                />
+                <Input
+                  label={t('cert.fieldLbId')}
+                  value={target.lb_id || ""}
+                  placeholder="lb-xxxxxxxx"
+                  className="mono"
+                  disabled={disabled}
+                  onChange={(e) => update(index, { lb_id: e.target.value })}
+                />
+                <Input
+                  label={t('cert.fieldListenerId')}
+                  value={target.listener_id || ""}
+                  placeholder="lbl-xxxxxxxx"
+                  className="mono"
+                  disabled={disabled}
+                  onChange={(e) => update(index, { listener_id: e.target.value })}
+                />
+              </>
+            ) : null}
+
+            {target.method === "aliyun_slb" ? (
+              <>
+                <Input
+                  label={t('cert.fieldLbId')}
+                  value={target.lb_id || ""}
+                  placeholder="lb-xxxxxxxx"
+                  className="mono"
+                  disabled={disabled}
+                  onChange={(e) => update(index, { lb_id: e.target.value })}
+                />
+                <Input
+                  label={t('cert.fieldListenerPort')}
+                  value={String(target.listener_port || 443)}
+                  placeholder="443"
+                  className="mono"
+                  disabled={disabled}
+                  onChange={(e) => update(index, { listener_port: Number(e.target.value) || 443 })}
+                />
+              </>
+            ) : null}
+
+            {target.method === "tencent_cdn" || target.method === "aliyun_cdn" ? (
+              <Input
+                label={t('cert.fieldCdnDomain')}
+                value={target.cdn_domain || ""}
+                placeholder={t('cert.cdnDomainPlaceholder')}
+                className="mono"
+                disabled={disabled}
+                onChange={(e) => update(index, { cdn_domain: e.target.value })}
+              />
+            ) : null}
 
             {target.method === "ssh" || target.method === "lxc" ? (
               <>

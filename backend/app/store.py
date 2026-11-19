@@ -985,6 +985,109 @@ async def add_audit(
         await db.commit()
 
 
+def _rewrap_json(value: Any) -> Tuple[Any, int]:
+    """递归重加密 JSON 里的 ``enc:v1:`` 字符串，返回 (新值, 改动数)。"""
+    if isinstance(value, str):
+        if not crypto.is_encrypted(value):
+            return value, 0
+        plain = crypto.decrypt(value)
+        if not plain:
+            return value, 0
+        new = crypto.rewrap(value)
+        return new, 0 if new == value else 1
+    if isinstance(value, dict):
+        changed = 0
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            out[key], count = _rewrap_json(item)
+            changed += count
+        return out, changed
+    if isinstance(value, list):
+        changed = 0
+        items = []
+        for item in value:
+            new, count = _rewrap_json(item)
+            items.append(new)
+            changed += count
+        return items, changed
+    return value, 0
+
+
+async def rewrap_all_settings() -> Dict[str, int]:
+    """把**所有** settings 条目里的密文用当前根密钥重写一遍。
+
+    证书模块只管自己的几个 key（站点、厂商、ACME），PVE 连接凭据、SMTP 口令、
+    飞书 Webhook、TOTP 种子等散落在别的 key 里。轮换根密钥时必须一起处理，
+    否则「证书能解开、连接凭据全失效」只是把故障延后到下一次用的时候。
+
+    逐行 CAS 写回：只更新自己读到的那一版，避免覆盖并发的配置修改。
+    解不开的密文原样保留（不写空串），由调用方从返回的 ``unreadable`` 里看到。
+    """
+    counts = {"rows": 0, "values": 0, "unreadable": 0}
+    async with database.connect() as db:
+        cursor = await db.execute("SELECT `key`, `value` FROM settings")
+        rows = await cursor.fetchall()
+    for row in rows:
+        key = str(row[0])
+        raw = row[1]
+        if not isinstance(raw, str) or crypto.PREFIX not in raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            # 不是 JSON：整值是密文的条目（极少）单独处理
+            data = raw
+        new, changed = _rewrap_json(data)
+        if isinstance(data, str) and isinstance(new, str):
+            payload = new
+        else:
+            payload = json.dumps(new, ensure_ascii=False)
+        if not changed:
+            # 统计一下「读到但解不开」的数量，便于运维判断是否可以清旧密钥
+            counts["unreadable"] += _count_unreadable(data)
+            continue
+        async with database.connect() as db:
+            cur = await db.execute(
+                "UPDATE settings SET `value` = ? WHERE `key` = ? AND `value` = ?",
+                (payload, key, raw),
+            )
+            await db.commit()
+            if cur.rowcount == 1:
+                counts["rows"] += 1
+                counts["values"] += changed
+                _remember_setting(key, payload)
+    return counts
+
+
+def _count_unreadable(value: Any) -> int:
+    """数一数递归结构里有多少密文解不开（只用于统计，不改数据）。"""
+    if isinstance(value, str):
+        return 1 if crypto.is_encrypted(value) and not crypto.decrypt(value) else 0
+    if isinstance(value, dict):
+        return sum(_count_unreadable(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_count_unreadable(item) for item in value)
+    return 0
+
+
+async def purge_audit_old(days: int) -> int:
+    """删除超过保留期的审计日志；``days<=0`` 表示永久保留，直接返回 0。
+
+    返回删除行数。保留期由 ``AUDIT_RETENTION_DAYS`` 控制，默认 180 天 ——
+    够覆盖一次季度复盘，也不会让单表无限膨胀。
+    """
+    keep = int(days or 0)
+    if keep <= 0:
+        return 0
+    cutoff = time.time() - keep * 86400
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "DELETE FROM audit_log WHERE timestamp < ?", (cutoff,)
+        )
+        await db.commit()
+        return int(cursor.rowcount or 0)
+
+
 def audit_filters(
     *,
     username: Optional[str] = None,
@@ -1238,6 +1341,38 @@ async def set_setting(key: str, value: str) -> None:
         await db.commit()
     # 写完就地更新读缓存：本进程必须立刻看到刚写的值，不能等 TTL 过期。
     _remember_setting(key, str(value or ""))
+
+
+async def insert_setting_if_absent(key: str, value: str) -> bool:
+    """仅当 key 不存在时插入；返回是否由本次插入成功创建。"""
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "INSERT IGNORE INTO settings (`key`, `value`) VALUES (?, ?)", (key, value)
+        )
+        await db.commit()
+        created = cursor.rowcount == 1
+    if created:
+        _remember_setting(key, str(value or ""))
+    return created
+
+
+async def compare_and_set_setting(key: str, value: str, expected: str) -> bool:
+    """仅当库里的值与 ``expected`` 一致时写入（跨进程乐观锁）。
+
+    站点列表是一整份 JSON，多个进程「读-改-写」时会互相覆盖。这里把
+    「我读到的快照」作为条件：快照变了就写不进去，由调用方重读后重试。
+    返回 ``True`` 表示写入成功。
+    """
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "UPDATE settings SET `value` = ? WHERE `key` = ? AND `value` = ?",
+            (value, key, expected),
+        )
+        await db.commit()
+        changed = cursor.rowcount == 1
+    if changed:
+        _remember_setting(key, str(value or ""))
+    return changed
 
 
 async def delete_setting(key: str) -> None:

@@ -577,6 +577,15 @@ export function App() {
             </RequirePermission>
           }
         />
+        {/* 旧书签：工作流已并入证书管理页的「工作流」标签，不再单独成页 */}
+        <Route
+          path="/cert-workflows"
+          element={<Navigate to="/certificates?view=workflows" replace />}
+        />
+        <Route
+          path="/cert-workflows/:id"
+          element={<Navigate to="/certificates?view=workflows" replace />}
+        />
         <Route
           path="/bot"
           element={

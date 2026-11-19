@@ -10,6 +10,7 @@ import "./styles/theme.css";
 import "./styles/global.css";
 import "./styles/components.css";
 import "./styles/layout.css";
+import "./styles/responsive.css";
 
 const vendorFields: CertProviderField[] = [
   { key: "secret_id", label_key: "cert.fieldSecretId", required: true },
@@ -159,9 +160,31 @@ function App() {
         providers={providers}
         canManage
         busy=""
+        tests={{
+          tencent: {
+            ok: false,
+            detail: "AuthFailure.SecretIdNotFound：SecretId 不存在或已被轮换，请到访问管理里确认",
+            at: Date.now() - 3_600_000,
+          },
+          acme: { ok: true, detail: "ACME 目录可达", at: Date.now() - 120_000 },
+        }}
+        counts={{ tencent: 3, aliyun: 1 }}
         onSave={async () => true}
-        onTest={() => undefined}
+        onTest={async () => ({ ok: true, detail: "ok" })}
       />
+
+      {/* 只读态：没有 cert.manage 时按钮禁用 + 一行说明 */}
+      <div className="card" style={{ marginTop: 16 }}>
+        <CertProvidersCard
+          bare
+          providers={providers}
+          canManage={false}
+          busy=""
+          counts={{ tencent: 3 }}
+          onSave={async () => true}
+          onTest={async () => ({ ok: true, detail: "ok" })}
+        />
+      </div>
     </div>
   );
 }

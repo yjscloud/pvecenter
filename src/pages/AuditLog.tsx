@@ -64,6 +64,7 @@ const ACTION_FILTERS: ReadonlyArray<{ label: MessageKey; value: string }> = [
   { label: 'audit.actionMigrate', value: 'migrate' },
   { label: 'audit.actionUser', value: 'user' },
   { label: 'audit.actionNetwork', value: 'network' },
+  { label: 'audit.actionCert', value: 'cert' },
 ];
 
 /** 时间范围快捷选项（小时）*/
@@ -741,7 +742,33 @@ const ACTION_LABELS: Record<string, MessageKey> = {
   config_update: 'audit.act.config_update',
   task_stop: 'audit.act.task_stop',
   task_remove: 'audit.act.task_remove',
+  cert_site_create: 'audit.act.cert_site_create',
+  cert_site_update: 'audit.act.cert_site_update',
+  cert_site_delete: 'audit.act.cert_site_delete',
+  cert_apply: 'audit.act.cert_apply',
+  cert_deploy: 'audit.act.cert_deploy',
+  cert_sync: 'audit.act.cert_sync',
+  cert_import: 'audit.act.cert_import',
+  cert_template: 'audit.act.cert_template',
+  cert_provider: 'audit.act.cert_provider',
+  cert_provider_test: 'audit.act.cert_provider_test',
+  cert_tencent: 'audit.act.cert_tencent',
+  cert_acme: 'audit.act.cert_acme',
+  cert_inventory_bind: 'audit.act.cert_inventory_bind',
+  cert_bind: 'audit.act.cert_bind',
+  cert_logs_clear: 'audit.act.cert_logs_clear',
+  cert_workflow_run: 'audit.act.cert_workflow_run',
+  cert_workflow_run_create: 'audit.act.cert_workflow_run_create',
+  cert_workflow_run_approve: 'audit.act.cert_workflow_run_approve',
+  cert_workflow_run_reject: 'audit.act.cert_workflow_run_reject',
+  cert_workflow_run_advance: 'audit.act.cert_workflow_run_advance',
+  cert_workflow_run_cancel: 'audit.act.cert_workflow_run_cancel',
 };
+
+/** 已知动作前缀，按长度降序 —— 给「xxx.<变量>」（cert.provider.tencent）这类动作兜底 */
+const ACTION_PREFIXES: ReadonlyArray<string> = Object.keys(ACTION_LABELS).sort(
+  (a, b) => b.length - a.length,
+);
 
 /** 动作标识可能带前缀（vm.power.start）或下划线（vm_start），统一归一化 */
 function normalizeAction(action: string): string {
@@ -760,7 +787,12 @@ function actionLabel(action: string | null | undefined, t: TFunc): string {
     if (ACTION_LABELS[sub]) return t(ACTION_LABELS[sub]);
   }
 
-  /* 兜底：把下划线换成空格，首字母大写 */
+  /* 尾部是变量（厂商名 / ID）时退回已知前缀，长前缀优先 */
+  for (const prefix of ACTION_PREFIXES) {
+    if (key.startsWith(prefix + '_')) return t(ACTION_LABELS[prefix]);
+  }
+
+  /* 兜底：把分隔符换成空格，原样输出未收录的动作名 */
   return action.replace(/[._]/g, ' ');
 }
 

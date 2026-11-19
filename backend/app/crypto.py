@@ -50,12 +50,31 @@ _NONCE_LEN = 16
 _TAG_LEN = 16
 
 
-def _derive_keys(info: bytes = _KDF_INFO) -> tuple:
+def _derive_keys(info: bytes = _KDF_INFO, master_key: bytes = b"") -> tuple:
     """从面板 ``secret_key`` 与 KDF 上下文派生 (加密密钥, 认证密钥)。"""
-    master = (settings.secret_key or "").encode("utf-8")
+    master = master_key or (settings.secret_key or "").encode("utf-8")
     enc_key = hmac.new(master, info + b"|enc", hashlib.sha256).digest()
     mac_key = hmac.new(master, info + b"|mac", hashlib.sha256).digest()
     return enc_key, mac_key
+
+
+def _masters() -> list:
+    """当前根密钥 + 轮换期保留的旧密钥（``SECRET_KEY_PREVIOUS``，逗号分隔）。
+
+    只用于**解密**：新写入始终用当前 ``secret_key``。这样轮换密钥时不会出现
+    「换了根密钥 → 全部凭据静默变成未配置」的情况。
+    """
+    current = (settings.secret_key or "").encode("utf-8")
+    masters = [current] if current else []
+    for item in str(getattr(settings, "secret_key_previous", "") or "").split(","):
+        value = item.strip().encode("utf-8")
+        if value and value not in masters:
+            masters.append(value)
+    return masters
+
+
+def _current_master() -> bytes:
+    return (settings.secret_key or "").encode("utf-8")
 
 
 def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
@@ -116,12 +135,57 @@ def decrypt(value: str) -> str:
     nonce = raw[:_NONCE_LEN]
     tag = raw[_NONCE_LEN:_NONCE_LEN + _TAG_LEN]
     body = raw[_NONCE_LEN + _TAG_LEN:]
-    for info in (_KDF_INFO, *_LEGACY_KDF_INFOS):
-        enc_key, mac_key = _derive_keys(info)
+    for master in _masters():
+        for info in (_KDF_INFO, *_LEGACY_KDF_INFOS):
+            enc_key, mac_key = _derive_keys(info, master)
+            expected = hmac.new(mac_key, nonce + body, hashlib.sha256).digest()[:_TAG_LEN]
+            if hmac.compare_digest(tag, expected):
+                return _xor(body, enc_key, nonce).decode("utf-8", "replace")
+    return ""
+
+
+def needs_rewrap(value: str) -> bool:
+    """密文是否需要用当前根密钥重写。
+
+    两种情况需要重写：旧根密钥加密的（``SECRET_KEY_PREVIOUS`` 能解开、当前
+    密钥解不开），以及旧 KDF 标识加密的。明文与空值返回 ``False``。
+    """
+    if not is_encrypted(value):
+        return False
+    plain = decrypt(value)
+    if not plain:
+        # 解不开的密文无从判断，交给运维排查；这里不谎报「需要重写」
+        return False
+    return _decrypt_with_current(value) != plain
+
+
+def _decrypt_with_current(value: str) -> str:
+    """只用当前根密钥解密（用于判断是否需要重写）。"""
+    try:
+        raw = base64.urlsafe_b64decode(value[len(PREFIX):].encode("ascii"))
+    except (ValueError, TypeError):
+        return ""
+    if len(raw) <= _NONCE_LEN + _TAG_LEN:
+        return ""
+    nonce = raw[:_NONCE_LEN]
+    tag = raw[_NONCE_LEN:_NONCE_LEN + _TAG_LEN]
+    body = raw[_NONCE_LEN + _TAG_LEN:]
+    for info in (_KDF_INFO,):
+        enc_key, mac_key = _derive_keys(info, _current_master())
         expected = hmac.new(mac_key, nonce + body, hashlib.sha256).digest()[:_TAG_LEN]
         if hmac.compare_digest(tag, expected):
             return _xor(body, enc_key, nonce).decode("utf-8", "replace")
     return ""
+
+
+def rewrap(value: str) -> str:
+    """用当前根密钥重写一段密文；明文 / 空值 / 解不开的密文原样返回。"""
+    if not is_encrypted(value):
+        return value
+    plain = decrypt(value)
+    if not plain:
+        return value
+    return encrypt(plain)
 
 
 def mask(value: str, head: int = 4, tail: int = 4) -> str:
