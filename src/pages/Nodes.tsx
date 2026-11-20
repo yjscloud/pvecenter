@@ -670,25 +670,13 @@ export function Nodes() {
                     {t('setup.pveManage')}
                   </Button>
                 ) : (
-                  /* 新装面板的第一屏：先给「一键接入」（扫描发现），再给
-                     「手动添加」（知道地址 / 跨网段）。两条路都通向同一个
-                     连接管理页，只是进去后停在哪个弹窗不同。 */
-                  <div className="empty-actions">
-                    <Button
-                      variant="primary"
-                      icon={<IconSearch size={15} />}
-                      onClick={() => navigate('/nodes/connections?discover=1')}
-                    >
-                      {t('conn.discoverEntry')}
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      icon={<IconPlus size={15} />}
-                      onClick={addNode}
-                    >
-                      {t('nodes.addNode')}
-                    </Button>
-                  </div>
+                  <Button
+                    variant="primary"
+                    icon={<IconPlus size={15} />}
+                    onClick={addNode}
+                  >
+                    {t('nodes.addNode')}
+                  </Button>
                 )
               ) : undefined
             }

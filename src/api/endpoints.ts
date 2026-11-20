@@ -59,10 +59,6 @@ import type {
   UserOut,
   ConnectionRepairResult,
   ConnectionTestResult,
-  PveDiscoveryResult,
-  PveProvisionResult,
-  RegisterCodeIssued,
-  RegisterCodeRow,
   DiagnosticsResult,
   LoginCaptchaMode,
   VmDefaults,
@@ -772,59 +768,6 @@ export const connectionsApi = {
     post<ConnectionProfile>(`/connections/${encodeURIComponent(id)}/pause`, {
       paused,
     }),
-  /**
-   * 一键接入第一步：扫描内网里的 PVE（只读，不发送任何凭据）。
-   *
-   * `cidr` 留空 = 用面板自己所在网段；也可以填 `192.168.1.0/24` 或单个 IP。
-   * 后端只允许扫内网地址段，不会把这个接口变成公网扫描器。
-   */
-  discover: (body: { cidr?: string; port?: number }) =>
-    post<PveDiscoveryResult>('/connections/discover', body),
-  /**
-   * 一键接入第二步：用 PVE 管理员账号在节点上建只读账号 + 令牌，复验后落库。
-   *
-   * 会触发二次确认（step-up）。密码默认不保存，只有 `store_admin_password`
-   * 为真时才存进连接（控制台与「一键修复权限」需要）。
-   */
-  provision: (body: {
-    host: string;
-    port?: number;
-    username?: string;
-    password: string;
-    name?: string;
-    region?: string;
-    verify_ssl?: boolean;
-    ca_cert?: string;
-    pve_user?: string;
-    store_admin_password?: boolean;
-  }) => post<PveProvisionResult>('/connections/provision', body),
-  /**
-   * 一键接入：签发一次性注册码（需 settings.manage + step-up）。
-   *
-   * 存在的理由：新建连接那条路径要求 step-up，而 step-up 对 API Token 一律 403，
-   * PVE 节点上的无人值守脚本永远过不去。注册码把「管理员在浏览器里的一次授权」
-   * 变成一张短期凭据，脚本用它只能建一条连接。
-   */
-  issueRegisterCode: (body: {
-    region?: string;
-    note?: string;
-    ttl_minutes?: number;
-    /** 可用次数：1 = 一次性；0 = 不限 */
-    max_uses?: number;
-  }) => post<RegisterCodeIssued>('/connections/register-codes', body),
-  /** 最近的注册码（不含明文：库里也只有哈希，只回状态） */
-  registerCodes: () => get<RegisterCodeRow[]>('/connections/register-codes'),
-  revokeRegisterCode: (id: string) =>
-    post<{ ok: boolean }>(
-      `/connections/register-codes/${encodeURIComponent(id)}/revoke`,
-    ),
-  /**
-   * 删除一条**已失效**的注册码（撤销 / 已用 / 过期）。
-   *
-   * 仍在有效期内的会被后端拒绝：从列表里删掉但链接还能用，等于让人以为处理过了。
-   */
-  deleteRegisterCode: (id: string) =>
-    del<{ ok: boolean }>(`/connections/register-codes/${encodeURIComponent(id)}`),
 };
 
 /* ---------------------------------------------------------------------------
