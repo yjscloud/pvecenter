@@ -467,6 +467,52 @@ export interface ConnectionProfile extends ConnectionConfig {
   active: boolean;
 }
 
+/**
+ * 「一键接入」注册码。
+ *
+ * 它替代 step-up 让 PVE 节点上的脚本能自助注册一条连接：管理员在浏览器里签发，
+ * 脚本拿着它建**一条**连接，用完即废（见后端 app/connregister.py）。
+ */
+export interface RegisterCodeIssued {
+  id: string;
+  /** 明文注册码。**只在签发响应里出现这一次**，之后列表接口只回状态 */
+  code: string;
+  region: string;
+  expires: number;
+  ttl_minutes: number;
+  /** 可用次数：1 = 一次性；0 = 不限次数 */
+  max_uses: number;
+  used_count: number;
+  /** 剩余次数；`null` = 不限次数 */
+  remaining: number | null;
+  /** 安装脚本地址（免登录，凭据在查询串里），可点开让运维先审一遍 */
+  script_url: string;
+  /** 复制粘贴到节点终端的那一条命令 */
+  command: string;
+}
+
+/** 注册码列表项（不含明文，用于回答「这张码为什么用不了」） */
+export interface RegisterCodeRow {
+  id: string;
+  region: string;
+  note: string;
+  created_by: string;
+  created: number;
+  expires: number;
+  /** 可用次数：1 = 一次性；0 = 不限次数 */
+  max_uses: number;
+  /** 已经成功用掉的次数（重复接入、失败重试不计数） */
+  used_count: number;
+  /** 剩余次数；`null` = 不限次数 */
+  remaining: number | null;
+  /** 首次使用时间戳（0 = 从未使用） */
+  used: number;
+  used_by: string;
+  /** 最近一次建出的连接 id（未使用 / 失败为空） */
+  connection_id: string;
+  status: 'active' | 'used' | 'exhausted' | 'expired' | 'revoked';
+}
+
 export interface ConnectionConfigInput {
   /** 连接显示名（多连接用） */
   name?: string;

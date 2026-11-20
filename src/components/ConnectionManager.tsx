@@ -50,11 +50,13 @@ import {
   IconEye,
   IconEyeOff,
   IconPlus,
+  IconTerminal,
   IconTrash,
 } from './Icons';
 import { useToast } from '../hooks/useToast';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
 import { useT } from '../i18n';
+import { ConnectionOnboardModal } from './ConnectionOnboardModal';
 import type {
   ConnectionConfigInput,
   ConnectionProfile,
@@ -170,6 +172,9 @@ export function ConnectionManager({
   /* 表单改成弹窗：一页里同时塞「连接列表 + 一张长表单」时，列表总要被表单
      顶到屏幕外，而新增 / 编辑本来就是低频动作，不该常驻占位。 */
   const [formOpen, setFormOpen] = useState(false);
+  /* 一键接入：签发注册码 + 给节点脚本。批量接入几十台时用它，
+     手工填表那套留在这里给单台 / 调试用。 */
+  const [onboardOpen, setOnboardOpen] = useState(false);
   /* 展开看节点名的那几条连接（默认收起：节点多的集群一屏就满了） */
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
   const toggleNodes = (id: string) =>
@@ -564,6 +569,18 @@ export function ConnectionManager({
                 ? t('conn.configuredCount', { n: connections.length })
                 : t('conn.notConfigured')}
             </Badge>
+            {/* 批量接入（注册码）：机房多、PVE 集群多时，逐台填表不现实 —— 签发
+                一张注册码（可设可用次数），脚本在节点上跑一次就接进来了。 */}
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<IconTerminal size={14} />}
+              disabled={!isAdmin}
+              onClick={() => setOnboardOpen(true)}
+              title={t('conn.onboardEntryHint')}
+            >
+              {t('conn.onboardEntry')}
+            </Button>
             <Button
               variant="secondary"
               size="sm"
@@ -1295,6 +1312,17 @@ export function ConnectionManager({
           </CollapsibleCard>
         </div>
       </Modal>
+
+    {/* ---- 批量接入：签发注册码 + 生成节点脚本（跨网段 / 批量） ---- */}
+    <ConnectionOnboardModal
+      open={onboardOpen}
+      onClose={() => setOnboardOpen(false)}
+      onChanged={() => {
+        void connectionsQuery.refetch();
+        void statusQuery.refetch();
+        void queryClient.invalidateQueries({ queryKey: ['nodes'] });
+      }}
+    />
     </>
   );
 }

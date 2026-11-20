@@ -59,6 +59,8 @@ import type {
   UserOut,
   ConnectionRepairResult,
   ConnectionTestResult,
+  RegisterCodeIssued,
+  RegisterCodeRow,
   DiagnosticsResult,
   LoginCaptchaMode,
   VmDefaults,
@@ -768,6 +770,33 @@ export const connectionsApi = {
     post<ConnectionProfile>(`/connections/${encodeURIComponent(id)}/pause`, {
       paused,
     }),
+  /**
+   * 一键接入：签发一次性注册码（需 settings.manage + step-up）。
+   *
+   * 存在的理由：新建连接那条路径要求 step-up，而 step-up 对 API Token 一律 403，
+   * PVE 节点上的无人值守脚本永远过不去。注册码把「管理员在浏览器里的一次授权」
+   * 变成一张短期凭据，脚本用它只能建一条连接。
+   */
+  issueRegisterCode: (body: {
+    region?: string;
+    note?: string;
+    ttl_minutes?: number;
+    /** 可用次数：1 = 一次性；0 = 不限 */
+    max_uses?: number;
+  }) => post<RegisterCodeIssued>('/connections/register-codes', body),
+  /** 最近的注册码（不含明文：库里也只有哈希，只回状态） */
+  registerCodes: () => get<RegisterCodeRow[]>('/connections/register-codes'),
+  revokeRegisterCode: (id: string) =>
+    post<{ ok: boolean }>(
+      `/connections/register-codes/${encodeURIComponent(id)}/revoke`,
+    ),
+  /**
+   * 删除一条**已失效**的注册码（撤销 / 已用 / 过期）。
+   *
+   * 仍在有效期内的会被后端拒绝：从列表里删掉但链接还能用，等于让人以为处理过了。
+   */
+  deleteRegisterCode: (id: string) =>
+    del<{ ok: boolean }>(`/connections/register-codes/${encodeURIComponent(id)}`),
 };
 
 /* ---------------------------------------------------------------------------

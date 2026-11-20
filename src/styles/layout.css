@@ -4054,6 +4054,530 @@
   }
 }
 
+/* ==== 一键接入（注册码弹窗） ====
+   这一段只在弹窗里出现，与上面的连接卡片互不影响。
+
+   布局自上而下：步骤条 → 参数卡（或签发结果）→ 最近注册码卡。卡片之间 14px，
+   所有颜色 / 圆角 / 字号只取主题令牌，深浅两套主题都不用另写覆盖。 */
+
+/* 头部一层极淡渐变，把标题区与正文分开；边框收细，避免「两层线」 */
+.onboard-modal .modal-header {
+  background: var(--grad-panel);
+  border-bottom-color: var(--border-muted);
+}
+
+.onboard-modal .modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 20px 20px;
+}
+
+/* --- 三步进度：生成 → 复制 → 节点执行 --- */
+.onboard-steps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.onboard-step {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* 除最后一步外都撑开，连接线才有余量可占 */
+.onboard-step:not(:last-child) {
+  flex: 1 1 auto;
+}
+
+/* 连接线画在两个步骤之间，吃掉剩余宽度；窄屏被压缩也不换行 */
+.onboard-step:not(:last-child)::after {
+  content: '';
+  flex: 1 1 12px;
+  min-width: 8px;
+  height: 1px;
+  margin: 0 2px;
+  background: var(--border);
+}
+
+.onboard-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.onboard-step.is-current {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.onboard-step.is-current .onboard-step-num {
+  border-color: var(--accent);
+  background: var(--accent);
+  /* 深色主题的强调蓝偏亮，白字对比不足；用面板底色当文字色，两套主题都清楚 */
+  color: var(--bg-surface);
+  box-shadow: var(--glow-accent);
+}
+
+.onboard-step.is-done {
+  color: var(--text-secondary);
+}
+
+.onboard-step.is-done .onboard-step-num {
+  border-color: var(--accent-border);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+/* --- 卡片外壳：参数卡与最近记录卡共用 --- */
+.onboard-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+}
+
+.onboard-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.onboard-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.onboard-card-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.onboard-card-title {
+  margin: 0;
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
+.onboard-card-desc {
+  margin: 2px 0 0;
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+/* 参数摘要：等宽数字 + 胶囊底，扫一眼就知道这张码「多久、几次」 */
+.onboard-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 3px 10px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.onboard-summary-active {
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+  color: var(--success);
+  font-weight: 600;
+}
+
+/* 正在签发：字段整片压暗并挡住点击，避免连点生成两张码 */
+.onboard-card.is-busy .onboard-grid,
+.onboard-card.is-busy .onboard-how {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* 四个参数排 2×2：区域 / 备注 一行，时长 / 次数 一行，语义两两成对 */
+.onboard-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px;
+}
+
+/* 原理说明默认收起：需要确认时再展开，让表单与主操作留在首屏 */
+.onboard-how {
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-muted);
+}
+
+.onboard-how summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  list-style: none;
+}
+
+.onboard-how summary::-webkit-details-marker {
+  display: none;
+}
+
+.onboard-how-chevron {
+  flex: none;
+  margin-left: auto;
+  transition: transform var(--transition-fast);
+}
+
+.onboard-how[open] .onboard-how-chevron {
+  transform: rotate(180deg);
+}
+
+.onboard-how p {
+  margin: 8px 0 0;
+  font-size: var(--font-size-xs);
+  line-height: 1.7;
+  color: var(--text-muted);
+}
+
+/* --- 签发成功：绿色结果卡，先确认「成了」，再给命令 --- */
+.onboard-result {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, var(--success) 28%, transparent);
+  border-radius: var(--radius-lg);
+  background: var(--success-dim);
+}
+
+.onboard-result-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-surface);
+  color: var(--success);
+  box-shadow: var(--shadow-sm);
+}
+
+.onboard-result-text {
+  min-width: 0;
+}
+
+.onboard-result-title {
+  margin: 0;
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.onboard-result-body {
+  margin: 4px 0 0;
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.onboard-result-uses {
+  margin: 4px 0 0;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--success);
+}
+
+/* --- 命令块 --- */
+.onboard-command {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.onboard-command-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.onboard-command-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* 安装命令是**一整行**（URL 很长）。必须允许折行：留横向滚动条会让人以为只需
+   复制看得见的那一半，粘到终端里就是一条残缺的命令。 */
+.console-command.onboard-script {
+  max-height: 200px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 命令块整块可点：鼠标移上去要给点反馈，否则没人会想到能点 */
+.console-command.is-clickable {
+  cursor: pointer;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.console-command.is-clickable:hover {
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.console-command.is-clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 刚复制过：左侧留一条绿色，与按钮上的「已复制」一起作为即时反馈 */
+.console-command.onboard-script.is-copied {
+  border-color: color-mix(in srgb, var(--success) 45%, transparent);
+  box-shadow: inset 3px 0 0 var(--success);
+}
+
+.onboard-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.onboard-hint {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* --- 最近注册码 --- */
+.onboard-recent {
+  gap: 10px;
+}
+
+.onboard-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 18px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-base);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.onboard-empty-state p {
+  max-width: 46ch;
+  margin: 0;
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+}
+
+/* 一行 = 状态 | 次数 | 机房·备注 | 谁 | 时间 | 操作。
+   用 grid 而不是 flex：时间戳长度随语言变化，grid 保证每一行的列对齐；
+   机房/备注吃掉剩余宽度并截断，其余列 nowrap，避免行高被撑乱。 */
+.onboard-code-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
+  grid-template-areas: 'status uses label by time actions';
+  align-items: center;
+  gap: 4px 12px;
+  padding: 8px 10px 8px 12px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  overflow: hidden;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.onboard-code-row:hover {
+  border-color: var(--border);
+  background: var(--bg-elevated);
+}
+
+/* 左侧状态色条：几条记录并排时，靠颜色就能分出「能用 / 用完 / 已撤销」 */
+.onboard-code-row::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--text-muted);
+  opacity: 0.45;
+}
+
+.onboard-code-row[data-status='active']::before {
+  background: var(--success);
+  opacity: 1;
+}
+
+.onboard-code-row[data-status='used']::before {
+  background: var(--info);
+  opacity: 1;
+}
+
+.onboard-code-row[data-status='exhausted']::before {
+  background: var(--warning);
+  opacity: 1;
+}
+
+.onboard-code-status {
+  grid-area: status;
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+/* 次数配额：贴在状态徽章旁边，用等宽数字，竖着扫一眼就能比较哪张快用完了 */
+.onboard-code-uses {
+  grid-area: uses;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.onboard-code-label {
+  grid-area: label;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.onboard-code-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.onboard-code-by {
+  grid-area: by;
+}
+
+.onboard-code-time {
+  grid-area: time;
+}
+
+.onboard-code-actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
+.onboard-empty {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* 底栏左侧提示：与右侧按钮一左一右 */
+.onboard-footer-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 窄屏：四参数改单列；记录行折两行，时间戳不再把机房/备注挤没 */
+@media (max-width: 767px) {
+  /* 与 .modal-body 的 16px 边距对齐（本段选择器优先级更高，得显式写回来） */
+  .onboard-modal .modal-body {
+    padding: 14px 16px 16px;
+  }
+}
+
+@media (max-width: 720px) {
+  .onboard-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 参数摘要与下面的字段重复，小屏优先把宽度留给字段 */
+  .onboard-card:not(.onboard-recent) .onboard-summary {
+    display: none;
+  }
+
+  .onboard-code-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      'status label actions'
+      'uses by time';
+    gap: 6px 10px;
+  }
+
+  .onboard-code-time {
+    text-align: right;
+  }
+}
+
+/* 手机：一个状态徽章 + 一个操作按钮就占满一行，其余信息各占一整行 */
+@media (max-width: 480px) {
+  .onboard-code-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'status actions'
+      'label label'
+      'uses uses'
+      'by time';
+  }
+
+  /* 三步仍带文字，只把字号与圆点收小：只剩数字的话，看不出「1 是什么」 */
+  .onboard-step {
+    gap: 5px;
+    font-size: var(--font-size-xs);
+  }
+
+  .onboard-step-num {
+    width: 18px;
+    height: 18px;
+  }
+}
+
 /* ---- 表单分组标题 ---- */
 .set-form-block-head {
   display: flex;

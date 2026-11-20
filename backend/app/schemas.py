@@ -158,6 +158,97 @@ class ConnectionPauseIn(BaseModel):
     paused: bool = True
 
 
+class ConnectionRegisterCodeIn(BaseModel):
+    """签发一张「一键接入」注册码。
+
+    注册码是给 PVE 节点上的脚本用的短期凭据（见 app/connregister.py）：它绕开了
+    step-up 对 API Token 的限制，只能在有效期内、按次数限额建连接。
+    """
+
+    #: 机房标签。注册时若脚本没传 region，就用这张码上的值 —— 批量接入时
+    #: 「一个机房一张码」比「每台机器手填机房」可靠得多。
+    region: str = ""
+    note: str = ""
+    ttl_minutes: int = 30
+    #: 可用次数：1 = 一次性（默认，与旧行为一致）；0 = 不限次数；上限 1000。
+    max_uses: int = 1
+
+    @field_validator("ttl_minutes")
+    @classmethod
+    def _ttl_valid(cls, value: int) -> int:
+        if not 1 <= int(value) <= 1440:
+            raise ValueError("有效期必须在 1 到 1440 分钟之间")
+        return int(value)
+
+    @field_validator("max_uses")
+    @classmethod
+    def _uses_valid(cls, value: int) -> int:
+        # 0 是不限次数，别被「必须 ≥1」的直觉挡掉；负数没有意义，按不限处理
+        count = int(value)
+        if count < 0:
+            raise ValueError("可用次数不能为负数（0 表示不限次数）")
+        if count > 1000:
+            raise ValueError("可用次数上限是 1000 次；长期自动化请改用 API Token")
+        return count
+
+
+class ConnectionRegisterIn(BaseModel):
+    """脚本注册一条 PVE 连接。
+
+    与 ``POST /api/connections`` 的差别：鉴权靠一次性注册码而不是登录会话，
+    因此没有 step-up；字段也收窄了（不允许设置控制台凭据、暂停状态等运维项）。
+    """
+
+    code: str
+    host: str
+    port: int = 8006
+    token_id: str
+    token_secret: str
+    name: str = ""
+    region: str = ""
+    verify_ssl: bool = settings.pve_verify_ssl
+    ca_cert: str = ""
+    node_default: str = ""
+    #: 脚本所在的 PVE 节点名（审计与提示用，不参与连接逻辑）
+    node_name: str = ""
+    #: 同集群已接入时是否强制把端点改成新地址（默认跳过，只提示）
+    force_update: bool = False
+
+    @field_validator("host")
+    @classmethod
+    def _host_valid(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise ValueError("PVE 地址不能为空")
+        if "/" in cleaned or " " in cleaned:
+            raise ValueError("PVE 地址只填主机名或 IP，不要带协议与路径")
+        return cleaned
+
+    @field_validator("port")
+    @classmethod
+    def _port_valid(cls, value: int) -> int:
+        if not 1 <= int(value) <= 65535:
+            raise ValueError("端口必须在 1 到 65535 之间")
+        return int(value)
+
+    @field_validator("token_id")
+    @classmethod
+    def _token_id_valid(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        # PVE 的令牌全名形如 root@pam!panel，缺了 ! 一定是填错了
+        if "!" not in cleaned:
+            raise ValueError("令牌 ID 必须是「用户@realm!令牌名」的形式")
+        return cleaned
+
+    @field_validator("token_secret", "code")
+    @classmethod
+    def _secret_valid(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise ValueError("不能为空")
+        return cleaned
+
+
 class ConnectionTestIn(BaseModel):
     host: str
     port: int = 8006
