@@ -314,11 +314,19 @@ export function Nodes() {
     () => regionGroups.map((g) => g.id).filter(Boolean),
     [regionGroups],
   );
+
+  /* 区域清单是两份数据拼出来的：节点列表（有哪些连接、多少节点）+ 连接列表
+     （每个连接属于哪个区域）。任一还在首屏加载，``pveRegions`` 都是残缺的 ——
+     拿它去判 PBS 归属，就会先把 PBS 画到页面底部，等清单到齐再搬进区域。
+     刷新时那一下闪烁正是这个时序，所以这里必须等两份都落地（``isLoading``
+     只在「没有任何数据」时为真，后台轮询刷新不会触发，不会闪）。 */
+  const regionsReady = !nodesQuery.isLoading && !connectionsQuery.isLoading;
+
   const {
     mergedRegions,
     hasStandalone: hasStandalonePbs,
     pbsCountOfRegion,
-  } = usePbsRegionMerge(pveRegions);
+  } = usePbsRegionMerge(pveRegions, regionsReady);
 
   /* 工具栏那个「全部展开 / 全部收起」要覆盖两级，但两级语义相反，
      所以分成两组 id：一组往 collapsedGroups 里放，一组往 openConns 里放。
@@ -662,13 +670,25 @@ export function Nodes() {
                     {t('setup.pveManage')}
                   </Button>
                 ) : (
-                  <Button
-                    variant="primary"
-                    icon={<IconPlus size={15} />}
-                    onClick={addNode}
-                  >
-                    {t('nodes.addNode')}
-                  </Button>
+                  /* 新装面板的第一屏：先给「一键接入」（扫描发现），再给
+                     「手动添加」（知道地址 / 跨网段）。两条路都通向同一个
+                     连接管理页，只是进去后停在哪个弹窗不同。 */
+                  <div className="empty-actions">
+                    <Button
+                      variant="primary"
+                      icon={<IconSearch size={15} />}
+                      onClick={() => navigate('/nodes/connections?discover=1')}
+                    >
+                      {t('conn.discoverEntry')}
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      icon={<IconPlus size={15} />}
+                      onClick={addNode}
+                    >
+                      {t('nodes.addNode')}
+                    </Button>
+                  </div>
                 )
               ) : undefined
             }

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -879,3 +880,265 @@ def test_save_config_keeps_paused_unless_explicitly_set(monkeypatch) -> None:
     # 显式传 false 才是「恢复」
     _run(pbs_router.save_config(body(False), {"username": "admin"}))
     assert saved[-1]["paused"] is False
+
+
+# ------------------------------------------------ 测试结论的落库（不再只活在内存里）
+def test_test_verdict_is_scoped_to_the_tested_config() -> None:
+    """结论按配置指纹对齐：地址 / 凭据改了就不再代表当前配置，没改就一直在。
+
+    「刷新后回退成未测试」的根因是结论只存在组件 state 里；落库之后还要保证
+    改了参数不会继续显示旧的「已连接」—— 那是另一种误导。
+    """
+    at = int(time.time()) - 60
+    conn = _conn()
+    conn["test_history"] = [
+        {
+            "fingerprint": pbs.config_fingerprint(pbs.PbsConnection.from_dict(_conn())),
+            "at": at,
+            "ok": True,
+            "code": "",
+            "message": "",
+            "version": "3.4.1",
+        }
+    ]
+
+    assert pbs.public_connection(conn)["last_test"] == {
+        "at": at,
+        "ok": True,
+        "code": "",
+        "message": "",
+        "version": "3.4.1",
+        "stale": False,
+    }
+
+    # 改了地址 / 换了 token：旧结论失效，回到「未测试」
+    assert pbs.public_connection(dict(conn, host="pbs2.lan"))["last_test"] is None
+    assert pbs.public_connection(dict(conn, token_secret="another"))["last_test"] is None
+
+    # 改名 / 改区域只是标签，不该把结论作废
+    renamed = dict(conn, name="改个名", region="广州")
+    assert pbs.public_connection(renamed)["last_test"]["ok"] is True
+
+
+def test_old_verdict_is_kept_but_flagged_stale() -> None:
+    """超过一周仍然显示「已测试」，只另行提示复测 —— 绝不自己退回未测试。"""
+    old = int(time.time()) - pbs.TEST_STALE_SECONDS - 60
+    conn = _conn()
+    conn["test_history"] = [
+        {
+            "fingerprint": pbs.config_fingerprint(pbs.PbsConnection.from_dict(_conn())),
+            "at": old,
+            "ok": True,
+        }
+    ]
+    view = pbs.public_connection(conn)["last_test"]
+    assert view["ok"] is True
+    assert view["at"] == old
+    assert view["stale"] is True
+
+
+def test_record_test_persists_and_is_readable_after_reload(monkeypatch) -> None:
+    """写回配置后，重新读出来的视图仍然是「已测试」（模拟刷新页面）。"""
+    saved: List[Dict[str, Any]] = []
+
+    async def fake_load():
+        return [_conn()]
+
+    async def fake_save(rows):
+        saved.extend(rows)
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "save_connections", fake_save)
+
+    cfg = pbs.PbsConnection.from_dict(_conn())
+    view = _run(pbs.record_test("a", cfg, {"ok": True, "version": "3.4.1"}))
+
+    assert view is not None and view["ok"] is True
+    # 指纹是服务端的对齐键，不下发给前端
+    assert "fingerprint" not in view
+    assert saved[-1]["test_history"][0]["fingerprint"] == pbs.config_fingerprint(cfg)
+    assert pbs.public_connection(saved[-1])["last_test"]["ok"] is True
+
+
+def test_record_test_ignores_unsaved_connection(monkeypatch) -> None:
+    """新增表单还没有 id：结论只回给弹窗，不落到任何一条已保存的连接上。"""
+
+    async def boom():
+        raise AssertionError("没有 id 时不该读写配置")
+
+    monkeypatch.setattr(pbs, "load_connections", boom)
+    cfg = pbs.PbsConnection.from_dict(_conn())
+    assert _run(pbs.record_test("", cfg, {"ok": True})) is None
+
+
+def test_config_test_records_success_for_saved_connection(monkeypatch) -> None:
+    """接口层：带 id 的测试把结论写回配置，响应里同时带上这份视图。"""
+    from app.routers import pbs as pbs_router
+    from app.schemas import PbsConnectionTestIn
+
+    saved: List[Dict[str, Any]] = []
+
+    class _Fake:
+        async def version(self):
+            return {"version": "3.4.1"}
+
+        async def datastores(self):
+            raise ProxmoxError("403 no permission", 403)
+
+        async def nodes(self):
+            raise ProxmoxError("403 no permission", 403)
+
+        async def node_status(self, node):
+            raise ProxmoxError("403 no permission", 403)
+
+        async def tasks(self, node, limit=1):
+            raise ProxmoxError("403 no permission", 403)
+
+        async def aclose(self):
+            return None
+
+    async def fake_load():
+        return [_conn()]
+
+    async def fake_save(rows):
+        saved.extend(rows)
+
+    monkeypatch.setattr(pbs, "PbsClient", lambda conn: _Fake())
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "save_connections", fake_save)
+
+    body = PbsConnectionTestIn(
+        id="a", host="pbs.lan", token_id="root@pam!panel", token_secret="secret"
+    )
+    result = _run(pbs_router.test_config(body, user={"username": "admin"}))
+
+    assert result["ok"] is True
+    assert result["last_test"]["ok"] is True
+    assert result["last_test"]["version"] == "3.4.1"
+    # 落库的是「这次测的配置」：指纹对上了，列表里也就能读到
+    assert pbs.public_connection(saved[-1])["last_test"]["ok"] is True
+
+
+def test_config_test_records_failure_for_saved_connection(monkeypatch) -> None:
+    """失败同样要落库：否则刷新后连「刚才测过、失败了」都看不出来。"""
+    from app.routers import pbs as pbs_router
+    from app.schemas import PbsConnectionTestIn
+
+    saved: List[Dict[str, Any]] = []
+
+    class _Fake:
+        async def version(self):
+            raise ProxmoxError("401 no permission", 401)
+
+        async def aclose(self):
+            return None
+
+    async def fake_load():
+        return [_conn()]
+
+    async def fake_save(rows):
+        saved.extend(rows)
+
+    monkeypatch.setattr(pbs, "PbsClient", lambda conn: _Fake())
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "save_connections", fake_save)
+
+    body = PbsConnectionTestIn(
+        id="a", host="pbs.lan", token_id="root@pam!panel", token_secret="secret"
+    )
+    result = _run(pbs_router.test_config(body, user={"username": "admin"}))
+
+    assert result["ok"] is False
+    assert result["last_test"]["ok"] is False
+    assert pbs.public_connection(saved[-1])["last_test"]["ok"] is False
+
+
+def _run_db(coro):
+    """真实库用例专用：每次 run 之后关掉连接池。
+
+    连接池是模块级缓存，``asyncio.run`` 每次新建（并在结束时关闭）一个事件循环；
+    池留着上一轮的连接，下一个 run 就会拿到「绑在已关闭循环上」的 Future。
+    """
+
+    from app import database
+
+    async def wrapper():
+        try:
+            return await coro
+        finally:
+            await database.close_pool()
+
+    return asyncio.run(wrapper())
+
+
+def test_verdict_round_trips_through_the_settings_table(clean_mysql_db) -> None:
+    """真库往返：结论随配置一起落库，重新 load 出来仍然在（= 刷新页面）。
+
+    单测里 mock 掉 load/save 只能证明逻辑，证明不了「JSON + 密钥加密」这一层
+    往返之后 test_history 还在 —— 而这正是线上「刷新后又变未测试」最可能踩的坑。
+    """
+    from app import store
+
+    _run_db(store.init_db())
+    _run_db(pbs.save_connections([_conn()]))
+
+    cfg = pbs.PbsConnection.from_dict(_conn())
+    assert _run_db(pbs.record_test("a", cfg, {"ok": True, "version": "3.4.1"}))[
+        "ok"
+    ] is True
+
+    reloaded = _run_db(pbs.load_connections())
+    assert pbs.public_connection(reloaded[0])["last_test"]["ok"] is True
+
+    # 再整份保存一次（等值回写）也不能抹掉结论
+    _run_db(pbs.save_connections(reloaded))
+    assert (
+        pbs.public_connection(_run_db(pbs.load_connections())[0])["last_test"]["ok"]
+        is True
+    )
+
+
+def test_save_config_keeps_test_history(monkeypatch) -> None:
+    """整份保存是重建每条记录：不带 test_history 就等于每次保存都把结论抹掉。"""
+    from app.routers import pbs as pbs_router
+    from app.schemas import PbsConfigIn
+
+    cfg = pbs.PbsConnection.from_dict(_conn())
+    history = [
+        {
+            "fingerprint": pbs.config_fingerprint(cfg),
+            "at": int(time.time()),
+            "ok": True,
+            "code": "",
+            "message": "",
+            "version": "3.4.1",
+        }
+    ]
+    saved: List[Dict[str, Any]] = []
+
+    async def fake_load():
+        return [_conn(test_history=history)]
+
+    async def fake_save(rows):
+        saved.extend(rows)
+
+    monkeypatch.setattr(pbs, "load_connections", fake_load)
+    monkeypatch.setattr(pbs, "save_connections", fake_save)
+
+    body = PbsConfigIn(
+        connections=[
+            {
+                "id": "a",
+                "name": "改个名",
+                "host": "pbs.lan",
+                "port": 8007,
+                "token_id": "root@pam!panel",
+                "token_secret": "",
+            }
+        ]
+    )
+    views = _run(pbs_router.save_config(body, {"username": "admin"}))
+
+    assert saved[-1]["test_history"] == history
+    # 保存接口直接回列表：结论要一起带回去，前端才不会立刻退回「未测试」
+    assert views[0]["last_test"]["ok"] is True

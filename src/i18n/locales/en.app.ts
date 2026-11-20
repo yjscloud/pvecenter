@@ -862,6 +862,10 @@ export const enApp: Partial<Record<MessageKey, string>> = {
     'Credentials are saved but this connection has never been tested. Run “Test” to verify reachability — until then it is not shown as online',
   'pbs.connected': 'Connected',
   'pbs.disconnected': 'Cannot connect',
+  'pbs.testedAt': 'Tested {when}',
+  'pbs.testedStale': 'Re-test advised',
+  'pbs.testedStaleHint':
+    'The last test is over 7 days old — the result is kept but may no longer reflect the current state; run “Test” to confirm',
   'pbs.pause': 'Pause',
   'pbs.resume': 'Resume',
   'pbs.pauseHint':

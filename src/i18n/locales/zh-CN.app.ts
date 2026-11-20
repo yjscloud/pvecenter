@@ -855,6 +855,11 @@ export const zhApp = {
   'pbs.untestedHint': '凭据已保存但还没测过：点「测试」确认能否连通。测通之前不显示为在线',
   'pbs.connected': '已连接',
   'pbs.disconnected': '无法连接',
+  /* 结论落库后带时间戳：没有它，「已连接」会被当成实时探测的结果 */
+  'pbs.testedAt': '测试于 {when}',
+  'pbs.testedStale': '建议复测',
+  'pbs.testedStaleHint':
+    '上次测试已超过 7 天：结论保留，但可能不再代表当前状态；建议点「测试」重新确认',
   /* 暂停 / 恢复：只改一个字段的专用端点，不走整份保存 */
   'pbs.pause': '暂停接入',
   'pbs.resume': '恢复接入',

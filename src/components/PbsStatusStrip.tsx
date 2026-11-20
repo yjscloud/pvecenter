@@ -39,6 +39,7 @@ import { pbsApi } from '../api/endpoints';
 import type {
   PbsConfigItem,
   PbsConnectionOverview,
+  PbsOverview,
 } from '../api/types';
 import { useAuth } from '../hooks/useAuth';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
@@ -74,6 +75,9 @@ function rowRank(conn: PbsConnectionOverview): number {
 /** 区域只用于界面分组：比较前统一去空白，别让「广州机房」和「广州机房 」被当成两处 */
 const normRegion = (value?: string) => (value ?? '').trim();
 
+/** 空集合常量：``useMemo`` 的返回值在「还没就绪」期间保持同一个引用，避免下游依赖抖动 */
+const EMPTY_REGIONS: ReadonlySet<string> = new Set<string>();
+
 function sortRows(rows: PbsConnectionOverview[]): PbsConnectionOverview[] {
   return [...rows].sort(
     (a, b) => rowRank(a) - rowRank(b) || a.name.localeCompare(b.name),
@@ -86,10 +90,47 @@ function sortRows(rows: PbsConnectionOverview[]): PbsConnectionOverview[] {
    底部那个独立分组、以及「已并入区域分组」的卡片用的是同一份缓存
    （queryKey 相同，react-query 只会打一次），所以两边不会出现一份在线、
    另一份离线的割裂。 */
+/* ---------------------------------------------------------------------------
+   概览种子：让「刷新页面」不出现 PBS 短暂缺失
+   ---------------------------------------------------------------------------
+   节点列表 20ms 就回来了，而 PBS 概览要真去探 PBS（本机冷启动实测约 660ms）。
+   这段时间页面已经是「节点全部就位、却没有备份链路」的状态，PBS 随后才弹出来 ——
+   看起来就是先闪一下才显示。于是把上次成功的响应按用户存进 sessionStorage：
+   刷新时先用它把结构画出来（位置、台数都对得上），真实请求回来后就地更新数值，
+   结构不变，也就没有跳动。
+
+   * 按用户名分键：同一浏览器换账号登录不会看到别人的 PBS 清单；
+   * 键里带版本号：字段形状变了直接换键，旧数据不会被当成新结构解析；
+   * 读写全部 try/catch：隐私模式 / 配额满都不该影响主流程；
+   * 只当「首屏种子」用：带 ``initialDataUpdatedAt``，过期照样立刻重新请求，
+     不会被当成新数据一直用下去。 */
+const OVERVIEW_SEED_PREFIX = 'pvecenter.pbs.overview.v1:';
+
+interface OverviewSeed {
+  at: number;
+  data: PbsOverview;
+}
+
+function readOverviewSeed(user: string): OverviewSeed | null {
+  if (!user) return null;
+  try {
+    const raw = window.sessionStorage.getItem(OVERVIEW_SEED_PREFIX + user);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as OverviewSeed;
+    if (!parsed || typeof parsed.at !== 'number') return null;
+    if (!parsed.data || !Array.isArray(parsed.data.connections)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 function usePbsOverview() {
-  const { hasPermission } = useAuth();
+  const { hasPermission, user } = useAuth();
   const canView = hasPermission('pbs.view');
   const refresh = useRefreshInterval();
+  const username = user?.username ?? '';
+  const seed = useMemo(() => readOverviewSeed(username), [username]);
 
   /* 与备份页共用同一个 queryKey：同一份 20 秒缓存，来回切页不会重复打 PBS */
   const overview = useQuery({
@@ -99,7 +140,25 @@ function usePbsOverview() {
     staleTime: 20_000,
     refetchInterval: refresh,
     retry: false,
+    ...(seed
+      ? { initialData: seed.data, initialDataUpdatedAt: seed.at }
+      : {}),
   });
+
+  useEffect(() => {
+    if (!username || !overview.data) return;
+    try {
+      window.sessionStorage.setItem(
+        OVERVIEW_SEED_PREFIX + username,
+        JSON.stringify({
+          at: overview.dataUpdatedAt || Date.now(),
+          data: overview.data,
+        }),
+      );
+    } catch {
+      /* 忽略：隐私模式 / 配额满 */
+    }
+  }, [username, overview.data, overview.dataUpdatedAt]);
 
   return { canView, overview };
 }
@@ -149,12 +208,28 @@ function usePbsStripData() {
  * 没填区域、或填的区域 PVE 侧不存在，仍然是「下面那一组」，不能凭空塞进别人的机房。
  *
  * 节点页要先用它决定两件事：每个区域里要不要挂 PBS 卡片、底部那个独立分组还留不留。
+ *
+ * ``ready`` 是「区域清单已经到齐」的意思（节点列表 + 连接列表两份数据都回来了）。
+ * **没到齐时必须什么都不判**：那时 ``pveRegions`` 必然是空的，任何填了区域的 PBS
+ * 都会被误判成「独立分组」先画到页面底部，等清单到达再搬进区域 —— 刷新时看到的
+ * 那一下闪烁就是这么来的（PBS 概览往往比节点列表先返回，正好卡在这个窗口里）。
  */
-export function usePbsRegionMerge(pveRegions: readonly string[]) {
+export function usePbsRegionMerge(
+  pveRegions: readonly string[],
+  ready = true,
+) {
   const { canView, overview } = usePbsOverview();
   const connections = overview.data?.connections ?? [];
 
   return useMemo(() => {
+    if (!ready) {
+      return {
+        mergedRegions: EMPTY_REGIONS,
+        hasStandalone: false,
+        pbsCountOfRegion: () => 0,
+      };
+    }
+
     const known = new Set(pveRegions.map(normRegion).filter(Boolean));
     const mergedRegions = new Set<string>();
     const pbsCount = new Map<string, number>();

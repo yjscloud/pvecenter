@@ -1,23 +1,28 @@
 """Proxmox connection configuration and health endpoints."""
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from .. import (
     # 面板版本：唯一来源在 app/__init__.py（package.json 与 CHANGELOG 跟着它走）
     __version__,
     accesscontrol,
     captcha,
+    connregister,
     defaults,
     faq,
     fleetstatus,
     mailer,
+    onboard,
     panel_url,
+    pvediscover,
     quota,
     security,
     site,
@@ -38,7 +43,11 @@ from ..pve import (
 )
 from ..schemas import (
     ConnectionConfigIn,
+    ConnectionDiscoverIn,
     ConnectionPauseIn,
+    ConnectionProvisionIn,
+    ConnectionRegisterCodeIn,
+    ConnectionRegisterIn,
     ConnectionTestIn,
     FaqIn,
     LoginCaptchaIn,
@@ -262,6 +271,771 @@ async def create_connection(
     pub = store.public_connection_config(profile)
     pub["active"] = store.get_active_connection_id() == cid
     return pub
+
+
+# ------------------------------------------------- 一键接入（局域网自动发现）
+#
+# 场景与新装面板最贴近：面板和 PVE 在同一个内网，用户只知道「我有几台 PVE」，
+# 不知道 IP、更不想先去 PVE 里手工建令牌。
+#
+# 两步：
+#   1. ``discover``：扫本机所在网段，靠 8006 端口 + ``/version`` 认出 PVE
+#      （只读、不带凭据）；
+#   2. ``provision``：用户输一次 PVE 管理员密码，面板在 PVE 上建
+#      ``pvecenter@pve`` 只读账号 + PVEAuditor + privsep=0 令牌，复验后落库。
+#
+# 与下面「注册码」那条路径的分工：注册码需要**已有面板**签码、并在节点上跑
+# root 脚本，适合跨网段 / 批量；这里只需要能连通 8006，适合首次接入。
+
+#: 连接列表是读-改-写，两个人同时「一键接入」会互相覆盖
+_PROVISION_LOCK = asyncio.Lock()
+
+
+def _provision_error(exc: ProxmoxError, host: str, port: int) -> str:
+    """把 PVE 的英文报错翻成用户能照着处理的一句话。"""
+    status = exc.pve_status
+    if status == 401:
+        return "Proxmox 账号或密码不正确：需要能登录管理界面的管理员账号（如 root@pam）"
+    if status == 403:
+        return f"该账号没有创建账号 / 授权 / 令牌的权限：{exc.message}"
+    if status in (502, 504) or "connect" in exc.message.lower():
+        return f"连不上 {host}:{port}：请确认地址、端口，以及 PVE 防火墙是否放行 8006"
+    return exc.message
+
+
+async def _create_token_with_retry(
+    admin: ProxmoxClient, pve_user: str
+) -> Dict[str, str]:
+    """建令牌；重名就换个后缀重试（PVE 不允许同名令牌）。"""
+    last: Optional[ProxmoxError] = None
+    for _ in range(3):
+        tokenid = f"pvecenter-{secrets.token_hex(3)}"
+        try:
+            return await admin.create_api_token(
+                pve_user, tokenid, privsep=False, comment="PVE Center 面板"
+            )
+        except ProxmoxError as exc:  # noqa: PERF203 —— 重试次数极少，写法更直白
+            if "already exists" not in exc.message.lower():
+                raise
+            last = exc
+    raise ProxmoxError(
+        "在 PVE 上找不到可用的令牌名，请稍后重试", 500, last.endpoint if last else ""
+    )
+
+
+@router.post("/connections/discover")
+async def discover_connections(
+    payload: ConnectionDiscoverIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+) -> Dict[str, Any]:
+    """扫描内网里的 PVE 节点（只读，不发送任何凭据）。"""
+    try:
+        cidrs = pvediscover.parse_cidrs(payload.cidr) or pvediscover.local_private_cidrs()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not cidrs:
+        raise HTTPException(
+            status_code=400,
+            detail="没有识别到可扫描的内网网段，请手动填写，例如 192.168.1.0/24",
+        )
+
+    port = int(payload.port or 8006)
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="端口不正确")
+
+    result = await pvediscover.scan(cidrs, port)
+
+    # 已在列表里的地址标出来：一次扫到十几台时，最怕把同一台再加一遍
+    known = {
+        (str(item.get("host") or "").strip().lower(), int(item.get("port") or 8006))
+        for item in store.get_connections()
+    }
+    for item in result["found"]:
+        item["already_added"] = (item["host"].lower(), int(item["port"])) in known
+
+    await security.audit(
+        request,
+        user,
+        "connection.discover",
+        target="connection/discover",
+        detail={"cidrs": cidrs, "port": port, "found": len(result["found"])},
+    )
+    return result
+
+
+@router.post("/connections/provision")
+async def provision_connection(
+    payload: ConnectionProvisionIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    """一键接入：建只读账号与令牌，复验通过后落库。
+
+    凭据只用于这一次登录，默认不保存（``store_admin_password`` 显式要求才存）。
+    权限模型与脚本接入一致：``pvecenter@pve`` + PVEAuditor + privsep=0 令牌，
+    不把 root 的令牌塞进面板。
+    """
+    host = (payload.host or "").strip()
+    username = (payload.username or "").strip() or "root@pam"
+    password = payload.password or ""
+    if not host:
+        raise HTTPException(status_code=400, detail="请填写节点地址")
+    if not password:
+        raise HTTPException(status_code=400, detail="需要 Proxmox 管理员密码")
+
+    port = int(payload.port or 8006)
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="端口不正确")
+    pve_user = (payload.pve_user or "pvecenter@pve").strip()
+    ca_cert = (payload.ca_cert or "").strip()
+
+    # 先查重再动手：避免在 PVE 上白建一套账号 / 令牌
+    async with _PROVISION_LOCK:
+        conns = store.get_connections()
+        for item in conns:
+            if (
+                str(item.get("host") or "").strip().lower() == host.lower()
+                and int(item.get("port") or 8006) == port
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{host}:{port} 已在连接列表里，无需重复接入",
+                )
+        was_empty = not conns
+
+        admin = ProxmoxClient(
+            PveConnection(
+                host=host,
+                port=port,
+                verify_ssl=payload.verify_ssl,
+                ca_cert=ca_cert,
+                console_user=username,
+                console_password=password,
+            )
+        )
+        try:
+            await admin.login()
+            await admin.ensure_user(pve_user, comment="PVE Center 面板只读账号")
+            await admin.grant_user_role(pve_user, "PVEAuditor")
+            token = await _create_token_with_retry(admin, pve_user)
+        except ProxmoxError as exc:
+            raise HTTPException(
+                status_code=400, detail=_provision_error(exc, host, port)
+            ) from exc
+        finally:
+            await admin.aclose()
+
+        # 用刚建的令牌再跑一遍真实读取：建得出来 ≠ 用得了
+        verifier = ProxmoxClient(
+            PveConnection(
+                host=host,
+                port=port,
+                token_id=token["full_tokenid"],
+                token_secret=token["value"],
+                verify_ssl=payload.verify_ssl,
+                ca_cert=ca_cert,
+            )
+        )
+        try:
+            version = await verifier.version()
+            nodes = await verifier.nodes() or []
+        except ProxmoxError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"令牌已创建但复验失败：{exc.message}",
+            ) from exc
+        finally:
+            await verifier.aclose()
+
+        node_names = [str(n.get("node")) for n in nodes if n.get("node")]
+        node_name = node_names[0] if node_names else ""
+
+        cid = secrets.token_hex(4)
+        profile: Dict[str, Any] = {
+            "id": cid,
+            # 没填名字就用 PVE 的节点名：比一串 IP 好认
+            "name": (payload.name or "").strip() or node_name or host,
+            "region": (payload.region or "").strip(),
+            "host": host,
+            "port": port,
+            "token_id": token["full_tokenid"],
+            "token_secret": token["value"],
+            "verify_ssl": payload.verify_ssl,
+            "ca_cert": ca_cert,
+            "node_default": node_name,
+        }
+        if payload.store_admin_password:
+            profile["console_user"] = username
+            profile["console_password"] = password
+
+        conns.append(profile)
+        await store.save_connections(conns)
+        if was_empty:
+            # 第一条连接自动设为当前，和「手动新增」保持一致
+            await store.set_active_connection(cid)
+            rebuild_client()
+
+    await security.audit(
+        request,
+        user,
+        "connection.provision",
+        target=f"connection/{cid}",
+        detail={
+            "host": host,
+            "port": port,
+            "pve_user": pve_user,
+            "token_id": token["full_tokenid"],
+            "store_admin_password": payload.store_admin_password,
+        },
+    )
+
+    pub = store.public_connection_config(profile)
+    pub["active"] = store.get_active_connection_id() == cid
+    return {
+        "connection": pub,
+        "token_id": token["full_tokenid"],
+        "pve_user": pve_user,
+        "node": node_name,
+        "nodes": node_names,
+        "version": str((version or {}).get("version") or ""),
+    }
+
+
+# ------------------------------------------------------------------ 一键接入
+#
+# 场景：机房多、PVE 集群多，一台台在浏览器里填表单不现实。脚本在 PVE 节点上以
+# root 跑一次，自动建 PVE 侧令牌并注册到面板。
+#
+# 为什么不用 API Token 直接调 POST /connections：那条路径要求 step-up，而 step-up
+# 对 API Token 无条件 403（令牌是无人值守凭据）。这里改成「一次性注册码」：
+# 管理员在浏览器里签发，脚本拿它建**一条**连接，用完即废。
+#
+# 幂等的三档结果（脚本据此给提示）：
+#   created   —— 新建；
+#   unchanged —— 已注册（同集群同端点），或同集群换了节点（默认跳过）；
+#   updated   —— 显式 --force 时，把已有那条改成新的端点/凭据。
+# 同 host:port 但集群指纹不同 = 两台不同 PVE 抢同一个地址，属于真冲突，409。
+
+#: 连接列表是一段 JSON，读-改-写必须串行；两个脚本同时注册会互相覆盖。
+_REGISTER_LOCK = asyncio.Lock()
+
+
+def _endpoint_key(host: Any, port: Any) -> Tuple[str, int]:
+    return (str(host or "").strip().lower(), int(port or 8006))
+
+
+def _same_cluster(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    key = str(a.get("cluster_key") or "").strip()
+    return bool(key) and key == str(b.get("cluster_key") or "").strip()
+
+
+async def _probe_registration(
+    payload: ConnectionRegisterIn,
+) -> Dict[str, Any]:
+    """连一次 PVE：确认凭据可用，并推导**集群指纹**。
+
+    指纹不能由脚本自报：同一集群从不同节点 IP 注册时，只有面板自己去 PVE 问
+    ``/cluster/status`` 才能认出「这其实是同一个集群」。单机（无集群）用节点名。
+    """
+    conn = PveConnection(
+        host=payload.host,
+        port=payload.port,
+        token_id=payload.token_id,
+        token_secret=payload.token_secret,
+        verify_ssl=payload.verify_ssl,
+        ca_cert=payload.ca_cert,
+    )
+    client = ProxmoxClient(conn)
+    try:
+        version = await client.version()
+        nodes = await client.nodes() or []
+        cluster_name = ""
+        try:
+            status = await client.get("/cluster/status") or []
+            cluster_name = next(
+                (
+                    str(item.get("name") or "")
+                    for item in status
+                    if str(item.get("type") or "") == "cluster"
+                ),
+                "",
+            )
+        except ProxmoxError:
+            # 单机 / 权限不足：退回「节点名」当指纹，仍然比 host 可靠
+            cluster_name = ""
+    except ProxmoxError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"连接失败：{exc.message}"
+        ) from exc
+    finally:
+        await client.aclose()
+
+    node_names = sorted(
+        str(node.get("node") or "") for node in nodes if node.get("node")
+    )
+    if not node_names:
+        raise HTTPException(status_code=400, detail="连接失败：PVE 没有返回任何节点")
+    return {
+        "cluster_key": cluster_name or f"standalone:{node_names[0]}",
+        "cluster_name": cluster_name,
+        "node_names": node_names,
+        "version": str(version.get("version") or ""),
+        "release": str(version.get("release") or ""),
+        # 令牌权限不足时 PVE 不报错，只是把指标字段留空 —— 这里顺手识别出来，
+        # 免得用户以为「接入成功」，实际上面板什么都看不到
+        "node_metrics": any(node.get("maxmem") is not None for node in nodes),
+    }
+
+
+def _register_profile(
+    payload: ConnectionRegisterIn,
+    probe: Dict[str, Any],
+    region: str,
+) -> Dict[str, Any]:
+    host = payload.host.strip()
+    name = payload.name.strip()
+    if not name and region:
+        # 批量接入时脚本一般不带名字：用「机房-集群」拼一个，比一串 IP 好认
+        name = f"{region}-{probe['cluster_key']}"
+    return {
+        "name": name or host,
+        "region": region,
+        "host": host,
+        "port": payload.port,
+        "token_id": payload.token_id,
+        "token_secret": payload.token_secret,
+        "verify_ssl": payload.verify_ssl,
+        "ca_cert": payload.ca_cert,
+        # 没显式指定默认节点时，用 PVE 报回来的第一个节点，省得用户再选一次
+        "node_default": payload.node_default or probe["node_names"][0],
+        "cluster_key": probe["cluster_key"],
+        "imported": int(time.time()),
+    }
+
+
+def _merge_registered(
+    current: Dict[str, Any],
+    payload: ConnectionRegisterIn,
+    probe: Dict[str, Any],
+    region: str,
+) -> Dict[str, Any]:
+    """把新参数合并进已有连接（--force 用）。只覆盖接入相关字段。"""
+    merged = dict(current)
+    merged.update(
+        {
+            "host": payload.host.strip(),
+            "port": payload.port,
+            "token_id": payload.token_id,
+            "token_secret": payload.token_secret,
+            "verify_ssl": payload.verify_ssl,
+            "ca_cert": payload.ca_cert,
+            "node_default": payload.node_default or probe["node_names"][0],
+            "cluster_key": probe["cluster_key"],
+            "imported": int(time.time()),
+        }
+    )
+    if payload.name.strip():
+        merged["name"] = payload.name.strip()
+    if region:
+        merged["region"] = region
+    if not merged.get("name"):
+        merged["name"] = merged.get("host") or "未命名连接"
+    return merged
+
+
+def _onboard_path(request: Request) -> str:
+    """安装脚本的路径。
+
+    由签发接口的路径推出来（``.../register-codes`` -> ``.../onboard.sh``），
+    不写死 ``/api`` 前缀：面板挂子路径（``/pve/api``）时也能拼对。
+    """
+    path = request.url.path
+    if path.endswith("/register-codes"):
+        path = path[: -len("/register-codes")] + "/onboard.sh"
+    return path
+
+
+def _onboard_url(
+    request: Request, base: str, code: str, *, force: bool = False
+) -> str:
+    params: Dict[str, str] = {"code": code}
+    if force:
+        params["force"] = "1"
+    return f"{base.rstrip('/')}{_onboard_path(request)}?{urlencode(params)}"
+
+
+def _onboard_command(url: str) -> str:
+    """给用户复制的那一条命令。
+
+    用 ``bash -c "$(curl ...)"`` 而不是 ``curl ... | bash``：后者在下载被中断时
+    会让 bash 执行**半截脚本** —— 前面的命令已经改了系统，后面的却没了，留下的
+    是「账号建了、注册没发」这种半成品。命令替换会等 curl 完整退出再交给 bash。
+    """
+    quoted = f"'{url}'"
+    return f'bash -c "$(curl -fsSL {quoted})"'
+
+
+@router.post("/connections/register-codes")
+async def issue_register_code(
+    payload: ConnectionRegisterCodeIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    """签发一张注册码（明文只在这次响应里出现）。"""
+    row = await connregister.create_code(
+        region=payload.region,
+        note=payload.note,
+        created_by=str(user.get("username") or ""),
+        ttl_minutes=payload.ttl_minutes,
+        max_uses=payload.max_uses,
+    )
+    await security.audit(
+        request,
+        user,
+        "connection.register_code",
+        target=f"register-code/{row['id']}",
+        detail={
+            "region": row.get("region") or "",
+            "ttl_minutes": row.get("ttl_minutes"),
+            "max_uses": row.get("max_uses"),
+        },
+    )
+    # 脚本地址优先用「设置」里的对外地址：节点常常在另一个网段，管理员从内网
+    # 访问面板时 request.base_url 会是内网 IP，节点那边反而连不上。
+    base = (await panel_url.resolve(request) or str(request.base_url)).rstrip("/")
+    script_url = _onboard_url(request, base, row["code"])
+    return {
+        "id": row["id"],
+        "code": row["code"],
+        "region": row["region"],
+        "expires": row["expires"],
+        "ttl_minutes": row["ttl_minutes"],
+        "max_uses": row["max_uses"],
+        "used_count": row["used_count"],
+        "remaining": row["remaining"],
+        "script_url": script_url,
+        "command": _onboard_command(script_url),
+    }
+
+
+@router.get("/connections/register-codes")
+async def list_register_codes(
+    limit: int = Query(default=50, ge=1, le=200),
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+) -> List[Dict[str, Any]]:
+    """最近的注册码（不含明文，只给状态，便于排查「为什么码用不了」）。"""
+    return await connregister.list_codes(limit)
+
+
+@router.post("/connections/register-codes/{code_id}/revoke")
+async def revoke_register_code(
+    code_id: str,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    ok = await connregister.revoke(code_id)
+    await security.audit(
+        request,
+        user,
+        "connection.register_code_revoke",
+        target=f"register-code/{code_id}",
+        result="success" if ok else "failed",
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="注册码不存在或已被使用")
+    return {"ok": True}
+
+
+@router.delete("/connections/register-codes/{code_id}")
+async def delete_register_code(
+    code_id: str,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+) -> Dict[str, Any]:
+    """删除一条已失效的注册码（已撤销 / 已使用 / 已过期）。
+
+    只清「历史记录」：仍在有效期内的一次性凭据必须先撤销再删，否则列表里看不见、
+    对方手里却还能用。审计照样留痕 —— 删掉的行只从列表消失，不抹掉「谁删的」。
+    """
+    row = await connregister.get_code(code_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="注册码不存在")
+    if row.get("status") == "active":
+        raise HTTPException(
+            status_code=400,
+            detail="这张注册码还有可用次数：请先撤销，确认失效后再删除",
+        )
+
+    ok = await connregister.delete_code(code_id)
+    await security.audit(
+        request,
+        user,
+        "connection.register_code_delete",
+        target=f"register-code/{code_id}",
+        result="success" if ok else "failed",
+        detail={
+            "status": row.get("status"),
+            "region": row.get("region"),
+            "used_by": row.get("used_by"),
+        },
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="注册码不存在或已被删除")
+    return {"ok": True}
+
+
+@router.get("/connections/onboard.sh", include_in_schema=False)
+async def onboard_script(
+    request: Request,
+    code: str = Query(default="", max_length=200),
+    force: int = Query(default=0, ge=0, le=1),
+) -> PlainTextResponse:
+    """把注册码渲染成一段能直接执行的安装脚本。
+
+    这是给运维用的「一条命令」入口::
+
+        bash -c "$(curl -fsSL 'https://panel/api/connections/onboard.sh?code=pvir_...')"
+
+    免鉴权，凭据就是 URL 里的注册码 —— 和 ``POST /connections/register`` 同一个
+    前提。判活失败时**仍然回 200 + 脚本体**：管道给 bash 的东西必须是脚本，回一
+    段 JSON 只会让节点上冒出一堆语法错误，而真正的原因（码过期了）反而看不见。
+
+    ``force=1`` 让脚本能覆盖「同集群已有连接」的端点与凭据。它只对**持码者**开放
+    （持码本来就能新建一条连接，能力上相仿），但会把已有连接的地址改到本次节点，
+    因此走审计：``connection.register`` 里 ``status=updated``。
+    """
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+    row = await connregister.peek(code)
+    if row is None or row.get("status") != "active":
+        if row is None:
+            reason = "注册码不存在，或链接被截断"
+        else:
+            reason = {
+                "used": "这张注册码是一次性的，已经用过了",
+                "exhausted": (
+                    "这张注册码的可用次数已用尽（"
+                    f"{row.get('used_count')}/{row.get('max_uses')} 次）"
+                ),
+                "expired": "这张注册码已过期",
+                "revoked": "这张注册码已被撤销",
+            }.get(str(row.get("status")), "这张注册码当前不可用")
+        return PlainTextResponse(onboard.error_script(reason), headers=headers)
+
+    base = (await panel_url.resolve(request) or str(request.base_url)).rstrip("/")
+    # SELF_URL 让脚本在「不是 root」时能提示用户用 sudo 重跑自己，而不必回面板
+    # 再复制一次：脚本得知道自己的地址。
+    self_url = _onboard_url(request, base, code.strip(), force=bool(force))
+    body = onboard.render(
+        panel=base,
+        code=code.strip(),
+        self_url=self_url,
+        force=bool(force),
+    )
+    return PlainTextResponse(body, headers=headers)
+
+
+@router.post("/connections/register")
+async def register_connection(
+    payload: ConnectionRegisterIn,
+    request: Request,
+) -> Dict[str, Any]:
+    """脚本用注册码注册一条 PVE 连接。
+
+    顺序是「先烧码、再探活、探活失败就退码」：探活会让面板去连脚本指定的任意
+    ``host:port``，若放在消费之前，任何人无需有效注册码就能把面板当跳板去探内网。
+    先消费把这道口子收窄到「持码者」，而失败退码保住了「打错 IP 不必重新签发」
+    这个运维体验。
+
+    HTTP 200 表示请求本身成立，具体结果看 ``status``；只有「同地址不同集群」
+    这种真冲突才回 409。
+    """
+    # 1) 原子占用一次额度（并发下由 used_count<max_uses 判定，超出即失败）
+    used_by = f"{payload.node_name or '-'}@{security.client_ip(request)}"
+    code_row = await connregister.consume(payload.code, used_by=used_by)
+    if code_row is None:
+        # 失败原因要分开说：次数用尽和「码过期」是两种处置方式（前者要重新生成，
+        # 后者可能只是要续期或看看是不是拿错了一张码）
+        info = await connregister.peek(payload.code)
+        status = str((info or {}).get("status") or "")
+        if status == "exhausted":
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "该注册码的可用次数已用尽（"
+                    f"{info.get('used_count')}/{info.get('max_uses')} 次），"
+                    "请到面板「节点 · 连接配置 → 一键接入」重新生成"
+                ),
+            )
+        if status == "used":
+            raise HTTPException(
+                status_code=403,
+                detail="该注册码是一次性的，已经用过了；请重新生成",
+            )
+        if status == "expired":
+            raise HTTPException(
+                status_code=403, detail="该注册码已过期；请重新生成"
+            )
+        if status == "revoked":
+            raise HTTPException(status_code=403, detail="该注册码已被撤销")
+        raise HTTPException(
+            status_code=403,
+            detail="注册码无效，请在面板「节点 · 连接配置 → 一键接入」重新生成",
+        )
+    code_id = str(code_row.get("id") or "")
+
+    # 2) 验证凭据与可达性；失败把码退回，让运维改完参数直接重跑
+    try:
+        probe = await _probe_registration(payload)
+    except Exception:  # noqa: BLE001 - 任何失败都要把码退回，让人改完参数直接重跑
+        await connregister.release(code_id)
+        raise
+
+    region = str(code_row.get("region") or payload.region or "").strip()
+
+    async with _REGISTER_LOCK:
+        conns = store.get_connections()
+        was_empty = len(conns) == 0
+        endpoint = _endpoint_key(payload.host, payload.port)
+        same_host = next(
+            (
+                c
+                for c in conns
+                if _endpoint_key(c.get("host"), c.get("port")) == endpoint
+            ),
+            None,
+        )
+        if same_host is not None and not _same_cluster(same_host, probe):
+            # 真冲突：退码再报错，否则运维只改错了一个 IP 却要回面板重签发
+            await connregister.release(code_id)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "该地址已被另一条连接占用（集群指纹不同）",
+                    "connection_id": str(same_host.get("id") or ""),
+                    "name": str(same_host.get("name") or ""),
+                    "cluster_key": str(same_host.get("cluster_key") or ""),
+                },
+            )
+
+        same_cluster = next(
+            (c for c in conns if _same_cluster(c, probe)),
+            None,
+        )
+
+        if same_host is not None:
+            target = same_host
+            status = "unchanged"
+            message = "该 PVE 已注册，无需重复接入"
+            if payload.force_update:
+                merged = _merge_registered(target, payload, probe, region)
+                conns = [
+                    merged if str(c.get("id")) == str(target.get("id")) else c
+                    for c in conns
+                ]
+                await store.save_connections(conns)
+                target = merged
+                status = "updated"
+                message = "已更新已有连接的端点与凭据"
+        elif same_cluster is not None:
+            target = same_cluster
+            message = (
+                "该集群已通过连接「"
+                + str(target.get("name") or target.get("id") or "")
+                + "」接入，本次跳过。需要改用本节点地址时，"
+                "在安装链接末尾加 &force=1 重跑（或在面板里改该连接的地址）"
+            )
+            status = "unchanged"
+            if payload.force_update:
+                merged = _merge_registered(target, payload, probe, region)
+                conns = [
+                    merged if str(c.get("id")) == str(target.get("id")) else c
+                    for c in conns
+                ]
+                await store.save_connections(conns)
+                target = merged
+                status = "updated"
+                message = "已把该集群的接入地址更新为本次节点"
+        else:
+            profile = {"id": secrets.token_hex(4), **_register_profile(payload, probe, region)}
+            conns.append(profile)
+            await store.save_connections(conns)
+            target = profile
+            status = "created"
+            message = "注册成功"
+            if was_empty:
+                # 第一条连接自动生效，否则面板还停在「未配置」状态
+                await store.set_active_connection(str(profile["id"]))
+                rebuild_client()
+
+        if status == "updated" and store.get_active_connection_id() == str(
+            target.get("id")
+        ):
+            rebuild_client()
+
+    if status == "unchanged":
+        # 面板什么都没改（同集群重复接入）：把这次占用的额度退回去。否则在同一
+        # 个集群的第二台节点上跑一遍，剩余次数少了一次、列表里却什么都没多。
+        await connregister.release(code_id)
+        message += "（本次未消耗可用次数）"
+    else:
+        await connregister.bind_connection(code_id, str(target.get("id") or ""))
+
+    # 本次操作之后这张码还剩几次：字面意义上的「实时可查」，脚本与面板都以它为准
+    code_after = await connregister.get_code(code_id) or {}
+
+    detail = {
+        "host": payload.host,
+        "port": payload.port,
+        "cluster_key": probe["cluster_key"],
+        "node_name": payload.node_name,
+        "code_id": str(code_row.get("id") or ""),
+        "status": status,
+        "ip": security.client_ip(request),
+    }
+    # 审计里的「操作者」写成 ``pve-import:<节点名>``：这条路径没有登录用户，
+    # 但排查时必须能回答「是哪台机器、从哪个地址把自己接进来的」。
+    actor = "pve-import:" + (
+        payload.node_name or security.client_ip(request) or "unknown"
+    )
+    await store.add_audit(
+        username=actor,
+        action="connection.register",
+        target=f"connection/{target.get('id')}",
+        result="success",
+        detail=detail,
+        ip=security.client_ip(request),
+    )
+
+    metrics_note = ""
+    if not probe["node_metrics"]:
+        metrics_note = (
+            "令牌可以连接，但读不到节点指标（多半是权限不足）："
+            "请在 PVE 上给该令牌的所属用户授予 PVEAuditor（或等价只读）权限"
+        )
+
+    return {
+        "status": status,
+        "message": message + (f"；{metrics_note}" if metrics_note else ""),
+        "connection_id": str(target.get("id") or ""),
+        "name": str(target.get("name") or ""),
+        "region": str(target.get("region") or ""),
+        "host": str(target.get("host") or ""),
+        "port": int(target.get("port") or 8006),
+        "cluster_key": probe["cluster_key"],
+        "node_count": len(probe["node_names"]),
+        "node_metrics": probe["node_metrics"],
+        "pve_version": probe["version"],
+        "pve_release": probe["release"],
+        "active": store.get_active_connection_id() == str(target.get("id")),
+        "max_uses": int(code_after.get("max_uses") or 0),
+        "used_count": int(code_after.get("used_count") or 0),
+        "remaining": code_after.get("remaining"),
+    }
 
 
 @router.put("/connections/{conn_id}")

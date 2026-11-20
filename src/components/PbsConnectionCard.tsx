@@ -21,6 +21,7 @@ import type { PbsConfigItem, PbsTestResult } from '../api/types';
 import { errorMessage } from '../api/client';
 import { useToast } from '../hooks/useToast';
 import { useT } from '../i18n';
+import { formatDateTime, formatRelative } from '../utils/format';
 import { Card, CardHeader } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Button, IconButton } from './ui/Button';
@@ -30,6 +31,7 @@ import { CollapsibleCard, EmptyState, Notice } from './ui/EmptyState';
 import {
   IconBackup,
   IconCheck,
+  IconClock,
   IconClose,
   IconGlobe,
   IconInfo,
@@ -62,11 +64,10 @@ function blank(): PbsConfigItem {
   };
 }
 
-/** 一条连接在页面上的「可读状态」：来自手动测试，未测过就是 unknown。 */
-interface RowState {
-  ok: boolean;
-  message?: string;
-}
+/* 连接状态**不再存在组件里**：测试结论由后端按连接落库（GET /config 的
+   `last_test`），这里只读它。以前用 `rowState` 存本地结果，刷新页面 / 切页 /
+   query 重新拉列表都会把 map 丢掉，徽章就从「已测试」退回「未测试」——
+   看起来像是测试没生效。 */
 
 export function PbsConnectionCard({
   viewMode = 'card',
@@ -101,7 +102,6 @@ export function PbsConnectionCard({
   /* 暂停 / 恢复正在提交的那一行：只锁它自己，别把整张卡片网格都锁住 */
   const [pausingId, setPausingId] = useState('');
   const [testResult, setTestResult] = useState<PbsTestResult | null>(null);
-  const [rowState, setRowState] = useState<Record<string, RowState>>({});
 
   const configuredCount = rows.filter(
     (item) => item.configured ?? Boolean(item.host && item.token_id),
@@ -172,6 +172,8 @@ export function PbsConnectionCard({
       /* 老记录没有 verify_ssl 字段时不能让它回填成 undefined（否则开关显示
          成「开」、保存时又把 undefined 传下去），按新建连接同一套默认走 */
       verify_ssl: item.verify_ssl ?? false,
+      /* 测试结论是服务端的：不进表单，避免保存时又把它原样回传一份 */
+      last_test: undefined,
     });
     setSecretSet(Boolean(item.token_secret_set));
     setErrors({});
@@ -248,31 +250,39 @@ export function PbsConnectionCard({
       const result = await pbsApi.test(target);
       if (fromModal) setTestResult(result);
 
+      /* 卡片上的结论由后端写进连接记录：这里只把返回的那份贴回缓存 ——
+         不等下一次列表请求徽章就生效，刷新 / 换页后读的也还是同一份。 */
+      if (!fromModal) {
+        const lastTest = result.last_test;
+        if (lastTest) {
+          queryClient.setQueryData<PbsConfigItem[]>(['pbs', 'config'], (prev) =>
+            (prev ?? []).map((row) =>
+              row.id === item.id ? { ...row, last_test: lastTest } : row,
+            ),
+          );
+        } else {
+          /* 后端没落库（只可能是写存储失败）：以服务端为准重拉一次，
+             别在界面上留一个只活在本次会话里的「已测试」。 */
+          void queryClient.invalidateQueries({ queryKey: ['pbs', 'config'] });
+        }
+      }
+
       if (result.ok) {
         toast.success(t('pbs.testOk'), capabilityNote(result));
-        if (!fromModal) {
-          setRowState((prev) => ({ ...prev, [item.id]: { ok: true } }));
-        }
       } else {
         const hint = failureHint(result);
         toast.error(
           result.code === 'pbs_auth_failed' ? t('pbs.authFailed') : t('pbs.testFailed'),
           hint,
         );
-        if (!fromModal) {
-          setRowState((prev) => ({
-            ...prev,
-            [item.id]: { ok: false, message: hint },
-          }));
-        }
       }
     } catch (err) {
+      /* 走到这里的是「浏览器 → 面板」这一段断了（面板重启、本地网络抖动），
+         不是「PBS 连不上」。此刻我们并不知道 PBS 的状态，所以**不动**已保存
+         的结论 —— 拿一次请求失败去覆盖一条真实的测试结果，正是状态乱跳的来源。 */
       const message = errorMessage(err);
       if (fromModal) setTestResult({ ok: false, error: message });
       toast.error(t('pbs.testFailed'), message);
-      if (!fromModal) {
-        setRowState((prev) => ({ ...prev, [item.id]: { ok: false, message } }));
-      }
     } finally {
       setTesting(false);
       setBusyRow('');
@@ -349,11 +359,6 @@ export function PbsConnectionCard({
   const remove = async (item: PbsConfigItem) => {
     try {
       await persist(rows.filter((row) => row.id !== item.id));
-      setRowState((prev) => {
-        const next = { ...prev };
-        delete next[item.id];
-        return next;
-      });
       toast.success(t('pbs.deleted'), item.name || item.host);
     } catch (err) {
       toast.error(t('pbs.configSaveFailed'), errorMessage(err));
@@ -438,13 +443,15 @@ export function PbsConnectionCard({
             {rows.map((item) => {
               const configured =
                 item.configured ?? Boolean(item.host && item.token_id);
-              const state = rowState[item.id];
+              /* 结论读后端落库的那份（按配置指纹对齐）：刷新、轮询、
+                 重新登录之后都是同一条，不会再退回「未测试」 */
+              const lastTest = item.last_test ?? null;
               /* 已暂停优先于「测过 / 没测过」：暂停的连接根本没发过请求，
                  画成红的「不可达」会让人以为机器坏了 */
               const tone = item.paused
                 ? 'paused'
-                : state
-                  ? state.ok
+                : lastTest
+                  ? lastTest.ok
                     ? 'ok'
                     : 'down'
                   : 'unknown';
@@ -468,9 +475,16 @@ export function PbsConnectionCard({
                       <Badge variant="neutral" size="sm" dot>
                         {t('pbs.paused')}
                       </Badge>
-                    ) : state ? (
-                      state.ok ? (
-                        <Badge variant="success" size="sm" dot>
+                    ) : lastTest ? (
+                      lastTest.ok ? (
+                        <Badge
+                          variant="success"
+                          size="sm"
+                          dot
+                          title={t('pbs.testedAt', {
+                            when: formatRelative(lastTest.at),
+                          })}
+                        >
                           {t('pbs.connected')}
                         </Badge>
                       ) : (
@@ -478,7 +492,13 @@ export function PbsConnectionCard({
                           variant="danger"
                           size="sm"
                           dot
-                          title={state.message || t('pbs.testFailed')}
+                          title={
+                            lastTest.message
+                              ? `${lastTest.message} · ${t('pbs.testedAt', {
+                                  when: formatRelative(lastTest.at),
+                                })}`
+                              : t('pbs.testFailed')
+                          }
                         >
                           {t('pbs.disconnected')}
                         </Badge>
@@ -523,6 +543,26 @@ export function PbsConnectionCard({
                       <span className="set-conn-tag" title={t('pbs.secretSavedHint')}>
                         <IconShield size={12} />
                         {t('pbs.secretSaved')}
+                      </span>
+                    ) : null}
+                    {/* 结论是什么时候测的：没有这行，「已测试」会看起来像是
+                        刚刚实时探测的结果。悬停给出完整时间。 */}
+                    {lastTest ? (
+                      <span
+                        className="set-conn-tag"
+                        title={formatDateTime(lastTest.at)}
+                      >
+                        <IconClock size={12} />
+                        {t('pbs.testedAt', { when: formatRelative(lastTest.at) })}
+                      </span>
+                    ) : null}
+                    {lastTest?.stale ? (
+                      <span
+                        className="set-conn-tag is-stale"
+                        title={t('pbs.testedStaleHint')}
+                      >
+                        <IconInfo size={12} />
+                        {t('pbs.testedStale')}
                       </span>
                     ) : null}
                   </div>

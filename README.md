@@ -101,7 +101,14 @@ sudo ./deploy.sh
 
 ### 准备 Proxmox API Token
 
-面板靠 API Token 跟 Proxmox 通信。在 PVE 上执行：
+面板靠 API Token 跟 Proxmox 通信，下面两节是**手动配置**的做法。嫌麻烦可以直接用
+**一键接入**：面板里「节点 · 连接配置 → 一键接入」生成一条命令，复制到 PVE 节点上以
+root 粘贴执行即可 —— 建账号、建令牌、注册到面板、结果自检都由脚本完成，失败会自动
+回滚并在屏幕上说清原因。链接可以设**可用次数**（默认 1 次，即一次性；也可以填 5 次、
+10 次或「不限次数」），适合一次接多台；同一集群重复执行不消耗次数，次数用尽或过了
+有效期链接自动失效。
+
+在 PVE 上执行：
 
 ```bash
 pveum user add panel@pve --comment "pvecenter panel"

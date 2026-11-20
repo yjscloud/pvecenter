@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -422,6 +423,128 @@ def diagnose(cfg: PbsConnection) -> Dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------------ 测试结论
+#: 测试结论存在连接记录里的键。**必须落库**：早先它只活在前端组件的 state 里，
+#: 于是刷新页面、切走再切回、甚至 query 重新拉一次列表，徽章就从「已测试」退回
+#: 「未测试」—— 用户以为自己刚做的操作没生效。
+_TEST_HISTORY_KEY = "test_history"
+
+#: 每条连接保留几份结论。按「配置指纹」存，最近 4 份足够覆盖「改了参数又改回去」
+#: 这种来回操作，也不会让一条连接的历史无限长。
+_TEST_HISTORY_LIMIT = 4
+
+#: 结论本身不会过期（过期的成功会被当成失败，那是另一种谎），但超过这个时长
+#: 会标记 ``stale``，界面提示「建议重新测试」。7 天：覆盖一个完整的备份周期。
+TEST_STALE_SECONDS = 7 * 24 * 3600
+
+
+def config_fingerprint(cfg: PbsConnection) -> str:
+    """配置指纹：一份测试结论只对**当时那份配置**成立。
+
+    改地址、换 token、开关证书校验都会换指纹 —— 旧结论随即不再代表当前配置，
+    界面回到「未测试」，而不是拿一份过期的成功去粉饰一份没测过的凭据。
+    名称 / 区域 / 暂停状态只是标签，不参与（改备注不该把测试结论作废）。
+    """
+    raw = "|".join(
+        [
+            cfg.host,
+            str(cfg.port),
+            cfg.token_id,
+            cfg.token_secret,
+            "1" if cfg.verify_ssl else "0",
+            cfg.ca_cert,
+            cfg.node,
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def test_view(conn: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """当前配置对应的最近一次测试结论；没有、或全是对不上的旧配置时返回 ``None``。
+
+    ``None`` 才是「未测试」：只有「从没测过」和「改了配置还没重测」两种情况。
+    时间流逝不会把结论改成 ``None``。
+    """
+    history = conn.get(_TEST_HISTORY_KEY)
+    if not isinstance(history, list):
+        return None
+    want = config_fingerprint(PbsConnection.from_dict(conn))
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("fingerprint") or "") != want:
+            continue
+        at = int(entry.get("at") or 0)
+        return {
+            "at": at,
+            "ok": bool(entry.get("ok")),
+            "code": str(entry.get("code") or ""),
+            "message": str(entry.get("message") or ""),
+            "version": str(entry.get("version") or ""),
+            "stale": bool(at and time.time() - at > TEST_STALE_SECONDS),
+        }
+    return None
+
+
+def _remember(
+    conn: Dict[str, Any], cfg: PbsConnection, result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """把一次结论写进记录（同一指纹只留最新一条，整体限长）。"""
+    entry = {
+        "fingerprint": config_fingerprint(cfg),
+        "at": int(time.time()),
+        "ok": bool(result.get("ok")),
+        "code": str(result.get("code") or ""),
+        # 失败时 ``error`` 是给人看的那句；成功时为空
+        "message": str(result.get("error") or ""),
+        "version": str(result.get("version") or ""),
+    }
+    history = [
+        item
+        for item in (conn.get(_TEST_HISTORY_KEY) or [])
+        if isinstance(item, dict)
+        and str(item.get("fingerprint") or "") != entry["fingerprint"]
+    ]
+    conn[_TEST_HISTORY_KEY] = [entry] + history[: _TEST_HISTORY_LIMIT - 1]
+    return entry
+
+
+async def record_test(
+    conn_id: str, cfg: PbsConnection, result: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """把这次测试结论记到已保存的连接上，返回可下发的视图。
+
+    只认已保存的连接（有 id）：新增表单测的是一份还没落库的参数，记到「别的
+    记录」上会把一条没测过的配置标成已测。但**编辑已有连接后先测再存**是常见
+    路径 —— 所以结论按配置指纹存，保存后指纹对上了，卡片自然就显示已测试。
+
+    DB 写失败只记日志：结论是辅助信息，不该把一次成功的连通性测试变成失败。
+    """
+    if not conn_id:
+        return None
+    try:
+        conns = await load_connections()
+        entry: Optional[Dict[str, Any]] = None
+        for item in conns:
+            if str(item.get("id") or "") == conn_id:
+                entry = _remember(item, cfg, result)
+                break
+        if entry is None:
+            return None
+        await save_connections(conns)
+    except Exception:  # noqa: BLE001
+        logger.warning("记录 PBS 测试结论失败（连接 %s）", conn_id, exc_info=True)
+        return None
+    return {
+        "at": entry["at"],
+        "ok": entry["ok"],
+        "code": entry["code"],
+        "message": entry["message"],
+        "version": entry["version"],
+        "stale": False,
+    }
+
+
 def public_connection(conn: Dict[str, Any]) -> Dict[str, Any]:
     """给前端的脱敏视图：**绝不回吐 token_secret**。"""
     cfg = PbsConnection.from_dict(conn)
@@ -439,6 +562,10 @@ def public_connection(conn: Dict[str, Any]) -> Dict[str, Any]:
         # 暂停接入：界面据此显示「已暂停」并关掉该行的采集类操作
         "paused": cfg.paused,
         "configured": cfg.configured,
+        # 最近一次手动测试结论（按配置指纹对齐；None = 未测试）。
+        # 与 online 的区别：那是每轮采集的**实时**结果，这是「人最后一次实测」，
+        # 刷新页面、换标签页、重新登录都不会丢。
+        "last_test": test_view(conn),
     }
 
 
@@ -699,6 +826,18 @@ async def datastore_row(client: "PbsClient", item: Dict[str, Any]) -> Dict[str, 
 #: 用户把「节点」填错时，每轮都得先撞一次 400 再回退；记住结果后只付一次代价。
 _node_name_cache: Dict[str, str] = {}
 
+#: ``/nodes`` 下次可以再试的时刻（``host:port`` -> monotonic 秒）。
+#: 缺 Sys.Audit 时这个端点要先把节点状态算一遍才回 403 —— 线上实测 526 ms，
+#: 比概览里其它调用加起来还贵；权限不变时结论也不会变，记住失败别每轮白等。
+_nodes_retry_at: Dict[str, float] = {}
+_NODES_RETRY_SECONDS = 600.0
+
+#: 磁盘清单缓存（``host:port:node`` -> (取到的时刻, 原始响应)）。
+#: ``/nodes/{node}/disks/list`` 要现场问 SMART，实测 88 ms ~ 1.1 s 不等，
+#: 是概览里最慢的一步；而盘数 / 型号 / 健康状态不会分钟级变化。
+_DISK_TTL = 300.0
+_disk_cache: Dict[str, Any] = {}
+
 
 def _perm_hint(exc: ProxmoxError) -> str:
     """把一次上游失败归类成界面能直接用的原因。
@@ -708,6 +847,93 @@ def _perm_hint(exc: ProxmoxError) -> str:
     「版本不支持」也写成「去加权限」，那种提示会把人带偏。
     """
     return "no_permission" if (exc.pve_status or 0) == 403 else "error"
+
+
+async def _listed_nodes(client: "PbsClient", cfg: PbsConnection) -> List[str]:
+    """``/nodes`` 里的节点名；读不到就是空列表。
+
+    失败会被记住 :data:`_NODES_RETRY_SECONDS` 秒：没有 Sys.Audit 时这个端点
+    不会立刻回 403，而是先算一遍节点状态（线上实测 526 ms），但结论在权限
+    不变时也不会变 —— 每轮都重付一次那个代价没有意义。
+    """
+    key = f"{cfg.host}:{cfg.port}"
+    if time.monotonic() < _nodes_retry_at.get(key, 0.0):
+        return []
+    try:
+        nodes = await client.nodes()
+    except ProxmoxError as exc:
+        logger.info("读取 PBS 节点列表失败（%s）：%s", cfg.host, exc.message)
+        _nodes_retry_at[key] = time.monotonic() + _NODES_RETRY_SECONDS
+        return []
+    _nodes_retry_at.pop(key, None)
+    names = [str(item.get("node") or "") for item in nodes if isinstance(item, dict)]
+    return [name for name in names if name]
+
+
+async def _resolve_node(
+    client: "PbsClient", cfg: PbsConnection
+) -> "tuple[str, Dict[str, Any], Optional[ProxmoxError]]":
+    """定下这一轮用哪个节点名，并顺手取到节点状态。
+
+    候选顺序：上一轮验证过的名字 → 用户填的名字 → ``localhost``；
+    三条都不通、且失败原因不是「没权限」时，才去读 ``/nodes`` 列表。
+
+    ``/nodes`` 排到最后是性能决定。它是概览里最贵的一步（缺 Sys.Audit 时
+    实测 526 ms 才回 403），而 ``localhost`` 是 PBS 对本地节点的官方别名 ——
+    PBS 只有一个节点，localhost 走得通就完全不需要那份列表。
+    """
+    key = f"{cfg.host}:{cfg.port}"
+    candidates: List[str] = []
+    # 上一轮已经验证可用的名字排最前：节点名写错时不必每轮都先撞一次 400
+    if _node_name_cache.get(key):
+        candidates.append(_node_name_cache[key])
+    if cfg.node:
+        candidates.append(cfg.node)
+    candidates.append("localhost")
+    candidates = list(dict.fromkeys(candidates))
+
+    status_error: Optional[ProxmoxError] = None
+    for candidate in candidates:
+        try:
+            status = await client.node_status(candidate)
+        except ProxmoxError as exc:
+            status_error = exc
+            logger.info(
+                "PBS 节点 %s 不可用（%s），换下一个候选", candidate, exc.message
+            )
+            continue
+        _node_name_cache[key] = candidate
+        return candidate, status, None
+
+    # 403 = 缺 Sys.Audit，``/nodes`` 要的是同一个权限：再问一次只是再等一次 403
+    if status_error is not None and (status_error.pve_status or 0) != 403:
+        for candidate in await _listed_nodes(client, cfg):
+            if candidate in candidates:
+                continue
+            try:
+                status = await client.node_status(candidate)
+            except ProxmoxError as exc:
+                status_error = exc
+                continue
+            _node_name_cache[key] = candidate
+            return candidate, status, None
+
+    # 全都没通也留一个名字：任务与磁盘是另外两条 ACL，仍可能读得到
+    return candidates[-1], {}, status_error
+
+
+async def _cached_disks(client: "PbsClient", cfg: PbsConnection, node: str) -> Any:
+    """节点磁盘清单（带 :data:`_DISK_TTL` 缓存）。
+
+    失败不缓存：读到一次 403 就记住 5 分钟，会把「刚补上权限」的用户挡在门外。
+    """
+    key = f"{cfg.host}:{cfg.port}:{node}"
+    hit = _disk_cache.get(key)
+    if isinstance(hit, tuple) and time.monotonic() - float(hit[0]) < _DISK_TTL:
+        return hit[1]
+    raw = await client.disks(node)
+    _disk_cache[key] = (time.monotonic(), raw)
+    return raw
 
 
 async def _collect_one(conn: Dict[str, Any]) -> Dict[str, Any]:
@@ -746,58 +972,19 @@ async def _collect_one(conn: Dict[str, Any]) -> Dict[str, Any]:
     # 节点名：`/nodes` 需要 Sys.Audit（缺权限就是 403），而 `cfg.node` 只是用户
     # 手填的偏好，写错（比如把连接名当节点名）会被 PBS 回 400 —— 之前正是这样，
     # 一处节点名打错，把内存、负载、运行时长、磁盘健康、任务列表全带没了。
+    # 候选顺序与「为什么 /nodes 排最后」见 _resolve_node。
     #
-    # 所以这里按候选依次试，谁先返回数据就用谁：
-    #   1. 用户填的节点名（且能在 `/nodes` 列表里对上）；
-    #   2. 列表里的第一台；
-    #   3. `localhost` —— PBS 对本地节点的官方别名，这台服务器只有一个节点，
-    #      它永远指向本机，缺 Sys.Audit 拿不到列表时它是唯一可靠的写法。
-    listed: List[str] = []
+    # 节点探测与仓库列表互不依赖，一起发：仓库列表只用到 datastore 接口，
+    # 没有理由等节点名定下来才开始。
+    node_task = asyncio.create_task(_resolve_node(client, cfg))
+    stores_task = asyncio.create_task(client.datastores())
     try:
-        nodes = await client.nodes()
-        listed = [
-            str(item.get("node") or "")
-            for item in nodes
-            if isinstance(item, dict)
-        ]
-        listed = [name for name in listed if name]
-    except ProxmoxError as exc:
-        logger.info("读取 PBS 节点列表失败（%s）：%s", cfg.host, exc.message)
-
-    key = f"{cfg.host}:{cfg.port}"
-    candidates: List[str] = []
-    # 上一轮已经验证可用的名字排最前：节点名写错时不必每轮都先撞一次 400
-    if _node_name_cache.get(key):
-        candidates.append(_node_name_cache[key])
-    if cfg.node and (not listed or cfg.node in listed):
-        candidates.append(cfg.node)
-    if listed:
-        candidates.append(listed[0])
-    candidates.append("localhost")
-    candidates = list(dict.fromkeys(candidates))
-
-    node_name = ""
-    status: Dict[str, Any] = {}
-    status_error: Optional[ProxmoxError] = None
-    for candidate in candidates:
-        try:
-            status = await client.node_status(candidate)
-        except ProxmoxError as exc:
-            status_error = exc
-            if len(candidates) > 1:
-                logger.info(
-                    "PBS 节点 %s 不可用（%s），换下一个候选",
-                    candidate,
-                    exc.message,
-                )
-            continue
-        node_name = candidate
-        _node_name_cache[key] = candidate
-        break
-
-    # 全都没通也留一个名字：任务与磁盘是另外两条 ACL，仍可能读得到
-    if not node_name:
-        node_name = candidates[-1]
+        node_name, status, status_error = await node_task
+    except BaseException:
+        # 提前退出（含取消）时把后台请求收掉，别留一条「Task was destroyed but
+        # it is pending」的告警
+        stores_task.cancel()
+        raise
 
     row["node"] = {"name": node_name, "status_available": bool(status)}
     if cfg.node and node_name != cfg.node:
@@ -838,42 +1025,52 @@ async def _collect_one(conn: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
-    if node_name:
-        try:
-            # 先多取一些再过滤：只要备份类任务，limit=20 里可能大半是 GC/同步，
-            # 过滤后不够 8 条就白读了一趟。
-            raw_tasks = await client.tasks(node_name, limit=60)
-            slim = [
-                _slim_task(item) for item in raw_tasks if isinstance(item, dict)
-            ]
-            row["tasks"] = [
-                task for task in slim if task["type"] in BACKUP_TASK_TYPES
-            ][:20]
-            # 「最近任务」只留备份/校验，但 GC 状态要单独给卡片看
-            row["node"]["gc"] = _latest_gc(slim)
-        except ProxmoxError as exc:
-            logger.info("读取 PBS 任务失败（%s）：%s", cfg.host, exc.message)
-        try:
-            raw_disks = await client.disks(node_name)
-            row["node"]["disks"] = _disk_alerts(raw_disks)
-            row["node"]["disks_total"] = _disk_count(raw_disks)
-            row["node"]["disks_summary"] = _disk_summary(raw_disks)
-            row["node"]["disks_all"] = _disk_rows(raw_disks)
-        except ProxmoxError as exc:
-            # 老版本 / 权限不足：磁盘健康留空，不影响其余字段
-            logger.info("读取 PBS 磁盘状态失败（%s）：%s", cfg.host, exc.message)
-            row["node"]["disks"] = []
-            row["node"]["disks_total"] = 0
-            row["node"]["disks_summary"] = _disk_summary(None)
-            row["node"]["disks_all"] = []
-            row["node"]["disks_hint"] = _perm_hint(exc)
-            row["node"]["disks_error"] = exc.message
+    # 任务与磁盘同时发：磁盘要现场问 SMART（实测 88 ms ~ 1.1 s），串行时会白等。
+    # 两边的失败互不牵连，所以用 return_exceptions 收，再各自决定降级形状。
+    raw_tasks, raw_disks = await asyncio.gather(
+        # 先多取一些再过滤：只要备份类任务，limit=20 里可能大半是 GC/同步，
+        # 过滤后不够 8 条就白读了一趟。
+        client.tasks(node_name, limit=60),
+        _cached_disks(client, cfg, node_name),
+        return_exceptions=True,
+    )
+    for result in (raw_tasks, raw_disks):
+        if isinstance(result, BaseException) and not isinstance(
+            result, ProxmoxError
+        ):
+            # 上游错误以外的异常（编程错误等）不该被悄悄吞掉
+            stores_task.cancel()
+            raise result
 
-    # datastore：列表拿到后逐个补容量。单个数不出来不影响其它
+    if isinstance(raw_tasks, ProxmoxError):
+        logger.info("读取 PBS 任务失败（%s）：%s", cfg.host, raw_tasks.message)
+    else:
+        slim = [_slim_task(item) for item in raw_tasks if isinstance(item, dict)]
+        row["tasks"] = [
+            task for task in slim if task["type"] in BACKUP_TASK_TYPES
+        ][:20]
+        # 「最近任务」只留备份/校验，但 GC 状态要单独给卡片看
+        row["node"]["gc"] = _latest_gc(slim)
+
+    if isinstance(raw_disks, ProxmoxError):
+        # 老版本 / 权限不足：磁盘健康留空，不影响其余字段
+        logger.info("读取 PBS 磁盘状态失败（%s）：%s", cfg.host, raw_disks.message)
+        row["node"]["disks"] = []
+        row["node"]["disks_total"] = 0
+        row["node"]["disks_summary"] = _disk_summary(None)
+        row["node"]["disks_all"] = []
+        row["node"]["disks_hint"] = _perm_hint(raw_disks)
+        row["node"]["disks_error"] = raw_disks.message
+    else:
+        row["node"]["disks"] = _disk_alerts(raw_disks)
+        row["node"]["disks_total"] = _disk_count(raw_disks)
+        row["node"]["disks_summary"] = _disk_summary(raw_disks)
+        row["node"]["disks_all"] = _disk_rows(raw_disks)
+
+    # datastore：列表在节点探测的同时就已经在取了，这里只等结果逐个补容量。
+    # 单个数不出来不影响其它
     try:
-        stores = [
-            item for item in await client.datastores() if isinstance(item, dict)
-        ]
+        stores = [item for item in await stores_task if isinstance(item, dict)]
     except ProxmoxError as exc:
         logger.info("读取 PBS datastore 失败（%s）：%s", cfg.host, exc.message)
         stores = []
@@ -907,6 +1104,11 @@ def invalidate_overview() -> None:
     _overview_cache["data"] = None
     # 节点名缓存也要清：用户可能刚刚把「节点」改对，别继续用旧的回退值
     _node_name_cache.clear()
+    # `/nodes` 的失败退避同理：用户可能刚补上 Sys.Audit 权限
+    _nodes_retry_at.clear()
+    # 磁盘清单：刚接进来的那台机器不该拿到别的配置留下的旧清单（key 含 host:port，
+    # 但换了 token 后能看到的磁盘可能不同）
+    _disk_cache.clear()
 
 
 def _dedupe_by_host(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

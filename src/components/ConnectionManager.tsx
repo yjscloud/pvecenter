@@ -50,11 +50,15 @@ import {
   IconEye,
   IconEyeOff,
   IconPlus,
+  IconSearch,
+  IconTerminal,
   IconTrash,
 } from './Icons';
 import { useToast } from '../hooks/useToast';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
 import { useT } from '../i18n';
+import { ConnectionDiscoverModal } from './ConnectionDiscoverModal';
+import { ConnectionOnboardModal } from './ConnectionOnboardModal';
 import type {
   ConnectionConfigInput,
   ConnectionProfile,
@@ -170,6 +174,11 @@ export function ConnectionManager({
   /* 表单改成弹窗：一页里同时塞「连接列表 + 一张长表单」时，列表总要被表单
      顶到屏幕外，而新增 / 编辑本来就是低频动作，不该常驻占位。 */
   const [formOpen, setFormOpen] = useState(false);
+  /* 一键接入：签发注册码 + 给节点脚本。批量接入几十台时用它，
+     手工填表那套留在这里给单台 / 调试用。 */
+  const [onboardOpen, setOnboardOpen] = useState(false);
+  /* 一键接入（自动发现）：只在「面板与 PVE 同网段」时可用，跨网段走注册码 */
+  const [discoverOpen, setDiscoverOpen] = useState(false);
   /* 展开看节点名的那几条连接（默认收起：节点多的集群一屏就满了） */
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
   const toggleNodes = (id: string) =>
@@ -413,6 +422,16 @@ export function ConnectionManager({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams, setSearchParams, isAdmin]);
 
+  /* /nodes/connections?discover=1：节点页空状态里的「一键接入」入口，
+     进来直接开始扫描（与 ?new=1 同一套「读完就抹掉参数」的处理）。 */
+  useEffect(() => {
+    if (searchParams.get('discover') !== '1') return;
+    if (isAdmin) setDiscoverOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete('discover');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams, isAdmin]);
+
   const removeProfile = async (p: ConnectionProfile) => {
     try {
       await connectionsApi.remove(p.id);
@@ -564,6 +583,32 @@ export function ConnectionManager({
                 ? t('conn.configuredCount', { n: connections.length })
                 : t('conn.notConfigured')}
             </Badge>
+            {/* 一键接入（自动发现）：新装面板最常用的入口 —— 扫本机网段，
+                选一台，输一次管理员密码就接进来 */}
+            <Button
+              variant="primary"
+              size="sm"
+              icon={<IconSearch size={14} />}
+              disabled={!isAdmin}
+              onClick={() => setDiscoverOpen(true)}
+              title={t('conn.discoverEntryHint')}
+            >
+              {t('conn.discoverEntry')}
+            </Button>
+            {/* 批量接入（注册码）：机房多、跨网段时，逐台填表不现实 —— 签发
+                一张一次性注册码，脚本在节点上跑一次就接进来了。与上面的
+                「一键接入」分工：那个要求面板能直接连到 8006，这个要求节点能
+                访问面板。 */}
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<IconTerminal size={14} />}
+              disabled={!isAdmin}
+              onClick={() => setOnboardOpen(true)}
+              title={t('conn.onboardEntryHint')}
+            >
+              {t('conn.onboardEntry')}
+            </Button>
             <Button
               variant="secondary"
               size="sm"
@@ -1295,6 +1340,23 @@ export function ConnectionManager({
           </CollapsibleCard>
         </div>
       </Modal>
+
+    {/* ---- 一键接入：扫描内网 → 选一台 → 输一次管理员密码 ---- */}
+    <ConnectionDiscoverModal
+      open={discoverOpen}
+      onClose={() => setDiscoverOpen(false)}
+    />
+
+    {/* ---- 批量接入：签发注册码 + 生成节点脚本（跨网段 / 批量） ---- */}
+    <ConnectionOnboardModal
+      open={onboardOpen}
+      onClose={() => setOnboardOpen(false)}
+      onChanged={() => {
+        void connectionsQuery.refetch();
+        void statusQuery.refetch();
+        void queryClient.invalidateQueries({ queryKey: ['nodes'] });
+      }}
+    />
     </>
   );
 }

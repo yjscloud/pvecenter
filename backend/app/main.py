@@ -103,6 +103,7 @@ from . import accesscontrol
 from . import apitokens
 from . import certmonitor as cert_monitor
 from . import certs as cert_manager
+from . import connregister
 from . import certworkflow_run
 from . import certworkflow_store
 from . import frp
@@ -217,6 +218,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await trusteddevices.init_table()
     # 每用户的界面偏好（仪表盘布局等，见 app.prefs）
     await prefs.init_table()
+    # PVE 一键接入注册码表（脚本用它建连接，绕开 step-up，见 app.connregister）
+    await connregister.init_table()
     # 清掉过期的令牌黑名单条目与早已过期的会话记录（纯残留清理，失败不影响启动）
     try:
         await purge_expired_tokens()

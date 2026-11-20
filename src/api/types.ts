@@ -467,6 +467,93 @@ export interface ConnectionProfile extends ConnectionConfig {
   active: boolean;
 }
 
+/* ---------------------------------------------------------------- 一键接入 */
+
+/** 扫描到的一台候选 PVE。 */
+export interface DiscoveredPve {
+  host: string;
+  port: number;
+  /** TCP 建连耗时（毫秒）：秒回的和勉强连上的，接进来的体验差别很大 */
+  latency_ms: number;
+  /** `/version` 读到的版本；空串 = 端口开着但要求认证（或不是 PVE） */
+  version: string;
+  release: string;
+  repoid: string;
+  /** 确认是 PVE（读到版本，或看到 pve-api-daemon 服务头） */
+  verified: boolean;
+  /** 地址已经在连接列表里，不要再加一遍 */
+  already_added: boolean;
+}
+
+/** 一次扫描的结果。 */
+export interface PveDiscoveryResult {
+  /** 实际扫描的网段（没填时是面板自己识别出来的） */
+  cidrs: string[];
+  port: number;
+  scanned: number;
+  found: DiscoveredPve[];
+  /** 网段太大被截断：提示用户缩小范围 */
+  truncated: boolean;
+  elapsed_ms: number;
+}
+
+/** 一键接入成功后返回的凭据与节点信息。 */
+export interface PveProvisionResult {
+  connection: ConnectionProfile;
+  /** 面板在 PVE 上创建的令牌（`pvecenter@pve!pvecenter-xxxxxx`） */
+  token_id: string;
+  pve_user: string;
+  node: string;
+  nodes: string[];
+  version: string;
+}
+
+/**
+ * 「一键接入」注册码。
+ *
+ * 它替代 step-up 让 PVE 节点上的脚本能自助注册一条连接：管理员在浏览器里签发，
+ * 脚本拿着它建**一条**连接，用完即废（见后端 app/connregister.py）。
+ */
+export interface RegisterCodeIssued {
+  id: string;
+  /** 明文注册码。**只在签发响应里出现这一次**，之后列表接口只回状态 */
+  code: string;
+  region: string;
+  expires: number;
+  ttl_minutes: number;
+  /** 可用次数：1 = 一次性；0 = 不限次数 */
+  max_uses: number;
+  used_count: number;
+  /** 剩余次数；`null` = 不限次数 */
+  remaining: number | null;
+  /** 安装脚本地址（免登录，凭据在查询串里），可点开让运维先审一遍 */
+  script_url: string;
+  /** 复制粘贴到节点终端的那一条命令 */
+  command: string;
+}
+
+/** 注册码列表项（不含明文，用于回答「这张码为什么用不了」） */
+export interface RegisterCodeRow {
+  id: string;
+  region: string;
+  note: string;
+  created_by: string;
+  created: number;
+  expires: number;
+  /** 可用次数：1 = 一次性；0 = 不限次数 */
+  max_uses: number;
+  /** 已经成功用掉的次数（重复接入、失败重试不计数） */
+  used_count: number;
+  /** 剩余次数；`null` = 不限次数 */
+  remaining: number | null;
+  /** 首次使用时间戳（0 = 从未使用） */
+  used: number;
+  used_by: string;
+  /** 最近一次建出的连接 id（未使用 / 失败为空） */
+  connection_id: string;
+  status: 'active' | 'used' | 'exhausted' | 'expired' | 'revoked';
+}
+
 export interface ConnectionConfigInput {
   /** 连接显示名（多连接用） */
   name?: string;
@@ -1346,6 +1433,29 @@ export interface PbsConfigItem {
    * 原样带回，前端也不要自己往 `saveConfig` 里塞这个字段。
    */
   paused?: boolean;
+  /**
+   * 最近一次手动测试的结论（后端持久化，按配置指纹对齐）。
+   *
+   * `null` / 缺省 = **未测试**：只有「从没测过」或「改了地址 / 凭据还没重测」
+   * 两种情况。时间流逝不会把它变成未测试 —— 结论是某一刻的事实，不该被
+   * 刷新、轮询或重新登录抹掉。
+   */
+  last_test?: PbsLastTest | null;
+}
+
+/** 一条连接最近一次手动测试的结论。 */
+export interface PbsLastTest {
+  /** 测试时间（Unix 秒） */
+  at: number;
+  ok: boolean;
+  /** 失败原因码，如 `pbs_auth_failed` */
+  code: string;
+  /** 失败原因（后端给的那句人话，成功时为空串） */
+  message: string;
+  /** 测到的 PBS 版本，失败时为空串 */
+  version: string;
+  /** 结论超过一周：仍算「已测试」，界面另行提示建议复测 */
+  stale: boolean;
 }
 
 /**
@@ -1390,6 +1500,11 @@ export interface PbsTestResult {
   /** 探测失败项的错误码，例如 { datastore_status: 'pbs_permission_denied' } */
   probe_errors?: Record<string, string>;
   diagnostics?: PbsCredentialDiagnostics;
+  /**
+   * 后端已把这次结论写进连接记录时给的视图（未保存的新表单为 null）。
+   * 卡片据此就地更新徽章，不必再等一次列表请求。
+   */
+  last_test?: PbsLastTest | null;
 }
 
 /** PBS 任务（备份 / 校验 / 回收 / 同步），字段已由后端白名单化。 */

@@ -103,6 +103,7 @@ async def save_config(
     for item in body.connections:
         raw = item.model_dump()
         conn_id = str(raw.get("id") or "").strip() or _new_id()
+        prev = existing.get(conn_id) or {}
         # 与 PbsConnection 保持一致：复制来的 secret 常带尾部空白，落库前清掉
         secret = str(raw.get("token_secret") or "").strip()
         if not secret:
@@ -111,7 +112,7 @@ async def save_config(
         # 顺手把它清掉（早先 PVE 连接在这里踩过坑）。
         paused = raw.get("paused")
         if paused is None:
-            paused = (existing.get(conn_id) or {}).get("paused")
+            paused = prev.get("paused")
         saved.append(
             {
                 "id": conn_id,
@@ -126,6 +127,10 @@ async def save_config(
                 "ca_cert": str(raw.get("ca_cert") or ""),
                 "node": str(raw.get("node") or "").strip(),
                 "paused": bool(paused),
+                # 测试结论跟着连接走（按配置指纹对齐，见 pbs.test_view）。这里是
+                # 重建整条记录，不显式带上就等于「每次保存都把已测试抹成未测试」——
+                # 也正是「测试完再点保存，徽章又变回未测试」的来源。
+                "test_history": list(prev.get("test_history") or []),
             }
         )
     await pbs.save_connections(saved)
@@ -275,10 +280,13 @@ async def test_config(
         }
         if exc.code == "pbs_auth_failed":
             result["diagnostics"] = pbs.diagnose(cfg)
+        # 失败也是一次结论：「这台现在连不上」同样要落库，否则刷新页面又回到
+        # 「未测试」，看不出刚才测过、也看不出失败原因。
+        result["last_test"] = await pbs.record_test(conn_id, cfg, result)
         return result
     finally:
         await client.aclose()
-    return {
+    result: Dict[str, Any] = {
         "ok": True,
         "version": str(version.get("version") or version.get("release") or ""),
         "capabilities": capabilities,
@@ -286,6 +294,10 @@ async def test_config(
         # 让界面能说「容量接口 403」而不是笼统的「不提供」
         "probe_errors": probe_errors,
     }
+    # 已保存的连接：结论写回配置（按配置指纹对齐），列表 / 保存 / 刷新后都还在；
+    # 没保存的新表单没有 id，只把结论回给弹窗，不落到别的记录上。
+    result["last_test"] = await pbs.record_test(conn_id, cfg, result)
+    return result
 
 
 @router.get("/overview")
