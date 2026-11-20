@@ -740,3 +740,34 @@ class TestConsoleAccount:
         conn = store.get_connections()[0]
         assert conn["console_user"] == "pvecenter-console@pve"
         assert conn["console_password"] == "random-pw"
+
+
+class TestRegenerateFlow:
+    """额度还在的码要能重新拿到一条命令。
+
+    明文只在签发时回一次，所以「继续用」的实现是「按剩余额度再签一张 + 作废旧码」。
+    这里钉住支撑它的那一步：**用过一部分次数的码也必须撤销得掉** —— 早先
+    ``revoke`` 带着 ``used=0`` 条件，1/3 次的那种码根本作废不了。
+    """
+
+    def test_revoke_works_after_partial_use(self, onboard) -> None:
+        client, port = onboard
+        auth = auth_headers(client)
+        issued = _issue(client, auth, max_uses=3)
+        assert _register(client, port, issued["code"]).status_code == 200
+
+        rows = client.get("/api/connections/register-codes", headers=auth).json()
+        assert rows[0]["status"] == "active"
+        assert rows[0]["remaining"] == 2
+
+        resp = client.post(
+            f"/api/connections/register-codes/{issued['id']}/revoke", headers=auth
+        )
+        assert resp.status_code == 200, resp.text
+
+        rows = client.get("/api/connections/register-codes", headers=auth).json()
+        assert rows[0]["status"] == "revoked"
+        # 撤销即刻生效：同一个链接再来取的就是「已撤销」的提示脚本
+        body = _fetch_script(client, issued["script_url"])
+        assert "已被撤销" in body
+        assert _bash_exit_code(body) == 1

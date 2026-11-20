@@ -315,6 +315,10 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'conn.onboardStatus.expired': 'Expired',
   'conn.onboardStatus.revoked': 'Revoked',
   'conn.onboardRevoke': 'Revoke',
+  'conn.onboardRegenerate': 'Regenerate command',
+  'conn.onboardRegenerateHint':
+    'A link shows its plaintext only once. This issues a new one with the same region / note / remaining uses, and revokes the old one',
+  'conn.onboardRegenerated': 'New command ready; the old link is revoked',
   'conn.onboardRevoked': 'Registration code revoked',
   'conn.onboardRevokeFailed': 'Could not revoke the code',
   'conn.onboardAgain': 'Generate another',

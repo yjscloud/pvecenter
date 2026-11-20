@@ -534,7 +534,7 @@ async def revoke_register_code(
         result="success" if ok else "failed",
     )
     if not ok:
-        raise HTTPException(status_code=404, detail="注册码不存在或已被使用")
+        raise HTTPException(status_code=404, detail="注册码不存在")
     return {"ok": True}
 
 

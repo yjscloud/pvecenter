@@ -387,11 +387,16 @@ async def delete_code(code_id: str) -> bool:
 
 
 async def revoke(code_id: str) -> bool:
+    """作废一张码的剩余额度。
+
+    以前只允许撤销「还没用过的」码（``used=0``），因为那时一次性码用过就等于废了。
+    支持多用途后，一张用了 1/3 次、还有 2 次额度的码同样需要能作废 —— 否则「重新
+    生成一条接着用」时旧码会一直留着，两条并行谁也说不清用哪条。
+    """
     try:
         async with database.connect() as db:
             cursor = await db.execute(
-                "UPDATE connection_register_codes SET revoked=1"
-                " WHERE id=? AND used=0",
+                "UPDATE connection_register_codes SET revoked=1 WHERE id=?",
                 (str(code_id),),
             )
             await db.commit()

@@ -308,6 +308,10 @@ export const zhNode = {
   'conn.onboardStatus.expired': '已过期',
   'conn.onboardStatus.revoked': '已撤销',
   'conn.onboardRevoke': '撤销',
+  'conn.onboardRegenerate': '重新生成命令',
+  'conn.onboardRegenerateHint':
+    '链接明文只显示一次。这里按原来的区域 / 备注 / 剩余次数签一张新链接，旧链接随即作废',
+  'conn.onboardRegenerated': '已生成新命令，旧链接已作废',
   'conn.onboardRevoked': '注册码已撤销',
   'conn.onboardRevokeFailed': '撤销注册码失败',
   'conn.onboardAgain': '再生成一条',

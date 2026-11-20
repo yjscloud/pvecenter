@@ -114,6 +114,7 @@ export function ConnectionOnboardModal({
   const [issueError, setIssueError] = useState<string | null>(null);
   const [codes, setCodes] = useState<RegisterCodeRow[]>([]);
   const [revoking, setRevoking] = useState<string | null>(null);
+  const [regening, setRegening] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   /* 删除是二次确认，但不用弹窗：点一次变成「确认删除」，再点才真删。
      一屏能清好几条时，比一路弹窗快得多，也不会误触。 */
@@ -204,6 +205,45 @@ export function ConnectionOnboardModal({
       toast.error(t('conn.onboardRevokeFailed'), errorMessage(err));
     } finally {
       setRevoking(null);
+    }
+  };
+
+  /* 额度还在、时间没到的码，不该逼用户回表单重填一遍。
+     库里只存 sha256，明文拿不回来，所以这里换个说法「按原参数 + 剩余次数再签一张」，
+     顺手把旧码作废 —— 否则两条并行，谁也说不清哪条是用得上的那条。 */
+  const regenerate = async (row: RegisterCodeRow) => {
+    setRegening(row.id);
+    try {
+      const unlimited = row.max_uses === 0;
+      /* active 状态必有剩余，兜底 1 免得 remaining 缺失时误发「0 = 不限」 */
+      const left = unlimited ? 0 : Math.max(1, row.remaining ?? 1);
+      /* 有效期取「原码剩余分钟」与 30 的较大者：剩 3 分钟的码照原样续，
+         用户还得手忙脚乱地复制；但也不越过 24 小时上限 */
+      const ttlMinutes = Math.min(
+        1440,
+        Math.max(30, Math.ceil((row.expires - Date.now() / 1000) / 60)),
+      );
+      const data = await connectionsApi.issueRegisterCode({
+        region: row.region,
+        note: row.note,
+        ttl_minutes: ttlMinutes,
+        max_uses: left,
+        console_enabled: row.console_enabled,
+      });
+      try {
+        await connectionsApi.revokeRegisterCode(row.id);
+      } catch {
+        /* 旧码作废失败不影响新链接可用，顶多列表里多一条「可用」，不打断流程 */
+      }
+      setIssued(data);
+      /* 顺手复制一次（与首次签发一致），但只弹一条 toast：两条叠在一起会互相盖住 */
+      setCopied(await copyText(data.command || fallbackCommand(data)));
+      toast.success(t('conn.onboardRegenerated'));
+      await loadCodes();
+    } catch (err) {
+      toast.error(t('conn.onboardIssueFailed'), errorMessage(err));
+    } finally {
+      setRegening(null);
     }
   };
 
@@ -592,14 +632,25 @@ export function ConnectionOnboardModal({
             </span>
             <div className="onboard-code-actions">
               {row.status === 'active' ? (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  loading={revoking === row.id}
-                  onClick={() => void revoke(row.id)}
-                >
-                  {t('conn.onboardRevoke')}
-                </Button>
+                <>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    loading={regening === row.id}
+                    onClick={() => void regenerate(row)}
+                    title={t('conn.onboardRegenerateHint')}
+                  >
+                    {t('conn.onboardRegenerate')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    loading={revoking === row.id}
+                    onClick={() => void revoke(row.id)}
+                  >
+                    {t('conn.onboardRevoke')}
+                  </Button>
+                </>
               ) : (
                 /* 已失效的码只留历史价值：撤销 / 用过 / 过期之后就能删 */
                 <Button
