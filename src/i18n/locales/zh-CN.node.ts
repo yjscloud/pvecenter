@@ -606,6 +606,9 @@ export const zhNode = {
   'nodes.quorumOk': '仲裁正常',
   'nodes.quorumBadCount': '{n} 个集群仲裁异常',
   'nodes.addNode': '添加节点',
+  /* 空态的两条路：手动（填地址与 Token）/ 批量（生成命令在节点上跑） */
+  'nodes.addManual': '手动添加',
+  'nodes.addBulk': '批量添加',
   'nodes.addNodeTitle': '接入一台新的 Proxmox 主机（新增 PVE 连接）',
   'nodes.quorumNoticeTitle': '集群失去仲裁',
   'nodes.quorumNoticeBody':
@@ -631,7 +634,7 @@ export const zhNode = {
   'nodes.loadFailed': '无法加载节点列表',
   'nodes.emptyTitle': '暂无节点',
   'nodes.emptyAdmin':
-    '面板还没有接入可用的 Proxmox 主机。点「添加节点」填写 PVE 地址与 API Token 即可。',
+    '面板还没有接入可用的 Proxmox 主机。一两台就点「手动添加」，填 PVE 地址与 API Token；整机房、跨网段就点「批量添加」，生成一条命令在节点上执行即可。',
   'nodes.emptyUser': '集群中没有检测到任何节点，请联系管理员检查 Proxmox 连接配置。',
   'nodes.emptyPermission':
     '已连接的 Proxmox 主机读不到任何节点，通常是 API Token 权限不足。可在「连接管理」里对该令牌执行「修复权限」。',

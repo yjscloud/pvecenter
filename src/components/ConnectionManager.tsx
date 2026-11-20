@@ -418,6 +418,17 @@ export function ConnectionManager({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams, setSearchParams, isAdmin]);
 
+  /* /nodes/connections?onboard=1：直接打开「批量接入」—— 节点页空态的第二条路。
+     与 ?new=1 同一套「读完就抹掉参数」的处理；两个同时出现时以 ?new=1 为准，
+     不叠两个弹窗（那种 URL 只会是手拼出来的，猜不如定死）。 */
+  useEffect(() => {
+    if (searchParams.get('onboard') !== '1') return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('onboard');
+    if (searchParams.get('new') !== '1' && isAdmin) setOnboardOpen(true);
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams, isAdmin]);
+
   const removeProfile = async (p: ConnectionProfile) => {
     try {
       await connectionsApi.remove(p.id);

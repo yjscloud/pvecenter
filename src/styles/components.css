@@ -3034,6 +3034,25 @@ button.kpi-card {
   margin-top: 8px;
 }
 
+/* 空态里并排两个动作（如「手动添加 / 批量添加」）。.empty-action 本身只是
+   一个 margin-top 的包裹层，撑不住两个按钮 —— 这里补一层横向布局，宽度不够
+   就换行，不把「批量添加」挤成两字一行 */
+.empty-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* 窄屏各占一行：并排时两个按钮都只剩半行，读起来像两个「添」字 */
+@media (max-width: 560px) {
+  .empty-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
 /* --- ErrorState --- */
 .error-state {
   display: flex;

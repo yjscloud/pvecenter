@@ -48,6 +48,7 @@ import {
   IconChevronRight,
   IconChevronDown,
   IconPlug,
+  IconTerminal,
   IconLayers,
 } from '../components/Icons';
 import {
@@ -670,13 +671,26 @@ export function Nodes() {
                     {t('setup.pveManage')}
                   </Button>
                 ) : (
-                  <Button
-                    variant="primary"
-                    icon={<IconPlus size={15} />}
-                    onClick={addNode}
-                  >
-                    {t('nodes.addNode')}
-                  </Button>
+                  /* 新装面板的第一屏：两条路并排给出来。手动那条填地址与 Token，
+                     适合一两台；批量那条生成一条命令逐台跑，适合整机房。
+                     都通向连接配置页，只是进去后停在哪个弹窗不同 —— 接完就能
+                     在同一个页面看到连接卡片，想再加一台也不用退回节点页。 */
+                  <div className="empty-actions">
+                    <Button
+                      variant="primary"
+                      icon={<IconPlus size={15} />}
+                      onClick={addNode}
+                    >
+                      {t('nodes.addManual')}
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      icon={<IconTerminal size={15} />}
+                      onClick={() => navigate('/nodes/connections?onboard=1')}
+                    >
+                      {t('nodes.addBulk')}
+                    </Button>
+                  </div>
                 )
               ) : undefined
             }

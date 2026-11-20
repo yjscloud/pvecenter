@@ -612,6 +612,9 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'nodes.quorumOk': 'Quorum healthy',
   'nodes.quorumBadCount': '{n} cluster(s) lost quorum',
   'nodes.addNode': 'Add node',
+  /* Empty state offers two paths: manual (address + token) or bulk (one command) */
+  'nodes.addManual': 'Add manually',
+  'nodes.addBulk': 'Add in bulk',
   'nodes.addNodeTitle': 'Onboard a new Proxmox host (adds a PVE connection)',
   'nodes.quorumNoticeTitle': 'Cluster lost quorum',
   'nodes.quorumNoticeBody':
@@ -641,7 +644,7 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'nodes.loadFailed': 'Could not load the node list',
   'nodes.emptyTitle': 'No nodes',
   'nodes.emptyAdmin':
-    'The panel has no usable Proxmox host yet. Click "Add node" and fill in the PVE address and API token.',
+    'The panel has no usable Proxmox host yet. For one or two hosts, click "Add manually" and fill in the PVE address and API token; for a whole room or another subnet, click "Add in bulk" to get one command to run on the node.',
   'nodes.emptyUser':
     'No nodes were detected in the cluster. Ask an administrator to check the Proxmox connection settings.',
   'nodes.emptyPermission':
