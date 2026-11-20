@@ -676,3 +676,67 @@ class TestRegisterConnection:
 
         rows = client.get("/api/connections/register-codes", headers=auth).json()
         assert rows[0]["status"] == "active"
+
+
+class TestConsoleAccount:
+    """控制台账号（可选）：签发时的勾选决定脚本建不建账号、面板收不收凭据。
+
+    PVE 不接受 API Token 换 VNC 票据，「能不能开控制台」只能靠节点上有没有一个
+    带密码的账号。默认关是基线：只读接入不该在节点上留密码。
+    """
+
+    def test_default_is_off_and_script_skips_console(self, onboard) -> None:
+        client, _ = onboard
+        issued = _issue(client, auth_headers(client))
+
+        assert issued["console_enabled"] is False
+        body = _fetch_script(client, issued["script_url"])
+        assert "CONSOLE=0" in body
+        assert _bash_syntax_ok(body)
+
+    def test_enabled_code_renders_the_console_steps(self, onboard) -> None:
+        client, _ = onboard
+        issued = _issue(client, auth_headers(client), console_enabled=True)
+
+        assert issued["console_enabled"] is True
+        body = _fetch_script(client, issued["script_url"])
+        assert "CONSOLE=1" in body
+        assert "pvecenter-console@pve" in body
+        # PVEAuditor 不含 VM.Console：脚本必须自己把角色补上，否则控制台照样 403
+        assert "VM.Console" in body
+        assert _bash_syntax_ok(body)
+
+    def test_credentials_dropped_when_code_did_not_enable_console(
+        self, onboard
+    ) -> None:
+        """持码者不能靠多塞两个字段，把只读接入升级成能操作控制台的接入。"""
+        client, port = onboard
+        issued = _issue(client, auth_headers(client))
+
+        resp = _register(
+            client,
+            port,
+            issued["code"],
+            console_user="pvecenter-console@pve",
+            console_password="sneaky",
+        )
+        assert resp.status_code == 200
+        conn = store.get_connections()[0]
+        assert conn.get("console_user", "") == ""
+        assert conn.get("console_password", "") == ""
+
+    def test_credentials_stored_when_enabled(self, onboard) -> None:
+        client, port = onboard
+        issued = _issue(client, auth_headers(client), console_enabled=True)
+
+        resp = _register(
+            client,
+            port,
+            issued["code"],
+            console_user="pvecenter-console@pve",
+            console_password="random-pw",
+        )
+        assert resp.status_code == 200
+        conn = store.get_connections()[0]
+        assert conn["console_user"] == "pvecenter-console@pve"
+        assert conn["console_password"] == "random-pw"

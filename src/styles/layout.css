@@ -4257,6 +4257,38 @@
 }
 
 /* 原理说明默认收起：需要确认时再展开，让表单与主操作留在首屏 */
+/* ---- 控制台开关（可选项） ---- */
+/* 不勾时是一行普通勾选；勾上后加淡边与提示底色，提醒「这条链接会多建一个带密码
+   的账号」—— 签发完才发现自己勾了什么，是这类开关最典型的误操作 */
+.onboard-console {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--bg-subtle, rgba(127, 127, 127, 0.06));
+}
+
+.onboard-console.is-on {
+  border-color: var(--accent);
+}
+
+.onboard-console-desc {
+  margin: 6px 0 0 24px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: 1.55;
+}
+
+/* 结果页「已附带控制台账号」：一行补充信息，别抢「复制命令」的视线 */
+.onboard-result-console {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 6px 0 0;
+  color: var(--success);
+  font-size: var(--font-size-xs);
+}
+
 .onboard-how {
   padding-top: 12px;
   border-top: 1px dashed var(--border-muted);

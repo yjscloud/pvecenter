@@ -263,6 +263,12 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'conn.onboardMaxUses': 'Uses allowed',
   'conn.onboardMaxUsesHint':
     'One use per node (1–1000, default 1 = single-use); tick “Unlimited” for no cap — uses are still logged',
+  'conn.onboardConsoleTitle': 'Also enable console (in-browser VNC)',
+  'conn.onboardConsoleDesc':
+    'PVE will not accept an API token for VNC. With this on, the script creates pvecenter-console@pve (random password, sent only to the panel) with VM.Audit + VM.Console — enough to open a console, still not enough to change config or power-cycle. Leave it off and the host stays read-only: metrics and tasks, no in-browser console.',
+  'conn.onboardConsoleReady':
+    'Console account included: VNC works right after onboarding, the password is stored in the panel',
+  'conn.onboardConsoleChip': 'with console',
   'conn.onboardUsesOption': '{n} uses',
   'conn.onboardUsesUnlimitedOption': 'Unlimited',
   'conn.onboardUsesLeft': 'Uses: {left} left of {total}',

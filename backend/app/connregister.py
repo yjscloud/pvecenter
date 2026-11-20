@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS connection_register_codes (
     expires       BIGINT       NOT NULL DEFAULT 0,
     max_uses      INT          NOT NULL DEFAULT 1,
     used_count    INT          NOT NULL DEFAULT 0,
+    console_enabled TINYINT    NOT NULL DEFAULT 0,
     used          BIGINT       NOT NULL DEFAULT 0,
     used_by       VARCHAR(191) NOT NULL DEFAULT '',
     connection_id VARCHAR(40)  NOT NULL DEFAULT '',
@@ -81,6 +82,12 @@ async def init_table() -> None:
             await db.execute(
                 "ALTER TABLE connection_register_codes"
                 " ADD COLUMN used_count INT NOT NULL DEFAULT 0"
+            )
+        # 控制台账号是可选项：老码按 0（纯只读）补，行为与升级前一致
+        if "console_enabled" not in columns:
+            await db.execute(
+                "ALTER TABLE connection_register_codes"
+                " ADD COLUMN console_enabled TINYINT NOT NULL DEFAULT 0"
             )
         await db.execute(
             "UPDATE connection_register_codes SET used_count=1"
@@ -148,6 +155,8 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "used": used,
         "used_by": str(row.get("used_by") or ""),
         "connection_id": str(row.get("connection_id") or ""),
+        # 这张码是否允许脚本顺带建控制台账号（默认否：只读 + 令牌是常态）
+        "console_enabled": bool(row.get("console_enabled")),
         "status": status,
     }
 
@@ -159,8 +168,14 @@ async def create_code(
     created_by: str,
     ttl_minutes: int = DEFAULT_TTL_MINUTES,
     max_uses: int = DEFAULT_MAX_USES,
+    console_enabled: bool = False,
 ) -> Dict[str, Any]:
-    """签发一张注册码。返回里带**明文**（只此一次）。"""
+    """签发一张注册码。返回里带**明文**（只此一次）。
+
+    ``console_enabled`` 决定脚本要不要顺带建一个带密码的控制台账号：PVE 不接受
+    API Token 换 VNC 票据，没有账号密码就打不开控制台。默认关，纯只读时不额外
+    在节点上留密码。
+    """
     ttl = max(1, min(MAX_TTL_MINUTES, int(ttl_minutes or DEFAULT_TTL_MINUTES)))
     uses = normalize_max_uses(max_uses)
     plain = PREFIX + secrets.token_urlsafe(32)
@@ -175,13 +190,14 @@ async def create_code(
         "expires": now + ttl * 60,
         "max_uses": uses,
         "used_count": 0,
+        "console_enabled": 1 if console_enabled else 0,
     }
     async with database.connect() as db:
         await db.execute(
             "INSERT INTO connection_register_codes"
             " (id, code_hash, region, note, created_by, created, expires,"
-            "  max_uses, used_count)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            "  max_uses, used_count, console_enabled)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 row["id"],
                 row["code_hash"],
@@ -192,6 +208,7 @@ async def create_code(
                 row["expires"],
                 row["max_uses"],
                 row["used_count"],
+                row["console_enabled"],
             ),
         )
         await db.commit()

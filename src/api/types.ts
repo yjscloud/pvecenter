@@ -485,6 +485,8 @@ export interface RegisterCodeIssued {
   used_count: number;
   /** 剩余次数；`null` = 不限次数 */
   remaining: number | null;
+  /** 这张码是否让脚本顺带建控制台账号（密码随机，已回填面板） */
+  console_enabled: boolean;
   /** 安装脚本地址（免登录，凭据在查询串里），可点开让运维先审一遍 */
   script_url: string;
   /** 复制粘贴到节点终端的那一条命令 */
@@ -508,6 +510,8 @@ export interface RegisterCodeRow {
   /** 首次使用时间戳（0 = 从未使用） */
   used: number;
   used_by: string;
+  /** 签发时是否勾了「同时启用控制台」 */
+  console_enabled: boolean;
   /** 最近一次建出的连接 id（未使用 / 失败为空） */
   connection_id: string;
   status: 'active' | 'used' | 'exhausted' | 'expired' | 'revoked';

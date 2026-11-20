@@ -783,6 +783,8 @@ export const connectionsApi = {
     ttl_minutes?: number;
     /** 可用次数：1 = 一次性；0 = 不限 */
     max_uses?: number;
+    /** 让脚本顺带建控制台账号（随机密码 + VM.Console），默认关 */
+    console_enabled?: boolean;
   }) => post<RegisterCodeIssued>('/connections/register-codes', body),
   /** 最近的注册码（不含明文：库里也只有哈希，只回状态） */
   registerCodes: () => get<RegisterCodeRow[]>('/connections/register-codes'),

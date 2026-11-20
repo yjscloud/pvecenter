@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,6 +58,8 @@ from ..schemas import (
     VmDefaultsIn,
     VmQuotaIn,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["config"])
 
@@ -379,7 +382,20 @@ def _register_profile(
         "node_default": payload.node_default or probe["node_names"][0],
         "cluster_key": probe["cluster_key"],
         "imported": int(time.time()),
+        **_console_fields(payload),
     }
+
+
+def _console_fields(payload: ConnectionRegisterIn) -> Dict[str, Any]:
+    """脚本这次带上来的控制台凭据。
+
+    没带就返回空字典 —— 不能返回 ``{"console_user": ""}``：那会把连接里已经填好
+    的控制台账号抹成空，用户下次开控制台才发现「凭据未配置」。
+    """
+    user = (payload.console_user or "").strip()
+    if not user or not payload.console_password:
+        return {}
+    return {"console_user": user, "console_password": payload.console_password}
 
 
 def _merge_registered(
@@ -401,6 +417,7 @@ def _merge_registered(
             "node_default": payload.node_default or probe["node_names"][0],
             "cluster_key": probe["cluster_key"],
             "imported": int(time.time()),
+            **_console_fields(payload),
         }
     )
     if payload.name.strip():
@@ -458,6 +475,7 @@ async def issue_register_code(
         created_by=str(user.get("username") or ""),
         ttl_minutes=payload.ttl_minutes,
         max_uses=payload.max_uses,
+        console_enabled=payload.console_enabled,
     )
     await security.audit(
         request,
@@ -468,6 +486,8 @@ async def issue_register_code(
             "region": row.get("region") or "",
             "ttl_minutes": row.get("ttl_minutes"),
             "max_uses": row.get("max_uses"),
+            # 开了控制台意味着节点上会多一个能操作客户机键盘的账号，必须留痕
+            "console_enabled": bool(row.get("console_enabled")),
         },
     )
     # 脚本地址优先用「设置」里的对外地址：节点常常在另一个网段，管理员从内网
@@ -483,6 +503,7 @@ async def issue_register_code(
         "max_uses": row["max_uses"],
         "used_count": row["used_count"],
         "remaining": row["remaining"],
+        "console_enabled": bool(row.get("console_enabled")),
         "script_url": script_url,
         "command": _onboard_command(script_url),
     }
@@ -601,6 +622,9 @@ async def onboard_script(
         code=code.strip(),
         self_url=self_url,
         force=bool(force),
+        # 是否建控制台账号看**签发时**的记录，不看查询串：允许 URL 自己声明
+        # 「我要控制台」等于让持码者给自己提权
+        console=bool(row.get("console_enabled")),
     )
     return PlainTextResponse(body, headers=headers)
 
@@ -653,6 +677,17 @@ async def register_connection(
             detail="注册码无效，请在面板「节点 · 连接配置 → 一键接入」重新生成",
         )
     code_id = str(code_row.get("id") or "")
+
+    # 控制台凭据只在签发时勾了「同时启用控制台」才接受。没勾的码即便脚本把这两个
+    # 字段塞上来也要丢掉 —— 否则持码者能把一条只读接入悄悄升级成「能操作客户机
+    # 键盘」的接入，比注册码本身授权的范围大出一级。
+    if not bool(code_row.get("console_enabled")) and payload.console_password:
+        logger.info(
+            "注册码 %s 未启用控制台，已忽略脚本提交的控制台凭据", code_id
+        )
+        payload = payload.model_copy(
+            update={"console_user": "", "console_password": ""}
+        )
 
     # 2) 验证凭据与可达性；失败把码退回，让运维改完参数直接重跑
     try:
@@ -707,6 +742,19 @@ async def register_connection(
                 target = merged
                 status = "updated"
                 message = "已更新已有连接的端点与凭据"
+            elif payload.console_password:
+                # 脚本每次执行都会轮换控制台密码（随机生成，没人记得住），所以连接
+                # 虽然已存在也要把新密码写回去 —— 否则面板还拿旧密码换票据，VNC
+                # 直接 401，而用户根本不知道新密码是什么
+                merged = {**target, **_console_fields(payload)}
+                conns = [
+                    merged if str(c.get("id")) == str(target.get("id")) else c
+                    for c in conns
+                ]
+                await store.save_connections(conns)
+                target = merged
+                status = "updated"
+                message = "已同步控制台账号密码"
         elif same_cluster is not None:
             target = same_cluster
             message = (
@@ -726,6 +774,17 @@ async def register_connection(
                 target = merged
                 status = "updated"
                 message = "已把该集群的接入地址更新为本次节点"
+            elif payload.console_password:
+                # 同集群重复执行：地址与令牌不变，但控制台密码被轮换了，得同步
+                merged = {**target, **_console_fields(payload)}
+                conns = [
+                    merged if str(c.get("id")) == str(target.get("id")) else c
+                    for c in conns
+                ]
+                await store.save_connections(conns)
+                target = merged
+                status = "updated"
+                message = "已同步控制台账号密码"
         else:
             profile = {"id": secrets.token_hex(4), **_register_profile(payload, probe, region)}
             conns.append(profile)

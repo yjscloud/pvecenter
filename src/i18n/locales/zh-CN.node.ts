@@ -256,6 +256,12 @@ export const zhNode = {
   'conn.onboardMaxUses': '可用次数',
   'conn.onboardMaxUsesHint':
     '接几台就填几次（1–1000，默认 1 次 = 一次性）；勾「不限次数」则不限额，仍逐次记账',
+  'conn.onboardConsoleTitle': '同时启用控制台（浏览器内 VNC）',
+  'conn.onboardConsoleDesc':
+    'PVE 不接受 API Token 打开 VNC 控制台。勾选后脚本会在节点上另建 pvecenter-console@pve（随机密码，只交给面板）并授予 VM.Audit + VM.Console：能开控制台，仍不能改配置或开关机。不勾则那台机器只有监控与任务，没有浏览器内控制台。',
+  'conn.onboardConsoleReady':
+    '已附带控制台账号：接入后可直接开 VNC，密码已自动写入面板',
+  'conn.onboardConsoleChip': '含控制台',
   'conn.onboardUsesOption': '{n} 次',
   'conn.onboardUsesUnlimitedOption': '不限次数',
   'conn.onboardUsesLeft': '可用次数：还剩 {left} 次（共 {total} 次）',

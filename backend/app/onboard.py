@@ -14,8 +14,12 @@
 3. 本机信息：节点名 + 面板回连地址（可用 ``PVE_ONBOARD_HOST=`` 覆盖）；
 4. 只读账号：建 ``pvecenter@pve`` 并授予 ``PVEAuditor``（幂等）；
 5. API 令牌：``--privsep 0`` 建令牌；已存在则轮换（旧 secret 不可恢复）；
-6. 注册：把地址与令牌 POST 给面板，按返回码区分「码失效 / 冲突 / 连不上」；
-7. 结果确认：核对面板回报的集群与节点指标，打印接入凭据。
+6. 控制台账号（**可选**，注册码签发时勾选）：建 ``pvecenter-console@pve``，随机
+   密码 + 自定义角色 ``VM.Audit VM.Console`` —— PVEAuditor 不含 ``VM.Console``，
+   光有密码仍会被 403；账号与只读账号分开，回收时互不影响；
+7. 注册：把地址、令牌与（可选）控制台凭据 POST 给面板，按返回码区分
+   「码失效 / 冲突 / 连不上」；
+8. 结果确认：核对面板回报的集群与节点指标，打印接入凭据。
 
 失败处理
 --------
@@ -37,6 +41,7 @@ PANEL_TOKEN = "@@PANEL@@"
 CODE_TOKEN = "@@CODE@@"
 SELF_TOKEN = "@@SELF@@"
 FORCE_TOKEN = "@@FORCE@@"
+CONSOLE_TOKEN = "@@CONSOLE@@"
 
 #: 脚本本体。``r"""`` 是必须的：里面全是 ``\033`` / ``\n`` 这类要被 bash
 #: 原样收到的转义，普通字符串会先吃掉一层。
@@ -45,7 +50,7 @@ _SCRIPT = r"""#!/usr/bin/env bash
 #  PVE Center · 一键接入
 #
 #  在 PVE 节点上执行（root）。脚本会：自检环境 -> 建只读账号与令牌 ->
-#  把本节点所在的集群注册到面板 -> 自检接入结果。
+#  （可选）建控制台账号 -> 把本节点所在的集群注册到面板 -> 自检接入结果。
 #
 #  同一个集群只需要在其中一台节点上执行；重复执行是安全的（会轮换令牌并同步
 #  更新面板里的连接，且「什么都没改」的那次不消耗链接的可用次数）。任何一步失败
@@ -61,10 +66,15 @@ PANEL='@@PANEL@@'
 CODE='@@CODE@@'
 SELF_URL='@@SELF@@'
 FORCE=@@FORCE@@                 # 1 = 该集群已接入时改用本节点地址
+CONSOLE=@@CONSOLE@@             # 1 = 顺带建控制台账号（浏览器内 VNC 需要）
 HOST_OVERRIDE="${PVE_ONBOARD_HOST:-}"
 
 PVE_USER='pvecenter@pve'
 PVE_TOKEN='pvecenter'
+# 控制台账号独立于只读账号：登录取票据的账号一旦持有，就等于能操作客户机键盘，
+# 与「面板只读」的承诺分开放，出问题时也好单独回收
+CONSOLE_USER='pvecenter-console@pve'
+CONSOLE_ROLE='PVECenterConsole'
 
 # 有终端才上色：写进日志文件时不带 ANSI 转义
 if [ -t 1 ]; then
@@ -74,7 +84,9 @@ else
 fi
 
 STEP=0
-step() { STEP=$((STEP + 1)); printf '\n%s[%d/7]%s %s\n' "$C_DIM" "$STEP" "$C_END" "$*"; }
+STEP_TOTAL=7
+if [ "$CONSOLE" = '1' ]; then STEP_TOTAL=8; fi
+step() { STEP=$((STEP + 1)); printf '\n%s[%d/%d]%s %s\n' "$C_DIM" "$STEP" "$STEP_TOTAL" "$C_END" "$*"; }
 ok()   { printf '  %s✓%s %s\n' "$C_OK" "$C_END" "$*"; }
 warn() { printf '  %s!%s %s\n' "$C_WARN" "$C_END" "$*"; }
 
@@ -82,16 +94,24 @@ warn() { printf '  %s!%s %s\n' "$C_WARN" "$C_END" "$*"; }
 # 只登记「本脚本改了什么」，回滚时也只动这些，绝不碰面板已有的配置。
 CREATED_USER=0
 TOKEN_TOUCHED=0
+CONSOLE_CREATED=0
 DONE=0
 
 _rollback() {
     if [ "$DONE" = 1 ]; then
         return 0
     fi
-    if [ "$CREATED_USER" = 0 ] && [ "$TOKEN_TOUCHED" = 0 ]; then
+    if [ "$CREATED_USER" = 0 ] && [ "$TOKEN_TOUCHED" = 0 ] && [ "$CONSOLE_CREATED" = 0 ]; then
         return 0
     fi
     printf '\n%s==> 回滚本机改动%s\n' "$C_DIM" "$C_END" >&2
+    if [ "$CONSOLE_CREATED" = 1 ]; then
+        if pveum user delete "$CONSOLE_USER" >/dev/null 2>&1; then
+            printf '  已删除控制台账号 %s\n' "$CONSOLE_USER" >&2
+        else
+            printf '  控制台账号删除失败，请手动执行：pveum user delete %s\n' "$CONSOLE_USER" >&2
+        fi
+    fi
     if [ "$TOKEN_TOUCHED" = 1 ]; then
         if pveum user token remove "$PVE_USER" "$PVE_TOKEN" >/dev/null 2>&1; then
             printf '  已删除 API 令牌 %s!%s\n' "$PVE_USER" "$PVE_TOKEN" >&2
@@ -249,13 +269,47 @@ fi
 ok '令牌就绪（--privsep 0：权限随账号，避免「特权分离」导致读不到指标）'
 
 # ============================================================================
+if [ "$CONSOLE" = '1' ]; then
+    step "准备控制台账号 $CONSOLE_USER"
+
+    # PVE 的 VNC 控制台要先「账号 + 密码」换票据再调 vncproxy，API Token 换不了票据
+    # —— 所以浏览器内控制台必须有一个能登录的账号。密码随机生成，只在注册请求里
+    # 交给面板（落库加密），不打印在屏幕上，也不留在 shell 历史里。
+    CONSOLE_PW=$(python3 -c '
+import secrets, string
+alphabet = string.ascii_letters + string.digits
+print("".join(secrets.choice(alphabet) for _ in range(24)))
+')
+    if [ -z "$CONSOLE_PW" ]; then
+        die '生成控制台密码失败'
+    fi
+
+    if pveum user list --output-format json 2>/dev/null | grep -q "\"$CONSOLE_USER\""; then
+        # 已存在：轮换密码。面板那边会被同一请求覆盖，不会出现「面板用旧密码」。
+        pveum user modify "$CONSOLE_USER" --password "$CONSOLE_PW" >/dev/null
+        warn '控制台账号已存在，密码已轮换（面板会同步更新）'
+    else
+        pveum user add "$CONSOLE_USER" --password "$CONSOLE_PW" \
+            --comment 'PVE Center 控制台账号（仅供面板打开 VNC）' >/dev/null
+        CONSOLE_CREATED=1
+        ok '已创建控制台账号（密码随机，不需要记）'
+    fi
+
+    # PVEAuditor 不含 VM.Console：只有密码也点不开控制台，会直接 403。
+    # 自定义角色只给这两个权限 —— 能看状态、能开控制台，仍然不能改配置、不能开关机。
+    pveum role add "$CONSOLE_ROLE" --privs 'VM.Audit VM.Console' >/dev/null 2>&1 || true
+    pveum acl modify / --users "$CONSOLE_USER" --roles "$CONSOLE_ROLE" >/dev/null
+    ok "已在 / 上授予 $CONSOLE_ROLE（VM.Audit + VM.Console）"
+fi
+
+# ============================================================================
 step '注册到面板'
 
-PAYLOAD=$(python3 - "$CODE" "$HOST_IP" "$NODE_NAME" "$PVE_USER" "$PVE_TOKEN" "$TOKEN_SECRET" "$FORCE" <<'PY'
+PAYLOAD=$(python3 - "$CODE" "$HOST_IP" "$NODE_NAME" "$PVE_USER" "$PVE_TOKEN" "$TOKEN_SECRET" "$FORCE" "$CONSOLE_USER" "${CONSOLE_PW:-}" <<'PY'
 import json, sys
 
-code, host, node, user, token, secret, force = sys.argv[1:8]
-print(json.dumps({
+code, host, node, user, token, secret, force, console_user, console_pw = sys.argv[1:10]
+data = {
     "code": code,
     "host": host,
     "port": 8006,
@@ -263,7 +317,12 @@ print(json.dumps({
     "token_secret": secret,
     "node_name": node,
     "force_update": force == "1",
-}))
+}
+# 只有勾了「同时启用控制台」的注册码才带这两个字段；没勾时面板会丢弃它们
+if console_pw:
+    data["console_user"] = console_user
+    data["console_password"] = console_pw
+print(json.dumps(data))
 PY
 ) || die '组装注册请求失败'
 
@@ -359,6 +418,9 @@ printf '  连接      %s\n' "${CONN_NAME:-未命名}"
 printf '  集群      %s（节点数 %s）\n' "${CLUSTER_KEY:-未知}" "${NODE_COUNT:-?}"
 printf '  PVE       %s\n' "${PVE_VER:-$PVE_VERSION}"
 printf '  本节点    %s @ %s:8006\n' "$NODE_NAME" "$HOST_IP"
+if [ "$CONSOLE" = '1' ]; then
+    printf '  控制台    %s（随机密码已写入面板，可直接开 VNC）\n' "$CONSOLE_USER"
+fi
 if [ "$MAX_USES" = '0' ]; then
     printf '  次数      不限次数（已用 %s 次）\n' "${USED_COUNT:-0}"
 elif [ -n "$MAX_USES" ]; then
@@ -389,17 +451,28 @@ exit 1
 """
 
 
-def render(*, panel: str, code: str, self_url: str, force: bool = False) -> str:
+def render(
+    *,
+    panel: str,
+    code: str,
+    self_url: str,
+    force: bool = False,
+    console: bool = False,
+) -> str:
     """渲染安装脚本。
 
     ``self_url`` 用于在「非 root」时提示用户可以``sudo bash -c "$(curl ...)"``
     重跑 —— 脚本得知道自己的地址，否则只能让用户回面板再复制一次。
+
+    ``console`` 来自**注册码记录**而不是查询串：允许 URL 自己声明「我要控制台」
+    等于让持码者给自己提权，而注册码签发那一刻才是管理员点头的地方。
     """
     return (
         _SCRIPT.replace(PANEL_TOKEN, str(panel or "").rstrip("/"))
         .replace(CODE_TOKEN, str(code or "").strip())
         .replace(SELF_TOKEN, str(self_url or ""))
         .replace(FORCE_TOKEN, "1" if force else "0")
+        .replace(CONSOLE_TOKEN, "1" if console else "0")
     )
 
 
