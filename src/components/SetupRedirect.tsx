@@ -1,9 +1,12 @@
 /* ==========================================================================
    pvecenter — 全新部署时的「初始化入口」
 
-   面板一次都没配过 Proxmox 连接时，让管理员登录后直接落到初始化流程上
-   （连接管理页 + 自动摊开新增表单），而不是先看到仪表盘上一句
-   「还没接入 Proxmox 主机」。
+   面板一次都没配过 Proxmox 连接时，让管理员登录后直接落到连接管理页，
+   而不是先看到仪表盘上一句「还没接入 Proxmox 主机」。
+
+   只落页、不摊开表单：早先这里会带 ``?new=1`` 直接把「新增连接」弹窗推
+   到用户脸上，等于逼他立刻填完一张长表单。现在停在空态，由「手动添加 /
+   批量添加」两个按钮决定怎么接、什么时候接。
 
    三条约束，都是为了让「帮忙」别变成「骚扰」：
 
@@ -97,8 +100,11 @@ export function SetupRedirect() {
     markRedirected();
     if (pathname.startsWith(SETUP_PATH)) return;
 
-    /* replace：不在历史里留一条「仪表盘」，否则用户按返回又回到引导前的位置 */
-    navigate(`${SETUP_PATH}?new=1`, { replace: true });
+    /* replace：不在历史里留一条「仪表盘」，否则用户按返回又回到引导前的位置。
+       只落到连接配置页，**不带 ?new=1** —— 首次登录就替用户摊开一张长表单，
+       像是在催他立刻填完；空态里已经有「手动添加 / 批量添加」两个按钮，
+       让他自己选什么时候开始更合适。 */
+    navigate(SETUP_PATH, { replace: true });
   }, [configured, loading, hasData, isAdmin, pathname, navigate]);
 
   return null;
