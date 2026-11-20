@@ -21,7 +21,13 @@ import { useT } from '../i18n';
 import { Card } from './ui/Card';
 import { EmptyState, ErrorState } from './ui/EmptyState';
 import { Button } from './ui/Button';
-import { IconAlert, IconPlug, IconPlus, IconRefresh } from './Icons';
+import {
+  IconAlert,
+  IconPlug,
+  IconPlus,
+  IconRefresh,
+  IconTerminal,
+} from './Icons';
 
 /** 「添加节点」跳转的目标：连接管理页，并让它自动摊开新增表单 */
 const SETUP_PATH = '/nodes/connections';
@@ -101,13 +107,24 @@ export function SetupRequired({
       {t('setup.pveManage')}
     </Button>
   ) : (
-    <Button
-      variant="primary"
-      icon={<IconPlus size={15} />}
-      onClick={() => navigate(`${SETUP_PATH}?new=1`)}
-    >
-      {t('setup.pveAction')}
-    </Button>
+    /* 未配置时给两条路：手动（填地址与 Token）适合一两台；批量（注册码 + 一条
+       命令）适合整机房。只给「添加节点」的话，装机房的人根本不知道还有第二种。 */
+    <div className="empty-actions">
+      <Button
+        variant="primary"
+        icon={<IconPlus size={15} />}
+        onClick={() => navigate(`${SETUP_PATH}?new=1`)}
+      >
+        {t('setup.pveActionManual')}
+      </Button>
+      <Button
+        variant="secondary"
+        icon={<IconTerminal size={15} />}
+        onClick={() => navigate(`${SETUP_PATH}?onboard=1`)}
+      >
+        {t('setup.pveActionBulk')}
+      </Button>
+    </div>
   );
 
   const action =

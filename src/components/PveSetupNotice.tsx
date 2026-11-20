@@ -80,10 +80,21 @@ export function PveSetupNotice() {
       tone="info"
       icon={<IconPlug size={16} />}
       title={t('setup.pveTitle')}
+      /* 与页面里的引导态同一套两条路：手动填表 / 批量生成命令。
+         条形提示上放两个 sm 按钮，窄屏由 .empty-actions 自动折行 */
       action={
-        <Button size="sm" onClick={() => navigate(`${SETUP_PATH}?new=1`)}>
-          {t('setup.pveAction')}
-        </Button>
+        <div className="empty-actions">
+          <Button size="sm" onClick={() => navigate(`${SETUP_PATH}?new=1`)}>
+            {t('setup.pveActionManual')}
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => navigate(`${SETUP_PATH}?onboard=1`)}
+          >
+            {t('setup.pveActionBulk')}
+          </Button>
+        </div>
       }
     >
       {t('setup.pveDesc')}

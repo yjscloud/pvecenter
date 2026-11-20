@@ -273,10 +273,11 @@ export const zhCore = {
   /* 「还没配置」不是故障：文案要说清「去做什么」，且管理员与普通用户看到的不一样 */
   'setup.pveTitle': '面板还没有接入 Proxmox 主机',
   'setup.pveDesc':
-    '填写 PVE 的访问地址与 API Token 即可开始管理。点下面的「添加节点」，或进入「节点 → 连接管理」。',
+    '填写 PVE 的访问地址与 API Token 即可开始管理：一两台点「手动添加」；整机房、跨网段点「批量添加」，生成一条命令在节点上执行即可。',
   'setup.pveUserTitle': '系统尚未完成初始化',
   'setup.pveUserDesc': '管理员还没有配置 Proxmox 连接，请联系管理员处理。',
-  'setup.pveAction': '添加节点',
+  'setup.pveActionManual': '手动添加',
+  'setup.pveActionBulk': '批量添加',
   'setup.pveManage': '连接管理',
 
   /* --------------------------------------------------- PVE 连不上的提示 */

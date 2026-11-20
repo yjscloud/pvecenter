@@ -282,11 +282,12 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   /* ------------------------------------------- Proxmox not configured yet */
   'setup.pveTitle': 'No Proxmox host connected yet',
   'setup.pveDesc':
-    'Enter the PVE address and an API token to get started. Use “Add node” below, or open “Nodes → Connections”.',
+    'Enter the PVE address and an API token to get started: for one or two hosts use “Add manually”; for a whole room or another subnet use “Add in bulk”, which gives you one command to run on the node.',
   'setup.pveUserTitle': 'Setup is not complete yet',
   'setup.pveUserDesc':
     'An administrator has not configured the Proxmox connection yet. Please contact an administrator.',
-  'setup.pveAction': 'Add node',
+  'setup.pveActionManual': 'Add manually',
+  'setup.pveActionBulk': 'Add in bulk',
   'setup.pveManage': 'Connections',
 
   /* ------------------------------------------------- Cannot reach Proxmox */
