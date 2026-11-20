@@ -215,7 +215,8 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'conn.repairTitle': 'Grant PVEAdmin to this connection’s API token to fix permission issues such as unreadable node CPU / memory',
   'conn.deleteAria': 'Delete connection {name}',
   'conn.empty': 'No connection saved yet',
-  'conn.emptyDesc': 'Once the first Proxmox host is connected, its nodes appear on the Nodes page and its VMs / containers are managed too.',
+  'conn.emptyDesc':
+    'Once the first Proxmox host is connected, its nodes appear on the Nodes page and its VMs / containers are managed too. For one or two hosts use “Add manually”; for a whole room or another subnet use “Add in bulk”, which gives you one command to run on the node.',
   'conn.notImplTitle': 'The connection API is not implemented yet',
   'conn.notImplMsg': 'The backend returned “not implemented” for /config/connection, so cluster connection settings cannot be read or saved.',
   'conn.editTitle': 'Edit connection',

@@ -798,9 +798,24 @@ export function ConnectionManager({
           description={t('conn.emptyDesc')}
           action={
             isAdmin ? (
-              <Button variant="primary" icon={<IconPlus size={15} />} onClick={startNew}>
-                {t('conn.add')}
-              </Button>
+              /* 与节点页空态、总览页引导态同一组入口：手动填表，或签发注册码让
+                 节点自己接进来。这一页本来就有两个弹窗，不必再跳一次 */
+              <div className="empty-actions">
+                <Button
+                  variant="primary"
+                  icon={<IconPlus size={15} />}
+                  onClick={startNew}
+                >
+                  {t('setup.pveActionManual')}
+                </Button>
+                <Button
+                  variant="secondary"
+                  icon={<IconTerminal size={15} />}
+                  onClick={() => setOnboardOpen(true)}
+                >
+                  {t('setup.pveActionBulk')}
+                </Button>
+              </div>
             ) : undefined
           }
         />

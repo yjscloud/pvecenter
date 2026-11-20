@@ -209,7 +209,8 @@ export const zhNode = {
   'conn.repairTitle': '给该连接的 API Token 授予 PVEAdmin，修复「读不到节点 CPU / 内存」等权限问题',
   'conn.deleteAria': '删除连接 {name}',
   'conn.empty': '还没有保存任何连接',
-  'conn.emptyDesc': '接入第一台 Proxmox 主机后，它的节点会出现在「节点」页，虚拟机 / 容器也会一并纳管。',
+  'conn.emptyDesc':
+    '接入第一台 Proxmox 主机后，它的节点会出现在「节点」页，虚拟机 / 容器也会一并纳管。一两台用「手动添加」填地址与 Token；整机房、跨网段用「批量添加」生成一条命令在节点上执行。',
   'conn.notImplTitle': '连接配置接口尚未实现',
   'conn.notImplMsg': '后端 /config/connection 返回未实现，无法读取或保存集群连接信息。',
   'conn.editTitle': '编辑连接',
