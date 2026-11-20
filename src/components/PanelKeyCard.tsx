@@ -20,6 +20,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { sshPanelKeyApi } from '../api/endpoints';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../hooks/useToast';
+import { copyText } from '../utils/clipboard';
 import { useT } from '../i18n';
 import { Badge } from './ui/Badge';
 import { Button } from './ui/Button';
@@ -55,12 +56,12 @@ export function PanelKeyCard() {
 
   const copy = async () => {
     if (!key?.public) return;
-    try {
-      await navigator.clipboard.writeText(key.public);
+    /* 走 copyText：http 内网部署下 navigator.clipboard 不存在 */
+    if (await copyText(key.public)) {
       toast.success(t('panelKey.copied'), t('panelKey.copiedHint'));
-    } catch {
-      toast.error(t('common.copyFailed'), t('common.clipboardDenied'));
+      return;
     }
+    toast.error(t('common.copyFailed'), t('common.clipboardDenied'));
   };
 
   const rotate = async () => {

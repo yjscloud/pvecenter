@@ -28,6 +28,7 @@ import { Modal } from './ui/Modal';
 import { Notice } from './ui/EmptyState';
 import { IconCheck, IconCopy, IconInfo, IconLink, IconTerminal } from './Icons';
 import { useToast } from '../hooks/useToast';
+import { copyText } from '../utils/clipboard';
 import { useT, type TFunc } from '../i18n';
 import type { RegisterCodeIssued, RegisterCodeRow } from '../api/types';
 
@@ -162,12 +163,11 @@ export function ConnectionOnboardModal({
       /* 拿到链接后用户的下一个动作一定是「粘贴到终端」，顺手复制一次：
          少了「再来点一下复制」这一步。浏览器拒绝写剪贴板就静默跳过，
          按钮还在，不会卡住流程。 */
-      try {
-        await navigator.clipboard.writeText(data.command || fallbackCommand(data));
+      if (
+        await copyText(data.command || fallbackCommand(data))
+      ) {
         setCopied(true);
         toast.success(t('conn.onboardAutoCopied'));
-      } catch {
-        /* 交给「复制命令」按钮 */
       }
     } catch (err) {
       setIssueError(errorMessage(err));
@@ -179,13 +179,14 @@ export function ConnectionOnboardModal({
 
   const copyCommand = async () => {
     if (!issued) return;
-    try {
-      await navigator.clipboard.writeText(command);
+    /* 走 copyText：http 内网部署下 navigator.clipboard 不存在，直接用它会
+       永远失败（见 utils/clipboard） */
+    if (await copyText(command)) {
       setCopied(true);
       toast.success(t('conn.onboardCopied'));
-    } catch {
-      toast.error(t('conn.onboardCopyFailed'));
+      return;
     }
+    toast.error(t('conn.onboardCopyFailed'));
   };
 
   const revoke = async (id: string) => {

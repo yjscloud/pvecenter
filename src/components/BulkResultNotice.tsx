@@ -22,6 +22,7 @@ import { Badge } from './ui/Badge';
 import { SegmentedControl } from './ui/Input';
 import { IconChevronDown, IconCopy } from './Icons';
 import { useToast } from '../hooks/useToast';
+import { copyText } from '../utils/clipboard';
 import { useT, type MessageKey } from '../i18n';
 import type { BulkAction, BulkItemResult, BulkResponse } from '../api/types';
 
@@ -105,17 +106,18 @@ export function BulkResultNotice({
           }`,
       );
     if (lines.length === 0) return;
-    try {
-      await navigator.clipboard.writeText(
-        `${t('bulk.failedList', { label, count: lines.length, unit })}\n${lines.join('\n')}`,
-      );
+    /* 走 copyText：http 内网部署下 navigator.clipboard 不存在 */
+    const ok = await copyText(
+      `${t('bulk.failedList', { label, count: lines.length, unit })}\n${lines.join('\n')}`,
+    );
+    if (ok) {
       toast.success(
         t('bulk.copyList'),
         t('bulk.copiedHint', { count: lines.length, unit }),
       );
-    } catch {
-      toast.error(t('common.copyFailed'), t('common.clipboardDenied'));
+      return;
     }
+    toast.error(t('common.copyFailed'), t('common.clipboardDenied'));
   };
 
   return (
