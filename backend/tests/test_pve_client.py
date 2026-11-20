@@ -33,6 +33,7 @@ from app.pve import (  # noqa: E402
     ProxmoxClient,
     ProxmoxError,
     error_code_headers,
+    explain_clone_error,
     node_from_upid,
     task_exit_ok,
 )
@@ -737,6 +738,23 @@ ROUTES = {
     ("GET", "/api2/json/storage"): lambda: STORAGES,
     ("GET", "/api2/json/nodes/pve1/network"): lambda: [NIC],
     ("GET", "/api2/json/nodes/pve1/tasks"): lambda: [TASK],
+    # 节点级列表：/api/vms 与 /api/lxc 用它拿 vmid 清单。**刻意不带 ostype** ——
+    # 真实 PVE（实测 8.4 / 9.2）的 `/nodes/{node}/qemu` 与 `/lxc` 都没有这个字段，
+    # ostype 只在各机自己的 config 里（见 app/guestostype.py）。想补图标就得走
+    # config，下面的 100 / 9000 / 101 config 路由就是那条路。
+    (
+        "GET",
+        "/api2/json/nodes/pve1/qemu",
+    ): lambda: [
+        {"vmid": 100, "name": "web-01"},
+        {"vmid": 9000, "name": "ubuntu-template"},
+    ],
+    (
+        "GET",
+        "/api2/json/nodes/pve1/lxc",
+    ): lambda: [{"vmid": 101, "name": "ct-101"}],
+    # 容器的 config：ostype 是具体发行版（`debian`），这是容器图标唯一的来源。
+    ("GET", "/api2/json/nodes/pve1/lxc/101/config"): lambda: {"ostype": "debian"},
     ("POST", "/api2/json/nodes/pve1/qemu"): lambda: (
         "UPID:pve1:0000A1B2:00C3D4E5:65F00001:qmcreate:105:root@pam:"
     ),
@@ -746,6 +764,9 @@ ROUTES = {
     ("POST", "/api2/json/nodes/pve1/qemu/100/status/start"): lambda: (
         "UPID:pve1:0000A1B3:00C3D4E6:65F00002:qmstart:100:root@pam:"
     ),
+    # 模板机的 config：`/api/templates` 靠它补 ostype。刻意与模板名（ubuntu-template）
+    # 不一致 —— 模板可以同名而系统不同，图标必须认 ostype 这个硬事实。
+    ("GET", "/api2/json/nodes/pve1/qemu/9000/config"): lambda: {"ostype": "win11"},
     ("POST", "/api2/json/nodes/pve1/qemu/9000/template"): lambda: (
         "UPID:pve1:0000A1B5:00C3D4E8:65F00004:qmtemplate:9000:root@pam:"
     ),
@@ -1249,3 +1270,28 @@ class TestConsoleWsUrl:
         assert "/vncwebsocket?" in url
         assert "termwebsocket" not in url
 
+
+def test_clone_permission_error_is_not_blamed_on_the_storage() -> None:
+    """403 VM.Clone 不能被翻译成「改成完整克隆」：改克隆方式永远不会成功。
+
+    真实报错::
+
+        Permission check failed (/vms/102, VM.Clone)
+
+    一键接入原先只授 PVEAuditor，于是克隆必然走到这里；用户照着「改用完整克隆」
+    重试，只会再失败一次。
+    """
+    raw = "Permission check failed (/vms/102, VM.Clone)"
+    for full in (False, True):
+        text = explain_clone_error(raw, full)
+        assert raw in text
+        assert "VM.Clone" in text
+        assert "force=1" in text
+        # 不许再出现「存储不支持链接克隆」这种误导
+        assert "存储支持链接克隆" not in text
+
+
+def test_clone_vmid_conflict_is_explained() -> None:
+    text = explain_clone_error("config file already exists", False)
+    assert "VMID" in text
+    assert "存储支持链接克隆" not in text

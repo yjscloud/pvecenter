@@ -90,12 +90,67 @@ class TestDefinitions:
         assert quota.GROUP_GUEST_KIND["ct"] == "lxc"
         assert quota.GROUP_GUEST_KIND["vm"] == "vm"
 
+    def test_kind_group_is_the_inverse(self) -> None:
+        """反方向（``lxc`` → ``ct``）也必须有一张表，且正好是它的逆。
+
+        :func:`quota.usage` 拿到的是上半部分的 ``vm`` / ``lxc``，而
+        ``summarise_usage`` / ``effective_limits`` 的键是 ``vm`` / ``ct``。
+        直接拿 ``"lxc"`` 去索引 ``GROUP_GUEST_KIND`` 会抛 ``KeyError: 'lxc'``
+        —— 那就是「保存容器额度 → 服务器内部错误：'lxc'」的成因。
+        """
+        assert set(quota.KIND_GROUP) == set(quota.GUEST_KINDS)
+        assert quota.KIND_GROUP == {"vm": "vm", "lxc": "ct"}
+        for kind in quota.GUEST_KINDS:
+            assert quota.GROUP_GUEST_KIND[quota.KIND_GROUP[kind]] == kind
+
     def test_empty_limits_shape(self) -> None:
         limits = quota.empty_limits()
         assert set(limits) == set(quota.LIMIT_GROUPS)
         for group, fields in quota.LIMIT_GROUPS.items():
             assert set(limits[group]) == set(fields)
             assert all(value is None for value in limits[group].values())
+
+
+# ------------------------------------------------------------------ 读数（usage）
+class TestUsageReading:
+    """``usage()`` 对两类 guest 都要能算 —— 容器那一支曾经整条 500。
+
+    回归的是「设置 →「创建默认值」→ 保存（含容器额度）→ 操作失败：服务器内部
+    错误：'lxc'」。它同时影响 ``GET /config/lxc-quota`` 与 ``GET /lxc/quota``，
+    也就是容器创建向量的额度提示与「还能建几台」的判据。
+    """
+
+    def test_container_quota_reading_does_not_raise(self, monkeypatch) -> None:
+        async def _guest_rows():
+            return (
+                [
+                    {"type": "lxc", "node": "pve", "vmid": 100, "connection_id": ""},
+                    {"type": "qemu", "node": "pve", "vmid": 200, "connection_id": ""},
+                ],
+                None,
+            )
+
+        async def _get_quota(_kind: str):
+            return 10
+
+        monkeypatch.setattr(quota, "guest_rows", _guest_rows)
+        monkeypatch.setattr(quota, "get_quota", _get_quota)
+        monkeypatch.setattr(quota.security, "is_admin", lambda _user: True)
+        monkeypatch.setattr(quota.security, "has_user_permission", lambda _u, _p: True)
+
+        user = {"username": "admin", "role": "admin"}
+        got = asyncio.run(quota.usage(user, "lxc"))
+
+        assert got["kind"] == "lxc"
+        assert got["label"] == "容器"
+        assert got["used"] == 1  # 只数容器；虚拟机那台不能算进容器额度
+        assert got["quota"] == 10
+        assert got["scope"] == "global"
+
+        # 虚拟机那一支不受影响：同一条读数里只数 qemu
+        vm = asyncio.run(quota.usage(user, "vm"))
+        assert vm["kind"] == "vm"
+        assert vm["used"] == 1
 
 
 # -------------------------------------------------------------- 规范化输入
@@ -900,7 +955,10 @@ class _DeadClient:
 
 
 def _reconcile(monkeypatch, targets):
-    monkeypatch.setattr(quota, "all_connection_clients", lambda: targets)
+    # 对账走 collection_targets()（"有没有保存过连接"与"有没有可采集的连接"分开判断，
+    # 全被暂停时不能回退到兜底客户端）。这里打桩的是它，不是更早的
+    # all_connection_clients —— 打桩打空会让这组用例全报 AttributeError。
+    monkeypatch.setattr(quota, "collection_targets", lambda: targets)
     return _db_run(quota.reconcile_owners())
 
 

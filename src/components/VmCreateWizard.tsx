@@ -843,7 +843,7 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
      配置），拿去批量开出来的机器要么起不来，要么几台之间 MAC 冲突。模板才是
      PVE 认可的、被「冻结」过的干净基线。没有模板时宁可让克隆源为空并给出提示，
      也不要给出一堆看着能用、实际会出问题的选项。 */
-  const cloneSources = useMemo(() => {
+  const templatesOnConn = useMemo(() => {
     /* 两道过滤：
 
        * 类型 —— 只能克隆虚拟机模板。后端已按 ``guest_type=qemu`` 收窄，这里再挡
@@ -859,6 +859,32 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
           tpl.connection_id === targetConn),
     );
   }, [templatesQuery.data, targetConn]);
+
+  /* 再按**目标节点**收紧：克隆源与新建目标是两个节点，`clone_from.node` 取自模板
+     自己所在的那台，跟 `form.node` 无关 —— 所以这里的过滤只能用 `tpl.node` 去比
+     `form.node`，不能拿提交结构去反推。模板的盘在本机，选了一台没有模板的节点
+     照样列出别节点的模板，用户挑完、提交，才在 PVE 那边吃一个「模板不存在 /
+     无法访问」；宁可当场说「这个节点没有模板」。
+
+     节点还没定下来时（首屏自动填节点之前）先不收紧，避免闪一下空列表。 */
+  const cloneSources = useMemo(
+    () =>
+      form.node
+        ? templatesOnConn.filter((tpl) => tpl.node === form.node)
+        : templatesOnConn,
+    [templatesOnConn, form.node],
+  );
+
+  /* 别的节点上有什么 —— 只用于把「这台节点没有，那 pve9-1 上有」讲清楚。
+     直接列出来的话用户会以为模板就在本机（模板的盘在本机，克隆不过去），
+     所以只点名，不进候选。 */
+  const cloneTemplatesElsewhere = useMemo(() => {
+    const list = form.node
+      ? templatesOnConn.filter((tpl) => tpl.node !== form.node)
+      : [];
+    const nodes = Array.from(new Set(list.map((tpl) => tpl.node)));
+    return { count: list.length, nodes };
+  }, [templatesOnConn, form.node]);
 
   /* 目标主机上已被占用的 VMID（含模板）。普通用户拿到的列表按归属过滤过，
      只包含自己名下的机器，所以这里只做「发现即拦截」，不声称覆盖全部占用；
@@ -876,12 +902,17 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
     [cloneSources, t],
   );
 
+  /* form.cloneFrom 存的是选择器的唯一值（连接|节点|VMID）：不同 PVE 上节点名与
+     VMID 都可能重复，只按 `node:vmid` 找会命中另一台主机的同名模板 —— 摘要卡与
+     Logo 都会显示成别人的。先从候选回原始标识，再回接口记录。 */
   const selectedCloneSource: TemplateItem | undefined = useMemo(() => {
     if (!form.cloneFrom) return undefined;
-    const [node, vmidStr] = form.cloneFrom.split(':');
+    const picked = clonePickItems.find((item) => item.value === form.cloneFrom);
+    if (!picked) return undefined;
+    const [node, vmidStr] = picked.raw.split(':');
     const vmid = Number(vmidStr);
     return cloneSources.find((v) => v.node === node && v.vmid === vmid);
-  }, [form.cloneFrom, cloneSources]);
+  }, [form.cloneFrom, clonePickItems, cloneSources]);
 
   /* 面板默认克隆方式：只用来给「链接 / 完整」两张卡片标一个「默认」（见下面
      第 2 步的 clone-method 卡片），不改写用户已选的值 */
@@ -894,12 +925,23 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
   useEffect(() => {
     if (!open || autoPickedRef.current) return;
     if (form.mode !== 'clone' || form.cloneFrom) return;
-    const first = cloneSources[0];
+    const first = clonePickItems[0];
     if (first) {
       autoPickedRef.current = true;
-      setForm((f) => (f.cloneFrom ? f : { ...f, cloneFrom: `${first.node}:${first.vmid}` }));
+      setForm((f) => (f.cloneFrom ? f : { ...f, cloneFrom: first.value }));
     }
-  }, [open, form.mode, form.cloneFrom, cloneSources]);
+  }, [open, form.mode, form.cloneFrom, clonePickItems]);
+
+  /* 目标节点一换，候选就换了一份：原来选中的模板若已不在列表里就清掉，交给上面
+     那段「默认选中第一个」按新节点重挑。不清的话界面上一个都没选中，提交时却还
+     带着上一台节点的 `clone_from.node` —— 源节点与目标节点是两回事，后端不会替
+     你纠正，克隆会直接打到模板不在的那台机器上。 */
+  useEffect(() => {
+    if (!open || !form.cloneFrom) return;
+    if (clonePickItems.some((item) => item.value === form.cloneFrom)) return;
+    autoPickedRef.current = false;
+    setForm((f) => (f.cloneFrom === form.cloneFrom ? { ...f, cloneFrom: '' } : f));
+  }, [open, form.cloneFrom, clonePickItems]);
 
   /* ---- 通用更新 ---- */
   const update = useCallback(<K extends keyof FormState>(key: K, value: FormState[K]) => {
@@ -1648,7 +1690,16 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                   error={errors.cloneFrom}
                   hint={
                     cloneSources.length === 0
-                      ? t('templatePicker.vmEmptyHint')
+                      ? /* 这台节点没有模板时，点名「哪台节点上有几个」：用户刚在
+                           模板页见过 ubuntu24，不点名他会以为列表坏了，反复刷新。
+                           共享存储的模板本来能跨节点克隆，这句也把出路写出来。 */
+                        cloneTemplatesElsewhere.count
+                        ? t('templatePicker.vmEmptyOnNode', {
+                            node: form.node,
+                            others: cloneTemplatesElsewhere.nodes.join(' / '),
+                            n: cloneTemplatesElsewhere.count,
+                          })
+                        : t('templatePicker.vmEmptyHint')
                       : t('templatePicker.vmHint')
                   }
                 >
@@ -1669,7 +1720,9 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                   </Notice>
                 ) : null}
 
-                {cloneSources.length === 0 && !templatesQuery.isLoading ? (
+                {/* 只有**整条连接**上都没有模板时才说「这台 PVE 没有克隆源」；
+                    仅仅是当前节点没有的话，上面的 hint 已经点名别的节点了。 */}
+                {templatesOnConn.length === 0 && !templatesQuery.isLoading ? (
                   <Notice
                     tone="warning"
                     title={t('vmCreate.cloneSourceEmptyTitle')}
@@ -2666,7 +2719,7 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                       value={
                         selectedCloneSource
                           ? `${selectedCloneSource.name || selectedCloneSource.vmid} @ ${selectedCloneSource.node}`
-                          : form.cloneFrom || '—'
+                          : '—'
                       }
                     />
                     <SummaryRow

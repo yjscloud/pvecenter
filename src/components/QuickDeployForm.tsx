@@ -425,10 +425,14 @@ export function QuickDeployForm({
     templateTouchedRef.current = false;
   }, [targetConn]);
 
-  /* 换节点：节点名不通用，存储与模板也跟着变 */
+  /* 换节点：节点名不通用，存储与模板也跟着变。模板列表现在按节点收窄了（见
+     vmPickItems），旧的那个选中值已经不在候选里 —— 不清掉的话，界面上显示的是
+     A 节点的模板、提交出去的却是 B 节点的 node:vmid。 */
   useEffect(() => {
     setStorage('');
     setOsTemplate('');
+    setTemplateRef('');
+    templateTouchedRef.current = false;
   }, [node]);
 
   /* 网桥默认取节点上的第一个（通常是 vmbr0），所有还没选网桥的网卡一起填上。
@@ -727,20 +731,42 @@ export function QuickDeployForm({
 
   /* 模板选择器的候选：只有「属于当前连接」这一层过滤是快速部署自己的业务，
      其余映射（名称 / 两列容量 / 标签 / 摘要说明）与自定义部署共用同一份
-     （见 utils/templatePick）。 */
+     （见 utils/templatePick）。
+
+     还要按**节点**过滤：虚拟机克隆的磁盘来自模板自身，模板在 pve9-1 上就克隆不到
+     pve9-2 去（除非那块盘在共享存储上，而模板本身也不保证）。原先只按连接过滤，
+     选了没模板的节点照样列出别的节点的模板 —— 用户挑完、提交，才在 PVE 那边吃
+     一个「模板不存在 / 无法访问」。宁可当场说「这个节点没有模板」。 */
   const vmPickItems = useMemo(
     () =>
       vmTemplatePickItems(
         (templatesQuery.data ?? []).filter(
           (tpl) =>
-            !targetConn ||
-            !tpl.connection_id ||
-            tpl.connection_id === targetConn,
+            (!targetConn ||
+              !tpl.connection_id ||
+              tpl.connection_id === targetConn) &&
+            (!node || tpl.node === node),
         ),
         t,
       ),
-    [templatesQuery.data, targetConn, t],
+    [templatesQuery.data, targetConn, node, t],
   );
+
+  /* 别的节点上有什么 —— 只用于把「这台节点没有，那 pve9-1 上有」讲清楚。
+     直接列出来的话用户会以为模板就在本机（模板的盘在本机，克隆不过去），
+     所以只点名，不进候选。 */
+  const vmTemplatesElsewhere = useMemo(() => {
+    const list = (templatesQuery.data ?? []).filter(
+      (tpl) =>
+        (!targetConn ||
+          !tpl.connection_id ||
+          tpl.connection_id === targetConn) &&
+        Boolean(node) &&
+        tpl.node !== node,
+    );
+    const nodes = Array.from(new Set(list.map((tpl) => tpl.node)));
+    return { count: list.length, nodes };
+  }, [templatesQuery.data, targetConn, node]);
 
   const ctPickItems = useMemo(
     () => ctTemplatePickItems(osTemplatesQuery.data ?? []),
@@ -895,9 +921,11 @@ export function QuickDeployForm({
       const nicRate = (nic: QuickNic) =>
         nic.rate.trim() ? Number(nic.rate) : undefined;
 
-      /* `node:vmid` —— 与自定义部署的选择器同一个值格式（见 utils/templatePick），
-         节点的名字里不会出现冒号 */
-      const [tplNode, tplVmid] = templateRef.split(':');
+      /* 选择器里存的是**唯一值**（连接|节点|VMID），提交要的是 `node:vmid`。
+         必须回候选表里按值取回原始标识：不同 PVE 上节点名与 VMID 都可能重复，
+         直接 split 会把「另一个连接上的同名模板」当成克隆源。 */
+      const pickedVmTpl = vmPickItems.find((item) => item.value === templateRef);
+      const [tplNode, tplVmid] = (pickedVmTpl?.raw ?? '').split(':');
 
       const buildVmPayload = (
         instanceName: string,
@@ -949,7 +977,10 @@ export function QuickDeployForm({
         batchIndex: number,
       ): LxcCreateRequest => ({
         node,
-        ostemplate: osTemplate,
+        /* 选择值是唯一标识（连接|节点|volid），PVE 要的是 volid 本身 */
+        ostemplate:
+          ctPickItems.find((item) => item.value === osTemplate)?.raw ??
+          osTemplate,
         storage,
         name: instanceName,
         rootfs: spec.disk,
@@ -1298,10 +1329,21 @@ export function QuickDeployForm({
                   ? errorMessage(templatesQuery.error)
                   : vmPickItems.length
                     ? t('templatePicker.vmHint')
-                    : t('templatePicker.vmEmptyHint')
+                    : /* 这台节点没有模板时，点名「哪台节点上有几个」：用户刚在
+                         截图里见过 ubuntu24，不点名他会以为列表坏了，反复刷新。
+                         共享存储的模板本来能跨节点克隆，这句也把出路写出来。 */
+                      vmTemplatesElsewhere.count
+                      ? t('templatePicker.vmEmptyOnNode', {
+                          node,
+                          others: vmTemplatesElsewhere.nodes.join(' / '),
+                          n: vmTemplatesElsewhere.count,
+                        })
+                      : t('templatePicker.vmEmptyHint')
                 : osTemplatesQuery.isError
                   ? errorMessage(osTemplatesQuery.error)
-                  : t('templatePicker.ctHint')
+                  : ctPickItems.length || !node
+                    ? t('templatePicker.ctHint')
+                    : t('templatePicker.ctEmptyOnNode', { node })
             }
           >
             <SystemTemplatePicker

@@ -485,8 +485,6 @@ export interface RegisterCodeIssued {
   used_count: number;
   /** 剩余次数；`null` = 不限次数 */
   remaining: number | null;
-  /** 这张码是否让脚本顺带建控制台账号（密码随机，已回填面板） */
-  console_enabled: boolean;
   /** 安装脚本地址（免登录，凭据在查询串里），可点开让运维先审一遍 */
   script_url: string;
   /** 复制粘贴到节点终端的那一条命令 */
@@ -510,8 +508,6 @@ export interface RegisterCodeRow {
   /** 首次使用时间戳（0 = 从未使用） */
   used: number;
   used_by: string;
-  /** 签发时是否勾了「同时启用控制台」 */
-  console_enabled: boolean;
   /** 最近一次建出的连接 id（未使用 / 失败为空） */
   connection_id: string;
   status: 'active' | 'used' | 'exhausted' | 'expired' | 'revoked';
@@ -628,6 +624,8 @@ export interface FleetStatus {
 /** 「一键修复令牌权限」的结果：给该连接的 API Token 授予 PVEAdmin */
 export interface ConnectionRepairResult {
   ok: boolean;
+  /** true = 令牌本来就全权，这次只是探了一下，没有改任何 ACL */
+  already_ok: boolean;
   token_id: string;
   role: string;
   /** 授权后该令牌的有效权限，形如 "VM.Audit@/" */
@@ -1740,6 +1738,15 @@ export interface VmSummary {
    * ``vmid`` 留给排查与跳转，不显示在表格里，避免出现完整路径或多余信息。
    */
   source_template?: { node: string; vmid: number; name: string } | null;
+  /**
+   * 客户机自己的系统类型：qemu 是 ``l26`` / ``win11``，容器是 ``debian`` /
+   * ``ubuntu`` / ``alpine`` 这类发行版名（读取自 PVE 的节点级列表，每节点一次
+   * 请求 + 2 分钟缓存）。
+   *
+   * 列表页的「操作系统」列要靠它：没有克隆记录的机器（PVE 上原有的、ISO 装的、
+   * 导入的）既没有来源模板也没有人工标注，只按名称判断时整列都是空白。
+   */
+  ostype?: string;
 }
 
 /** guest 类型：虚拟机 / 容器 */
@@ -2258,6 +2265,15 @@ export interface LxcTemplateItem {
   name: string;
   size?: number;
   ctime?: number;
+  /**
+   * 这份 vztmpl 是在哪台节点上看到的。**本地存储的两个节点可以各有一份同名文件，
+   * volid 完全相同**（都叫 `local:vztmpl/debian-12.tar.zst`），只有节点能区分；
+   * 共享存储才是同一份，后端已按 volid 去重且 ``shared`` 为 true。
+   */
+  node?: string;
+  shared?: boolean;
+  connection_id?: string;
+  connection_name?: string;
 }
 
 /** 创建容器时的网卡配置 */
@@ -2692,6 +2708,12 @@ export interface TemplateItem {
   guest_type?: 'qemu' | 'lxc';
   /** 客户机 OS 类型；后端当前未填充，保留以便与 VmSummary 对齐 */
   type?: string;
+  /**
+   * PVE 自己认的客户机系统类型（`l26` / `win11` / `debian` …），读自 guest config。
+   * **同名模板不等于同系统**：两台 PVE 上各有一台叫 `ubuntu24` 的模板，其中一台
+   * 可能是 Windows。OS 图标必须靠它兜底，不能只看名称。
+   */
+  ostype?: string;
   maxcpu?: number;
   maxmem?: number;
   maxdisk?: number;

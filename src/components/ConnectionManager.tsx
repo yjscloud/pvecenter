@@ -448,13 +448,21 @@ export function ConnectionManager({
     setRepairingId(p.id);
     try {
       const result = await connectionsApi.repair(p.id);
-      toast.success(
-        t('conn.repairOk'),
-        t('conn.repairOkDetail', {
-          token: result.token_id,
-          n: result.effective_privileges.length,
-        }),
-      );
+      if (result.already_ok) {
+        /* root@pam 的全权令牌：探过一次就够了，本来就没有可补的 ACL */
+        toast.success(
+          t('conn.repairNothing'),
+          t('conn.repairNothingDetail', { token: result.token_id }),
+        );
+      } else {
+        toast.success(
+          t('conn.repairOk'),
+          t('conn.repairOkDetail', {
+            token: result.token_id,
+            n: result.effective_privileges.length,
+          }),
+        );
+      }
       if (!result.node_metrics) {
         toast.warning(t('conn.metricsMissing'), t('conn.metricsMissingDetail'));
       }

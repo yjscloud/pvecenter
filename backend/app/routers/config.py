@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import ssl as ssl_module
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -301,6 +302,43 @@ def _same_cluster(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     return bool(key) and key == str(b.get("cluster_key") or "").strip()
 
 
+#: TLS 握手里的「证书不被信任」几种措辞：OpenSSL / Python 版本不同，文案也不同。
+_TLS_VERIFY_MARKERS = (
+    "certificate_verify_failed",
+    "certificate verify failed",
+    "unable to get local issuer",
+    "self-signed certificate",
+    "self signed certificate",
+)
+
+
+def _is_tls_verify_error(message: str) -> bool:
+    low = (message or "").lower()
+    return any(marker in low for marker in _TLS_VERIFY_MARKERS)
+
+
+def _tls_hint(payload: ConnectionRegisterIn) -> str:
+    """自签证书校验失败时给一句能直接照做的说明。
+
+    这条路上有个很常见的死循环：面板开了 ``PVE_VERIFY_SSL``，PVE 又是出厂自签，
+    于是脚本永远注册不上，而原始报错只有一句 ``unable to get local issuer
+    certificate`` —— 看不出这是「证书没钉扎」还是「面板连不上」。
+    """
+    if payload.ca_cert:
+        # 已经钉扎还失败：要么 PEM 里缺签发者（节点证书是 CA 签的，不是自签），
+        # 要么证书换过了（pvecm updatecerts / 换节点证书）
+        return (
+            "。带的证书和节点当前用的对不上（PEM 缺签发者，或证书换过？）—— "
+            "重跑接入命令会重新取整条证书链；实在不行在面板里把这条连接的"
+            "「证书 PEM」清空后重试"
+        )
+    return (
+        "。PVE 的 pveproxy 出厂是自签证书，面板校验不过才连不上：重跑接入命令即可，"
+        "脚本会把本机证书带上来做钉扎；确实取不到证书时可加 PVE_ONBOARD_INSECURE=1 "
+        "跳过校验，或在面板里给这条连接填「证书 PEM」"
+    )
+
+
 async def _probe_registration(
     payload: ConnectionRegisterIn,
 ) -> Dict[str, Any]:
@@ -335,10 +373,23 @@ async def _probe_registration(
         except ProxmoxError:
             # 单机 / 权限不足：退回「节点名」当指纹，仍然比 host 可靠
             cluster_name = ""
-    except ProxmoxError as exc:
+    except ssl_module.SSLError as exc:
+        # 传上来的 ca_cert 本身读不出来（PEM 结构坏了 / 换行被吃掉）。这条以前是
+        # 裸的 500，只回一句 "no start line: cadata does not contain a certificate"；
+        # 现在明确告诉对方是「证书内容有问题」，本机改动会照常回滚。
         raise HTTPException(
-            status_code=400, detail=f"连接失败：{exc.message}"
+            status_code=400,
+            detail=(
+                f"证书 PEM 无法解析：{exc}。"
+                "重跑接入命令会重新抓取本机证书链；也可以在面板里把这条连接的"
+                "「证书 PEM」清空，让校验回到 PVE_VERIFY_SSL 策略"
+            ),
         ) from exc
+    except ProxmoxError as exc:
+        detail = f"连接失败：{exc.message}"
+        if _is_tls_verify_error(exc.message):
+            detail += _tls_hint(payload)
+        raise HTTPException(status_code=400, detail=detail) from exc
     finally:
         await client.aclose()
 
@@ -475,7 +526,6 @@ async def issue_register_code(
         created_by=str(user.get("username") or ""),
         ttl_minutes=payload.ttl_minutes,
         max_uses=payload.max_uses,
-        console_enabled=payload.console_enabled,
     )
     await security.audit(
         request,
@@ -486,8 +536,8 @@ async def issue_register_code(
             "region": row.get("region") or "",
             "ttl_minutes": row.get("ttl_minutes"),
             "max_uses": row.get("max_uses"),
-            # 开了控制台意味着节点上会多一个能操作客户机键盘的账号，必须留痕
-            "console_enabled": bool(row.get("console_enabled")),
+            # 这张码会在节点上建 root@pam 令牌（全权）与控制台账号，必须留痕
+            "grants_root": True,
         },
     )
     # 脚本地址优先用「设置」里的对外地址：节点常常在另一个网段，管理员从内网
@@ -503,7 +553,6 @@ async def issue_register_code(
         "max_uses": row["max_uses"],
         "used_count": row["used_count"],
         "remaining": row["remaining"],
-        "console_enabled": bool(row.get("console_enabled")),
         "script_url": script_url,
         "command": _onboard_command(script_url),
     }
@@ -576,6 +625,63 @@ async def delete_register_code(
     return {"ok": True}
 
 
+@router.get("/connections/onboard/preflight", include_in_schema=False)
+async def onboard_preflight(
+    code: str = Query(default="", max_length=200),
+    cluster_key: str = Query(default="", max_length=200),
+    host: str = Query(default="", max_length=200),
+    port: int = Query(default=8006, ge=1, le=65535),
+) -> Dict[str, Any]:
+    """脚本动手之前问一句：这台机器 / 这个集群是不是已经接过了（不消费注册码）。
+
+    为什么必须先问：同一个 PVE 集群共用同一份账号与令牌（``/etc/pve`` 是集群级
+    配置）。在第二个节点上再跑一遍脚本，会把**共享的**令牌轮换掉，面板里那条连接
+    当场失效 —— 而脚本接下来很可能还会因为别的原因失败并回滚，等于白拆了别人正在
+    用的凭据。所以脚本在动 ``pveum`` 之前先来问，答案是「已接入」就原地停下。
+
+    只回「有没有」和那条连接的名字 / 地址，不回任何凭据。
+    """
+    row = await connregister.peek(code)
+    if row is None or row.get("status") != "active":
+        return {"code_ok": False, "registered": False}
+
+    key = (cluster_key or "").strip()
+    conns = store.get_connections()
+    hit: Optional[Dict[str, Any]] = None
+    if key:
+        # 集群指纹是权威判据：脚本从 /cluster/status 读到的集群名，面板注册时也是这么
+        # 认的（单机则是 standalone:<节点名>）
+        hit = next(
+            (c for c in conns if str(c.get("cluster_key") or "").strip() == key),
+            None,
+        )
+    elif host:
+        # 读不出集群名（老旧节点 / 权限不足）时退回按端点判断
+        endpoint = _endpoint_key(host, port)
+        hit = next(
+            (
+                c
+                for c in conns
+                if _endpoint_key(c.get("host"), c.get("port")) == endpoint
+            ),
+            None,
+        )
+    if hit is None:
+        return {"code_ok": True, "registered": False}
+
+    cid = str(hit.get("id") or "")
+    return {
+        "code_ok": True,
+        "registered": True,
+        "connection_id": cid,
+        "name": str(hit.get("name") or ""),
+        "host": str(hit.get("host") or ""),
+        "port": int(hit.get("port") or 8006),
+        "cluster_key": str(hit.get("cluster_key") or ""),
+        "active": store.get_active_connection_id() == cid,
+    }
+
+
 @router.get("/connections/onboard.sh", include_in_schema=False)
 async def onboard_script(
     request: Request,
@@ -617,14 +723,13 @@ async def onboard_script(
     # SELF_URL 让脚本在「不是 root」时能提示用户用 sudo 重跑自己，而不必回面板
     # 再复制一次：脚本得知道自己的地址。
     self_url = _onboard_url(request, base, code.strip(), force=bool(force))
+    # 权限与控制台都没有开关：脚本一律用 root@pam 令牌（全权）并一律建控制台账号。
+    # 查询串能改的只有 force（改端点 / 轮换令牌），改不了授权范围。
     body = onboard.render(
         panel=base,
         code=code.strip(),
         self_url=self_url,
         force=bool(force),
-        # 是否建控制台账号看**签发时**的记录，不看查询串：允许 URL 自己声明
-        # 「我要控制台」等于让持码者给自己提权
-        console=bool(row.get("console_enabled")),
     )
     return PlainTextResponse(body, headers=headers)
 
@@ -678,16 +783,8 @@ async def register_connection(
         )
     code_id = str(code_row.get("id") or "")
 
-    # 控制台凭据只在签发时勾了「同时启用控制台」才接受。没勾的码即便脚本把这两个
-    # 字段塞上来也要丢掉 —— 否则持码者能把一条只读接入悄悄升级成「能操作客户机
-    # 键盘」的接入，比注册码本身授权的范围大出一级。
-    if not bool(code_row.get("console_enabled")) and payload.console_password:
-        logger.info(
-            "注册码 %s 未启用控制台，已忽略脚本提交的控制台凭据", code_id
-        )
-        payload = payload.model_copy(
-            update={"console_user": "", "console_password": ""}
-        )
+    # 控制台凭据一律接受：一键接入现在总是创建控制台账号（VNC 要账号密码换票据），
+    # 签发时已经没有「是否启用控制台」这个选项可供降级。
 
     # 2) 验证凭据与可达性；失败把码退回，让运维改完参数直接重跑
     try:
@@ -999,12 +1096,18 @@ async def repair_connection_permissions(
     request: Request,
     user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
 ) -> Dict[str, Any]:
-    """一键修复：给该连接的 API Token 授予 PVEAdmin。
+    """修复连接的 PVE 令牌权限。
 
-    为什么需要它：在 Proxmox 界面新建 Token 时「特权分离」默认勾选，这种
-    Token 的有效权限为空，PVE 会隐藏节点 CPU / 内存 / 磁盘指标并在特权接口
-    返回 403 —— 表现就是「面板读不到节点信息」。零权限的 Token 无法给自己
-    授权，所以这里用该连接里保存的 Proxmox 账号密码换取票据来改 ACL。
+    要解决的问题：在 PVE 界面新建令牌时「特权分离」默认勾选，这种令牌的有效权限
+    为空，PVE 会隐藏节点 CPU / 内存 / 磁盘指标、特权接口一律 403 —— 表现就是
+    「面板读不到这台机器」。修它是一次 ACL 变更，而零权限的令牌不能给自己授权，
+    所以借用连接里保存的账号密码换票据来改。
+
+    借用谁很关键：改 ACL 需要 ``Permissions.Modify``。旧版一键接入建的账号是
+    ``pvecenter@pve``（CenterPanel 角色，刻意不含 Permissions.Modify）与
+    ``pvecenter-console@pve``（只有 VM.Audit + VM.Console），拿它们的凭据去改
+    ACL 只会得到 ``Permission check failed (/, Permissions.Modify)`` —— 不是按钮
+    坏了，而是这条路根本走不通。所以先看能不能修：能修就修，修不了给准话。
     """
     conns = store.get_connections()
     profile = _find_connection(conns, conn_id)
@@ -1012,18 +1115,60 @@ async def repair_connection_permissions(
         raise HTTPException(status_code=404, detail="连接不存在")
 
     conn = connection_from_profile(profile)
-    if not (conn.console_user and conn.console_password):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "需要先在该连接中填写 Proxmox 账号与密码（例如 root@pam），"
-                "只有账号密码才能修改 PVE 权限。"
-            ),
-        )
     if not conn.token_id:
         raise HTTPException(status_code=400, detail="该连接未填写 API Token ID")
 
-    # 1) 用账号密码换票据，给令牌授予 PVEAdmin
+    token_owner = (conn.token_id.split("!")[0] or "").strip()
+
+    # 1) 先用令牌本身探一次：root@pam 的全权令牌压根没什么可修的
+    privileges: List[str] = []
+    has_modify = False
+    node_metrics = False
+    probe = ProxmoxClient(conn)
+    try:
+        perms = await probe.access_permissions()
+        for path, privs in (perms or {}).items():
+            for priv in privs or []:
+                privileges.append(f"{priv}@{path}")
+                if priv == "Permissions.Modify" and path == "/":
+                    has_modify = True
+        nodes = await probe.nodes() or []
+        node_metrics = bool(nodes) and any(n.get("maxmem") is not None for n in nodes)
+    except ProxmoxError as exc:
+        # 零权限令牌读 /access/permissions 也会 403，这正是要修的形态，继续往下走
+        logger.info("探测 %s 的令牌权限失败：%s", conn.token_id, exc.message)
+    finally:
+        await probe.aclose()
+
+    if has_modify:
+        return {
+            "ok": True,
+            "already_ok": True,
+            "token_id": conn.token_id,
+            "role": "",
+            "effective_privileges": sorted(set(privileges)),
+            "node_metrics": node_metrics,
+        }
+
+    # 2) 只有 root@pam 的账号密码能改 ACL；受限账号去改只会 403
+    console_user = (conn.console_user or "").strip()
+    if console_user != "root@pam" or not conn.console_password:
+        if token_owner == "root@pam":
+            detail = (
+                "令牌属于 root@pam，但创建时勾选了「特权分离」，它不继承 root 的权限，"
+                "而 PVE 不支持事后取消这一项。重新执行一次一键接入链接即可：新令牌以"
+                " --privsep 0 创建，权限一次到位。"
+            )
+        else:
+            detail = (
+                f"这条连接用的是 {token_owner or '受限账号'}，它没有「权限管理」"
+                "（Permissions.Modify），而 PVE 不允许账号给自己授权，所以没法就地修。"
+                "请到「一键接入」重新生成链接并在节点上执行一次：面板账号会换成"
+                " root@pam 的全权令牌。"
+            )
+        raise HTTPException(status_code=400, detail=detail)
+
+    # 3) 用 root@pam 换票据，给令牌在 / 上授予 PVEAdmin
     admin = ProxmoxClient(conn)
     try:
         await admin.grant_token_role(conn.token_id, role="PVEAdmin", path="/")
@@ -1034,9 +1179,9 @@ async def repair_connection_permissions(
     finally:
         await admin.aclose()
 
-    # 2) 复验：改用令牌本身再读一次权限与节点指标，确认真的生效
+    # 4) 复验：改用令牌本身再读一次权限与节点指标，确认真的生效
     verify = ProxmoxClient(conn)
-    privileges: List[str] = []
+    privileges = []
     node_metrics = False
     try:
         perms = await verify.access_permissions()
@@ -1067,6 +1212,7 @@ async def repair_connection_permissions(
 
     return {
         "ok": True,
+        "already_ok": False,
         "token_id": conn.token_id,
         "role": "PVEAdmin",
         "effective_privileges": sorted(set(privileges)),

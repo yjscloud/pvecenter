@@ -355,6 +355,7 @@ export function Templates() {
         key: 'os',
         header: t('templates.colOs'),
         width: 130,
+        /* vztmpl 是一份文件，PVE 不提供 ostype —— 只能按文件名判断家族 */
         render: (tpl) => <OsTag family={templateFamily({ name: tpl.name })} />,
       },
       {
@@ -436,7 +437,7 @@ export function Templates() {
         header: t('templates.colOs'),
         width: 130,
         render: (tpl) => (
-          <OsTag family={templateFamily({ name: tpl.name, ostype: tpl.type })} />
+          <OsTag family={templateFamily({ name: tpl.name, ostype: tpl.ostype })} />
         ),
       },
       {

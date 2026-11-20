@@ -104,9 +104,6 @@ export function ConnectionOnboardModal({
   const [maxUses, setMaxUses] = useState('1');
   /* 「不限次数」勾上就发 0：后端把 0 当不限额（仍逐次记账），输入框随之禁用 */
   const [unlimitedUses, setUnlimitedUses] = useState(false);
-  /* 控制台账号：默认关。PVE 不接受 API Token 换 VNC 票据，不建这个账号就没有
-     浏览器内控制台；代价是节点上多一个带密码的账号，所以不替用户做主。 */
-  const [consoleEnabled, setConsoleEnabled] = useState(false);
   const [issuing, setIssuing] = useState(false);
   const [issued, setIssued] = useState<RegisterCodeIssued | null>(null);
   /* 签发失败就地把原因贴在表单上方：只弹 toast 的话，用户点完按钮一抬眼就找不到
@@ -160,7 +157,6 @@ export function ConnectionOnboardModal({
         // 0 = 不限；其余夹到 1..1000，清空输入框按一次性算 —— 空提交会被后端
         // 的参数校验拦下，而这里本就该给一个能用的默认值
         max_uses: unlimitedUses ? 0 : usesValue,
-        console_enabled: consoleEnabled,
       });
       setIssued(data);
       setCopied(false);
@@ -228,7 +224,6 @@ export function ConnectionOnboardModal({
         note: row.note,
         ttl_minutes: ttlMinutes,
         max_uses: left,
-        console_enabled: row.console_enabled,
       });
       try {
         await connectionsApi.revokeRegisterCode(row.id);
@@ -433,22 +428,6 @@ export function ConnectionOnboardModal({
             />
           </div>
 
-          {/* 控制台账号：默认不勾。不勾就是纯只读接入（令牌 + PVEAuditor），节点上
-              不会多出任何带密码的账号；勾上脚本会另建一个只带 VM.Audit +
-              VM.Console 的账号，面板才点得开 VNC。 */}
-          <div
-            className={`onboard-console${consoleEnabled ? ' is-on' : ''}`}
-          >
-            <Checkbox
-              checked={consoleEnabled}
-              onChange={(e) => setConsoleEnabled(e.target.checked)}
-              label={t('conn.onboardConsoleTitle')}
-            />
-            <p className="onboard-console-desc">
-              {t('conn.onboardConsoleDesc')}
-            </p>
-          </div>
-
           {/* 原理说明是「想确认一下」时才读的内容，收起来交给一行摘要，
               让表单与主按钮回到首屏第一眼的位置 */}
           <details className="onboard-how">
@@ -501,14 +480,12 @@ export function ConnectionOnboardModal({
                       })}
                 </p>
               ) : null}
-              {/* 勾了控制台就让用户在这里确认一句：账号密码由脚本生成并直接写进
-                  面板，不需要他记，也不该再去「编辑连接」里找一个不存在的密码 */}
-              {issued.console_enabled ? (
-                <p className="onboard-result-console">
-                  <IconCheck size={13} />
-                  {t('conn.onboardConsoleReady')}
-                </p>
-              ) : null}
+              {/* 控制台账号每次都会建：账号密码由脚本生成并直接写进面板，
+                  不需要他记，也不该再去「编辑连接」里找一个不存在的密码 */}
+              <p className="onboard-result-console">
+                <IconCheck size={13} />
+                {t('conn.onboardConsoleReady')}
+              </p>
             </div>
           </section>
 
@@ -612,8 +589,6 @@ export function ConnectionOnboardModal({
             <span className="onboard-code-label mono fs-xs">
               {row.region || t('conn.onboardNoRegion')}
               {row.note ? ` · ${row.note}` : ''}
-              {/* 带控制台的码会在节点上多留一个带密码的账号，回溯时就靠这一条 */}
-              {row.console_enabled ? ` · ${t('conn.onboardConsoleChip')}` : ''}
             </span>
             {/* 时间写在「谁用的」后面：一列时间戳读起来最碍事，放右边次要位置 */}
             <span className="onboard-code-meta onboard-code-by fs-xs text-muted">

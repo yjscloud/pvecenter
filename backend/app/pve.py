@@ -97,11 +97,23 @@ def explain_clone_error(message: str, full: bool) -> str:
     如果这时还补「链接克隆失败，请改用完整克隆」，用户会朝完全错误的方向排查。
     """
     text = str(message or "")
-    if "config file already exists" in text.lower():
+    low = text.lower()
+    if "config file already exists" in low:
         return (
             text
             + "（该 VMID 在目标主机上已被占用：每台 PVE 的 VMID 各自独立，"
             "换主机后请重新取号或改用其它 VMID）"
+        )
+    # 权限不足被误当成「存储不支持链接克隆」是最贵的一种误判：用户会去换克隆方式、
+    # 换存储、反复重试，而真正要改的是账号的 ACL。PVE 的原话是
+    # `Permission check failed (/vms/102, VM.Clone)`。
+    if "permission check failed" in low:
+        return (
+            text
+            + "（面板账号缺少写权限 —— 拒绝的是 VM.Clone。这也解释了为什么换「完整克隆」"
+            "同样会失败：该连接多半是旧版一键接入建的（只授了 PVEAuditor）。用一键接入"
+            "链接加 &force=1 重跑即可换成 root 令牌，或手动执行 pveum acl modify / "
+            "--users <账号> --roles PVEVMAdmin,PVEDatastoreAdmin）"
         )
     if not full:
         return text + "（链接克隆失败：请确认源磁盘所在存储支持链接克隆，或改用「完整克隆」重试）"
@@ -170,6 +182,13 @@ def build_ssl_context(verify_ssl: bool, ca_cert: str = "") -> Any:
         context = ssl_module.create_default_context(cadata=pem)
         # 钉扎即身份：PVE 证书的 CN 是 pve.local，用 IP / 短名访问都会对不上
         context.check_hostname = False
+        # 允许「链在这里终止」：`ca_cert` 里可能只有叶子证书（节点证书由 PVE 根 CA
+        # 签发、本身不是自签），而 OpenSSL 默认只认自签的根当锚点，会报
+        # unable to get local issuer certificate。钉扎的目标本来就是证书本身，
+        # 不要求它恰好是自签根。常量在 3.13 才有，低版本直接按 OpenSSL 的值来。
+        context.verify_flags |= int(
+            getattr(ssl_module, "VERIFY_X509_PARTIAL_CHAIN", 0x80000)
+        )
         return context
     return bool(verify_ssl)
 
@@ -655,6 +674,15 @@ class ProxmoxClient:
         """All QEMU VMs across every node, enriched from cluster resources."""
         resources = await self.cluster_resources("vm")
         return [r for r in resources if r.get("type") == "qemu"]
+
+    async def guest_list(self, node: str, kind: str) -> List[Dict[str, Any]]:
+        """节点上的 guest 列表（``kind`` = ``qemu`` / ``lxc``）。
+
+        **注意：这里没有 ostype**（实测 PVE 8.4 / 9.2 的 ``qemu`` 与 ``lxc`` 列表
+        都不带）。列表只提供 ``vmid`` / ``name`` / 资源用量；系统类型要读每台机器
+        的 ``config`` —— 编排与缓存见 :mod:`app.guestostype`。
+        """
+        return await self.get(f"/nodes/{node}/{kind}") or []
 
     async def qemu_config(self, node: str, vmid: int) -> Dict[str, Any]:
         return await self.get(f"/nodes/{node}/qemu/{vmid}/config")
@@ -1347,8 +1375,9 @@ def _auth_hint(status: int) -> str:
         )
     if status == 403:
         return (
-            "该 API Token 权限不足（403）：请在 Proxmox 中为令牌授予相应角色，"
-            "或使用连接卡片上的「修复权限」。"
+            "该 API Token 权限不足（403）：请确认令牌是以 --privsep 0 创建的"
+            "（勾了「特权分离」的令牌有效权限为空）；旧版一键接入建的受限账号"
+            "改不了自己的 ACL，重跑一次接入链接即可换成 root@pam 全权令牌。"
         )
     return f"HTTP {status}"
 

@@ -23,9 +23,22 @@ import { ctTemplateName } from './status';
 
 /** 一个可选项。字段刻意做成「已格式化好的文本」，组件只管摆位置。 */
 export interface TemplatePickItem {
-  /** 选择值：虚拟机 `node:vmid`，容器 `volid` */
+  /**
+   * **唯一**选择值：`连接|节点|标识`。
+   *
+   * 为什么要带连接与节点：模板在不同节点/不同 PVE 上可以同名，本地存储上甚至是
+   * 同一个 ``volid``（都叫 ``local:vztmpl/debian-12-standard.tar.zst``）。只拿
+   * `node:vmid` 或 `volid` 当值，两条记录的值会一模一样 —— React 的 key 重复、
+   * `items.find(i => i.value === value)` 永远命中第一条，选中 B 节点的那份、
+   * 摘要卡却显示 A 节点的信息，图标也就跟着串了。
+   */
   value: string;
+  /** 提交给后端的原始标识：虚拟机 `node:vmid`，容器 `volid` */
+  raw: string;
   name: string;
+  /** 所属连接 / 节点（摘要与搜索用，也便于排查串味） */
+  connection_id?: string;
+  node?: string;
   /** 家族判定的兜底依据（PVE 的 ostype，可能为空） */
   ostype?: string | null;
   /** 第一列：内存 / 模板大小 */
@@ -45,7 +58,10 @@ export interface VmTemplateLike {
   node: string;
   vmid: number;
   name: string;
-  /** PVE 的 ostype；后端目前未填充，家族判定实际靠名称 */
+  /** 所属连接：多台 PVE 上节点名与 VMID 都可能重复，必须参与唯一标识 */
+  connection_id?: string;
+  /** PVE 的 ostype（`/api/templates` 现在会填）；读不到时家族判定靠名称 */
+  ostype?: string;
   type?: string;
   maxcpu?: number;
   maxmem?: number;
@@ -57,6 +73,9 @@ export interface CtTemplateLike {
   volid: string;
   name: string;
   storage: string;
+  /** 本地存储上同名文件在不同节点是两份，节点必须参与唯一标识 */
+  node?: string;
+  connection_id?: string;
   size?: number;
 }
 
@@ -71,12 +90,16 @@ export function vmTemplatePickItems(
   t: TFunc,
 ): TemplatePickItem[] {
   return templates.map((tpl) => ({
-    value: `${tpl.node}:${tpl.vmid}`,
+    value: `${tpl.connection_id || ''}|${tpl.node}|${tpl.vmid}`,
+    raw: `${tpl.node}:${tpl.vmid}`,
     name: tpl.name || t('templatePicker.templateName', { vmid: tpl.vmid }),
-    ostype: tpl.type,
+    connection_id: tpl.connection_id,
+    node: tpl.node,
+    // ostype 优先：同名模板可能一个是 Windows、一个是 Linux
+    ostype: tpl.ostype || tpl.type,
     sizeText: tpl.maxmem ? formatBytes(tpl.maxmem, 0) : '—',
     metaText: tpl.maxdisk ? formatBytes(tpl.maxdisk, 0) : '—',
-    keywords: `${tpl.vmid} ${tpl.node}`,
+    keywords: `${tpl.vmid} ${tpl.node} ${tpl.name}`,
     tags: [`VMID ${tpl.vmid}`],
     note: t('templatePicker.vmNote', {
       node: tpl.node,
@@ -96,10 +119,14 @@ export function ctTemplatePickItems(
   templates: CtTemplateLike[],
 ): TemplatePickItem[] {
   return templates.map((tpl) => ({
-    value: tpl.volid,
+    // volid 在本地存储上会跨节点重名，节点与连接都得进唯一值
+    value: `${tpl.connection_id || ''}|${tpl.node || ''}|${tpl.volid}`,
+    raw: tpl.volid,
     name: ctTemplateName(tpl.name),
+    connection_id: tpl.connection_id,
+    node: tpl.node,
     sizeText: tpl.size ? formatBytes(tpl.size, 0) : '—',
     metaText: tpl.storage,
-    keywords: `${tpl.volid} ${tpl.storage}`,
+    keywords: `${tpl.volid} ${tpl.storage} ${tpl.node || ''}`,
   }));
 }

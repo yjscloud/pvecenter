@@ -1002,10 +1002,14 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
 
   /* ---- Shared: quick OS-template picker in the create flow ---- */
   'templatePicker.vmLabel': 'Clone source (template)',
-  'templatePicker.vmHint': 'Lists only VM templates on this cluster (regular VMs cannot be cloned)',
+  'templatePicker.vmHint': 'Lists only VM templates on the selected node (regular VMs cannot be cloned)',
   'templatePicker.vmEmptyHint': 'This cluster has no templates to clone from yet',
+  'templatePicker.vmEmptyOnNode':
+    'No VM templates on node {node}. {n} live on {others} — a template on shared storage can be cloned across nodes; otherwise migrate one to {node} first.',
   'templatePicker.ctLabel': 'OS template',
   'templatePicker.ctHint': 'Comes from storage on the node whose content type includes vztmpl',
+  'templatePicker.ctEmptyOnNode':
+    'Node {node} has no OS templates. They live on that node\u2019s storage and are not shared across nodes \u2014 pick another node, or download one onto this node first.',
   'templatePicker.templateName': 'Template {vmid}',
   'templatePicker.vmNote': 'node {node} · {cpu} vCPU',
   'templatePicker.colMem': 'RAM',

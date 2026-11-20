@@ -30,7 +30,16 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
-from . import alerting, guestip, i18n, ippool, notifications, security, vmconfig
+from . import (
+    alerting,
+    guestip,
+    guestostype,
+    i18n,
+    ippool,
+    notifications,
+    security,
+    vmconfig,
+)
 from .pve import ProxmoxError, client_for_connection
 
 logger = logging.getLogger(__name__)
@@ -637,6 +646,10 @@ async def _reclone(
     # 不变 —— 不清的话，页面会在最长 15 分钟里继续显示**旧系统的地址**，与重装后
     # 客户机真实拿到的地址对不上。内存缓存（60 秒）同理。
     await guestip.forget(connection, node, vmid, "qemu")
+
+    # 系统类型跟着换了模板：不清的话列表会继续按**旧系统**画图标（单台缓存 6
+    # 小时），而重装最常见的用途正是「把 Windows 换成 Linux」—— 徽标必须立刻跟着变。
+    guestostype.forget(connection, node, "qemu", vmid)
 
     # 等配置文件真的消失再克隆：DELETE 只是「已受理」，收尾还要一会儿，
     # 而这期间克隆会直接失败 —— 那一刻机器已经没了，绝不能卡在这儿

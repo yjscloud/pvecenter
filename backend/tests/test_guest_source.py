@@ -245,6 +245,215 @@ def test_legacy_clone_target_without_node_is_not_self_source(api) -> None:
     assert ("", "pve1", 109) not in sources
 
 
+def test_same_node_name_on_two_connections_is_disambiguated_by_template(
+    api, monkeypatch
+) -> None:
+    """同名节点 + 同 VMID：靠「来源模板是否在这条连接上」分开，而不是整页放弃。
+
+    审计的 ``target`` 是 ``节点/VMID``，**不含连接**。早先只要节点名在多台 PVE 上
+    重名就整页不填，于是多连接部署下面板的「来源模板」列永远是空的 —— 连面板刚
+    克隆出来的机器也显示不出来源，「操作系统」列顺着就是一片空白。
+    """
+    from app import guest_created
+
+    async def fake_unique():
+        return {"pve1": 2}
+
+    async def fake_templates():
+        return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
+
+    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
+
+    async def seed() -> None:
+        # 两条克隆记录，target 完全一样：光看审计分不出是谁的
+        await security.audit(
+            None, {"username": "admin"}, "vm.clone", target="pve1/9001 -> pve1/117"
+        )
+        await security.audit(
+            None, {"username": "admin"}, "vm.clone", target="pve1/9000 -> pve1/117"
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [
+                {"connection_id": "c1", "node": "pve1", "vmid": 117},
+                {"connection_id": "c2", "node": "pve1", "vmid": 117},
+            ]
+        )
+
+    sources = api.portal.call(resolve)
+    assert sources[("c1", "pve1", 117)] == {"node": "pve1", "vmid": 9000}
+    assert sources[("c2", "pve1", 117)] == {"node": "pve1", "vmid": 9001}
+
+
+def test_unique_node_name_does_not_fetch_template_index(api, monkeypatch) -> None:
+    """节点名唯一时不必拉模板清单：行为与引入消歧前完全一致，也不多打一轮 PVE。"""
+    from app import guest_created
+
+    async def fake_unique():
+        return {"pve1": 1}
+
+    async def boom():
+        raise AssertionError("节点名唯一时不该为消歧去拉模板清单")
+
+    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_template_keys_by_connection", boom)
+
+    async def seed() -> None:
+        await security.audit(
+            None, {"username": "admin"}, "vm.clone", target="pve1/9000 -> pve1/130"
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [{"connection_id": "c9", "node": "pve1", "vmid": 130}]
+        )
+
+    assert api.portal.call(resolve)[("c9", "pve1", 130)] == {
+        "node": "pve1",
+        "vmid": 9000,
+    }
+
+
+def test_source_template_absent_on_connection_is_not_filled(api, monkeypatch) -> None:
+    """来源模板不在这条连接上时宁可不填，也不能把别的连接的记录贴上来。"""
+    from app import guest_created
+
+    async def fake_unique():
+        return {"pve1": 2}
+
+    async def fake_templates():
+        # c2 上没有 pve1/9000 这张模板
+        return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
+
+    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
+
+    async def seed() -> None:
+        await security.audit(
+            None, {"username": "admin"}, "vm.clone", target="pve1/9000 -> pve1/131"
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [{"connection_id": "c2", "node": "pve1", "vmid": 131}]
+        )
+
+    assert api.portal.call(resolve) == {}
+
+
+def test_unknown_node_uniqueness_leaves_the_column_empty(api, monkeypatch) -> None:
+    """连「节点名是否唯一」都探测不到时整页不填 —— 没有可用的消歧依据。
+
+    探测失败（客户端不可达 / 连接表读不出来）返回的空字典不能当成「全都唯一」，
+    否则又会退回到「把别的连接上的记录贴过来」。
+    """
+    from app import guest_created
+
+    async def unknown_unique():
+        return {}
+
+    async def fake_templates():
+        return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
+
+    monkeypatch.setattr(guest_created, "_node_names_are_unique", unknown_unique)
+    monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
+
+    async def seed() -> None:
+        await security.audit(
+            None, {"username": "admin"}, "vm.clone", target="pve1/9000 -> pve1/140"
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.sources_for(
+            [{"connection_id": "c1", "node": "pve1", "vmid": 140}]
+        )
+
+    assert api.portal.call(resolve) == {}
+
+
+def test_container_clone_is_disambiguated_across_connections(api, monkeypatch) -> None:
+    """容器克隆：与虚拟机同一套消歧，同号容器各归各的连接。"""
+    from app import guest_created
+
+    async def fake_unique():
+        return {"pve1": 2}
+
+    async def fake_templates():
+        return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
+
+    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
+
+    async def seed() -> None:
+        await security.audit(
+            None, {"username": "admin"}, "ct.clone", target="pve1/9001 -> pve1/150"
+        )
+        await security.audit(
+            None, {"username": "admin"}, "ct.clone", target="pve1/9000 -> pve1/150"
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.lxc_sources_for(
+            [
+                {"connection_id": "c1", "node": "pve1", "vmid": 150},
+                {"connection_id": "c2", "node": "pve1", "vmid": 150},
+            ]
+        )
+
+    sources = api.portal.call(resolve)
+    assert sources[("c1", "pve1", 150)] == {"node": "pve1", "vmid": 9000}
+    assert sources[("c2", "pve1", 150)] == {"node": "pve1", "vmid": 9001}
+
+
+def test_container_os_template_stays_empty_when_node_name_is_shared(
+    api, monkeypatch
+) -> None:
+    """``ct.create`` 的来源是模板文件，审计里没有连接信息可校验：重名节点上留空。
+
+    填上去的代价是「别的连接上同号容器的来源」——比「—」糟得多。
+    """
+    from app import guest_created
+
+    async def fake_unique():
+        return {"pve1": 2}
+
+    async def fake_templates():
+        return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
+
+    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
+
+    async def seed() -> None:
+        await security.audit(
+            None,
+            {"username": "admin"},
+            "ct.create",
+            target="pve1/151",
+            detail={"ostemplate": "local:vztmpl/ubuntu-2204.tar.zst"},
+        )
+
+    api.portal.call(seed)
+
+    async def resolve() -> dict:
+        return await guest_created.lxc_sources_for(
+            [{"connection_id": "c1", "node": "pve1", "vmid": 151}]
+        )
+
+    assert api.portal.call(resolve) == {}
+
+
 def test_template_file_name_strips_storage_and_query() -> None:
     from app import guest_created
 

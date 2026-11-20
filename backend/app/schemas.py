@@ -172,10 +172,6 @@ class ConnectionRegisterCodeIn(BaseModel):
     ttl_minutes: int = 30
     #: 可用次数：1 = 一次性（默认，与旧行为一致）；0 = 不限次数；上限 1000。
     max_uses: int = 1
-    #: 是否让脚本顺带建一个控制台账号（随机密码 + VM.Console 权限）并回填面板。
-    #: PVE 不接受 API Token 打开 VNC 控制台，不建这个账号，面板里那台机器就只有
-    #: SSH / 任务 / 监控，没有浏览器内控制台。默认关：常态是纯只读接入。
-    console_enabled: bool = False
 
     @field_validator("ttl_minutes")
     @classmethod
@@ -202,10 +198,9 @@ class ConnectionRegisterIn(BaseModel):
     与 ``POST /api/connections`` 的差别：鉴权靠一次性注册码而不是登录会话，
     因此没有 step-up；字段也收窄了（不允许设置暂停状态等运维项）。
 
-    控制台凭据是唯一的例外：它只在**注册码签发时**勾了「同时启用控制台」才被接受
-    （见 :func:`app.routers.config.register_connection` 里的校验）。没勾的码即使
-    脚本硬塞这两个字段也会被丢弃 —— 否则持码者能凭空给自己一张「能操作客户机
-    键盘」的凭据，比只读接入高出一整级。
+    控制台凭据（``console_user`` / ``console_password``）随请求一起收下：脚本现在
+    总是创建控制台账号，签发时已经没有「是否启用控制台」可选。风险由注册码本身
+    的时效与次数兜住 —— 持码者本来就能用 root@pam 令牌注册一条全权连接。
     """
 
     code: str

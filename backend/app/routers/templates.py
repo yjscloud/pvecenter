@@ -125,6 +125,39 @@ async def _await(client: Any, result: Any, timeout: float = 600.0) -> str:
 
 
 # ------------------------------------------------------------------ listing
+#: 模板 ostype 的缓存时长。模板重建（同一 VMID 换系统）是低频操作，5 分钟足够；
+#: 换来的是每次打开模板页 / 创建向导都不必再逐台读 config。
+TEMPLATE_OSTYPE_TTL = 300.0
+
+
+async def _template_ostype(
+    client: Any, kind: str, node: str, vmid: int, cid: str
+) -> str:
+    """模板客户机的 ``ostype``（``l26`` / ``win11`` / ``debian`` …），读不到留空。
+
+    为什么要它：**不同节点上的模板可以同名，而系统并不相同**（两台 PVE 上各有
+    一台叫 ``ubuntu24`` 的模板，其中一台其实是 Windows）。前端只靠名称猜家族时，
+    同名必然把图标配错；ostype 是 PVE 自己认的类型，用来兜底比名称可靠。
+    """
+    if not node or not vmid:
+        return ""
+
+    async def _load() -> str:
+        cfg = await client.get(f"/nodes/{node}/{kind}/{vmid}/config")
+        return str((cfg or {}).get("ostype") or "")
+
+    try:
+        value = await pvecache.cached(
+            f"templates:ostype:{cid}:{kind}:{node}:{vmid}",
+            TEMPLATE_OSTYPE_TTL,
+            _load,
+        )
+    except ProxmoxError:
+        # 模板刚好被删 / 节点离线：图标退化成按名称判断，不该让整份列表失败
+        return ""
+    return value if isinstance(value, str) else ""
+
+
 @router.get("/templates")
 async def list_templates(
     guest_type: Optional[str] = Query(
@@ -163,8 +196,10 @@ async def list_templates(
 
     output: List[Dict[str, Any]] = []
     failure: Optional[ProxmoxError] = None
+    # 待补 ostype 的条目：(行, client, kind, node, vmid, connection_id)
+    lookups: List[Tuple[Dict[str, Any], Any, str, str, int, str]] = []
 
-    for profile, resources in zip((p for p, _c in targets), resources_list):
+    for (profile, client), resources in zip(targets, resources_list):
         if isinstance(resources, BaseException):
             if isinstance(resources, ProxmoxError):
                 failure = failure or resources
@@ -184,28 +219,52 @@ async def list_templates(
                 continue
             if pve_flag(vm.get("template", 0)) != 1:
                 continue
-            output.append(
-                {
-                    "node": vm.get("node"),
-                    "vmid": vm.get("vmid"),
-                    "name": vm.get("name") or f"Template {vm.get('vmid')}",
-                    "status": vm.get("status", "stopped"),
-                    "template": True,
-                    # 前端据此区分克隆 / 删除该走哪套接口（qemu 与 lxc 的参数不同）。
-                    # 必须是这台机器自己的类型 kind，不是上面那个查询参数 ——
-                    # 写成 guest_type 的话，不传参数时整份列表的类型都会是 None。
-                    "guest_type": kind,
-                    "maxcpu": vm.get("maxcpu"),
-                    "maxmem": vm.get("maxmem"),
-                    "maxdisk": vm.get("maxdisk"),
-                    "disk": vm.get("disk"),
-                    "tags": vm.get("tags") or "",
-                    "uptime": vm.get("uptime"),
-                    "pool": vm.get("pool"),
-                    "connection_id": cid,
-                    "connection_name": label,
-                }
+            row = {
+                "node": vm.get("node"),
+                "vmid": vm.get("vmid"),
+                "name": vm.get("name") or f"Template {vm.get('vmid')}",
+                "status": vm.get("status", "stopped"),
+                "template": True,
+                # 前端据此区分克隆 / 删除该走哪套接口（qemu 与 lxc 的参数不同）。
+                # 必须是这台机器自己的类型 kind，不是上面那个查询参数 ——
+                # 写成 guest_type 的话，不传参数时整份列表的类型都会是 None。
+                "guest_type": kind,
+                "maxcpu": vm.get("maxcpu"),
+                "maxmem": vm.get("maxmem"),
+                "maxdisk": vm.get("maxdisk"),
+                "disk": vm.get("disk"),
+                "tags": vm.get("tags") or "",
+                "uptime": vm.get("uptime"),
+                "pool": vm.get("pool"),
+                "connection_id": cid,
+                "connection_name": label,
+                # 下面并发读 config 补齐；读不到就是空串
+                "ostype": "",
+            }
+            output.append(row)
+            lookups.append(
+                (
+                    row,
+                    client,
+                    kind,
+                    str(vm.get("node") or ""),
+                    int(vm.get("vmid") or 0),
+                    cid,
+                )
             )
+
+    if lookups:
+        # 模板数量通常是几张到几十张，逐个串行读 config 会让模板页多等几百毫秒；
+        # parallel 限流 8，失败的那一项返回异常对象（下面当空串处理）。
+        ostypes = await parallel(
+            (
+                _template_ostype(client, kind, node, vmid, cid)
+                for _row, client, kind, node, vmid, cid in lookups
+            ),
+            limit=8,
+        )
+        for (row, *_rest), value in zip(lookups, ostypes):
+            row["ostype"] = value if isinstance(value, str) else ""
 
     if not output and failure is not None:
         _raise(failure)

@@ -54,10 +54,16 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from . import database
-from .pve import ProxmoxClient, collection_targets, parallel
+from .formatters import pve_flag
+from .pve import (
+    ProxmoxClient,
+    collection_targets,
+    parallel,
+    requested_connection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +141,11 @@ _backfilled: set = set()
 # 节点名是不是全局唯一（回填的前提）：(检查时刻, 节点名 -> 出现在几条连接上)
 _node_name_counts: Tuple[float, Dict[str, int]] = (0.0, {})
 _NODE_NAME_TTL = 300.0
+
+# 每条连接上的模板集合：(检查时刻, {连接 id: {(节点, VMID)}})
+# 节点名在多台 PVE 上重名时，审计里的 `节点/VMID` 分不清是哪一台 —— 但克隆记录里
+# 还写着**来源模板**，只要那台模板确实存在于某条连接，就能反推记录属于它。
+_template_index: Tuple[float, Dict[str, Set[Tuple[str, int]]]] = (0.0, {})
 
 
 async def init_table() -> None:
@@ -354,6 +365,48 @@ async def _node_names_are_unique() -> Dict[str, int]:
     return result
 
 
+async def _template_keys_by_connection() -> Dict[str, Set[Tuple[str, int]]]:
+    """每条连接上的模板集合：``{连接 id: {(节点, VMID)}}``（5 分钟缓存）。
+
+    用于 :func:`sources_for` 消歧：审计的 ``target`` 不含连接，同名节点上分不清是
+    哪一台 PVE，但克隆记录里的**来源模板**只可能存在于它自己那条连接上 —— 拿模板
+    清单做一次存在性校验，「整页放弃」就能换成「逐条判定」。
+    """
+    global _template_index
+    checked_at, index = _template_index
+    if index and time.time() - checked_at < _NODE_NAME_TTL:
+        return index
+
+    result: Dict[str, Set[Tuple[str, int]]] = {}
+    try:
+        targets = collection_targets()
+    except Exception:  # noqa: BLE001 - 探测不到就当作不可判定
+        return {}
+    for profile, client in targets:
+        cid = (
+            str(profile.get("id") or "")
+            if profile
+            else str(requested_connection() or "")
+        )
+        try:
+            resources = await client.cluster_resources("vm") or []
+        except Exception:  # noqa: BLE001 - 单台失败只跳过它自己
+            continue
+        keys = result.setdefault(cid, set())
+        for row in resources:
+            if pve_flag(row.get("template", 0)) != 1:
+                continue
+            node = str(row.get("node") or "")
+            try:
+                vmid = int(row.get("vmid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if node and vmid:
+                keys.add((node, vmid))
+    _template_index = (time.time(), result)
+    return result
+
+
 async def _backfill_from_audit(
     conn_id: Any, node: Any, vmid: Any, guest_type: Any, meta: Optional[int]
 ) -> Optional[int]:
@@ -556,27 +609,46 @@ async def sources_for(
     是 N 次往返；这里用 ``target_guest IN (...)`` 一次取回本页所有目标，再在
     内存里按键取**最近一条**。索引是 ``(target_guest, timestamp)``，不会全表扫。
 
-    返回 ``{(connection_id, node, vmid): {"node", "vmid"}}``。节点名在多台 PVE
-    上重名时整页都不填（审计的 target 里没有连接信息，猜错比空着更糟）。
+    返回 ``{(connection_id, node, vmid): {"node", "vmid"}}``。
+
+    多台 PVE 上可以有同名节点 + 同 VMID 的机器，而审计的 ``target`` 不含连接。
+    早先的做法是「只要能重名就整页不填」，结果是多连接部署下这一列**永远是空的**，
+    连面板刚克隆出来的机器也显示不出来源（顺着就变成「操作系统」列一片空白）。
+    现在改成逐条判定：克隆记录里的来源模板只可能存在于它自己那条连接上，用模板
+    清单做一次存在性校验即可；校验不过就继续看更早的记录。节点名全局唯一时行为
+    与变化前完全一致。
+
+    连「节点名是否唯一」都探测不到时（客户端不可达、连接表读不出来）仍然整页
+    不填：那种情况下没有任何可用于消歧的依据。
+
+    代价说明：模板在克隆之后被删掉的机器，重名节点上就校验不出归属，这一列只能
+    留空 —— 比起把别的连接上同名节点的记录贴过来，空着更安全（模板一旦被删，
+    「来源」本身也已经不可用）。
     """
-    wanted: Dict[str, Tuple[str, str, int]] = {}
+    wanted: Dict[str, List[Tuple[str, str, int]]] = {}
     for item in items:
         node = str(item.get("node") or "")
         vmid = item.get("vmid")
         if not node or vmid is None:
             continue
-        wanted[f"{node}/{vmid}"] = (
-            str(item.get("connection_id") or ""),
-            node,
-            int(vmid),
-        )
+        key = (str(item.get("connection_id") or ""), node, int(vmid))
+        bucket = wanted.setdefault(f"{node}/{vmid}", [])
+        if key not in bucket:
+            bucket.append(key)
     if not wanted:
         return {}
 
     counts = await _node_names_are_unique()
-    refs = [ref for ref in wanted if counts.get(wanted[ref][1], 0) == 1]
-    if not refs:
-        return {}
+    # 节点名出现在多条连接上的那些 ref：需要靠「来源模板是否在这条连接上」消歧
+    ambiguous = {
+        ref for ref, keys in wanted.items() if counts.get(keys[0][1], 0) > 1
+    }
+    # 连节点名是否唯一都探测不到的（客户端不可达 / 存储异常）：照旧不填。
+    # counts 为空时若当成「唯一」，等于把别的连接的记录贴上来的老问题原样放回来。
+    refs = [
+        ref for ref, keys in wanted.items() if counts.get(keys[0][1], 0) > 0
+    ]
+    templates = await _template_keys_by_connection() if ambiguous else {}
 
     out: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     actions = ", ".join("?" for _ in _SOURCE_ACTIONS)
@@ -602,9 +674,10 @@ async def sources_for(
             continue
         for row in rows:
             ref = str(row["target_guest"] or "")
-            key = wanted.get(ref)
-            if key is None or key in out:
-                # ORDER BY timestamp DESC：每个目标只认第一条（最近一次）
+            # 同一个 `节点/VMID` 可能对应多条连接的机器（同名节点），逐条判定
+            keys = [k for k in wanted.get(ref, []) if k not in out]
+            if not keys:
+                # ORDER BY timestamp DESC：每个目标只认最近一条能对上的记录
                 continue
             cutoff = cutoffs.get(ref)
             if cutoff and (float(row["timestamp"] or 0), int(row["id"] or 0)) <= cutoff:
@@ -613,11 +686,18 @@ async def sources_for(
             src_node, _, src_vmid = origin.rpartition("/")
             if not src_vmid.isdigit():
                 continue
-            origin_node = src_node or key[1]
-            # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
-            if int(src_vmid) == int(key[2]) and origin_node == key[1]:
-                continue
-            out[key] = {"node": origin_node, "vmid": int(src_vmid)}
+            origin_node = src_node or keys[0][1]
+            src_id = int(src_vmid)
+            for key in keys:
+                # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
+                if src_id == key[2] and origin_node == key[1]:
+                    continue
+                if ref in ambiguous:
+                    # 同名节点：来源模板只可能存在于它自己那条连接上，
+                    # 不在就是别人的记录，接着看更早的那条
+                    if (origin_node, src_id) not in templates.get(key[0], set()):
+                        continue
+                out[key] = {"node": origin_node, "vmid": src_id}
     return out
 
 
@@ -671,27 +751,34 @@ async def lxc_sources_for(
     每个目标只认**最近一次**成功记录：先新建、后来重装成别的模板，当前这块盘来自
     最后一次；而克隆与新建不会同时成立（同一 VMID 只能被建一次）。
 
-    节点名在多台 PVE 上重名时整页都不填（审计的 target 里没有连接信息），与
-    :func:`sources_for` 同一条前提。
+    与 :func:`sources_for` 同一条消歧前提：节点名在多台 PVE 上重名时，克隆 / 重装
+    记录靠「来源模板是否在这条连接上」判定归属；而 ``ct.create`` 的来源是一个模板
+    **文件**，审计里既没有连接信息也没有可校验的落点，所以这类记录在重名节点上
+    只能留空 —— 宁可空着，也不能把别的连接上同号容器的来源贴过来。
     """
-    wanted: Dict[str, Tuple[str, str, int]] = {}
+    wanted: Dict[str, List[Tuple[str, str, int]]] = {}
     for item in items:
         node = str(item.get("node") or "")
         vmid = item.get("vmid")
         if not node or vmid is None:
             continue
-        wanted[f"{node}/{vmid}"] = (
-            str(item.get("connection_id") or ""),
-            node,
-            int(vmid),
-        )
+        key = (str(item.get("connection_id") or ""), node, int(vmid))
+        bucket = wanted.setdefault(f"{node}/{vmid}", [])
+        if key not in bucket:
+            bucket.append(key)
     if not wanted:
         return {}
 
     counts = await _node_names_are_unique()
-    refs = [ref for ref in wanted if counts.get(wanted[ref][1], 0) == 1]
+    # 节点名出现在多条连接上的那些 ref：靠来源模板做存在性校验来消歧
+    ambiguous = {
+        ref for ref, keys in wanted.items() if counts.get(keys[0][1], 0) > 1
+    }
+    # 探测不到节点名是否唯一的，照旧不填（理由见 sources_for）
+    refs = [ref for ref, keys in wanted.items() if counts.get(keys[0][1], 0) > 0]
     if not refs:
         return {}
+    templates = await _template_keys_by_connection() if ambiguous else {}
 
     out: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     actions = ", ".join("?" for _ in _CLONE_ACTIONS)
@@ -717,27 +804,38 @@ async def lxc_sources_for(
             continue
         for row in rows:
             ref = str(row["target_guest"] or "")
-            key = wanted.get(ref)
-            if key is None or key in out:
-                # ORDER BY timestamp DESC：每个目标只认第一条（最近一次）
+            # 同一个 `节点/VMID` 可能对应多条连接的容器（同名节点），逐条判定
+            keys = [k for k in wanted.get(ref, []) if k not in out]
+            if not keys:
+                # ORDER BY timestamp DESC：每个目标只认最近一条能对上的记录
                 continue
             cutoff = cutoffs.get(ref)
             if cutoff and (float(row["timestamp"] or 0), int(row["id"] or 0)) <= cutoff:
                 continue
             if str(row["action"] or "") == _CREATE_ACTION:
                 name = template_file_name(_ostemplate_of(row["detail"]))
-                if name:
+                if not name or ref in ambiguous:
+                    # 重名节点上分不清这条建机记录是哪条连接的，见函数说明
+                    continue
+                for key in keys:
                     out[key] = {"file": name}
                 continue
             origin = str(row["target"] or "").split("->", 1)[0].strip()
             src_node, _, src_vmid = origin.rpartition("/")
             if not src_vmid.isdigit():
                 continue
-            origin_node = src_node or key[1]
-            # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
-            if int(src_vmid) == int(key[2]) and origin_node == key[1]:
-                continue
-            out[key] = {"node": origin_node, "vmid": int(src_vmid)}
+            origin_node = src_node or keys[0][1]
+            src_id = int(src_vmid)
+            for key in keys:
+                # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
+                if src_id == key[2] and origin_node == key[1]:
+                    continue
+                if ref in ambiguous and (
+                    (origin_node, src_id) not in templates.get(key[0], set())
+                ):
+                    # 来源模板不在这条连接上：这条记录是别人的
+                    continue
+                out[key] = {"node": origin_node, "vmid": src_id}
     return out
 
 

@@ -41,6 +41,9 @@ DEFAULT_MAX_USES = 1
 #: 想长期自动化应该发 API Token。
 MAX_USES_LIMIT = 1000
 
+#: ``console_enabled`` / ``read_only`` 是历史列：一键接入已改成「一律 root@pam 全权
+#: + 一律带控制台」，签发时不再有这两个选项，列也不再参与任何判断。保留它们是为了
+#: 老库不必重建表（本模块的迁移策略只加列不删列），新行写入时用默认值。
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS connection_register_codes (
     id            VARCHAR(40)  NOT NULL,
@@ -53,6 +56,7 @@ CREATE TABLE IF NOT EXISTS connection_register_codes (
     max_uses      INT          NOT NULL DEFAULT 1,
     used_count    INT          NOT NULL DEFAULT 0,
     console_enabled TINYINT    NOT NULL DEFAULT 0,
+    read_only     TINYINT      NOT NULL DEFAULT 0,
     used          BIGINT       NOT NULL DEFAULT 0,
     used_by       VARCHAR(191) NOT NULL DEFAULT '',
     connection_id VARCHAR(40)  NOT NULL DEFAULT '',
@@ -83,11 +87,17 @@ async def init_table() -> None:
                 "ALTER TABLE connection_register_codes"
                 " ADD COLUMN used_count INT NOT NULL DEFAULT 0"
             )
-        # 控制台账号是可选项：老码按 0（纯只读）补，行为与升级前一致
+        # 两个历史列：现在签发不再有「控制台 / 只读」选项，补列只为老库结构一致，
+        # 值不再被读取
         if "console_enabled" not in columns:
             await db.execute(
                 "ALTER TABLE connection_register_codes"
                 " ADD COLUMN console_enabled TINYINT NOT NULL DEFAULT 0"
+            )
+        if "read_only" not in columns:
+            await db.execute(
+                "ALTER TABLE connection_register_codes"
+                " ADD COLUMN read_only TINYINT NOT NULL DEFAULT 0"
             )
         await db.execute(
             "UPDATE connection_register_codes SET used_count=1"
@@ -155,8 +165,6 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "used": used,
         "used_by": str(row.get("used_by") or ""),
         "connection_id": str(row.get("connection_id") or ""),
-        # 这张码是否允许脚本顺带建控制台账号（默认否：只读 + 令牌是常态）
-        "console_enabled": bool(row.get("console_enabled")),
         "status": status,
     }
 
@@ -168,13 +176,12 @@ async def create_code(
     created_by: str,
     ttl_minutes: int = DEFAULT_TTL_MINUTES,
     max_uses: int = DEFAULT_MAX_USES,
-    console_enabled: bool = False,
 ) -> Dict[str, Any]:
     """签发一张注册码。返回里带**明文**（只此一次）。
 
-    ``console_enabled`` 决定脚本要不要顺带建一个带密码的控制台账号：PVE 不接受
-    API Token 换 VNC 票据，没有账号密码就打不开控制台。默认关，纯只读时不额外
-    在节点上留密码。
+    权限与控制台都没有开关了：脚本一律给节点上的 ``root@pam`` 建令牌（面板拿到
+    的是 root 全权），并一律创建控制台账号（PVE 的 VNC 要账号密码换票据，令牌
+    换不了）。这两个历史列留着不写，让老库照旧工作。
     """
     ttl = max(1, min(MAX_TTL_MINUTES, int(ttl_minutes or DEFAULT_TTL_MINUTES)))
     uses = normalize_max_uses(max_uses)
@@ -190,14 +197,13 @@ async def create_code(
         "expires": now + ttl * 60,
         "max_uses": uses,
         "used_count": 0,
-        "console_enabled": 1 if console_enabled else 0,
     }
     async with database.connect() as db:
         await db.execute(
             "INSERT INTO connection_register_codes"
             " (id, code_hash, region, note, created_by, created, expires,"
-            "  max_uses, used_count, console_enabled)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "  max_uses, used_count)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 row["id"],
                 row["code_hash"],
@@ -208,7 +214,6 @@ async def create_code(
                 row["expires"],
                 row["max_uses"],
                 row["used_count"],
-                row["console_enabled"],
             ),
         )
         await db.commit()

@@ -66,6 +66,11 @@ def test_build_ssl_context_modes() -> None:
     # 钉扎的对象是证书本身：PVE 用 IP 访问时 CN/SAN 对不上，主机名不参与校验
     assert pinned.check_hostname is False
     assert pinned.verify_mode == ssl.CERT_REQUIRED
+    # 允许链在钉扎的证书上终止：节点证书是被 PVE 根 CA 签的（不是自签），只钉叶子
+    # 时 OpenSSL 会报 unable to get local issuer certificate（真实接入踩过）
+    assert pinned.verify_flags & int(
+        getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0x80000)
+    )
 
 
 def test_ca_cert_wins_over_disabled_switch() -> None:

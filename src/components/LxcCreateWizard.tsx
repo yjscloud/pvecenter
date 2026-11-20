@@ -342,16 +342,6 @@ export function LxcCreateWizard({
     staleTime: 60_000,
   });
 
-  /* 节点（或主机）一换，模板列表就是另一份：原来选中的 volid 若不在新列表里
-     就清掉 —— 否则界面上一个都没选中，提交时却带着上一台节点的模板路径。 */
-  useEffect(() => {
-    if (!open || !form.ostemplate || templatesQuery.isLoading) return;
-    const list = templatesQuery.data;
-    if (!list) return;
-    if (list.some((tpl) => tpl.volid === form.ostemplate)) return;
-    setForm((f) => (f.ostemplate === form.ostemplate ? { ...f, ostemplate: '' } : f));
-  }, [open, form.ostemplate, templatesQuery.data, templatesQuery.isLoading]);
-
   /* 存储：只列**所选节点上**的存储池（含显式带连接，见 useNodeStorages） */
   const storagesQuery = useNodeStorages(form.node, targetConn, open && Boolean(targetConn));
 
@@ -425,6 +415,28 @@ export function LxcCreateWizard({
     [templatesQuery.data],
   );
 
+  /* 节点（或主机）一换，模板列表就是另一份：原来选中的模板若不在新列表里就清掉
+     —— 否则界面上一个都没选中，提交时却带着上一台节点的模板路径。
+
+     另外要把「原始 volid」翻译成唯一值：从系统模板卡片跳进来时带的是 volid，
+     而本地存储上两个节点可以各有一份同名文件（volid 完全相同），只能按 volid
+     粗匹配 —— 优先取当前节点那一份，找不到再退回第一条。 */
+  useEffect(() => {
+    if (!open || !form.ostemplate || templatesQuery.isLoading) return;
+    if (!templatePickItems.length) return;
+    if (templatePickItems.some((item) => item.value === form.ostemplate)) return;
+    const byRaw =
+      templatePickItems.find(
+        (item) =>
+          item.raw === form.ostemplate && (!form.node || item.node === form.node),
+      ) ?? templatePickItems.find((item) => item.raw === form.ostemplate);
+    setForm((f) =>
+      f.ostemplate === form.ostemplate
+        ? { ...f, ostemplate: byRaw ? byRaw.value : '' }
+        : f,
+    );
+  }, [open, form.ostemplate, form.node, templatePickItems, templatesQuery.isLoading]);
+
   /* 节点上读不到网桥时保留一个 vmbr0 兜底：不该让「读列表失败」把新建流程卡死 */
   const bridgeOptions = useMemo(
     () => [
@@ -474,7 +486,11 @@ export function LxcCreateWizard({
     const payload: LxcCreateRequest = {
       node: form.node,
       name: form.name.trim(),
-      ostemplate: form.ostemplate,
+      /* 选择值是唯一标识（连接|节点|volid），PVE 要的是 volid 本身。
+         从模板页跳进来时 form 里可能还留着原始 volid，兜底原样提交。 */
+      ostemplate:
+        templatePickItems.find((item) => item.value === form.ostemplate)?.raw ??
+        form.ostemplate,
       storage: form.storage,
       rootfs: form.rootfs,
       memory: form.memory,

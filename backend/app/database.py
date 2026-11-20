@@ -368,6 +368,38 @@ async def table_columns(conn: _Connection, table: str) -> Set[str]:
     return {str(row["COLUMN_NAME"]) for row in rows}
 
 
+#: 「这条 DDL 已经被别人做过」的 MySQL 错误码：
+#: 1060 = Duplicate column name，1061 = Duplicate key name。
+_ALREADY_DONE_ERRNOS = frozenset({1060, 1061})
+
+
+async def add_columns(
+    conn: _Connection, table: str, columns: Sequence[Tuple[str, str]]
+) -> None:
+    """按需补列：表里缺哪列才执行对应的 ALTER，重复 / 并发执行都安全。
+
+    只靠 :func:`table_columns` 判断是不够的：读列与实际 ALTER 之间有窗口。两个进程
+    同时首启（``uvicorn --workers N``、systemd 重启与旧进程重叠、两个 pytest 并发
+    用同一个测试库）时，双方都可能读到「列不存在」，随后一个成功、另一个撞
+    1060 / 1061，整个启动流程直接失败 —— 而 MySQL 的 ``CREATE TABLE IF NOT EXISTS``
+    建表是幂等的，偏偏 ``ALTER TABLE ... ADD COLUMN`` 不是。这两个错误码的语义就是
+    「已经有人做了」，当成成功继续即可。
+
+    ``columns`` 是 ``(列名, DDL)`` 序列；DDL 里可以顺带建索引。
+    """
+    existing = await table_columns(conn, table)
+    for column, ddl in columns:
+        if column in existing:
+            continue
+        try:
+            await conn.execute(ddl)
+        except pymysql.err.OperationalError as exc:
+            code = int(exc.args[0]) if exc.args else 0
+            if code not in _ALREADY_DONE_ERRNOS:
+                raise
+            logger.debug("列 %s.%s 已由其它进程补上，跳过", table, column)
+
+
 def read_setting_sync(key: str) -> Optional[str]:
     """同步读取一个 setting。
 

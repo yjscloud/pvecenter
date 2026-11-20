@@ -184,15 +184,27 @@ export function osFamilyOf(
 /**
  * 一个**模板**属于哪个家族。
  *
- * 与 :func:`osFamilyOf` 的取舍相反：名称优先。模板名是运维起的、通常写明发行版；
- * 而 ostype 在建模板时很容易停在默认的 `l26` —— 一个叫 `windows-server-2019`
- * 的模板被分进 Linux 组，比认不出系统更糟。
+ * 名称大部分时候最可信（模板名是运维起的，通常写明发行版），但有一个例外必须让
+ * 位给 ostype：**不同节点上的模板可以同名，而系统并不相同** —— 两台 PVE 上各有
+ * 一台叫 `ubuntu24` 的模板，其中一台其实是 Windows，按名称优先就会给它配 Ubuntu
+ * 图标。`win*` 的 ostype 是硬事实，反方向的误判不存在（真正的 Linux 模板不会是
+ * win 系 ostype）。
+ *
+ * 其余情况仍名称优先：ostype 在建模板时很容易停在默认的 `l26`，一个叫
+ * `windows-server-2019` 的模板被分进 Linux 组，比认不出系统更糟。
  */
 export function templateFamily(item: OsLabeled): OsFamily {
+  const ostype = String(item.ostype ?? '').trim();
+  if (isWindowsOstype(ostype)) return FAMILIES.windows;
+  /* 容器的 ostype 是**具体发行版**（debian / ubuntu / alpine …），比机器名可信：
+     `prokom`、`php74` 这类业务名一个月也命不中一次规则，而 ostype 一次就能对上。
+     虚拟机的 ostype 是 l26 / win11 这类大类，不会命中这里的发行版规则，
+     仍然交给名称判断。 */
+  const typed = matchName(ostype);
+  if (typed) return typed;
   const named = matchName(String(item.name ?? '').trim());
   if (named) return named;
-  if (isWindowsOstype(item.ostype)) return FAMILIES.windows;
-  return String(item.ostype ?? '').trim() ? FAMILIES.linux : FAMILIES.other;
+  return ostype ? FAMILIES.linux : FAMILIES.other;
 }
 
 /** 分组标题：专名直接用，Linux / Other 走 i18n */

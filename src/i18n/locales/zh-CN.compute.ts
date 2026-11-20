@@ -681,10 +681,14 @@ export const zhCompute = {
 
   /* ---- 通用：创建流程里的系统模板快速选择 ---- */
   'templatePicker.vmLabel': '克隆源（模板）',
-  'templatePicker.vmHint': '只列出该集群上的虚拟机模板（普通虚拟机不可克隆）',
+  'templatePicker.vmHint': '只列出所选节点上的虚拟机模板（普通虚拟机不可克隆）',
   'templatePicker.vmEmptyHint': '该集群上还没有任何模板可作克隆源',
+  'templatePicker.vmEmptyOnNode':
+    '节点 {node} 上没有虚拟机模板；{others} 上有 {n} 个 —— 磁盘在共享存储上的模板可以直接跨节点克隆，否则先把模板迁到 {node}。',
   'templatePicker.ctLabel': '系统模板',
   'templatePicker.ctHint': '来自节点上内容类型含 vztmpl 的存储',
+  'templatePicker.ctEmptyOnNode':
+    '节点 {node} 上还没有系统模板。系统模板存在节点的存储里，不跨节点共享 —— 换一台节点，或先在该节点的存储里下载一份模板。',
   'templatePicker.templateName': '模板 {vmid}',
   'templatePicker.vmNote': '节点 {node} · {cpu} vCPU',
   'templatePicker.colMem': '内存',

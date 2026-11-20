@@ -15,6 +15,7 @@ from .. import (
     bulk,
     defaults,
     guest_created,
+    guestostype,
     guestguard,
     guestip,
     guestnotify,
@@ -279,6 +280,26 @@ async def collect_vms(
                     int(resource.get("vmid") or 0),
                 )
             ] = str(resource.get("name") or "")
+        # 每台机器的系统类型：按节点取一次（含缓存），不阻塞列表主体
+        ostype_index: Dict[Tuple[str, int], str] = {}
+        node_kinds = sorted(
+            {
+                (str(v.get("node") or ""), str(v.get("type") or "qemu"))
+                for v in vms
+                if v.get("node")
+            }
+        )
+        # 轻量列表（仪表盘轮询）不需要图标，跳过这次额外请求
+        if node_kinds and not lightweight:
+            ostype_maps = await parallel(
+                (guestostype.index(client, cid, n, k) for n, k in node_kinds),
+                limit=8,
+            )
+            for (_n, _kind), mapping in zip(node_kinds, ostype_maps):
+                if isinstance(mapping, dict):
+                    for vmid, ostype in mapping.items():
+                        ostype_index[(_n, vmid)] = ostype
+
         items: List[Dict[str, Any]] = [
             {
                 "id": vm.get("id"),
@@ -306,6 +327,11 @@ async def collect_vms(
                 "tags": vm.get("tags") or vm.get("tag") or "",
                 "pool": vm.get("pool"),
                 "lock": vm.get("lock"),
+                # 客户机自己的系统类型（`l26` / `win11` / `debian` …，PVE 权威）：
+                # 列表页的 OS 图标优先用它，其次才回落到来源模板名
+                "ostype": ostype_index.get(
+                    (str(vm.get("node") or ""), int(vm.get("vmid") or 0)), ""
+                ),
                 "netin": vm.get("netin"),
                 "netout": vm.get("netout"),
                 "diskread": vm.get("diskread"),

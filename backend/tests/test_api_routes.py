@@ -592,6 +592,41 @@ class TestReadRoutes:
         assert templates[0]["vmid"] == 9000
         assert templates[0]["template"] is True
 
+    def test_templates_listing_carries_ostype(self, api) -> None:
+        """每张模板都要带 ostype。
+
+        前端用它兜底 OS 图标：**模板可以同名而系统不同**（不同节点/不同 PVE 上
+        各有一台叫 `ubuntu24` 的模板，其中一台其实是 Windows），只按名称判断就会
+        把图标配错。桩里这张模板名叫 `ubuntu-template`，config 里却是 `win11` ——
+        正是这种「名称不可信」的形态。
+        """
+        resp = api.get("/api/templates", headers=auth_headers(api))
+        assert resp.status_code == 200
+        tpl = resp.json()[0]
+        assert tpl["ostype"] == "win11"
+        # 归属信息一并带齐：跨连接的同名模板只能靠「连接 + 节点 + VMID」区分
+        assert "connection_id" in tpl
+        assert tpl["node"] == "pve1"
+
+    def test_guest_lists_carry_ostype(self, api) -> None:
+        """列表里每台机器都要带自己的 ostype。
+
+        列表页的「操作系统」列只靠来源模板名判断时，PVE 上原有的机器（没有克隆
+        记录）整列都是空白。ostype 来自节点级列表（一次请求换整节点），
+        容器给的是具体发行版（`debian`），虚拟机是 `l26` / `win11` 大类。
+        """
+        resp = api.get("/api/vms?type=all", headers=auth_headers(api))
+        assert resp.status_code == 200
+        by_vmid = {row["vmid"]: row for row in resp.json()}
+        assert by_vmid[100]["ostype"] == "l26"
+        # 名字叫 ubuntu-template，ostype 却是 win11 —— 图标必须认后者
+        assert by_vmid[9000]["ostype"] == "win11"
+
+        # 容器列表走同一个 ostype 索引（桩里没有容器资源，验证不报错且字段存在）
+        resp = api.get("/api/lxc", headers=auth_headers(api))
+        assert resp.status_code == 200
+        assert all("ostype" in row for row in resp.json())
+
     def test_dashboard_top_aggregates_running_vms(self, api) -> None:
         """榜单汇总全部连接（只剩一台时可验证形状），且每条都带 connection_id ——
         前端要靠它把条目链到正确的详情页。"""
@@ -1415,7 +1450,13 @@ class TestGuestDiskUsage:
                 mock_mod.ROUTES.pop(key, None)
 
     def test_viewer_of_other_vm_is_blocked(self, api) -> None:
-        """归属隔离：普通用户不能拿别人的虚拟机当命令通道。"""
+        """归属隔离：普通用户不能拿别人的虚拟机当命令通道。
+
+        拒绝语义是 **404** 而不是 403：403 等于承认「这台存在，只是不属于你」，
+        拿号段批量打一遍就能把全平台在用的 VMID 摸出来（见 ``app/guestguard.py``
+        的「拒绝语义」）。断言里只校验状态码，不校验文案 —— 文案同样不能带
+        node / vmid。
+        """
         admin = auth_headers(api)
         api.post(
             "/api/users",
@@ -1429,7 +1470,7 @@ class TestGuestDiskUsage:
             "/api/vms/pve1/100/disk-usage",
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
 
 # ------------------------------------------------------ 额度总览（/quota/overview）

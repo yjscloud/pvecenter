@@ -148,7 +148,7 @@ async def usage(user: Dict[str, Any], kind: str = "vm") -> Dict[str, Any]:
     ``false`` —— 这是创建按钮唯一的判据，不能因为展示口径变了而放宽。
     """
     name = normalise_kind(kind)
-    group = GROUP_GUEST_KIND[name]
+    group = KIND_GROUP[name]
     quota = await get_quota(name)
 
     # 一次读数同时供「全局」与「按人」两个视角使用：两次分别拉 cluster_resources
@@ -324,6 +324,15 @@ LIMIT_GROUPS: Dict[str, Tuple[str, ...]] = {
 #: 上半部分沿用历史叫法 ``lxc``，归属 / 权限那一侧叫 ``ct``，换算只此一处 ——
 #: 别在调用点各自硬编码，否则迟早有人把 ``ct`` 传进 :func:`get_quota`。
 GROUP_GUEST_KIND: Dict[str, str] = {"vm": "vm", "ct": "lxc"}
+
+#: 反向换算：上半部分的 guest 类型（``vm`` / ``lxc``）→ 额度分组（``vm`` / ``ct``）。
+#:
+#: :func:`usage` 的入参是前者，而 :func:`summarise_usage` / :func:`effective_limits`
+#: 的键是后者。**不能**直接拿 ``"lxc"`` 去索引 :data:`GROUP_GUEST_KIND` —— 那张表的
+#: 键是 ``vm`` / ``ct``，``GROUP_GUEST_KIND["lxc"]`` 会抛 ``KeyError: 'lxc'``，
+#: 表现为「保存容器额度时服务器内部错误：'lxc'」（``/config/lxc-quota``、
+#: ``/lxc/quota`` 两条路都会踩到）。
+KIND_GROUP: Dict[str, str] = {kind: group for group, kind in GROUP_GUEST_KIND.items()}
 
 #: 额度来源：给前端解释「这个数字是哪一层给的」
 SOURCE_USER = "user"

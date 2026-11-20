@@ -28,6 +28,7 @@ from .. import (
     batchcreate,
     defaults,
     guest_created,
+    guestostype,
     guestip,
     guestnotify,
     guestpasswd,
@@ -171,6 +172,20 @@ async def list_containers(
         cid = str(profile.get("id") or "") if profile else str(requested_connection() or "")
         label = connection_label(profile) if profile else ""
         region = str((profile or {}).get("region") or "").strip()
+        # 容器的 ostype（`debian` / `ubuntu` / `alpine` …）：列表页 OS 图标靠它，
+        # 而 /cluster/resources 不带这个字段。按节点取一次，别为图标逐台读 config。
+        ostype_index: Dict[int, str] = {}
+        nodes_needed = sorted({str(c.get("node") or "") for c in containers if c.get("node")})
+        # 轻量列表（仪表盘轮询）不需要图标，跳过这次额外请求
+        if nodes_needed and not summary:
+            maps = await parallel(
+                (guestostype.index(client, cid, n, "lxc") for n in nodes_needed),
+                limit=8,
+            )
+            for mapping in maps:
+                if isinstance(mapping, dict):
+                    ostype_index.update(mapping)
+
         items: List[Dict[str, Any]] = [
             {
                 "id": ct.get("id"),
@@ -192,6 +207,8 @@ async def list_containers(
                 "tags": ct.get("tags") or ct.get("tag") or "",
                 "pool": ct.get("pool"),
                 "lock": ct.get("lock"),
+                # 容器自己的系统类型（`debian` / `ubuntu` …，PVE 权威）
+                "ostype": ostype_index.get(int(ct.get("vmid") or 0), ""),
                 "netin": ct.get("netin"),
                 "netout": ct.get("netout"),
                 "diskread": ct.get("diskread"),

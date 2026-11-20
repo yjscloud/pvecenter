@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -441,12 +442,65 @@ class TestOnboardScript:
         assert "/api/connections/register" in body
         assert _bash_syntax_ok(body)
 
+    def test_script_asks_before_touching_pve(self, onboard) -> None:
+        """已接入的集群应当在动 pveum 之前就停手，并说清为什么要停下。"""
+        client, _ = onboard
+        issued = _issue(client, auth_headers(client))
+        body = _fetch_script(client, issued["script_url"])
+
+        assert "/api/connections/onboard/preflight" in body
+        # 停手之后要给出「同一集群只需接入一次」和「真要用本机地址就加 &force=1」
+        assert "无需重复接入" in body
+        assert "&force=1" in body
+        # 这句判断必须排在第一个真正动 pveum 的调用之前
+        assert body.index("onboard/preflight") < body.index("pveum user list")
+        assert _bash_syntax_ok(body)
+
+    def test_console_password_rotation_uses_the_api_not_user_modify(self, onboard) -> None:
+        """`pveum user modify` 没有 --password（PVE 9 上直接 Unknown option）。"""
+        client, _ = onboard
+        issued = _issue(client, auth_headers(client))
+        body = _fetch_script(client, issued["script_url"])
+
+        # 注释里可以提到它（说明为什么不用），但绝不能真的调用
+        assert 'pveum user modify "' not in body
+        assert "pveum user modify --password" not in body
+        assert "/access/password" in body
+        assert _bash_syntax_ok(body)
+
     def test_script_bakes_panel_and_force(self, onboard) -> None:
         client, _ = onboard
         issued = _issue(client, auth_headers(client))
         body = _fetch_script(client, issued["script_url"] + "&force=1")
         assert "FORCE=1" in body
         assert "http://testserver" in body
+
+    def test_script_pins_the_node_certificate(self, onboard) -> None:
+        """面板回连走 https，而 PVE 出厂自签：脚本必须把本机证书带上去钉扎。
+
+        不带 ``ca_cert`` 时面板按 ``PVE_VERIFY_SSL`` 校验，注册必然
+        ``CERTIFICATE_VERIFY_FAILED`` —— 部署在真实机房里这几乎是必踩的一条。
+        """
+        client, _ = onboard
+        issued = _issue(client, auth_headers(client))
+        body = _fetch_script(client, issued["script_url"])
+
+        assert "openssl s_client -connect '127.0.0.1:8006'" in body
+        # -showcerts 不能少：s_client 默认只打印叶子，而叶子是被 PVE 根 CA 签的，
+        # 只钉叶子时面板侧建不出链（CERTIFICATE_VERIFY_FAILED）
+        assert "-showcerts" in body
+        # 根 CA 也要带上，不能指望 s_client 一定吐得出根
+        assert "/etc/pve/pve-root-ca.pem" in body
+        assert "/etc/pve/local/pve-ssl.pem" in body
+        # 拼接必须自己补换行（_pem_add），并在发出去之前就地清洗 + 自证可用：
+        # 块粘在一起时 PEM 会整体失效，面板只能回一句看不懂的 500
+        assert "_pem_add" in body
+        assert "def normalize_pem" in body
+        # 证书要随注册请求发上去，且是按证书钉扎（verify_ssl 仍为 True）
+        assert 'data["ca_cert"] = ca_pem' in body
+        # 取不到证书时不能默认把校验关掉：降级必须由运维显式要求
+        assert "PVE_ONBOARD_INSECURE" in body
+        assert _bash_syntax_ok(body)
 
     def test_used_code_serves_an_error_script_not_json(self, onboard) -> None:
         """码用过之后再来下载：仍是脚本，但只打印原因并退出 1。"""
@@ -678,38 +732,139 @@ class TestRegisterConnection:
         assert rows[0]["status"] == "active"
 
 
-class TestConsoleAccount:
-    """控制台账号（可选）：签发时的勾选决定脚本建不建账号、面板收不收凭据。
+class TestOnboardPreflight:
+    """第二个节点不该再跑一遍：同一集群共享账号与令牌，重跑会把别人的令牌轮换掉。"""
 
-    PVE 不接受 API Token 换 VNC 票据，「能不能开控制台」只能靠节点上有没有一个
-    带密码的账号。默认关是基线：只读接入不该在节点上留密码。
-    """
-
-    def test_default_is_off_and_script_skips_console(self, onboard) -> None:
-        client, _ = onboard
-        issued = _issue(client, auth_headers(client))
-
-        assert issued["console_enabled"] is False
-        body = _fetch_script(client, issued["script_url"])
-        assert "CONSOLE=0" in body
-        assert _bash_syntax_ok(body)
-
-    def test_enabled_code_renders_the_console_steps(self, onboard) -> None:
-        client, _ = onboard
-        issued = _issue(client, auth_headers(client), console_enabled=True)
-
-        assert issued["console_enabled"] is True
-        body = _fetch_script(client, issued["script_url"])
-        assert "CONSOLE=1" in body
-        assert "pvecenter-console@pve" in body
-        # PVEAuditor 不含 VM.Console：脚本必须自己把角色补上，否则控制台照样 403
-        assert "VM.Console" in body
-        assert _bash_syntax_ok(body)
-
-    def test_credentials_dropped_when_code_did_not_enable_console(
+    def test_registered_cluster_is_reported_and_the_code_survives(
         self, onboard
     ) -> None:
-        """持码者不能靠多塞两个字段，把只读接入升级成能操作控制台的接入。"""
+        client, port = onboard
+        auth = auth_headers(client)
+        first = _register(client, port, _issue(client, auth)["code"])
+        assert first.status_code == 200
+        cluster_key = first.json()["cluster_key"]
+
+        # 另一条链接 + 同一集群的另一台节点
+        second = _issue(client, auth)
+        resp = client.get(
+            "/api/connections/onboard/preflight",
+            params={"code": second["code"], "cluster_key": cluster_key},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["registered"] is True
+        assert body["connection_id"] == first.json()["connection_id"]
+        assert body["name"] and body["host"]
+
+        # 问一句不等于用掉：这条链接还能拿去接别的集群
+        rows = client.get("/api/connections/register-codes", headers=auth).json()
+        row = next(r for r in rows if r["id"] == second["id"])
+        assert row["status"] == "active"
+        assert row["used_count"] == 0
+
+    def test_unknown_cluster_is_not_registered(self, onboard) -> None:
+        client, _ = onboard
+        issued = _issue(client, auth_headers(client))
+        resp = client.get(
+            "/api/connections/onboard/preflight",
+            params={"code": issued["code"], "cluster_key": "standalone:another"},
+        )
+        assert resp.json()["registered"] is False
+
+    def test_bad_code_is_not_registered(self, onboard) -> None:
+        client, _ = onboard
+        resp = client.get(
+            "/api/connections/onboard/preflight",
+            params={"code": "pvir_nope", "cluster_key": "standalone:pve1"},
+        )
+        assert resp.json() == {"code_ok": False, "registered": False}
+
+
+class TestOnboardPermissions:
+    """一键接入直接把 PVE 的 root 权限交给面板：不建中间账号、不建角色、不写 ACL。"""
+
+    def test_script_uses_the_root_token(self, onboard) -> None:
+        client, _ = onboard
+        issued = _issue(client, auth_headers(client))
+        body = _fetch_script(client, issued["script_url"])
+
+        assert "PVE_USER='root@pam'" in body
+        # --privsep 0：令牌继承 root 的全部权限，不再有「特权分离」导致的缺权限
+        assert '"$PVE_USER" "$PVE_TOKEN" --privsep 0' in body
+        # 中间账号 / 自定义角色 / ACL 那一整套全部退场（只留一句清理旧账号的提示）
+        assert 'pveum user add "$PVE_USER"' not in body
+        assert "MANAGE_ROLE" not in body
+        assert 'pveum acl modify / --users "$PVE_USER"' not in body
+        # 运维执行完要看到「能做什么」，而不是一行权限名清单
+        assert "  权限      创建 / 克隆 / 开关机 / 快照 / 备份 / 防火墙 / 节点网络" in body
+        # root 令牌的风险要在接入完成时就讲清楚，不能只写在文档里
+        assert "这份令牌等同 PVE 最高权限" in body
+        assert "二次验证（TOTP）" in body
+        assert _bash_syntax_ok(body)
+
+    def test_permission_switches_are_gone(self, onboard) -> None:
+        client, _ = onboard
+        # 老前端缓存仍可能带着旧字段：后端要静默忽略，不能 422
+        issued = _issue(client, auth_headers(client), read_only=True)
+
+        assert "read_only" not in issued
+        body = _fetch_script(client, issued["script_url"])
+        assert "READONLY=" not in body
+        assert "只读：只能看" not in body
+        assert _bash_syntax_ok(body)
+
+    def test_code_list_no_longer_carries_the_switches(self, onboard) -> None:
+        client, _ = onboard
+        auth = auth_headers(client)
+        issued = _issue(client, auth)
+
+        rows = client.get("/api/connections/register-codes", headers=auth).json()
+        row = next(r for r in rows if r["id"] == issued["id"])
+        assert "read_only" not in row
+        assert "console_enabled" not in row
+
+
+class TestRegisterTlsHint:
+    """自签证书导致的 400，文案必须能直接照做。
+
+    原始报错只有一句 ``unable to get local issuer certificate``，看不出这是
+    「证书没钉扎」还是「面板连不上」；而 PVE 出厂自签，这条路上第一次接入
+    几乎必踩。
+    """
+
+    _TLS_MSG = (
+        "Cannot reach Proxmox at https://127.0.0.1:8006: "
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+        "unable to get local issuer certificate (_ssl.c:1016)"
+    )
+
+    def _boom(self, monkeypatch) -> None:
+        message = self._TLS_MSG
+
+        async def _raise(client: Any, *args: Any, **kwargs: Any) -> Any:
+            raise pve_module.ProxmoxError(message)
+
+        monkeypatch.setattr(pve_module.ProxmoxClient, "version", _raise)
+
+    def test_tls_failure_explains_pinning(self, onboard, monkeypatch) -> None:
+        client, port = onboard
+        issued = _issue(client, auth_headers(client))
+        self._boom(monkeypatch)
+
+        resp = _register(client, port, issued["code"])
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        # 原文保留（排障要看），后面跟上能直接照做的下一步
+        assert "CERTIFICATE_VERIFY_FAILED" in detail
+        assert "钉扎" in detail
+        assert "PVE_ONBOARD_INSECURE" in detail
+
+    def test_unparsable_ca_cert_is_400_not_500(self, onboard) -> None:
+        """坏 PEM 必须是 400 + 人话，不能是裸 500。
+
+        真实踩过：命令替换吃掉换行，两段证书粘在一行，面板侧抛
+        ``no start line: cadata does not contain a certificate`` 的 500。
+        """
         client, port = onboard
         issued = _issue(client, auth_headers(client))
 
@@ -717,17 +872,65 @@ class TestConsoleAccount:
             client,
             port,
             issued["code"],
-            console_user="pvecenter-console@pve",
-            console_password="sneaky",
+            ca_cert=(
+                "-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----"
+                "\n-----BEGIN CERTIFICATE-----\nnope2\n-----END CERTIFICATE-----"
+            ),
         )
-        assert resp.status_code == 200
-        conn = store.get_connections()[0]
-        assert conn.get("console_user", "") == ""
-        assert conn.get("console_password", "") == ""
+        assert resp.status_code == 400
+        assert "证书 PEM 无法解析" in resp.json()["detail"]
 
-    def test_credentials_stored_when_enabled(self, onboard) -> None:
+    def test_pinned_cert_still_failing_points_at_rotation(
+        self, onboard, monkeypatch
+    ) -> None:
+        """已经带证书还失败：多半是证书换过，提示要指向这一点而不是「没带证书」。"""
         client, port = onboard
-        issued = _issue(client, auth_headers(client), console_enabled=True)
+        issued = _issue(client, auth_headers(client))
+        self._boom(monkeypatch)
+
+        resp = _register(
+            client, port, issued["code"], ca_cert="-----BEGIN CERTIFICATE-----x"
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "对不上" in detail
+        assert "PVE_ONBOARD_INSECURE" not in detail
+
+
+class TestConsoleAccount:
+    """控制台账号：一律创建 —— PVE 的 VNC 要「账号 + 密码」换票据，令牌换不了。
+
+    哪怕面板手里握着 root 令牌，没有密码账号照样点不开控制台。
+    """
+
+    def test_script_always_renders_the_console_steps(self, onboard) -> None:
+        client, _ = onboard
+        issued = _issue(client, auth_headers(client))
+
+        assert "console_enabled" not in issued
+        body = _fetch_script(client, issued["script_url"])
+        assert "CONSOLE=" not in body
+        assert "pvecenter-console@pve" in body
+        # 控制台角色必须自带 VM.Console：光有密码、没有权限，VNC 照样 403
+        assert "VM.Console" in body
+        # privs 必须是逗号分隔：空格版被 pveum 当成一个非法权限，角色建不出来，
+        # 然后 ACL 才报「role does not exist」（PVE 8.4 上踩过）
+        assert "VM.Audit,VM.Console" in body
+        assert "--privs 'VM.Audit VM.Console'" not in body
+        # 角色名不能以 PVE 开头（大小写不敏感）：那是 PVE 的保留命名空间，
+        # `pveum role add` 会直接 400（PVECenterConsole 上踩过）
+        role = re.search(r"^CONSOLE_ROLE='([^']+)'$", body, re.M).group(1)
+        assert not role.lower().startswith("pve"), role
+        # 顺序也不能反：先建角色，再授 ACL
+        assert body.index("pveum role add") < body.index(
+            'pveum acl modify / --users "$CONSOLE_USER" --roles "$CONSOLE_ROLE"'
+        )
+        assert _bash_syntax_ok(body)
+
+    def test_credentials_are_always_stored(self, onboard) -> None:
+        """控制台凭据无条件接收：签发时已经没有「是否启用控制台」可勾。"""
+        client, port = onboard
+        issued = _issue(client, auth_headers(client))
 
         resp = _register(
             client,
@@ -771,3 +974,61 @@ class TestRegenerateFlow:
         body = _fetch_script(client, issued["script_url"])
         assert "已被撤销" in body
         assert _bash_exit_code(body) == 1
+
+
+class TestRepairPermissions:
+    """「修复权限」不再走进「用受限账号去改 ACL」的死路。
+
+    旧版一键接入建的账号刻意不含 ``Permissions.Modify``（CenterPanel 角色、
+    控制台账号只有 VM.Audit + VM.Console），拿它去 ``PUT /access/acl`` 只会得到
+    ``Permission check failed (/, Permissions.Modify)``。现在的行为是：
+    全权令牌直接回「无需修复」，受限令牌给一条能照做的指引。
+    """
+
+    @staticmethod
+    def _repair(client: TestClient, auth: Dict[str, str]):
+        conn_id = str(store.get_connections()[0]["id"])
+        return client.post(
+            f"/api/connections/{conn_id}/repair-permissions", headers=auth
+        )
+
+    def test_full_privilege_token_needs_no_repair(self, onboard, monkeypatch) -> None:
+        import test_pve_client as pve_stub
+
+        # 全权令牌：/ 上带 Permissions.Modify（root@pam + --privsep 0 的形态）
+        monkeypatch.setitem(
+            pve_stub.PERMISSIONS, "/", ["Sys.Audit", "VM.Audit", "Permissions.Modify"]
+        )
+        client, port = onboard
+        auth = auth_headers(client)
+        issued = _issue(client, auth)
+        assert _register(client, port, issued["code"]).status_code == 200
+
+        resp = self._repair(client, auth)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["already_ok"] is True
+        assert "Permissions.Modify@/" in body["effective_privileges"]
+
+    def test_limited_account_gets_an_actionable_error(self, onboard) -> None:
+        client, port = onboard
+        auth = auth_headers(client)
+        issued = _issue(client, auth)
+        # 注册时带上旧版控制台账号：它只有 VM.Audit + VM.Console，改不了 ACL
+        assert (
+            _register(
+                client,
+                port,
+                issued["code"],
+                console_user="pvecenter-console@pve",
+                console_password="random-pw",
+            ).status_code
+            == 200
+        )
+
+        resp = self._repair(client, auth)
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        # 说清楚「该干什么」，而不是把 PVE 的 403 原样抛给用户
+        assert "一键接入" in detail
+        assert "Permission check failed" not in detail

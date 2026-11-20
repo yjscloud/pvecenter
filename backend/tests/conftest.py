@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import pymysql
 import pytest
@@ -98,6 +101,36 @@ TABLES = (
     # 「签一张就能用一次」这类断言会被旧行干扰。
     "connection_register_codes",
 )
+
+
+@contextmanager
+def _exclusive_db_lock(database_name: str) -> Iterator[None]:
+    """同一时刻只允许一个 pytest 进程使用同一个测试库。
+
+    没有这把锁时，两个 pytest 同时跑（IDE 里点一次、终端里又跑一次；上一轮还在
+    退出时又重跑一遍）会互相清库：A 刚 ``init_db`` 建好表，B 的 ``clean_mysql_db``
+    把表 drop 掉，A 紧接着读 ``information_schema`` 拿到空集合 → 去 ALTER 已经
+    建好的列 → 报 ``1060 Duplicate column name``，看起来像迁移代码写错了，实际
+    是两个进程在抢同一份库。锁按库名取，所以不同库的测试仍然可以并行。
+
+    非 POSIX 平台没有 ``fcntl``，退化成不加锁（Windows 上开发时单进程跑即可）。
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - 非 POSIX
+        yield
+        return
+
+    path = Path(tempfile.gettempdir()) / f"pvecenter-test-{database_name}.lock"
+    handle = open(path, "w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def connect(database_name: str | None = None):
@@ -215,7 +248,10 @@ def mysql_test_db():
 
     settings.db_name = target
     database._mysql_pool = None
-    yield target
+    # 整场会话持锁：清库 / 建表 / 断言都在这把锁之内，别的 pytest 进程只能排队。
+    with _exclusive_db_lock(target):
+        yield target
+    database._mysql_pool = None
 
 
 @pytest.fixture(autouse=True)
@@ -245,13 +281,16 @@ def _clear_process_caches() -> None:
     """清掉不落库的进程内缓存 —— 它们不随表清理，会跨用例串数据。
 
     * ``reportcache``：巡检报告的内存 TTL 缓存；
-    * ``pvecache``：仪表盘 / 连接状态的只读缓存。
+    * ``pvecache``：仪表盘 / 连接状态的只读缓存；
+    * ``guestostype``：系统类型索引（单台 6 小时），不清的话上一个用例桩出来的
+      ostype 会被下一个用例命中，「列表按名称兜底」这类断言就测不出来。
     """
-    from app import pbs, pvecache, reportcache, store
+    from app import guestostype, pbs, pvecache, reportcache, store
 
     reportcache._cache.clear()
     reportcache._locks.clear()
     reportcache._refresh_marks.clear()
+    guestostype.clear()
     pvecache.invalidate()
     # PBS 概览缓存同样是模块级全局：不清的话，上一个用例桩出来的“已配置”会在
     # 下一个用例里被直接命中，断言看到的不是自己造的数据。

@@ -193,56 +193,63 @@ async def init_db() -> None:
         # status       注册审批状态，DEFAULT 'active' 让存量账号直接可用
         # token_version 会话版本号：+1 即让该用户所有已发出的 token 立刻失效
         # totp_*       两步验证（密钥用 crypto 加密后落库）
-        columns = await database.table_columns(db, "users")
-        for column, ddl in (
-            ("permissions", "ALTER TABLE users ADD COLUMN permissions TEXT"),
+        # 走 database.add_columns 而不是「先查列、再 ALTER」：读列与 ALTER 之间有
+        # 窗口，两个进程同时首启时会撞 1060 Duplicate column name，直接起不来。
+        await database.add_columns(
+            db,
+            "users",
             (
-                "status",
-                "ALTER TABLE users ADD COLUMN status VARCHAR(16) NOT NULL"
-                " DEFAULT 'active'",
+                ("permissions", "ALTER TABLE users ADD COLUMN permissions TEXT"),
+                (
+                    "status",
+                    "ALTER TABLE users ADD COLUMN status VARCHAR(16) NOT NULL"
+                    " DEFAULT 'active'",
+                ),
+                (
+                    "token_version",
+                    "ALTER TABLE users ADD COLUMN token_version INT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "totp_secret",
+                    "ALTER TABLE users ADD COLUMN totp_secret VARCHAR(255) NOT NULL"
+                    " DEFAULT ''",
+                ),
+                (
+                    "totp_enabled",
+                    "ALTER TABLE users ADD COLUMN totp_enabled TINYINT NOT NULL"
+                    " DEFAULT 0",
+                ),
+                ("totp_recovery", "ALTER TABLE users ADD COLUMN totp_recovery TEXT"),
+                # 账号有效期：expires_at 到期后由后台作业关机并冻结（见 app.userexpiry）；
+                # 后两列是作业的幂等标记，避免重复发信 / 重复关机。
+                (
+                    "expires_at",
+                    "ALTER TABLE users ADD COLUMN expires_at DOUBLE NOT NULL DEFAULT 0",
+                ),
+                (
+                    "expiry_notice",
+                    "ALTER TABLE users ADD COLUMN expiry_notice INT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "expiry_frozen",
+                    "ALTER TABLE users ADD COLUMN expiry_frozen DOUBLE NOT NULL"
+                    " DEFAULT 0",
+                ),
+                # 区域管理员可管理的区域（JSON 数组）。NULL = 不按区域限制，存量账号
+                # 无需迁移；这一列只对 role='region_admin' 的账号有实际作用。
+                ("regions", "ALTER TABLE users ADD COLUMN regions TEXT"),
             ),
-            (
-                "token_version",
-                "ALTER TABLE users ADD COLUMN token_version INT NOT NULL DEFAULT 0",
-            ),
-            (
-                "totp_secret",
-                "ALTER TABLE users ADD COLUMN totp_secret VARCHAR(255) NOT NULL"
-                " DEFAULT ''",
-            ),
-            (
-                "totp_enabled",
-                "ALTER TABLE users ADD COLUMN totp_enabled TINYINT NOT NULL DEFAULT 0",
-            ),
-            ("totp_recovery", "ALTER TABLE users ADD COLUMN totp_recovery TEXT"),
-            # 账号有效期：expires_at 到期后由后台作业关机并冻结（见 app.userexpiry）；
-            # 后两列是作业的幂等标记，避免重复发信 / 重复关机。
-            (
-                "expires_at",
-                "ALTER TABLE users ADD COLUMN expires_at DOUBLE NOT NULL DEFAULT 0",
-            ),
-            (
-                "expiry_notice",
-                "ALTER TABLE users ADD COLUMN expiry_notice INT NOT NULL DEFAULT 0",
-            ),
-            (
-                "expiry_frozen",
-                "ALTER TABLE users ADD COLUMN expiry_frozen DOUBLE NOT NULL DEFAULT 0",
-            ),
-            # 区域管理员可管理的区域（JSON 数组）。NULL = 不按区域限制，存量账号
-            # 无需迁移；这一列只对 role='region_admin' 的账号有实际作用。
-            ("regions", "ALTER TABLE users ADD COLUMN regions TEXT"),
-        ):
-            if column not in columns:
-                await db.execute(ddl)
+        )
         await db.commit()
 
         # 角色表补列：quota = 角色默认资源额度（JSON，见 app.quota）。
         # NULL = 未配置；用户级额度也没配时按「不限制」处理，存量角色无需迁移。
-        role_columns = await database.table_columns(db, "roles")
-        if "quota" not in role_columns:
-            await db.execute("ALTER TABLE roles ADD COLUMN quota TEXT")
-            await db.commit()
+        await database.add_columns(
+            db,
+            "roles",
+            (("quota", "ALTER TABLE roles ADD COLUMN quota TEXT"),),
+        )
+        await db.commit()
 
         # 审计表补列：target_guest = target 里的「那台机器」（取 `a -> b` 的最后
         # 一段）。创建时间回填要按 node/vmid 查克隆记录，而 target 有两种形态
@@ -250,35 +257,46 @@ async def init_db() -> None:
         # 用不上索引、每台机器一次全表扫描 —— 它跑在虚拟机列表的首屏路径上。
         # 用 VIRTUAL 而不是 STORED：加虚拟列是 INPLACE 的，不必重建整张表
         # （审计表动辄几十万行），代价只是读取那几列时现算一次。
-        audit_columns = await database.table_columns(db, "audit_log")
-        if "target_guest" not in audit_columns:
-            try:
-                await db.execute(
-                    "ALTER TABLE audit_log ADD COLUMN target_guest VARCHAR(255)"
-                    " GENERATED ALWAYS AS (SUBSTRING_INDEX(TRIM(target), ' -> ', -1))"
-                    " VIRTUAL,"
-                    " ADD KEY idx_audit_guest_time (target_guest, timestamp)"
-                )
-                await db.commit()
-            except Exception:  # noqa: BLE001 - 迁移尽力而为，失败不影响主流程
-                # 这条 DDL 带了生成列与索引，比单纯补一列更容易受 MySQL 版本 /
-                # 权限影响。失败也不该让面板起不来：回填那条查询自己会退化成
-                # 「查不到」（见 guest_created._backfill_from_audit 的 except），
-                # 少的是「克隆机器的创建时间纠正」，不是功能。
-                logger.warning(
-                    "给 audit_log 补 target_guest 失败：创建时间回填会退化成查不到",
-                    exc_info=True,
-                )
+        try:
+            await database.add_columns(
+                db,
+                "audit_log",
+                (
+                    (
+                        "target_guest",
+                        "ALTER TABLE audit_log ADD COLUMN target_guest VARCHAR(255)"
+                        " GENERATED ALWAYS AS"
+                        " (SUBSTRING_INDEX(TRIM(target), ' -> ', -1))"
+                        " VIRTUAL,"
+                        " ADD KEY idx_audit_guest_time (target_guest, timestamp)",
+                    ),
+                ),
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001 - 迁移尽力而为，失败不影响主流程
+            # 这条 DDL 带了生成列与索引，比单纯补一列更容易受 MySQL 版本 /
+            # 权限影响。失败也不该让面板起不来：回填那条查询自己会退化成
+            # 「查不到」（见 guest_created._backfill_from_audit 的 except），
+            # 少的是「克隆机器的创建时间纠正」，不是功能。
+            logger.warning(
+                "给 audit_log 补 target_guest 失败：创建时间回填会退化成查不到",
+                exc_info=True,
+            )
 
         # 会话表补列：elevated_until = 该会话最后一次「二次确认」的到期时间
         # （敏感操作前要重输密码 / 动态码，见 security.require_step_up）。
-        session_columns = await database.table_columns(db, "refresh_tokens")
-        if "elevated_until" not in session_columns:
-            await db.execute(
-                "ALTER TABLE refresh_tokens ADD COLUMN elevated_until DOUBLE"
-                " NOT NULL DEFAULT 0"
-            )
-            await db.commit()
+        await database.add_columns(
+            db,
+            "refresh_tokens",
+            (
+                (
+                    "elevated_until",
+                    "ALTER TABLE refresh_tokens ADD COLUMN elevated_until DOUBLE"
+                    " NOT NULL DEFAULT 0",
+                ),
+            ),
+        )
+        await db.commit()
 
         cursor = await db.execute("SELECT COUNT(*) FROM users")
         (count,) = await cursor.fetchone()

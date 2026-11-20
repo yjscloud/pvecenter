@@ -859,13 +859,37 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   /* 可关联的模板：只列同类（虚拟机模板给虚拟机、容器模板给容器）。
      弹窗打开时才拉 —— 模板页另有一份缓存，这里的键与它不同但同属 `['templates']`
      前缀，任何一处转换 / 删除模板都会让两边一起失效。 */
+  /* 候选只列**这台虚拟机所属连接**的模板：跨连接拉全量时，两边的模板可以同名
+     同节点同 VMID，选中行与存档就对不上了（备注会记到另一台主机的模板上）。
+     按连接收窄后 `node|vmid` 在连接内天然唯一。 */
+  const metaPickConn = ipTarget?.connection_id;
   const templateChoicesQuery = useQuery({
-    queryKey: ['templates', 'meta-pick', isLxc ? 'lxc' : 'qemu'],
-    queryFn: () => templatesApi.list(undefined, isLxc ? 'lxc' : 'qemu'),
+    queryKey: ['templates', 'meta-pick', metaPickConn ?? '', isLxc ? 'lxc' : 'qemu'],
+    queryFn: () => templatesApi.list(metaPickConn, isLxc ? 'lxc' : 'qemu'),
     enabled: Boolean(ipTarget),
     staleTime: 60_000,
     retry: false,
   });
+
+  /* 来源模板的 ostype：**模板可以同名而系统不同**（两台 PVE 上各有一台叫
+     ubuntu24 的模板，其中一台是 Windows）。列表列只按名称推断时会把 Windows
+     那行画成 Linux 图标。这里与模板页共用 ['templates','all'] 缓存，模板页
+     打开过就命中，不额外打 PVE。 */
+  const templateLookupQuery = useQuery({
+    queryKey: ['templates', 'all'],
+    queryFn: () => templatesApi.list(undefined, undefined),
+    staleTime: 60_000,
+    retry: false,
+  });
+  const templateOstypeByKey = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const tpl of templateLookupQuery.data ?? []) {
+      if (tpl.ostype) {
+        map.set(`${tpl.connection_id ?? ''}|${tpl.node}|${tpl.vmid}`, tpl.ostype);
+      }
+    }
+    return map;
+  }, [templateLookupQuery.data]);
   /* 选择器的候选：只换形状，不排序 —— 分组与排序交给选择器（按系统家族分组，
      组内按名称自然序），列表页这边不再维护第二套顺序。 */
   const templateOptions = useMemo<SourceTemplateOption[]>(
@@ -1741,7 +1765,27 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
            2. 来源模板名推断（克隆 / 重装的出处）—— 没有记录时的回落。
            两者都没有才是「真不知道」，退回 `#VMID` / 「—」。 */
         const metaFamily = metaOsOf(vm);
-        const family = metaFamily ?? (name ? templateFamily({ name }) : null);
+        /* 同名模板未必同系统：按 (连接, 节点, VMID) 精确取来源模板的 ostype，
+           让 Windows / Linux 大类以 PVE 的记录为准，其余仍看名称 */
+        const sourceOstype = source?.vmid
+          ? templateOstypeByKey.get(
+              `${vm.connection_id ?? ''}|${source.node ?? ''}|${source.vmid}`,
+            )
+          : undefined;
+        /* 机器自己的 ostype 是 PVE 的权威记录：容器直接就是发行版名
+           （debian / ubuntu / alpine），虚拟机至少能分开 Windows 与 Linux。
+           没有克隆记录的老机器（PVE 上原有的、ISO 装的、导入的）之前完全没有
+           图标，靠的就是这一级证据。机器名作为最后一档文字线索（`ubuntu24`
+           这类命名很常见），认不出仍是「···」，不会乱配。 */
+        const guestOstype = vm.ostype || '';
+        const family =
+          metaFamily ??
+          (name || sourceOstype || guestOstype || vm.name
+            ? templateFamily({
+                name: name || vm.name,
+                ostype: guestOstype || sourceOstype,
+              })
+            : null);
 
         /* 名字取不到（来源模板被改名 / 被删，或不在当前这一页的清单里）时退回
            `#VMID` —— VMID 是来源里唯一不会变的部分，比「—」有用得多。
