@@ -260,7 +260,8 @@ export const enNode: Partial<Record<MessageKey, string>> = {
   'conn.onboardTtlHint': 'Unused links expire; 30 minutes is plenty for a batch',
   'conn.onboardTtlOption': '{n} min',
   'conn.onboardMaxUses': 'Uses allowed',
-  'conn.onboardMaxUsesHint': '1 = single-use link (default); use more or "unlimited" for batches',
+  'conn.onboardMaxUsesHint':
+    'One use per node (1–1000, default 1 = single-use); tick “Unlimited” for no cap — uses are still logged',
   'conn.onboardUsesOption': '{n} uses',
   'conn.onboardUsesUnlimitedOption': 'Unlimited',
   'conn.onboardUsesLeft': 'Uses: {left} left of {total}',

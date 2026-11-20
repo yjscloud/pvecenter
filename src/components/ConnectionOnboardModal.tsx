@@ -23,7 +23,7 @@ import { connectionsApi } from '../api/endpoints';
 import { errorMessage } from '../api/client';
 import { Badge } from './ui/Badge';
 import { Button } from './ui/Button';
-import { Input, Select } from './ui/Input';
+import { Checkbox, Input, Select } from './ui/Input';
 import { Modal } from './ui/Modal';
 import { Notice } from './ui/EmptyState';
 import { IconCheck, IconCopy, IconInfo, IconLink, IconTerminal } from './Icons';
@@ -42,9 +42,10 @@ export interface ConnectionOnboardModalProps {
    再长就等于一张长期有效的「建连接许可证」，不如直接发 API Token。 */
 const TTL_OPTIONS = [15, 30, 60, 240];
 
-/* 可用次数：1 是一次性（旧行为），0 表示不限。中间几档覆盖「一个机房几台 / 十几台」
-   的常见规模；再往上就等于长期凭据了，不如发 API Token。 */
-const USES_OPTIONS = [1, 3, 5, 10, 20, 0];
+/* 可用次数由用户自己填（1–1000）：一个机房三台、一个机柜十二台、一次扩十台都常见，
+   写成几档预设反而逼人去「凑数」。0 仍表示不限（后端按 0 处理，只逐次记账）。
+   上限与后端校验对齐（schemas.ConnectionRegisterCodeIn），填超了会被拦下。 */
+const USES_MAX = 1000;
 
 /** 注册码状态 → 徽章样式 */
 const STATUS_VARIANT = {
@@ -100,6 +101,8 @@ export function ConnectionOnboardModal({
   const [note, setNote] = useState('');
   const [ttl, setTtl] = useState('30');
   const [maxUses, setMaxUses] = useState('1');
+  /* 「不限次数」勾上就发 0：后端把 0 当不限额（仍逐次记账），输入框随之禁用 */
+  const [unlimitedUses, setUnlimitedUses] = useState(false);
   const [issuing, setIssuing] = useState(false);
   const [issued, setIssued] = useState<RegisterCodeIssued | null>(null);
   /* 签发失败就地把原因贴在表单上方：只弹 toast 的话，用户点完按钮一抬眼就找不到
@@ -112,6 +115,14 @@ export function ConnectionOnboardModal({
      一屏能清好几条时，比一路弹窗快得多，也不会误触。 */
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  /* 输入框只收数字，空 / 0 都按一次性（1 次）算；提交与摘要共用这一套夹取，
+     于是「摘要写 3 次」与「实际发 3 次」不可能对不上 */
+  const usesValue = Math.min(
+    USES_MAX,
+    Math.max(1, Math.round(Number(maxUses) || 1)),
+  );
+  const uses = unlimitedUses ? 0 : usesValue;
 
   /* 「已复制」不能常亮：用户过一会儿还要再复制一次，按钮一直写着「已复制」会
      让人以为点不动。2.5 秒后回到常态。 */
@@ -141,7 +152,9 @@ export function ConnectionOnboardModal({
         region: region.trim(),
         note: note.trim(),
         ttl_minutes: Number(ttl),
-        max_uses: Number(maxUses),
+        // 0 = 不限；其余夹到 1..1000，清空输入框按一次性算 —— 空提交会被后端
+        // 的参数校验拦下，而这里本就该给一个能用的默认值
+        max_uses: unlimitedUses ? 0 : usesValue,
       });
       setIssued(data);
       setCopied(false);
@@ -221,8 +234,7 @@ export function ConnectionOnboardModal({
   /* 命令取后端返回值；后端还没升级时用 code 现拼一条，别让用户对着空框发呆 */
   const command = issued ? issued.command || fallbackCommand(issued) : '';
 
-  const uses = Number(maxUses);
-  /* 参数摘要：让「30 分钟 / 3 次」这种决定一眼可见，不用回头读两个下拉框 */
+  /* 参数摘要：让「30 分钟 / 3 次」这种决定一眼可见，不用回头读两个下拉框（输入框） */
   const summary = `${t('conn.onboardTtlOption', { n: Number(ttl) })} · ${
     uses === 0
       ? t('conn.onboardUsesUnlimitedOption')
@@ -350,18 +362,29 @@ export function ConnectionOnboardModal({
                 label: t('conn.onboardTtlOption', { n: m }),
               }))}
             />
-            <Select
+            <Input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={USES_MAX}
+              step={1}
               label={t('conn.onboardMaxUses')}
+              /* 「不限次数」与输入框同一行：二选一的关系摆在一起，比藏进下拉更直白 */
+              labelExtra={
+                <Checkbox
+                  className="onboard-uses-unlimited"
+                  label={t('conn.onboardUsesUnlimitedOption')}
+                  checked={unlimitedUses}
+                  onChange={(e) => setUnlimitedUses(e.target.checked)}
+                />
+              }
               hint={t('conn.onboardMaxUsesHint')}
-              value={maxUses}
-              onChange={(e) => setMaxUses(e.target.value)}
-              options={USES_OPTIONS.map((n) => ({
-                value: String(n),
-                label:
-                  n === 0
-                    ? t('conn.onboardUsesUnlimitedOption')
-                    : t('conn.onboardUsesOption', { n }),
-              }))}
+              value={unlimitedUses ? '' : maxUses}
+              disabled={unlimitedUses}
+              placeholder={unlimitedUses ? '—' : '1'}
+              /* 只留数字：粘贴「3 次」这种文本时也别把输入框弄成 NaN */
+              onChange={(e) => setMaxUses(e.target.value.replace(/[^\d]/g, ''))}
+              autoComplete="off"
             />
           </div>
 

@@ -253,7 +253,8 @@ export const zhNode = {
   'conn.onboardTtlHint': '过期未使用即作废，批量接入一般 30 分钟足够',
   'conn.onboardTtlOption': '{n} 分钟',
   'conn.onboardMaxUses': '可用次数',
-  'conn.onboardMaxUsesHint': '1 次 = 一次性链接（默认）；接多台就用多次或「不限」',
+  'conn.onboardMaxUsesHint':
+    '接几台就填几次（1–1000，默认 1 次 = 一次性）；勾「不限次数」则不限额，仍逐次记账',
   'conn.onboardUsesOption': '{n} 次',
   'conn.onboardUsesUnlimitedOption': '不限次数',
   'conn.onboardUsesLeft': '可用次数：还剩 {left} 次（共 {total} 次）',
