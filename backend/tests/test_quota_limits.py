@@ -43,6 +43,7 @@ def _row(
     cores: int = 4,
     memory_bytes: int = 4 * GIB,
     disk_bytes: int = 32 * GIB,
+    template: bool = False,
 ) -> dict:
     """一行 PVE 分配读数（形状与 quota._build_guest_rows 一致）。"""
     return {
@@ -50,6 +51,7 @@ def _row(
         "node": node,
         "vmid": vmid,
         "type": kind,
+        "template": template,
         "cores": cores,
         "memory_bytes": memory_bytes,
         "disk_bytes": disk_bytes,
@@ -265,8 +267,15 @@ class TestSummariseUsage:
         assert quota.summarise_usage(rows, refs)["ct"]["count"] == 1
 
     def test_template_row_counts(self) -> None:
-        """模板同样占核数 / 内存 / 磁盘，沿用第一层的口径。"""
-        rows = [_row(9000, cores=2, memory_bytes=2 * GIB, disk_bytes=16 * GIB)]
+        """模板同样占核数 / 内存 / 磁盘，**按人分配**这一层仍照常计入。
+
+        与全局台数护栏口径不同是有意的：那一层问的是「还能跑几台机器」，模板
+        不占名额；这一层问的是「这个人占了多少预分配容量」，模板的盘和内存是
+        实实在在占着的。
+        """
+        rows = [
+            _row(9000, cores=2, memory_bytes=2 * GIB, disk_bytes=16 * GIB, template=True)
+        ]
         assert quota.summarise_usage(rows, _refs(vm=[_ref(9000)]))["vm"]["count"] == 1
 
     def test_bytes_round_to_nearest_unit(self) -> None:
@@ -819,13 +828,13 @@ class TestCountGuestsUsesCachedRows:
     def test_counts_from_the_shared_rows(self, monkeypatch) -> None:
         rows = [
             {"type": "qemu", "node": "pve1", "vmid": 100},
-            {"type": "qemu", "node": "pve1", "vmid": 9000},  # 模板也算
+            {"type": "qemu", "node": "pve1", "vmid": 9000, "template": 1},  # 模板不算
             {"type": "lxc", "node": "pve1", "vmid": 110},
         ]
         monkeypatch.setattr(quota, "guest_rows", _Rows(rows))
         import asyncio
 
-        assert asyncio.run(quota.count_guests("vm")) == (2, "")
+        assert asyncio.run(quota.count_guests("vm")) == (1, "")
         assert asyncio.run(quota.count_guests("lxc")) == (1, "")
 
     def test_propagates_incomplete_reads(self, monkeypatch) -> None:
@@ -834,6 +843,159 @@ class TestCountGuestsUsesCachedRows:
         import asyncio
 
         assert asyncio.run(quota.count_guests("vm")) == (0, "PVE 连不上")
+
+
+class TestGlobalQuotaExcludesTemplates:
+    """全局台数上限（虚拟机 / 容器各一份）**不算模板**。
+
+    背景：模板在 PVE 里也是「一台机器」，但它是下发能力的来源，不是谁在占名额。
+    把模板数进去，模板一多就会把额度吃光 ——「上限 20、已有 20 个模板」时一台
+    机器都建不出来，而实际没人占用名额。同一口径必须贯穿三处：读数（usage）、
+    台数统计（count_guests）、拦截（enforce_for_create）。
+    """
+
+    def test_flag_parsing(self) -> None:
+        """PVE 给的可能是 1 / 0 / True / "1" / None —— 只有真值才算模板。"""
+        assert quota.is_template({"template": 1})
+        assert quota.is_template({"template": True})
+        assert quota.is_template({"template": "1"})
+        assert not quota.is_template({"template": 0})
+        assert not quota.is_template({"template": False})
+        assert not quota.is_template({"template": ""})
+        assert not quota.is_template({"template": None})
+        assert not quota.is_template({})  # 手工构造的行：按非模板处理
+
+    def test_count_guests_skips_templates_of_both_kinds(self, monkeypatch) -> None:
+        rows = [
+            _row(100),  # 虚拟机
+            _row(9000, template=True),  # 虚拟机模板
+            _row(200, kind="lxc"),  # 容器
+            _row(9100, kind="lxc", template=True),  # 容器模板
+        ]
+        monkeypatch.setattr(quota, "guest_rows", _Rows(rows))
+        assert asyncio.run(quota.count_guests("vm")) == (1, "")
+        assert asyncio.run(quota.count_guests("lxc")) == (1, "")
+
+    def test_usage_reports_templates_separately(self, monkeypatch) -> None:
+        """读数：``used`` 不含模板，模板台数单独给，剩余量按非模板算。"""
+        rows = [_row(100), _row(9000, template=True)]
+        monkeypatch.setattr(quota, "guest_rows", _Rows(rows))
+
+        async def _quota(_kind: str):
+            return 1
+
+        monkeypatch.setattr(quota, "get_quota", _quota)
+        monkeypatch.setattr(quota.security, "is_admin", lambda _user: True)
+        monkeypatch.setattr(quota.security, "has_user_permission", lambda _u, _p: True)
+
+        got = asyncio.run(quota.usage({"username": "admin", "role": "admin"}, "vm"))
+        assert got["scope"] == "global"
+        assert got["used"] == 1
+        assert got["templates"] == 1
+        assert got["remaining"] == 0
+        assert got["global"]["used"] == 1
+        assert got["global"]["templates"] == 1
+
+    def test_templates_alone_do_not_exhaust_the_quota(self, monkeypatch) -> None:
+        """上限 2、只有 2 个模板 → 仍可创建（本次要修的核心问题）。"""
+        rows = [_row(9000, template=True), _row(9001, template=True)]
+        monkeypatch.setattr(quota, "guest_rows", _Rows(rows))
+
+        async def _quota(_kind: str):
+            return 2
+
+        monkeypatch.setattr(quota, "get_quota", _quota)
+        monkeypatch.setattr(quota.security, "is_admin", lambda _user: True)
+        monkeypatch.setattr(quota.security, "has_user_permission", lambda _u, _p: True)
+
+        got = asyncio.run(quota.usage({"username": "admin", "role": "admin"}, "vm"))
+        assert got["used"] == 0
+        assert got["remaining"] == 2
+        assert got["can_create"] is True
+
+    def test_enforce_for_create_ignores_templates(self, monkeypatch) -> None:
+        """拦截与读数同一口径：模板占满额度不该把普通用户挡在门外。"""
+        monkeypatch.setattr(quota, "guest_rows", _Rows([_row(9000, template=True)]))
+        monkeypatch.setattr(quota.security, "is_admin", lambda _user: False)
+
+        async def _quota(_kind: str):
+            return 1
+
+        monkeypatch.setattr(quota, "get_quota", _quota)
+
+        async def _audit(*_a, **_kw):  # pragma: no cover - 正常路径不该走到
+            raise AssertionError("模板不该触发额度拦截")
+
+        monkeypatch.setattr(quota.security, "audit", _audit)
+
+        asyncio.run(
+            quota.enforce_for_create({"username": "alice", "role": "user"}, None, "vm")
+        )
+
+    def test_enforce_for_create_still_blocks_real_guests(self, monkeypatch) -> None:
+        """反向确认：去掉模板之后，真实机器照样会被拦 —— 别把护栏整个删掉。"""
+        monkeypatch.setattr(quota, "guest_rows", _Rows([_row(100)]))
+        monkeypatch.setattr(quota.security, "is_admin", lambda _user: False)
+
+        async def _quota(_kind: str):
+            return 1
+
+        async def _audit(*_a, **_kw):
+            return None
+
+        monkeypatch.setattr(quota, "get_quota", _quota)
+        monkeypatch.setattr(quota.security, "audit", _audit)
+
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as err:
+            asyncio.run(
+                quota.enforce_for_create(
+                    {"username": "alice", "role": "user"}, None, "vm"
+                )
+            )
+        assert err.value.status_code == 403
+
+    def test_row_reader_keeps_the_flag(self, monkeypatch) -> None:
+        """读 PVE 时就要把标记落下来，否则下游无从排除。"""
+
+        class _Client:
+            async def cluster_resources(self, rtype=None):
+                return [
+                    {"node": "pve1", "vmid": 100, "type": "qemu", "maxcpu": 4},
+                    {"node": "pve1", "vmid": 9000, "type": "qemu", "template": 1},
+                    {"node": "pve1", "vmid": 110, "type": "lxc", "template": True},
+                ]
+
+        monkeypatch.setattr(
+            quota, "collection_targets", lambda: [({"id": "c1"}, _Client())]
+        )
+        rows, error = asyncio.run(quota._build_guest_rows())
+        assert error == ""
+        assert {row["vmid"]: row["template"] for row in rows} == {
+            100: False,
+            9000: True,
+            110: True,
+        }
+
+    def test_validate_quota_rules(self) -> None:
+        """写入口径：None = 不限制、0 = 关闸、负数拒绝。"""
+        assert quota.validate_quota(None) is None
+        assert quota.validate_quota(0) == 0
+        assert quota.validate_quota(12) == 12
+        with pytest.raises(ValueError):
+            quota.validate_quota(-1)
+
+    def test_set_quota_rejects_negative_without_touching_store(self, monkeypatch) -> None:
+        """负数在落库前就被拒：别写进一条「读回来是 0」的假配置。"""
+
+        async def _boom(*_a, **_kw):  # pragma: no cover - 不该被调用
+            raise AssertionError("负值不该写库")
+
+        monkeypatch.setattr(quota.store, "set_setting", _boom)
+        monkeypatch.setattr(quota.store, "delete_setting", _boom)
+        with pytest.raises(ValueError):
+            asyncio.run(quota.set_quota("vm", -1))
 
 
 class TestOverview:

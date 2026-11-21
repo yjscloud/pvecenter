@@ -29,8 +29,13 @@
 * **未设置 = 不限制**。存量部署装上这个功能不该突然被锁死，管理员显式填数才生效。
 * **管理员不受限**。配额是给「下发」行为兜底的；真到上限时把管理员一起锁住，
   只会让谁都动不了手（清理、扩容都需要管理员）。
-* **计数口径含模板**。模板在 PVE 里同样是一台机器，占 VMID 与存储；
-  算进去才不会出现「账面上没超、实际堆了一堆」。
+* **全局台数护栏不含模板**。模板在 PVE 里确实占 VMID 与存储，但它是**下发能力的
+  来源**，不是「谁在用名额」：把它算进上限，模板一多就会把额度吃光 ——「上限 20、
+  已有 20 个模板」时一台机器都建不出来，而实际没有任何人占用名额。所以
+  :func:`count_guests` / :func:`usage` / :func:`enforce_for_create` 统计的都是
+  **非模板**的虚拟机和容器（判定见 :func:`is_template`）。
+  注意：本文件下半部分「按人分配」那一层仍把模板计入核数 / 内存 / 磁盘 ——
+  那里记的是预分配容量，模板同样占着盘，口径不同是有意的。
 * **计数失败时拒绝并如实上报**（**仅第二层**）。这一点与第一层的旧行为（放行 +
   提示）**不同**，是有意分开的：额度既然按用户分配，就允许把它当作**硬边界**
   用（多租户场景），统计不准时放行等于把边界开在最不该开的地方。代价是 PVE
@@ -67,6 +72,31 @@ KIND_LABEL: Dict[str, str] = {"vm": "虚拟机", "lxc": "容器"}
 # cluster/resources 里对应的 type（两者都算「一台机器」，但这里分账统计）
 RESOURCE_TYPES: Dict[str, Tuple[str, ...]] = {"vm": ("qemu",), "lxc": ("lxc",)}
 
+#: PVE 的「这是一台模板」标记。``cluster/resources`` 对 qemu 与 lxc 都给
+#: ``template: 1``（容器模板也一样），所以判定只看这一个字段。
+TEMPLATE_FLAG = "template"
+
+
+def _flag(row: Dict[str, Any], key: str) -> bool:
+    """读 PVE 的布尔标记：它可能是 ``1`` / ``0`` / ``True`` / ``"1"`` / ``None``。"""
+    value = row.get(key)
+    if isinstance(value, bool):
+        return value
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def is_template(row: Dict[str, Any]) -> bool:
+    """这一行读数是不是模板。
+
+    全局台数护栏（:func:`count_guests`、:func:`usage`、:func:`enforce_for_create`）
+    一律跳过模板：模板是管理员维护的下发来源，不是普通用户占用名额的机器。
+    面板的模板页、列表接口照常显示它们，不受这里影响。
+    """
+    return _flag(row, TEMPLATE_FLAG)
+
 
 def normalise_kind(kind: Optional[str]) -> str:
     """把外部传入的 kind 收进已知取值；不认识的一律当虚拟机。
@@ -87,7 +117,16 @@ def label(kind: str) -> str:
 
 
 async def get_quota(kind: str = "vm") -> Optional[int]:
-    """该类 guest 的总配额；``None`` 表示不限制。"""
+    """该类 guest 的总配额；``None`` 表示不限制（**默认值**）。
+
+    读口径（三段，写入侧见 :func:`validate_quota`）：
+
+    * 配置不存在 / 空串 —— 默认值「不限制」（``None``）。存量部署装上这个功能
+      不该突然被锁死，管理员显式填数才生效；
+    * 坏值（非整数）—— 按不限制处理并记一条 warning：一个坏配置不该把创建流程
+      卡死，但也不能静默；
+    * 负数 —— 按 ``0`` 处理（0 = 明确关闸，比负数更有意义）。
+    """
     raw = await store.get_setting(_key(kind))
     text = str(raw or "").strip()
     if not text:
@@ -95,29 +134,42 @@ async def get_quota(kind: str = "vm") -> Optional[int]:
     try:
         value = int(text)
     except (TypeError, ValueError):
-        # 配置坏了就当没配：绝不让一个坏值把创建流程卡死
         logger.warning("%s 配置损坏，已按「不限制」处理：%r", _key(kind), raw)
         return None
     return value if value >= 0 else 0
 
 
+def validate_quota(value: Optional[int]) -> Optional[int]:
+    """上限值的校验规则 —— 写入口径只此一处，读口径见 :func:`get_quota`。
+
+    * ``None`` = 不限制（删掉这条配置，回到默认值）；
+    * ``0`` = 明确关闸：普通用户一台都不给建；
+    * 负数直接拒绝 ——「负的上限」没有意义，放进去只会让后面的 ``used < quota``
+      永远不成立，表现成「建不了但界面上限是 -1」。
+    """
+    if value is None:
+        return None
+    number = int(value)
+    if number < 0:
+        raise ValueError("配额不能为负数")
+    return number
+
+
 async def set_quota(kind: str, value: Optional[int]) -> Optional[int]:
     """设置该类配额；传 ``None`` 表示「不限制」（删掉这条配置）。"""
-    if value is None:
+    checked = validate_quota(value)
+    if checked is None:
         await store.delete_setting(_key(kind))
         return None
-    if value < 0:
-        raise ValueError("配额不能为负数")
-    await store.set_setting(_key(kind), str(int(value)))
-    return int(value)
+    await store.set_setting(_key(kind), str(checked))
+    return checked
 
 
 async def count_guests(kind: str = "vm") -> Tuple[int, Optional[str]]:
-    """统计现有该类 guest 的总数。返回 ``(台数, 错误信息)``。
+    """统计现有该类 guest 的台数（**不含模板**）。返回 ``(台数, 错误信息)``。
 
-    口径与 ``GET /vms?type=all`` 一致（都用 ``cluster/resources``），
-    这样用户看到的台数和配额算的台数不会打架。模板一并计入 ——
-    它在 PVE 里同样占一个 VMID 与一份存储。
+    口径与 ``GET /vms?type=all`` 一致（都用 ``cluster/resources``），唯一的差别
+    就是模板：列表里照常显示，但这本账不算（见模块说明与 :func:`is_template`）。
 
     **与「按人分配」那一层共用同一份读数**（:func:`guest_rows`）：两者本来就是
     同一件事的两个视角（全平台 / 某个人），各拉一次 ``cluster_resources`` 既浪费，
@@ -129,7 +181,10 @@ async def count_guests(kind: str = "vm") -> Tuple[int, Optional[str]]:
     """
     wanted = RESOURCE_TYPES[normalise_kind(kind)]
     rows, error = await guest_rows()
-    return sum(1 for row in rows if row.get("type") in wanted), error
+    return (
+        sum(1 for row in rows if row.get("type") in wanted and not is_template(row)),
+        error,
+    )
 
 
 async def usage(user: Dict[str, Any], kind: str = "vm") -> Dict[str, Any]:
@@ -146,6 +201,10 @@ async def usage(user: Dict[str, Any], kind: str = "vm") -> Dict[str, Any]:
 
     ``can_create`` 永远是**两层取最严**：全局护栏满了或者个人额度用尽都返回
     ``false`` —— 这是创建按钮唯一的判据，不能因为展示口径变了而放宽。
+
+    **全局 ``used`` 不含模板**（与 :func:`count_guests` 同一个口径）：设置页那句
+    「当前已用 N 台」就是它，把模板数进去会让管理员按一个偏大的数字去调上限。
+    模板台数单独放在 ``templates`` 里给管理端提示，不参与 ``remaining`` 计算。
     """
     name = normalise_kind(kind)
     group = KIND_GROUP[name]
@@ -155,7 +214,17 @@ async def usage(user: Dict[str, Any], kind: str = "vm") -> Dict[str, Any]:
     # 既浪费，又可能在两次之间隔了几秒而给出互相矛盾的数字。
     rows, error = await guest_rows()
     wanted = RESOURCE_TYPES[name]
-    global_used = sum(1 for row in rows if row.get("type") in wanted)
+    # 全局护栏只数「能跑东西的机器」：模板不进这本账（见模块说明）。
+    # 读数是共用的，所以在这里分开数，别去改行里的模板标记。
+    global_used = 0
+    template_count = 0
+    for row in rows:
+        if row.get("type") not in wanted:
+            continue
+        if is_template(row):
+            template_count += 1
+        else:
+            global_used += 1
     global_remaining = None if quota is None else max(0, quota - global_used)
     global_room = quota is None or global_used < quota
 
@@ -187,6 +256,8 @@ async def usage(user: Dict[str, Any], kind: str = "vm") -> Dict[str, Any]:
             "scope": "global",
             "quota": quota,
             "used": global_used,
+            # 模板台数：不进上限，只用来在设置页把「已用」的统计范围说清楚
+            "templates": template_count,
             "remaining": global_remaining,
             "limited": quota is not None,
             "can_create": can_create,
@@ -196,6 +267,7 @@ async def usage(user: Dict[str, Any], kind: str = "vm") -> Dict[str, Any]:
             "global": {
                 "quota": quota,
                 "used": global_used,
+                "templates": template_count,
                 "remaining": global_remaining,
                 "limited": quota is not None,
             },
@@ -240,6 +312,9 @@ async def enforce_for_create(
     ``count`` 是本次要新增的台数：单台入口默认 1，批量入口传 N。全局台数护栏
     必须按「已用 + N」判断 —— 单台口径下 ``quota - used > 0`` 会让一批 50 台
     在只剩 1 个空位时整体放行（BUG 之外的批量超卖点）。
+
+    「已用」来自 :func:`count_guests`，**不含模板** —— 与设置页回显的读数同一
+    口径。否则管理员看到「已用 3 / 上限 20」却因为 17 个模板被拒，怎么都对不上。
     """
     name = normalise_kind(kind)
     need = max(1, int(count or 1))
@@ -544,7 +619,9 @@ async def effective_limits(
 #   读数只是参考。
 # * **预分配而不是实际占用**：核数 / 内存 / 磁盘都取 PVE ``cluster/resources``
 #   的 ``maxcpu`` / ``maxmem`` / ``maxdisk``（配置了多大），不是实际用了多少。
-# * **含模板**：模板同样占 VMID、核数、内存与磁盘（沿用第一层的口径）。
+# * **含模板**：模板同样占核数、内存与磁盘 —— 这一层记的是预分配容量，模板一样
+#   占着盘。它与上面「全局台数护栏不含模板」**有意不同**：那边问的是「还能跑几台
+#   机器」，这边问的是「这个人占了多少容量」。
 # ==========================================================================
 
 #: 有「名下总量」用量的字段。其余字段（``max_*``）是单台封顶，没有累加值。
@@ -620,6 +697,9 @@ async def _build_guest_rows() -> Tuple[List[Dict[str, Any]], str]:
                     "node": str(item.get("node") or ""),
                     "vmid": _int_field(item, "vmid"),
                     "type": kind,
+                    # 模板标记必须在这里落下来：全局台数护栏靠它把模板排除在外，
+                    # 而 PVE 只在 cluster/resources 里给这一位（qemu / lxc 同一套）
+                    TEMPLATE_FLAG: _flag(item, TEMPLATE_FLAG),
                     "cores": _int_field(item, "maxcpu"),
                     "memory_bytes": _int_field(item, "maxmem"),
                     "disk_bytes": _int_field(item, "maxdisk"),

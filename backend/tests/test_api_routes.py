@@ -1792,7 +1792,8 @@ class TestUserQuota:
 class TestVmQuota:
     """可下发虚拟机数量：**全局**容量上限，不是按用户分配的。
 
-    mock 的 cluster/resources 里有两台 qemu（100 与模板 9000），所以 used == 2。
+    mock 的 cluster/resources 里有两台 qemu（100 与模板 9000）。模板**不算**台数
+    —— 它是下发能力的来源，不该占普通用户的名额 —— 所以 used == 1、templates == 1。
     """
 
     PAYLOAD = {
@@ -1840,7 +1841,7 @@ class TestVmQuota:
         assert "额度" in resp.json()["detail"]
 
     def test_exhausted_quota_blocks_operator(self, api) -> None:
-        self._set_quota(api, 2)  # 已有 2 台，额度刚好用完
+        self._set_quota(api, 1)  # 已有 1 台真实虚拟机（模板不算），额度刚好用完
         operator = self._operator(api)
         resp = api.post("/api/vms", json=self.PAYLOAD, headers=operator)
         assert resp.status_code == 403
@@ -1877,14 +1878,18 @@ class TestVmQuota:
         assert resp.status_code == 403
         assert "额度" in resp.json()["detail"]
 
-    def test_usage_counts_templates_as_well(self, api) -> None:
-        """模板在 PVE 里同样是一台虚拟机，必须计入已用。"""
+    def test_usage_excludes_templates(self, api) -> None:
+        """模板不计入全局额度：``used`` 只数真实虚拟机，模板台数单独报。"""
         self._set_quota(api, 5)
         data = api.get("/api/vms/quota", headers=auth_headers(api)).json()
         assert data["quota"] == 5
-        assert data["used"] == 2  # VM 100 + 模板 9000
-        assert data["remaining"] == 3
+        assert data["used"] == 1  # 只有 VM 100；模板 9000 不算
+        assert data["templates"] == 1
+        assert data["remaining"] == 4
         assert data["limited"] is True
+        # 管理端那份明细同一口径（设置页回显用的就是它）
+        assert data["global"]["used"] == 1
+        assert data["global"]["templates"] == 1
 
     def test_usage_reports_unlimited_when_unset(self, api) -> None:
         data = api.get("/api/vms/quota", headers=auth_headers(api)).json()
@@ -1896,8 +1901,8 @@ class TestVmQuota:
     def test_batch_quota_counts_the_whole_batch(self, api) -> None:
         """全局台数护栏必须按「已用 + N」判断，不能只看还有没有空位。
 
-        mock 里已用 2 台：上限 4 只剩 2 个空位，本次要 3 台必须整批 403；
-        调到 5 才放行。
+        mock 里已用 1 台真实虚拟机（模板不算）：上限 3 只剩 2 个空位，本次要 3 台
+        必须整批 403；调到 4 才放行。
         """
         operator = self._operator(api, "op-batch-quota")
         payload = {
@@ -1915,12 +1920,12 @@ class TestVmQuota:
                 for index in range(3)
             ]
         }
-        self._set_quota(api, 4)
+        self._set_quota(api, 3)
         denied = api.post("/api/vms/batch", json=payload, headers=operator)
         assert denied.status_code == 403, denied.text
         assert "本次需要 3 台" in denied.json()["detail"]
 
-        self._set_quota(api, 5)
+        self._set_quota(api, 4)
         allowed = api.post("/api/vms/batch", json=payload, headers=operator)
         assert allowed.status_code == 200, allowed.text
         assert allowed.json()["ok"] == 3
@@ -1977,8 +1982,9 @@ class TestVmQuota:
         # 管理员仍是全局视角（设置页要用它回显「全平台已用」）
         admin_data = api.get("/api/vms/quota", headers=admin).json()
         assert admin_data["scope"] == "global"
-        assert admin_data["used"] == 2  # VM 100 + 模板 9000
-        assert admin_data["global"]["used"] == 2
+        assert admin_data["used"] == 1  # 只有 VM 100；模板 9000 不进这本账
+        assert admin_data["templates"] == 1
+        assert admin_data["global"]["used"] == 1
 
 
 # ------------------------------------------------------------------- RBAC

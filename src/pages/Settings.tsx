@@ -802,10 +802,14 @@ function VMCreateDefaultsSection() {
     }
   };
 
-  /* 已用 / 可下发的实时读数，让管理员填数时知道现在是多少 */
+  /* 已用 / 可下发的实时读数，让管理员填数时知道现在是多少。
+     口径由后端给：模板不进这本账（``used`` 已排除），这里只把排除掉的
+     模板台数顺带标出来 —— 否则管理员数了列表会以为少了。 */
   const quotaUsed = quotaQuery.data?.used ?? 0;
+  const quotaTemplates = quotaQuery.data?.templates ?? 0;
   const quotaRemaining = quotaQuery.data?.remaining ?? null;
   const lxcUsed = lxcQuotaQuery.data?.used ?? 0;
+  const lxcTemplates = lxcQuotaQuery.data?.templates ?? 0;
   const lxcRemaining = lxcQuotaQuery.data?.remaining ?? null;
 
   return (
@@ -880,6 +884,9 @@ function VMCreateDefaultsSection() {
           {quotaQuery.data ? (
             <div className="set-readout">
               <span>{t('settings.vmUsedVm', { n: quotaUsed })}</span>
+              {quotaTemplates > 0 ? (
+                <span>{t('settings.vmTplExcluded', { n: quotaTemplates })}</span>
+              ) : null}
               {quotaRemaining != null ? (
                 <span>{t('settings.vmRemainingVm', { n: quotaRemaining })}</span>
               ) : null}
@@ -924,6 +931,9 @@ function VMCreateDefaultsSection() {
           {lxcQuotaQuery.data ? (
             <div className="set-readout">
               <span>{t('settings.vmUsedLxc', { n: lxcUsed })}</span>
+              {lxcTemplates > 0 ? (
+                <span>{t('settings.vmTplExcludedLxc', { n: lxcTemplates })}</span>
+              ) : null}
               {lxcRemaining != null ? (
                 <span>{t('settings.vmRemainingLxc', { n: lxcRemaining })}</span>
               ) : null}

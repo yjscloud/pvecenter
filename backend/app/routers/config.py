@@ -2097,12 +2097,16 @@ async def put_vm_quota(
     request: Request,
     user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
 ) -> Dict[str, Any]:
-    """保存总配额。填 0 = 普通用户完全不能下发；留空 = 不限制。"""
-    value = payload.quota
-    if value is not None and value < 0:
-        raise HTTPException(status_code=400, detail="配额不能为负数")
+    """保存总配额。填 0 = 普通用户完全不能下发；留空 = 不限制。
 
-    saved = await quota.set_quota("vm", value)
+    校验规则只在 :func:`app.quota.set_quota` 里写一份（负数拒绝、``None`` 删除
+    配置），这里只负责把 ``ValueError`` 翻成 400 —— 别在路由里另抄一段阈值判断，
+    否则两处迟早不一致。
+    """
+    try:
+        saved = await quota.set_quota("vm", payload.quota)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await security.audit(
         request,
         user,
@@ -2119,12 +2123,14 @@ async def put_lxc_quota(
     request: Request,
     user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
 ) -> Dict[str, Any]:
-    """保存容器下发额度。填 0 = 普通用户完全不能建容器；留空 = 不限制。"""
-    value = payload.quota
-    if value is not None and value < 0:
-        raise HTTPException(status_code=400, detail="配额不能为负数")
+    """保存容器下发额度。填 0 = 普通用户完全不能建容器；留空 = 不限制。
 
-    saved = await quota.set_quota("lxc", value)
+    校验与虚拟机那份同一处（:func:`app.quota.set_quota`），只是记的键不同。
+    """
+    try:
+        saved = await quota.set_quota("lxc", payload.quota)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await security.audit(
         request,
         user,

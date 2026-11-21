@@ -2428,8 +2428,10 @@ export interface LxcConfigUpdate {
 export interface GlobalQuotaInfo {
   /** 全平台总配额；null = 不限制 */
   quota: number | null;
-  /** 全平台现有数量（跨所有 PVE 连接，含模板） */
+  /** 全平台现有数量（跨所有 PVE 连接，**不含模板** —— 模板不进这本账） */
   used: number;
+  /** 被排除在 ``used`` 之外的模板台数（只用于说明统计范围，不占额度） */
+  templates: number;
   /** 全平台还能下发几台；null = 不限制 */
   remaining: number | null;
   /** 是否启用了全局配额 */
@@ -2450,8 +2452,14 @@ export interface VmQuotaInfo {
   scope?: 'user' | 'global';
   /** 总配额：最多能下发多少台。null = 不限制（口径见 ``scope``） */
   quota: number | null;
-  /** 现有数量（口径见 ``scope``；user 口径下是自己名下、含模板） */
+  /**
+   * 现有数量（口径见 ``scope``）：
+   * * ``global`` —— 全平台非模板台数（模板不占全局额度）；
+   * * ``user`` —— 自己名下台数（按人分配那层仍按预分配容量记账，含模板）。
+   */
   used: number;
+  /** 被排除在全局 ``used`` 之外的模板台数；只有 ``scope === 'global'`` 才有 */
+  templates?: number;
   /** 还能下发几台；null = 不限制 */
   remaining: number | null;
   /** 是否启用了配额限制（任一层） */
