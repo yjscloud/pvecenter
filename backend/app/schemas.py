@@ -495,6 +495,12 @@ class IpConfig(BaseModel):
     ip: str = "dhcp"          # "dhcp" or "192.168.1.50/24"
     gateway: Optional[str] = None
     ipv6: Optional[str] = None
+    #: 从哪个网段（IP 池）取地址。
+    #:
+    #: 只在 ``ip`` 是 dhcp 时有意义。**克隆模式必须靠它**：那时请求体里没有
+    #: ``networks``（网卡由模板继承），网桥 / VLAN 只能从源机读，提不出「用户
+    #: 选了哪个池」，地址就只能按网桥猜一个。带上它，后端只从该池分配。
+    pool_id: Optional[str] = None
 
 
 class CloudInitSpec(BaseModel):
@@ -509,10 +515,13 @@ class CloudInitSpec(BaseModel):
 
 class CloneSpec(BaseModel):
     vmid: int
+    #: **模板**所在的节点（不是克隆体的落点）
     node: str
     # 默认链接克隆：以源磁盘为 backing file 增量生成，秒级完成、几乎不占空间
     full: bool = False
     target_storage: Optional[str] = None
+    #: 克隆体落到哪台节点。留空时按 :attr:`node` 落点；两者不同即跨节点克隆，
+    #: 要求模板磁盘全在共享存储上且目标节点挂得到（见 app/cloneguard.py）。
     target_node: Optional[str] = None
     # 克隆完成后是否自动开机（默认开）。
     start: bool = True

@@ -23,6 +23,7 @@ import { setPageConnection, isNotImplemented } from '../api/client';
 import { PveQueryError } from '../components/SetupRequired';
 import { usePveReady } from '../hooks/usePveStatus';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
+import { guestLiveKey, useMetricsStream } from '../hooks/useMetricsStream';
 import { useNodeBridges } from '../hooks/useNodeBridges';
 import { useAnimatedNumber } from '../hooks/useAnimatedNumber';
 import { AskAiButton } from '../components/AskAiButton';
@@ -316,7 +317,39 @@ export function VmDetail() {
       .slice(0, 6);
   }, [tasksQuery.data, vmid]);
 
-  const vm: VmDetailType | undefined = vmQuery.data;
+  /* ---- 实时读数覆盖 ----
+     状态 / CPU / 内存 / 运行时长优先取实时流（后端 3 秒一帧），其余字段仍以
+     详情接口为准 —— 配置、卷、Agent 这些是慢变数据，重取整份没有意义，
+     而轮询间隔（默认 30 秒、还可能被关掉）对这几个读数又太慢。
+
+     断线、或这台机器不在当前推送的连接上时原样回落到轮询数据。 */
+  const live = useMetricsStream(pveReady);
+  const vm: VmDetailType | undefined = useMemo(() => {
+    const data = vmQuery.data;
+    if (!data || !live.connected) return data;
+    const hit = live.guests[guestLiveKey(pageConnection, node, vmid)];
+    if (!hit) return data;
+    const lock = hit.lock ?? undefined;
+    if (
+      hit.status === data.status &&
+      hit.cpu === data.cpu &&
+      hit.mem === data.mem &&
+      hit.maxmem === data.maxmem &&
+      hit.uptime === data.uptime &&
+      lock === data.lock
+    ) {
+      return data;
+    }
+    return {
+      ...data,
+      status: hit.status ?? data.status,
+      cpu: hit.cpu ?? data.cpu,
+      mem: hit.mem ?? data.mem,
+      maxmem: hit.maxmem ?? data.maxmem,
+      uptime: hit.uptime ?? data.uptime,
+      lock,
+    };
+  }, [vmQuery.data, live, node, vmid, pageConnection]);
 
   /**
    * 这台虚拟机对应哪台受管主机（给「问 AI」用）。

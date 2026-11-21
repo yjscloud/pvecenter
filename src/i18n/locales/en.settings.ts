@@ -799,6 +799,14 @@ export const enSettings: Partial<Record<MessageKey, string>> = {
   'spec.fieldDisk': 'Disk (GB)',
   'spec.fieldDesc': 'Description',
   'spec.descPlaceholder': 'e.g. general workloads, small databases',
+  'spec.addRow': 'Add plan',
+  'spec.presetsAdd': 'Add preset plans',
+  'spec.presetsAdded': 'Added {n} preset plans',
+  'spec.presetsAddedHint': 'Click Save to apply; duplicate combinations are skipped',
+  'spec.presetsNone': 'All preset plans are already here',
+  'spec.presetsFailed': 'Could not load preset plans',
+  'spec.diskMatchHint':
+    'The disk in a plan is the system-disk size. Plans smaller than a template disk are disabled on the deploy page — shrinking a volume truncates the template partition table and the guest will not boot.',
   /* --------------------------------------------------- Miscellaneous components */
   'permPicker.loading': 'Loading the permission catalogue…',
   'permPicker.selectAll': 'Select all',

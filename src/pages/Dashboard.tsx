@@ -646,8 +646,8 @@ export function Dashboard() {
   }, [invalidateDashboard, pveReady, refresh, updatedAt]);
 
   /* 实时节点指标流：后端把逐页轮询集中到一条 WebSocket 上，
-     5s 推一次。连接正常时优先用实时值驱动 KPI 与节点行，
-     断线则回落到 10s 轮询，保证任何情况下都有数据。
+     3s 推一次。连接正常时优先用实时值驱动 KPI 与节点行，
+     断线则回落到「数据刷新间隔」轮询，保证任何情况下都有数据。
      没有 node.view 就别连：这条 WS 也过 node.view，连上会被后端拒，
      而 hook 是按指数退避「断线重连」的（它分不出拒绝与网络抖动），
      结果就是这类账号在后台一直空转握手、服务端日志一路刷 403。 */
@@ -718,12 +718,14 @@ export function Dashboard() {
 
   /* ---- 实时节点指标合并 ----
      WebSocket 在线时，用它覆盖轮询拿到的 cpu/mem/状态，让 KPI 与节点行
-     变成秒级刷新；离线则原样回落到轮询数据。 */
+     变成秒级刷新；离线则原样回落到轮询数据。
+     连接是**全标签页共享**的（见 hooks/useMetricsStream）：客户机状态监听
+     用的是同一条流，不会为了这块 KPI 多开一条连接。 */
   const mergedNodes = useMemo(() => {
     const list = nodesQuery.data ?? [];
     if (!metrics.connected) return list;
     return list.map((n) => {
-      const live = metrics.metrics[n.node];
+      const live = metrics.nodes[n.node];
       if (!live) return n;
       return {
         ...n,

@@ -288,3 +288,51 @@ def test_container_dhcp_honors_selected_pool(api) -> None:
     body = _requests("/api2/json/nodes/pve1/lxc")
     assert body is not None
     assert "ip=10.0.0.100/24,gw=10.0.0.1" in body["net0"]
+
+
+# --------------------------------------------------------- 克隆模式的网段
+def test_clone_mode_pool_id_comes_from_ip_configs(monkeypatch) -> None:
+    """克隆模式请求体里没有 ``networks``（网卡由模板继承），网段只能从
+    ``ip_configs[].pool_id`` 带进 PoolScope。
+
+    丢了这一步，「克隆时选网段」就只剩界面上的一个下拉框：后端会退化成按源机
+    网桥猜一个池，多池共用同一网桥时永远落在配置顺序第一个上。
+    """
+    import asyncio
+
+    from app.routers import vms as vms_router
+    from app.schemas import CloudInitSpec, IpConfig, VmCreateRequest
+
+    captured: list = []
+
+    async def fake_allocate(scopes, **_kwargs):
+        captured.extend(scopes)
+        return [None for _ in scopes]
+
+    monkeypatch.setattr(vms_router.ippool, "allocate", fake_allocate)
+    # 不在请求上下文里：连接 id 直接给空串，别再往设置表里读
+    monkeypatch.setattr(vms_router, "_op_connection", lambda: "")
+
+    class FakeClient:
+        async def qemu_config(self, node: str, vmid: int):
+            return {"net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,tag=10"}
+
+    payload = VmCreateRequest(
+        node="pve1",
+        name="clone-pool",
+        clone_from={"node": "pve1", "vmid": 9000, "full": False},
+        cloudinit=CloudInitSpec(
+            enabled=True,
+            ip_configs=[IpConfig(ip="dhcp", pool_id="pool-b")],
+        ),
+    )
+
+    asyncio.run(
+        vms_router._assign_dhcp_ips(payload, FakeClient(), {"username": "root"}, 500)
+    )
+
+    assert len(captured) == 1
+    assert captured[0].pool_id == "pool-b"
+    # 网桥 / VLAN 仍以源机网卡为准（克隆体继承网卡）
+    assert captured[0].bridge == "vmbr0"
+    assert captured[0].vlan == 10

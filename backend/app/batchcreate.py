@@ -217,6 +217,9 @@ async def run_batch(
             "error": None,
             "post_steps": created.get("post_steps") or [],
             "disk_note": created.get("disk_note") or "",
+            # 规格容量是否真的达成：批量结果页与单台用同一套判定。
+            "disk_ok": bool(created.get("disk_ok", True)),
+            "disk_gb": int(created.get("disk_gb") or 0),
             "template": bool(created.get("template")),
         }
 

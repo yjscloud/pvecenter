@@ -516,9 +516,18 @@ rules won't take effect. Permissions split into `firewall.view` / `firewall.mana
 `firewall.cluster` (cluster-level and security groups, admin only by default).
 
 The networking page also holds **IP address pools**: a pool = subnet + assignable range + bridge, with used
-addresses derived by scanning every guest's static configuration. When creating, cloning or editing a NIC
-you can pick a free address from the pools assigned to you, and address plus gateway are filled in. It
-doesn't depend on DHCP or SDN; creating and editing pools still needs `network.manage`.
+addresses derived by scanning every guest's static configuration. It doesn't depend on DHCP or SDN;
+creating and editing pools still needs `network.manage`.
+
+Segment selection is **one shared control in both quick deploy and custom deploy** (custom deploy: “Disks
+and network → NIC”, or “Network configuration → IP list” in clone mode): each NIC first picks how it gets
+an address — static fills the address and gateway from the chosen segment's free list, DHCP also picks a
+segment (that decides which L2 network the address comes from), and picking a segment aligns the bridge and
+VLAN with it. The dropdown only lists pools that belong to you *and* match the target node and current
+bridge. On submit, a static address goes straight into `ipconfig0` (containers: `net0`), while DHCP hands the
+chosen pool to the backend, which allocates a free address at create time and writes it into the config —
+i.e. “the panel allocates from the pool”; only when no pool matches does it fall back to real DHCP. In
+clone mode that choice travels with `ip_configs`, so clones never inherit the template's address.
 
 ### Internal tunneling (frp)
 
@@ -647,8 +656,11 @@ powers go far beyond any other page.
 ### Monitoring and alerting
 
 Total VM count and run distribution, CPU / memory / storage ring charts, a node overview, recent tasks and
-the top 8 resource consumers; live node metrics come over `/ws/metrics` (pushed every 5 seconds,
-reconnecting automatically and falling back to 10-second polling); disk capacity is extrapolated linearly
+the top 8 resource consumers; node readings plus VM / container status, CPU and memory come over
+`/ws/metrics` (pushed every 3 seconds over a single connection shared by all tabs, reconnecting
+automatically and falling back to the configured refresh interval). A change in guest status or lock
+invalidates the list and detail queries, so starting, stopping or reinstalling a guest never needs a
+manual page reload; disk capacity is extrapolated linearly
 from the node root partition history for a daily growth rate and estimated days until full; nodes and guests
 each have RRD charts. Alert rules take a threshold and a duration; notifications can go out over mail, a
 Feishu group bot, generic webhooks and the in-app inbox (WeCom / DingTalk / Slack are covered by webhook

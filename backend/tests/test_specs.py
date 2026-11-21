@@ -93,6 +93,67 @@ class TestNormalise:
         assert specs.normalise({"a": 1}) == []
 
 
+class TestBuiltinCatalog:
+    """内置那组常用规格的约束。
+
+    这组数据是「开箱即用」的样例，也是一份可以直接照抄的选型表 —— 一旦出现
+    「两张一模一样的 2C4G」或「1C1G 配 2T 盘」，用户第一眼就会觉得这份清单
+    没被认真对待。用测试卡住这几条，比写在注释里靠谱。
+    """
+
+    def test_names_and_ids_are_unique(self) -> None:
+        names = [s["name"] for s in specs.DEFAULT_SPECS]
+        ids = [s["id"] for s in specs.DEFAULT_SPECS]
+        assert len(set(names)) == len(names), "名字重复，下拉里分不清谁是谁"
+        assert len(set(ids)) == len(ids), "id 重复，前端 key 会撞"
+
+    def test_core_memory_disk_combinations_are_distinct(self) -> None:
+        combos = [
+            (s["cores"], s["memory"], s["disk"]) for s in specs.DEFAULT_SPECS
+        ]
+        assert len(set(combos)) == len(combos), "有两条规格的核/内存/盘完全一样"
+
+    def test_sorted_and_monotonic(self) -> None:
+        keys = [(s["cores"], s["memory"]) for s in specs.DEFAULT_SPECS]
+        assert keys == sorted(keys), "按核数、内存升序排列，界面上才是一条阶梯"
+
+    def test_every_entry_survives_normalise(self) -> None:
+        """内置条目必须是**合法**的：名字非空、字段在取值范围内。
+
+        不合法的话首访展示的和保存回去的不是同一份，改一下别的字段就会悄悄丢条目。
+        """
+        cleaned = specs.normalise(specs.DEFAULT_SPECS)
+        assert cleaned == specs.DEFAULT_SPECS
+
+    def test_covers_the_four_tiers(self) -> None:
+        """四档都要有：入门（≤2 核小盘）、通用（2~4 核中盘）、进阶（8~16 核大盘）、
+        高配（32 核起）。少一档，下单页的筛选条就少一个可点的分类。
+
+        但**不预置 64 核 / 1T 以上的旗舰档**：公有云里那是按需定制的宿主级规格，
+        1T 盘也走另挂的按量数据盘；塞进「常用规格」只会诱导过度配置（调研口径
+        见 :mod:`app.specs` 的 ``DEFAULT_SPECS`` 注释）。
+        """
+        by_cores = {s["cores"] for s in specs.DEFAULT_SPECS}
+        assert {1, 2, 4, 8, 16, 32} <= by_cores
+        disks = {s["cores"]: s["disk"] for s in specs.DEFAULT_SPECS}
+        assert min(disks.values()) <= 20, "入门档要有一个小盘"
+        assert max(disks.values()) >= 500, "高配档要能放下一套业务 + 日志"
+
+    def test_disk_grows_with_tier(self) -> None:
+        """同一档位里核内存越大、盘不该反而更小；跨档更不能倒挂。"""
+        prev = 0
+        for item in sorted(specs.DEFAULT_SPECS, key=lambda s: (s["cores"], s["memory"])):
+            assert item["disk"] >= prev, f"{item['name']} 的盘比更低的档还小"
+            prev = item["disk"]
+
+    def test_presets_are_copies(self) -> None:
+        """返回副本：调用方改到的是自己的那份，不会污染模块级常量。"""
+        got = specs.presets()
+        assert got == specs.DEFAULT_SPECS
+        got[0]["name"] = "改坏了"
+        assert specs.DEFAULT_SPECS[0]["name"] != "改坏了"
+
+
 class TestPersistence:
     def test_defaults_when_never_saved(self) -> None:
         got = asyncio.run(specs.list_specs())

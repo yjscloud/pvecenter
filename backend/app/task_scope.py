@@ -78,14 +78,27 @@ class TaskScope:
         return bool(region) and region in self.regions
 
     def allows(self, connection_id: str, upid: str) -> bool:
+        guest = task_guest(upid)
+        if guest is None:
+            return False
+        return self.allows_guest(connection_id, guest[0], guest[1])
+
+    def allows_guest(self, connection_id: str, node: str, vmid: Any) -> bool:
+        """这台客户机在不在可见范围内。
+
+        与 :meth:`allows` 同源，只是入参不是 UPID —— 指标 WebSocket 推的是
+        客户机快照（节点 + VMID），没有 UPID 可解析，但它必须走**同一套**归属
+        判定，否则「HTTP 列表收紧了、实时推送还是全量」就成了绕过隔离的后门。
+
+        ``vmid`` 用 ``Any``：调用方手里可能是 int（PVE 原始数据）也可能是 str
+        （从归属 ref 里切出来的）。统一按字符串比，避免 ``100 != "100"``。
+        """
         cid = str(connection_id or "")
         if not self._region_allows(cid):
             return False
         if self.regions is not None:
             return True
-        guest = task_guest(upid)
-        if guest is None:
-            return False
+        guest = (str(node or ""), str(vmid or ""))
         if guest in self.legacy:
             return True
         if not cid:

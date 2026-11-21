@@ -13,8 +13,8 @@ JSON 就够，省掉一次迁移与并发写入的复杂度。规格只在创建
       "kind": "both",           # vm | lxc | both —— 多数规格两类通用
       "cores": 1,
       "memory": 2048,           # MB
-      "disk": 100,              # GB
-      "description": "轻量服务、测试环境"
+      "disk": 20,               # GB
+      "description": "轻量服务、监控采集"
     }
 
 首访（设置里还没有这份配置）返回 :data:`DEFAULT_SPECS`，管理员保存后即以保存的
@@ -34,43 +34,138 @@ SPECS_KEY = "resource_specs"
 
 KINDS = ("vm", "lxc", "both")
 
-# 首访默认给的几档（与需求里举例的三档一致，外加一档 8C16G）
+# 首访默认给的一组常用档位，也是设置页「添加常用规格」的来源（见 :func:`presets`）。
+#
+# 这份表按公有云的**实际售卖档位**选，调研口径（2026-11 查官方规格页）：
+#   · 阿里云 ECS g7（1:4）：2C8G / 4C16G / 8C32G / 16C64G / 32C128G；
+#     c 系（1:2）、r 系（1:8），u1 可调 1:2 / 1:4 / 1:8。
+#   · 腾讯云 CVM 标准型 S5：1C1G / 1C2G、2C2G / 2C4G / 2C8G、4C8G / 4C16G、
+#     8C16G / 8C32G、16C32G，产品线同时提供 1:2 与 1:4 两种处理器内存比。
+#   · AWS EC2：t 系 2C1G~2C8G、m6i（1:4）2C8G / 4C16G / 8C32G / 16C64G、
+#     c6i（1:2）、r6i（1:8）。
+#   盘的基准是**系统盘**：公有云默认 40~100G，1T 以上是另挂的按量数据盘，
+#   不打包进规格 —— 所以这里最高只到 500G，不再出现 1T / 2T。
+#
+# 四条原则，改这份表时别破：
+#   1. **档位命名统一**「<档位>型 <核>C<内存>G」—— 下单页一行里同时能看到名字与数字时，
+#      名字自己就能被认出来，不用现场换算。
+#   2. **组合互不重复**：核 / 内存 / 磁盘三元组唯一（测试里卡着）。两张「2C4G 100G」
+#      只是名字不同，选的人只会更犹豫。
+#   3. **盘随档位长大**：入门 20~40G、通用 40~100G（业务 + 日志）、进阶 200~300G、
+#      高配 500G（更大的数据盘在创建时按需另挂，别在这里一次性给足）。
+#   4. **单调递增**：按核数、内存升序排列，界面上就是一条阶梯。
 DEFAULT_SPECS: List[Dict[str, Any]] = [
+    # ---- 入门型：小型站点、跳板机、探针（对应腾讯 S5.SMALL1/2、AWS t 系） ----
+    {
+        "id": "spec-1c1g",
+        "name": "入门型 1C1G",
+        "kind": "both",
+        "cores": 1,
+        "memory": 1024,
+        "disk": 20,
+        "description": "静态页面、跳板机、告警探针",
+    },
     {
         "id": "spec-1c2g",
         "name": "入门型 1C2G",
         "kind": "both",
         "cores": 1,
         "memory": 2048,
-        "disk": 100,
-        "description": "轻量服务、测试环境",
+        "disk": 20,
+        "description": "轻量服务、反向代理、监控采集",
     },
     {
+        "id": "spec-2c2g",
+        "name": "入门型 2C2G",
+        "kind": "both",
+        "cores": 2,
+        "memory": 2048,
+        "disk": 40,
+        "description": "测试环境、小型站点",
+    },
+    # ---- 通用型：常规业务、容器宿主、中小数据库（1:2 与 1:4 两条主线） ----
+    {
         "id": "spec-2c4g",
-        "name": "标准型 2C4G",
+        "name": "通用型 2C4G",
         "kind": "both",
         "cores": 2,
         "memory": 4096,
-        "disk": 100,
+        "disk": 40,
         "description": "常规业务、小型数据库",
     },
     {
+        "id": "spec-2c8g",
+        "name": "通用型 2C8G",
+        "kind": "both",
+        "cores": 2,
+        "memory": 8192,
+        "disk": 50,
+        "description": "Web 应用、容器宿主",
+    },
+    {
         "id": "spec-4c8g",
-        "name": "性能型 4C8G",
+        "name": "通用型 4C8G",
         "kind": "both",
         "cores": 4,
         "memory": 8192,
-        "disk": 100,
-        "description": "中等并发、容器宿主",
+        "disk": 80,
+        "description": "中等并发 Web、CI 构建节点",
     },
     {
+        "id": "spec-4c16g",
+        "name": "通用型 4C16G",
+        "kind": "both",
+        "cores": 4,
+        "memory": 16384,
+        "disk": 100,
+        "description": "Java 应用、中型数据库",
+    },
+    # ---- 进阶型：高负载应用、缓存集群、业务主库 ----
+    {
         "id": "spec-8c16g",
-        "name": "计算型 8C16G",
+        "name": "进阶型 8C16G",
         "kind": "both",
         "cores": 8,
         "memory": 16384,
-        "disk": 100,
+        "disk": 200,
         "description": "高负载应用、编译构建",
+    },
+    {
+        "id": "spec-8c32g",
+        "name": "进阶型 8C32G",
+        "kind": "both",
+        "cores": 8,
+        "memory": 32768,
+        "disk": 300,
+        "description": "Redis / ES、离线分析",
+    },
+    {
+        "id": "spec-16c32g",
+        "name": "进阶型 16C32G",
+        "kind": "both",
+        "cores": 16,
+        "memory": 32768,
+        "disk": 500,
+        "description": "核心业务主库、高并发集群",
+    },
+    # ---- 高配型：只留到 32 核；再往上属于按需定制的宿主级规格 ----
+    {
+        "id": "spec-16c64g",
+        "name": "高配型 16C64G",
+        "kind": "both",
+        "cores": 16,
+        "memory": 65536,
+        "disk": 500,
+        "description": "内存型业务、数据仓库",
+    },
+    {
+        "id": "spec-32c64g",
+        "name": "高配型 32C64G",
+        "kind": "both",
+        "cores": 32,
+        "memory": 65536,
+        "disk": 500,
+        "description": "大型业务、批量计算",
     },
 ]
 
@@ -135,6 +230,16 @@ def normalise(raw: Any) -> List[Dict[str, Any]]:
         if len(out) >= MAX_SPECS:
             break
     return out
+
+
+def presets() -> List[Dict[str, Any]]:
+    """内置的一组常用规格（:data:`DEFAULT_SPECS` 的副本）。
+
+    设置页的「添加常用规格」用它：已经在用的部署早把规格存进 KV 了，读
+    ``/config/specs`` 拿不到这份内置表，所以单独给一个只读入口。返回副本，
+    调用方拿去做 UI 时不可能改到模块级常量。
+    """
+    return [dict(item) for item in DEFAULT_SPECS]
 
 
 async def list_specs() -> List[Dict[str, Any]]:

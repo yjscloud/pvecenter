@@ -19,6 +19,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   configApi,
   connectionsApi,
+  ipPoolsApi,
   lxcApi,
   nodesApi,
   quotaApi,
@@ -42,6 +43,7 @@ import { Spinner } from './ui/Spinner';
 import { NodePicker } from './NodePicker';
 import { QuickDeployForm } from './QuickDeployForm';
 import { SystemTemplatePicker } from './SystemTemplatePicker';
+import { NicSegmentFields, type IpMode, type SegmentValue } from './NicSegmentFields';
 import { ctTemplatePickItems } from '../utils/templatePick';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../hooks/useToast';
@@ -72,8 +74,12 @@ interface FormState {
   start: boolean;
   startOnBoot: boolean;
   bridge: string;
+  /** 地址怎么来：静态（池子预填 / 手填）还是 DHCP —— 与快速部署同一个开关 */
+  ipMode: IpMode;
   ip: string;
   gateway: string;
+  /** 选中的网段（IP 池 id）：DHCP 时决定从哪个网段取地址 */
+  poolId: string;
   ip6: string;
   vlanTag: string;
   firewall: boolean;
@@ -99,8 +105,12 @@ const INITIAL: FormState = {
   start: true,
   startOnBoot: true,
   bridge: 'vmbr0',
-  ip: 'dhcp',
+  /* 与快速部署一致：默认静态、由 IP 池预填地址；一个池都匹配不上时
+     NicSegmentFields 会自动退回 DHCP，没配池的环境行为不变。 */
+  ipMode: 'static',
+  ip: '',
   gateway: '',
+  poolId: '',
   ip6: '',
   vlanTag: '',
   firewall: false,
@@ -130,7 +140,8 @@ function validate(step: StepIndex, f: FormState, t: TFunc): Errors {
   }
   if (step === 2) {
     if (!f.bridge) e.bridge = t('lxcWizard.errBridge');
-    if (f.ip && f.ip !== 'dhcp' && f.ip !== 'manual' && !f.ip.includes('/')) {
+    /* 只看静态：DHCP 时地址由池子/ DHCP 服务器给，输入框里的残留值不生效 */
+    if (f.ipMode === 'static' && f.ip && f.ip !== 'manual' && !f.ip.includes('/')) {
       e.ip = t('lxcWizard.errIp');
     }
   }
@@ -353,6 +364,27 @@ export function LxcCreateWizard({
     open && Boolean(targetConn),
   );
 
+  /* IP 地址池（可选）：网段选择与静态地址预填都用它，与快速部署同一个接口 */
+  const poolsQuery = useQuery({
+    queryKey: ['ip-pools'],
+    queryFn: ipPoolsApi.get,
+    enabled: open,
+    staleTime: 30_000,
+    retry: false,
+  });
+
+  /** 网段编辑块的改动 → 表单（组件用 vlan，这里叫 vlanTag） */
+  const patchSegment = (patch: Partial<SegmentValue>) =>
+    setForm((f) => ({
+      ...f,
+      ...(patch.bridge !== undefined ? { bridge: patch.bridge } : {}),
+      ...(patch.vlan !== undefined ? { vlanTag: patch.vlan } : {}),
+      ...(patch.ipMode !== undefined ? { ipMode: patch.ipMode } : {}),
+      ...(patch.ip !== undefined ? { ip: patch.ip } : {}),
+      ...(patch.gateway !== undefined ? { gateway: patch.gateway } : {}),
+      ...(patch.poolId !== undefined ? { poolId: patch.poolId } : {}),
+    }));
+
   /** 下发额度：容器有**自己的一份**（与虚拟机额度互相独立），填了才显示 */
   const quotaQuery = useQuery({
     queryKey: ['lxc', 'quota'],
@@ -473,15 +505,19 @@ export function LxcCreateWizard({
       return;
     }
 
+    /* 静态但地址空着（池子没配 / 用户清空）：退回 DHCP，别提交一个空 ip */
+    const staticIp = form.ipMode === 'static' ? (form.ip || '').trim() : '';
     const network: LxcCreateNetwork = {
       bridge: form.bridge,
       name: 'eth0',
-      ip: form.ip || 'dhcp',
+      ip: staticIp || 'dhcp',
       firewall: form.firewall,
     };
-    if (form.gateway) network.gateway = form.gateway;
+    if (staticIp && form.gateway) network.gateway = form.gateway;
     if (form.ip6) network.ip6 = form.ip6;
     if (form.vlanTag) network.vlan_tag = Number(form.vlanTag);
+    /* 选了网段就带下去：DHCP 时后端只从这个池分配（与快速部署同一口径） */
+    if (form.poolId) network.pool_id = form.poolId;
 
     const payload: LxcCreateRequest = {
       node: form.node,
@@ -891,19 +927,6 @@ export function LxcCreateWizard({
                 error={errors.bridge}
               />
               <Input
-                label="IPv4"
-                hint={t('lxcWizard.fieldIpv4Hint')}
-                value={form.ip}
-                onChange={(e) => update('ip', e.target.value)}
-                error={errors.ip}
-              />
-              <Input
-                label={t('lxcWizard.fieldGateway')}
-                hint={t('lxcWizard.fieldGatewayHint')}
-                value={form.gateway}
-                onChange={(e) => update('gateway', e.target.value)}
-              />
-              <Input
                 label="IPv6"
                 hint={t('lxcWizard.fieldIpv6Hint')}
                 value={form.ip6}
@@ -918,6 +941,28 @@ export function LxcCreateWizard({
                 onChange={(e) => update('vlanTag', e.target.value)}
               />
             </div>
+            {/* IPv4 / 网段：与快速部署同一块界面（NicSegmentFields）。
+                选网段会把网桥与 VLAN 一起对齐，静态地址由池子预填；DHCP 时
+                随请求带上 pool_id，后端按该网段分配。IPv6 在上面的网格里。 */}
+            <NicSegmentFields
+              value={{
+                bridge: form.bridge,
+                vlan: form.vlanTag,
+                ipMode: form.ipMode,
+                ip: form.ip,
+                gateway: form.gateway,
+                poolId: form.poolId,
+              }}
+              onChange={patchSegment}
+              node={form.node}
+              connection={targetConn}
+              pools={poolsQuery.data?.pools ?? []}
+              ready={Boolean(poolsQuery.data)}
+              poolError={
+                poolsQuery.isError ? errorMessage(poolsQuery.error) : undefined
+              }
+              ipError={errors.ip}
+            />
             <Switch
               checked={form.firewall}
               onChange={(v) => update('firewall', v)}

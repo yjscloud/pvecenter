@@ -19,7 +19,7 @@
    ========================================================================== */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNodeBridges } from '../hooks/useNodeBridges';
 import {
   ipPoolsApi,
@@ -121,6 +121,7 @@ function cleanText(value: string | null | undefined): string {
 export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWizardProps) {
   const t = useT();
   const toast = useToast();
+  const queryClient = useQueryClient();
 
   const [templateId, setTemplateId] = useState('');
   const [storage, setStorage] = useState('');
@@ -449,6 +450,13 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
       });
       setConfirmOpen(false);
       toast.success(t('vmReinstall.queued'), t('vmReinstall.queuedBody', { name: vm.name }));
+      /* 作业已经排队：机器马上会被停掉、锁住、再重建系统盘。这三份读数都过时了，
+         立刻作废一次 —— 只弹一句「已排队」而列表纹丝不动，用户会以为没提交上。
+         之后的每一步由实时流（GuestLiveWatcher）与作业轮询（ReinstallWatcher）
+         继续跟，不必在这里轮询。 */
+      void queryClient.invalidateQueries({ queryKey: ['reinstall-jobs'] });
+      void queryClient.invalidateQueries({ queryKey: ['vms'] });
+      void queryClient.invalidateQueries({ queryKey: ['vm', vm.node, vm.vmid] });
       onDone();
       onClose();
     } catch (err) {

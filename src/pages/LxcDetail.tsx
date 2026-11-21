@@ -22,6 +22,7 @@ import { guestPower } from '../api/guests';
 import { PveQueryError } from '../components/SetupRequired';
 import { usePveReady } from '../hooks/usePveStatus';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
+import { guestLiveKey, useMetricsStream } from '../hooks/useMetricsStream';
 import { Breadcrumb } from '../components/Topbar';
 import { NicSpecTags } from '../components/NicSpecTags';
 import { PoolIpSelect } from '../components/PoolIpSelect';
@@ -201,7 +202,37 @@ export function LxcDetail() {
     staleTime: 60_000,
   });
 
-  const ct = ctQuery.data;
+  /* ---- 实时读数覆盖 ----
+     与虚拟机详情同一口径：状态 / CPU / 内存 / 运行时长跟实时流走（3 秒一帧），
+     其余字段（配置、卷、快照）仍以详情接口为准。断线或不在当前推送的连接上时
+     原样回落到轮询数据。 */
+  const live = useMetricsStream(pveReady);
+  const ct = useMemo(() => {
+    const data = ctQuery.data;
+    if (!data || !live.connected) return data;
+    const hit = live.guests[guestLiveKey(pageConnection, node, ctId)];
+    if (!hit) return data;
+    const lock = hit.lock ?? undefined;
+    if (
+      hit.status === data.status &&
+      hit.cpu === data.cpu &&
+      hit.mem === data.mem &&
+      hit.maxmem === data.maxmem &&
+      hit.uptime === data.uptime &&
+      lock === data.lock
+    ) {
+      return data;
+    }
+    return {
+      ...data,
+      status: hit.status ?? data.status,
+      cpu: hit.cpu ?? data.cpu,
+      mem: hit.mem ?? data.mem,
+      maxmem: hit.maxmem ?? data.maxmem,
+      uptime: hit.uptime ?? data.uptime,
+      lock,
+    };
+  }, [ctQuery.data, live, node, ctId, pageConnection]);
 
   const invalidate = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ['lxc', node, ctId] });
@@ -1720,11 +1751,16 @@ function LxcMonitorTab({
 }) {
   const t = useT();
   const [timeframe, setTimeframe] = useState<RrdTimeframe>('hour');
+  /* 曲线跟「数据刷新间隔」走，与虚拟机详情的监控页签同一口径（见
+     useRefreshInterval）。原先这里只有 staleTime、没有轮询 —— 打开页面看到的
+     是那一刻的曲线，之后不再动，容器忙起来也看不出来。 */
+  const refresh = useRefreshInterval();
 
   const rrdQuery = useQuery<RrdPoint[]>({
     queryKey: ['lxc', node, ctId, 'rrd', timeframe],
     queryFn: () => lxcApi.rrddata(node, ctId, timeframe),
     enabled,
+    refetchInterval: enabled ? refresh : false,
     staleTime: 30_000,
     retry: false,
   });

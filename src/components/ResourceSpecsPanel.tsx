@@ -12,6 +12,9 @@
    * **整份覆盖保存**（与 IP 池同一契约）：本地随便改，点保存才落库；不合法的行
      由后端逐条丢弃，返回值才是真正生效的那份，保存后以返回值回显。
    * 规格**只是数字**，不参与配额判定（配额是「能下发几台」，见创建默认值那一节）。
+   * **内置一组常用规格**（入门 / 通用 / 进阶 / 高配共 12 档，见后端 specs.py），
+     「添加常用规格」把它们并进草稿：只并进草稿、点保存才落库，而且按
+     核 / 内存 / 磁盘三元组去重，不会把手上的配置冲掉。
    ========================================================================== */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -24,7 +27,8 @@ import { useT, type TFunc } from '../i18n';
 import { Field, Input, Select } from './ui/Input';
 import { Badge } from './ui/Badge';
 import { Notice } from './ui/EmptyState';
-import { IconPlus, IconRefresh, IconTrash } from './Icons';
+import { ScrollArea } from './ui/ScrollArea';
+import { IconPlus, IconRefresh, IconSparkle, IconTrash } from './Icons';
 import { useToast } from '../hooks/useToast';
 import { useAuth } from '../hooks/useAuth';
 import type { ResourceSpec } from '../api/types';
@@ -158,6 +162,32 @@ export function ResourceSpecsPanel() {
   const removeRow = (index: number) =>
     setDrafts((list) => list.filter((_, i) => i !== index));
 
+  /* 判重键：核 / 内存 / 磁盘三元组。按三元组而不是按名字判 —— 管理员可能把
+     4C8G 改名成「生产 A」，那仍是同一个资源组合，再加一遍没有意义。 */
+  const comboKey = (draft: Pick<SpecDraft, 'cores' | 'memoryGb' | 'disk'>) =>
+    `${Number(draft.cores) || 0}|${Number(draft.memoryGb) || 0}|${Number(draft.disk) || 0}`;
+
+  /* 「添加常用规格」：把后端内置的那组并进草稿（只进草稿，点保存才落库）。
+     为什么要这个入口：老部署早把规格存进 KV 了，内置表就只在「从未保存过」时
+     才返回，新增的常用档位永远到不了这些实例 —— 而一条条手填十几行既慢又容易填错。 */
+  const addPresets = useMutation({
+    mutationFn: () => configApi.getSpecPresets(),
+    onSuccess: (result) => {
+      const existing = new Set(drafts.map(comboKey));
+      const add = result.specs.map(toDraft).filter((d) => !existing.has(comboKey(d)));
+      if (add.length === 0) {
+        toast.info(t('spec.presetsNone'));
+        return;
+      }
+      setDrafts((list) => [...list, ...add]);
+      toast.success(
+        t('spec.presetsAdded', { n: add.length }),
+        t('spec.presetsAddedHint'),
+      );
+    },
+    onError: (err) => toast.error(t('spec.presetsFailed'), errorMessage(err)),
+  });
+
   return (
     <Card>
       <CardHeader
@@ -187,6 +217,14 @@ export function ResourceSpecsPanel() {
         }
       />
 
+      {canManage ? (
+        /* 一句话说清磁盘语义：它不只是个数字，还决定一个规格能不能用于某个模板。
+           真正的拦截在选择阶段（见 QuickDeployForm），这里只交代规则。 */
+        <p className="fs-xs text-muted" style={{ margin: '0 0 8px' }}>
+          {t('spec.diskMatchHint')}
+        </p>
+      ) : null}
+
       {query.isError ? (
         <Notice tone="warning" title={t('spec.loadFailed')}>
           {errorMessage(query.error)}
@@ -205,7 +243,9 @@ export function ResourceSpecsPanel() {
         </Notice>
       ) : null}
 
-      <div className="flex flex-col gap-12">
+      {/* 列表自带滚动：条数多时只在这里滚，卡片底部的「添加规格」始终在视野里。
+          滚动条是鼠标移进来才淡入的那根（见 ui/ScrollArea）。 */}
+      <ScrollArea className="spec-edit-list" label={t('spec.title')}>
         {drafts.map((draft, index) => (
           <div className="spec-row" key={draft.id || `new-${index}`}>
             <div className="spec-row-head">
@@ -292,12 +332,21 @@ export function ResourceSpecsPanel() {
             </div>
           </div>
         ))}
-      </div>
+      </ScrollArea>
 
       {canManage ? (
-        <div className="mt-12">
+        <div className="mt-12 flex items-center gap-8 flex-wrap">
           <Button variant="secondary" icon={<IconPlus size={14} />} onClick={addRow}>
-            添加规格
+            {t('spec.addRow')}
+          </Button>
+          {/* 常用规格：入门 / 通用 / 进阶 / 高配共 12 档，只并进草稿，保存后才生效 */}
+          <Button
+            variant="secondary"
+            icon={<IconSparkle size={14} />}
+            loading={addPresets.isPending}
+            onClick={() => addPresets.mutate()}
+          >
+            {t('spec.presetsAdd')}
           </Button>
         </div>
       ) : null}

@@ -39,7 +39,12 @@ import { Badge } from './ui/Badge';
 import { NodePicker } from './NodePicker';
 import { QuickDeployForm } from './QuickDeployForm';
 import { SystemTemplatePicker } from './SystemTemplatePicker';
-import { vmTemplatePickItems } from '../utils/templatePick';
+import {
+  clonePlacement,
+  elsewhereTemplatesHint,
+  vmTemplatePickItems,
+} from '../utils/templatePick';
+import { NicSegmentFields, type IpMode, type SegmentValue } from './NicSegmentFields';
 import { isPathDisabled, SSH_SECURITY_NAV_PATH } from './Sidebar';
 import {
   IconPlus,
@@ -72,7 +77,6 @@ import {
 } from '../utils/status'
 import { useT, type MessageKey, type TFunc } from '../i18n';
 import { formatBytes } from '../utils/format';
-import { fitsPools } from '../utils/ippool';
 import type {
   CloudInitConfig,
   NumaNodeSpec,
@@ -125,10 +129,20 @@ interface NetRow {
   vlan_tag: string;
   firewall: boolean;
   macaddr: string;
-  /** cloud-init 下发的 IP：dhcp 或 192.168.1.10/24 */
+  /**
+   * 地址怎么来：静态（手填 / 池子预填）还是 DHCP。
+   *
+   * 与快速部署同一套开关（界面也在同一个组件里，见 NicSegmentFields）：
+   * 原先这里只能把一个自由文本填成 `dhcp`，既没有可见的「获取方式」，也没法
+   * 指定要哪个网段。
+   */
+  ipMode: IpMode;
+  /** 静态地址：192.168.1.10/24；DHCP 时为空 */
   ip: string;
   /** 静态 IP 对应的网关 */
   gateway: string;
+  /** 选中的网段（IP 池 id）：DHCP 时决定从哪个网段拿地址，随请求下发 */
+  poolId: string;
   /** 速率上限（MB/s）；'' = 不限速 */
   rate: string;
 }
@@ -146,10 +160,20 @@ interface NumaRow {
   policy: string;
 }
 
+/**
+ * 克隆模式下的「IP 列表」一行。
+ *
+ * 克隆体继承模板的网卡，这里只是**覆盖** cloud-init 里的地址；但「从哪个网段
+ * 拿地址」同样要能选（与快速部署一致），所以带上 ipMode / poolId，随
+ * ``ip_configs`` 下发，后端按 pool_id 分配（见 app/routers/vms 的地址分配）。
+ */
 interface IpRow {
   key: string;
+  ipMode: IpMode;
   ip: string;
   gateway: string;
+  /** 选中的网段（IP 池 id）；DHCP 时决定从哪个网段取地址 */
+  poolId: string;
 }
 
 interface FormState {
@@ -271,7 +295,9 @@ const initialState: FormState = {
     { key: uid(), storage: '', size: 20, interface: 'scsi0', format: 'qcow2' },
   ],
   networks: [
-    { key: uid(), bridge: 'vmbr0', model: 'virtio', vlan_tag: '', firewall: true, macaddr: '', ip: 'dhcp', gateway: '', rate: '' },
+    /* 主网卡默认「静态」并由 IP 池预填地址，与快速部署一致；一个池都匹配不上时
+       NicSegmentFields 会自动退回 DHCP，所以没配池的环境行为不变。 */
+    { key: uid(), bridge: 'vmbr0', model: 'virtio', vlan_tag: '', firewall: true, macaddr: '', ipMode: 'static', ip: '', gateway: '', poolId: '', rate: '' },
   ],
   iso: '',
 
@@ -281,7 +307,7 @@ const initialState: FormState = {
   ciSshKeys: '',
   ciManage: false,
   ciDns: '',
-  ciIps: [{ key: uid(), ip: 'dhcp', gateway: '' }],
+  ciIps: [{ key: uid(), ipMode: 'dhcp', ip: '', gateway: '', poolId: '' }],
 };
 
 /**
@@ -343,8 +369,9 @@ const isCpuset = (value: string) => CPUSET_RE.test(value.trim());
 /** 网卡里是否填了静态 IP */
 function hasStaticIpOnNics(form: FormState): boolean {
   return form.networks.some((n) => {
-    const ip = (n.ip || '').trim().toLowerCase();
-    return ip !== '' && ip !== 'dhcp';
+    /* 按「获取方式」判，而不是看 ip 框里有没有字：DHCP 时那个框不显示，
+       里面可能还留着切过去之前的旧地址，不能据此认定要下发静态配置。 */
+    return n.ipMode === 'static' && (n.ip || '').trim() !== '';
   });
 }
 
@@ -433,8 +460,9 @@ function validateStep(
     if (form.disks.length === 0) e.disks = t('vmCreate.vDisksRequired');
     form.networks.forEach((n, i) => {
       if (!n.bridge) e[`net-bridge-${i}`] = t('vmDetail.addNicBridgePlaceholder');
+      /* 只看静态：DHCP 时 ip 框根本不显示，里面残留的旧值不参与下发 */
       const ip = (n.ip || '').trim();
-      if (ip && ip.toLowerCase() !== 'dhcp' && !ip.includes('/')) {
+      if (n.ipMode === 'static' && ip && !ip.includes('/')) {
         e[`net-ip-${i}`] = t('vmDetail.ipCidr');
       }
     });
@@ -449,7 +477,8 @@ function validateStep(
     // 全新创建时 IP 在「磁盘与网络」的网卡里配置，这里只校验克隆模式下的 IP 列表。
     if (form.mode !== 'new') {
       form.ciIps.forEach((row, i) => {
-        if (row.ip !== 'dhcp' && !row.ip.includes('/')) {
+        const ip = (row.ip || '').trim();
+        if (row.ipMode === 'static' && ip && !ip.includes('/')) {
           e[`ip-${i}`] = t('vmDetail.ipCidr');
         }
       });
@@ -754,29 +783,7 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
     retry: false,
   });
 
-  const poolIpOptions = useMemo(() => {
-    const list: Array<{ label: string; value: string; gateway: string }> = [];
-    /* 只列适用于当前节点的池：集群里同一个 vmbr0 在不同节点上可能是不同网段，
-       把别的节点的池列出来，用户选了地址也不通（判定见 utils/ippool）。
-       这里只按节点过滤、不看网桥 —— 这个候选列表是所有网卡共用的，没有
-       「当前是哪张网卡」的概念，按网桥过滤反而会误伤。 */
-    const usable = fitsPools(poolsQuery.data?.pools ?? [], {
-      node: form.node,
-      /* 连接一并纳入：多套 PVE 的节点可能同名，池的适用 PVE 按连接 id 记 */
-      connection: targetConn,
-    });
-    usable.forEach((p) => {
-      const prefix = (p.subnet || '').split('/')[1] || '24';
-      p.free.slice(0, 100).forEach((ip) => {
-        list.push({
-          label: `${ip}/${prefix}${p.name ? ` · ${p.name}` : ''}`,
-          value: `${ip}/${prefix}`,
-          gateway: p.gateway,
-        });
-      });
-    });
-    return list;
-  }, [poolsQuery.data, form.node, targetConn]);
+
 
   const storageOptions = useMemo(
     () => [
@@ -860,31 +867,56 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
     );
   }, [templatesQuery.data, targetConn]);
 
-  /* 再按**目标节点**收紧：克隆源与新建目标是两个节点，`clone_from.node` 取自模板
-     自己所在的那台，跟 `form.node` 无关 —— 所以这里的过滤只能用 `tpl.node` 去比
-     `form.node`，不能拿提交结构去反推。模板的盘在本机，选了一台没有模板的节点
-     照样列出别节点的模板，用户挑完、提交，才在 PVE 那边吃一个「模板不存在 /
-     无法访问」；宁可当场说「这个节点没有模板」。
-
-     节点还没定下来时（首屏自动填节点之前）先不收紧，避免闪一下空列表。 */
-  const cloneSources = useMemo(
+  /* 目标节点的存储清单：判定「别节点的模板能不能跨过来」要用它的 shared 标记。
+     还没读到（加载中 / 读失败）时传 undefined，判定按「未知」放行 —— 拦住的话
+     用户会看到一张空列表，比交给后端报错更糟。 */
+  const placementStorages = useMemo(
     () =>
-      form.node
-        ? templatesOnConn.filter((tpl) => tpl.node === form.node)
-        : templatesOnConn,
-    [templatesOnConn, form.node],
+      storagesQuery.isLoading || storagesQuery.error
+        ? undefined
+        : storagesQuery.data,
+    [storagesQuery.isLoading, storagesQuery.error, storagesQuery.data],
   );
 
-  /* 别的节点上有什么 —— 只用于把「这台节点没有，那 pve9-1 上有」讲清楚。
-     直接列出来的话用户会以为模板就在本机（模板的盘在本机，克隆不过去），
-     所以只点名，不进候选。 */
+  /* 克隆源与新建目标是两个节点：`clone_from.node` 取自模板自己所在的那台，跟
+     `form.node` 无关。原先这里只用 `tpl.node === form.node` 收紧，于是**共享存储
+     上的模板永远跨不过来** —— 模板明明在各节点都挂着的 Ceph/NFS 上，却提示
+     「这个节点没有模板」。跨节点克隆在 PVE 里是支持的（clone 接口带 `target`），
+     前提是模板盘在共享存储上且目标节点挂得到，判定见 utils/templatePick 的
+     clonePlacement。本地盘的模板仍然只在本节点出现。
+
+     节点还没定下来时（首屏自动填节点之前）先不收紧，避免闪一下空列表。 */
+  const cloneSources = useMemo(() => {
+    if (!form.node) return templatesOnConn;
+    return templatesOnConn.filter((tpl) => {
+      const placement = clonePlacement(tpl, form.node, placementStorages);
+      return placement.kind !== 'blocked';
+    });
+  }, [templatesOnConn, form.node, placementStorages]);
+
+  /* 别的节点上有什么、为什么用不了 —— 只用于把话说清楚，不进候选。
+     「缺共享存储」与「本地盘」是两种完全不同的修法，必须分开讲。 */
   const cloneTemplatesElsewhere = useMemo(() => {
     const list = form.node
       ? templatesOnConn.filter((tpl) => tpl.node !== form.node)
       : [];
     const nodes = Array.from(new Set(list.map((tpl) => tpl.node)));
-    return { count: list.length, nodes };
-  }, [templatesOnConn, form.node]);
+    const missing: string[] = [];
+    const local: string[] = [];
+    let blocked = 0;
+    for (const tpl of list) {
+      const placement = clonePlacement(tpl, form.node, placementStorages);
+      if (placement.kind !== 'blocked') continue;
+      blocked += 1;
+      for (const name of placement.missing) {
+        if (!missing.includes(name)) missing.push(name);
+      }
+      for (const name of placement.local) {
+        if (!local.includes(name)) local.push(name);
+      }
+    }
+    return { count: list.length, nodes, blocked, missing, local };
+  }, [templatesOnConn, form.node, placementStorages]);
 
   /* 目标主机上已被占用的 VMID（含模板）。普通用户拿到的列表按归属过滤过，
      只包含自己名下的机器，所以这里只做「发现即拦截」，不声称覆盖全部占用；
@@ -898,8 +930,9 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
      那条流程用的是同一个函数，同一张模板在两个入口里的名称 / 容量 / 标签才不会
      各写一套。 */
   const clonePickItems = useMemo(
-    () => vmTemplatePickItems(cloneSources, t),
-    [cloneSources, t],
+    /* 带上目标节点：跨节点候选（共享存储上的模板）的摘要行要点明「将克隆到哪」 */
+    () => vmTemplatePickItems(cloneSources, t, form.node),
+    [cloneSources, t, form.node],
   );
 
   /* form.cloneFrom 存的是选择器的唯一值（连接|节点|VMID）：不同 PVE 上节点名与
@@ -1042,10 +1075,15 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
 
     // 全新创建：IP 在网卡上配置，折叠进初始化下发；克隆：用初始化步骤里的 IP 列表。
     // ciActive（实际是否下发）在组件体里算好了 —— 确认页显示的就是同一个值。
-    const netIpConfigs = form.networks.map((n) => ({
-      ip: (n.ip || '').trim() || 'dhcp',
-      gateway: (n.gateway || '').trim(),
-    }));
+    const netIpConfigs = form.networks.map((n) => {
+      /* 静态但地址空着（池子没配 / 用户清空了）：退回 DHCP 而不是提交一个
+         空 ip，否则 PVE 会写出一行 `ip=` 的 cloud-init 配置，机器起来没地址。 */
+      const ip = n.ipMode === 'static' ? (n.ip || '').trim() : '';
+      return {
+        ip: ip || 'dhcp',
+        gateway: ip ? (n.gateway || '').trim() : '',
+      };
+    });
 
     const cloudinit: CloudInitConfig | undefined = ciActive
       ? {
@@ -1057,10 +1095,16 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
           ip_configs:
             form.mode === 'new'
               ? netIpConfigs
-              : form.ciIps.map((r) => ({
-                  ip: r.ip || 'dhcp',
-                  gateway: r.gateway || '',
-                })),
+              : form.ciIps.map((r) => {
+                  const ip = r.ipMode === 'static' ? (r.ip || '').trim() : '';
+                  return {
+                    ip: ip || 'dhcp',
+                    gateway: ip ? r.gateway || '' : '',
+                    /* 克隆体沿用模板网卡，这里能指定的就是「地址从哪个网段来」：
+                       pool_id 让后端按该池分配，而不是按网桥猜一个。 */
+                    pool_id: r.poolId || undefined,
+                  };
+                }),
         }
       : undefined;
 
@@ -1130,6 +1174,11 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
           full: form.cloneFull,
           // 链接克隆不允许指定目标存储（PVE 会报错），仅完整克隆携带。
           target_storage: form.cloneFull ? form.cloneStorage || undefined : undefined,
+          /* 模板在别的节点时（共享存储上的模板）必须显式告诉后端「克隆体落到
+             哪台节点」：clone_from.node 是**模板**所在的节点，不带 target_node
+             的话后端只能按它落点 —— 克隆体会悄悄建在模板那台机器上。 */
+          target_node:
+            selectedCloneSource.node !== form.node ? form.node : undefined,
           start: form.cloneStart,
         },
       };
@@ -1148,6 +1197,10 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
         firewall: n.firewall,
         macaddr: n.macaddr || undefined,
         rate: n.rate.trim() ? Number(n.rate) : undefined,
+        /* 选了网段就把它带下去：DHCP 时后端**只从这个池**分配（不然多个池共用
+           同一个网桥时会永远取配置里的第一个，用户选的「测试网」就失效了）。
+           静态地址的池只用于预填，这里带不带都不影响下发，带上无害。 */
+        pool_id: n.poolId || undefined,
       }));
 
       payload = {
@@ -1247,8 +1300,11 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
           vlan_tag: '',
           firewall: true,
           macaddr: '',
-          ip: 'dhcp',
+          /* 与快速部署一致：附加网卡不抢池子里的地址，默认 DHCP */
+          ipMode: 'dhcp',
+          ip: '',
           gateway: '',
+          poolId: '',
           rate: '',
         },
       ],
@@ -1273,6 +1329,22 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
         if (static_ && !isWindowsOstype(next.ostype)) next.ciEnabled = true;
       }
       return next;
+    });
+
+  /**
+   * 网段编辑块（NicSegmentFields）的改动 → 网卡状态。
+   *
+   * 组件用的是通用字段名（``vlan``），网卡状态里叫 ``vlan_tag``；两边对不上会
+   * 静默丢掉「选网段顺带带上 VLAN」这一步，所以映射显式写出来。
+   */
+  const patchNetSegment = (key: string, patch: Partial<SegmentValue>) =>
+    patchNet(key, {
+      ...(patch.bridge !== undefined ? { bridge: patch.bridge } : {}),
+      ...(patch.vlan !== undefined ? { vlan_tag: patch.vlan } : {}),
+      ...(patch.ipMode !== undefined ? { ipMode: patch.ipMode } : {}),
+      ...(patch.ip !== undefined ? { ip: patch.ip } : {}),
+      ...(patch.gateway !== undefined ? { gateway: patch.gateway } : {}),
+      ...(patch.poolId !== undefined ? { poolId: patch.poolId } : {}),
     });
 
   /* ---- NUMA 节点（动态列表，与磁盘/网卡同一套操作）---- */
@@ -1345,7 +1417,7 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
   const addIp = () =>
     setForm((f) => ({
       ...f,
-      ciIps: [...f.ciIps, { key: uid(), ip: 'dhcp', gateway: '' }],
+      ciIps: [...f.ciIps, { key: uid(), ipMode: 'dhcp', ip: '', gateway: '', poolId: '' }],
     }));
 
   const removeIp = (key: string) =>
@@ -1356,6 +1428,20 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
       ...f,
       ciIps: f.ciIps.map((r) => (r.key === key ? { ...r, ...patch } : r)),
     }));
+
+  /**
+   * 网段编辑块的改动 → 克隆模式的 IP 行。
+   *
+   * 克隆体沿用模板的网卡，网桥 / VLAN 不在这里改（组件带回来的 bridge / vlan
+   * 忽略掉）；只有地址与网段生效。
+   */
+  const patchIpSegment = (key: string, patch: Partial<SegmentValue>) =>
+    patchIp(key, {
+      ...(patch.ipMode !== undefined ? { ipMode: patch.ipMode } : {}),
+      ...(patch.ip !== undefined ? { ip: patch.ip } : {}),
+      ...(patch.gateway !== undefined ? { gateway: patch.gateway } : {}),
+      ...(patch.poolId !== undefined ? { poolId: patch.poolId } : {}),
+    });
 
   /* ---- 磁盘总量估算 ---- */
   const diskTotal = useMemo(
@@ -1690,16 +1776,11 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                   error={errors.cloneFrom}
                   hint={
                     cloneSources.length === 0
-                      ? /* 这台节点没有模板时，点名「哪台节点上有几个」：用户刚在
-                           模板页见过 ubuntu24，不点名他会以为列表坏了，反复刷新。
-                           共享存储的模板本来能跨节点克隆，这句也把出路写出来。 */
-                        cloneTemplatesElsewhere.count
-                        ? t('templatePicker.vmEmptyOnNode', {
-                            node: form.node,
-                            others: cloneTemplatesElsewhere.nodes.join(' / '),
-                            n: cloneTemplatesElsewhere.count,
-                          })
-                        : t('templatePicker.vmEmptyHint')
+                      ? /* 这台节点没有可用模板时，点名「哪台节点上有几个、为什么用不了」：
+                           用户刚在模板页见过 ubuntu24，不点名他会以为列表坏了，反复刷新；
+                           共享存储没挂到本节点与「模板盘在本地」是两种不同的修法。 */
+                        elsewhereTemplatesHint(t, form.node, cloneTemplatesElsewhere) ??
+                        t('templatePicker.vmEmptyHint')
                       : t('templatePicker.vmHint')
                   }
                 >
@@ -2334,54 +2415,31 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                             hint={t('vmCreate.nicRateHint')}
                             mono
                           />
-                          <Input
-                            label={t('vmCreate.nicIp', { index: i + 1 })}
-                            value={net.ip}
-                            onChange={(e) => patchNet(net.key, { ip: e.target.value })}
-                            placeholder={t('vmCreate.nicIpPlaceholder')}
-                            error={errors[`net-ip-${i}`]}
-                            mono
-                            hint={
-                              windowsGuest
-                                ? t('vmCreate.nicIpWinHint')
-                                : t('vmCreate.nicIpHint')
-                            }
-                          />
-                          <Input
-                            label={t('vmCreate.nicGateway')}
-                            value={net.gateway}
-                            onChange={(e) => patchNet(net.key, { gateway: e.target.value })}
-                            placeholder={t('vmCreate.nicGatewayPlaceholder')}
-                            mono
-                            disabled={(net.ip || '').trim().toLowerCase() === 'dhcp'}
-                            hint={t('vmCreate.nicGatewayHint')}
-                          />
-                          <Select
-                            label={t('vmCreate.nicPool')}
-                            value=""
-                            onChange={(e) => {
-                              const opt = poolIpOptions.find(
-                                (o) => o.value === e.target.value,
-                              );
-                              if (!opt) return;
-                              patchNet(net.key, { ip: opt.value, gateway: opt.gateway });
-                            }}
-                            options={[
-                              {
-                                label: poolIpOptions.length
-                                  ? t('vmCreate.poolManual')
-                                  : t('vmCreate.poolEmpty'),
-                                value: '',
-                              },
-                              ...poolIpOptions.map((o) => ({ label: o.label, value: o.value })),
-                            ]}
-                            hint={
-                              poolIpOptions.length
-                                ? t('vmCreate.poolHint')
-                                : t('vmCreate.poolHintEmpty')
-                            }
-                          />
                         </div>
+                        {/* 网段 / 地址：与快速部署同一块界面（NicSegmentFields）。
+                            选网段会把网桥与 VLAN 一起对齐，静态地址由池子预填，
+                            DHCP 时随请求带上 pool_id，后端按该网段分配。 */}
+                        <NicSegmentFields
+                          value={{
+                            bridge: net.bridge,
+                            vlan: net.vlan_tag,
+                            ipMode: net.ipMode,
+                            ip: net.ip,
+                            gateway: net.gateway,
+                            poolId: net.poolId,
+                          }}
+                          onChange={(patch) => patchNetSegment(net.key, patch)}
+                          node={form.node}
+                          connection={targetConn}
+                          pools={poolsQuery.data?.pools ?? []}
+                          ready={Boolean(poolsQuery.data)}
+                          poolError={
+                            poolsQuery.isError
+                              ? errorMessage(poolsQuery.error)
+                              : undefined
+                          }
+                          ipError={errors[`net-ip-${i}`]}
+                        />
                         <div className="mt-8">
                           <Checkbox
                             checked={net.firewall}
@@ -2561,50 +2619,32 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                       {form.ciIps.map((row, i) => (
                     <div className="dyn-item" key={row.key}>
                       <div className="dyn-item-fields">
-                        <div className="form-grid-2">
-                          <Input
-                            label={t('vmCreate.nicIp', { index: i + 1 })}
-                            value={row.ip}
-                            onChange={(e) => patchIp(row.key, { ip: e.target.value })}
-                            placeholder={t('vmCreate.nicIpPlaceholder')}
-                            error={errors[`ip-${i}`]}
-                            mono
-                            hint={t('vmCreate.ciIpHint')}
-                          />
-                          <Input
-                            label={t('vmCreate.nicGateway')}
-                            value={row.gateway}
-                            onChange={(e) => patchIp(row.key, { gateway: e.target.value })}
-                            placeholder={t('vmCreate.nicGatewayPlaceholder')}
-                            mono
-                            disabled={row.ip === 'dhcp'}
-                          />
-                          <Select
-                            label={t('vmCreate.nicPool')}
-                            value=""
-                            onChange={(e) => {
-                              const opt = poolIpOptions.find(
-                                (o) => o.value === e.target.value,
-                              );
-                              if (!opt) return;
-                              patchIp(row.key, { ip: opt.value, gateway: opt.gateway });
-                            }}
-                            options={[
-                              {
-                                label: poolIpOptions.length
-                                  ? t('vmCreate.poolManual')
-                                  : t('vmCreate.poolEmpty'),
-                                value: '',
-                              },
-                              ...poolIpOptions.map((o) => ({ label: o.label, value: o.value })),
-                            ]}
-                            hint={
-                              poolIpOptions.length
-                                ? t('vmCreate.poolHint')
-                                : t('vmCreate.poolHintEmpty')
-                            }
-                          />
-                        </div>
+                        {/* 与快速部署同一套网段选择：克隆体的网卡沿用模板，这里
+                            选的是「地址从哪个网段来」，静态直接填地址、DHCP 把
+                            pool_id 交给后端分配。 */}
+                        <NicSegmentFields
+                          value={{
+                            bridge: '',
+                            vlan: '',
+                            ipMode: row.ipMode,
+                            ip: row.ip,
+                            gateway: row.gateway,
+                            poolId: row.poolId,
+                          }}
+                          onChange={(patch) => patchIpSegment(row.key, patch)}
+                          node={form.node}
+                          connection={targetConn}
+                          pools={poolsQuery.data?.pools ?? []}
+                          ready={Boolean(poolsQuery.data)}
+                          poolError={
+                            poolsQuery.isError
+                              ? errorMessage(poolsQuery.error)
+                              : undefined
+                          }
+                          ipError={errors[`ip-${i}`]}
+                          /* IP 列表是「覆盖项」：用户明确要静态时不要被自动退回 DHCP */
+                          autoFallbackDhcp={false}
+                        />
                       </div>
                       {form.ciIps.length > 1 ? (
                         <div className="dyn-item-remove">
@@ -2758,8 +2798,8 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                           n.vlan_tag ? ` · VLAN ${n.vlan_tag}` : ''
                         }${
                           n.firewall ? t('vmCreate.confirmNicFirewall') : ''
-                        }${
-                          n.ip && n.ip.trim().toLowerCase() !== 'dhcp'
+                        }                        ${
+                          n.ipMode === 'static' && n.ip.trim()
                             ? t('vmCreate.confirmNicIp', { ip: n.ip }) +
                               (n.gateway
                                 ? t('vmCreate.confirmNicGateway', {
@@ -2828,8 +2868,12 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                       <SummaryRow
                         key={r.key}
                         label={`IP ${i + 1}`}
-                        value={`${(r.ip || 'dhcp').trim() || 'dhcp'}${
-                          r.gateway
+                        value={`${
+                          r.ipMode === 'static' && (r.ip || '').trim()
+                            ? r.ip.trim()
+                            : 'dhcp'
+                        }${
+                          r.ipMode === 'static' && r.gateway
                             ? t('vmCreate.ciRouteGateway', { gateway: r.gateway })
                             : ''
                         }`}

@@ -13,7 +13,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from .. import (
     batchcreate,
     bulk,
+    cloneguard,
     defaults,
+    diskspec,
     guest_created,
     guestostype,
     guestguard,
@@ -1098,6 +1100,57 @@ async def _enqueue_managed_registration(
     asyncio.create_task(_await_managed_registration(payload, vmid, user))
 
 
+#: 模板系统盘容量的缓存时长（秒）。模板改盘是低频操作，60 秒足够；换来的是
+#: 批量下发 N 台只读一次模板 config。
+TEMPLATE_ROOTFS_TTL = 60.0
+
+
+async def _template_rootfs_gb(client: Any, node: str, vmid: int) -> Optional[int]:
+    """模板系统盘容量（GB）；读不到返回 None（按「未知」处理，不拦建机）。"""
+    if not node or not vmid:
+        return None
+
+    async def _load() -> Optional[int]:
+        # 不吞异常：失败若返回 None，pvecache 会把「读不到」缓存 60 秒，
+        # 之后的建机就都跳过校验了。让异常传出去，外层返回 None 且不写缓存。
+        config = await client.qemu_config(node, int(vmid))
+        return diskspec.root_disk_gb(config or {})
+
+    try:
+        return await pvecache.cached(
+            f"vms:template-rootfs:{_op_connection()}:{node}:{vmid}",
+            TEMPLATE_ROOTFS_TTL,
+            _load,
+        )
+    except Exception as exc:  # noqa: BLE001 - 探测失败一律放行，见函数注释
+        logger.warning(
+            "读不到模板 %s/%s 的系统盘容量，跳过容量校验：%s", node, vmid, exc
+        )
+        return None
+
+
+async def _ensure_spec_disk_fits(payload: VmCreateRequest, client: Any) -> None:
+    """规格盘与模板系统盘的容量守卫（单台 / 批量共用）。
+
+    必须在任何 PVE 写操作之前：规格小于模板时直接 400，不产出半成品；规格大于
+    模板却用链接克隆时，要求改用完整克隆（共享底层卷不能安全扩容）。开关关闭或
+    模板容量读不到时放行 —— 「不知道」不能变成「不让建」。
+    """
+    clone = payload.clone_from
+    if not clone or not clone.disk_size:
+        return
+    if not await diskspec.guard_enabled():
+        return
+    required = await _template_rootfs_gb(client, clone.node, clone.vmid)
+    problem = diskspec.check_clone_disk(int(clone.disk_size), required, clone.full)
+    if problem:
+        raise ProxmoxError(
+            str(problem["message"]),
+            status_code=400,
+            code=str(problem["code"]),
+        )
+
+
 @router.post("/vms")
 async def create_vm(
     payload: VmCreateRequest,
@@ -1113,17 +1166,25 @@ async def create_vm(
     connection_id = _op_connection()
     security.ensure_region_allowed(user, connection_id)
     await security.ensure_node_allowed(user, connection_id, payload.node)
-    if payload.clone_from and payload.clone_from.node:
-        await security.ensure_node_allowed(
-            user, connection_id, payload.clone_from.node
-        )
+    if payload.clone_from:
+        # 源节点（模板所在）与落点节点（跨节点克隆时的 target_node）都要校验：
+        # 只挡前者的话，把 target_node 写成一台受限节点就能把机器建过去。
+        for clone_node in (payload.clone_from.node, payload.clone_from.target_node):
+            if clone_node:
+                await security.ensure_node_allowed(user, connection_id, clone_node)
+
+    # --- 规格盘 vs 模板系统盘：装不下就别建 ---
+    # 放在额度之前：额度是按容量算的，先报「磁盘不够」比先报「额度超了」更准确，
+    # 也不会出现「额度检查通过、克隆却建出起不来的机器」。
+    await _ensure_spec_disk_fits(payload, client)
 
     # --- 虚拟机额度：可下发为 0（或已用达到上限）时普通用户不能再建 ---
     # 放在最前面，别等做完 DNS / VMID / 存储探测才告诉人家不行。
     await quota.enforce_for_create(user, request, "vm")
     # --- 资源额度（按所有者分配）：核数 / 内存 / 磁盘 ---
     # 从模板克隆（clone_from）时磁盘随来源机器，请求体里通常没有 disks —— 交给
-    # source 去读数里取，别当成 0。
+    # source 去读数里取，别当成 0。规格给了系统盘目标容量时以它为准：实际下发
+    # 的就是那个容量（扩容后），按模板盘算会漏掉差额。
     await quota.enforce_create(
         user,
         request,
@@ -1131,7 +1192,11 @@ async def create_vm(
         spec={
             "cores": payload.cores * payload.sockets,
             "memory_mb": payload.memory,
-            "disk_gb": sum(disk.size for disk in payload.disks) or None,
+            "disk_gb": (
+                payload.clone_from.disk_size
+                if payload.clone_from and payload.clone_from.disk_size
+                else (sum(disk.size for disk in payload.disks) or None)
+            ),
         },
         source=(payload.clone_from.node, payload.clone_from.vmid)
         if payload.clone_from
@@ -1233,6 +1298,12 @@ async def _assign_dhcp_ips(
             scopes[index] = ippool.PoolScope(
                 bridge=str(item.get("bridge") or ""),
                 vlan=_vlan_of(item.get("tag")),
+                # 克隆体沿用模板网卡：用户在「IP 列表」里选的网段只能从
+                # ip_configs 带进来。丢了它就会按网桥猜一个池 —— 多池共用同一
+                # 网桥时，用户选的「测试网」永远轮不到。
+                pool_id=(
+                    entries[index].pool_id if index < len(entries) else None
+                ),
             )
 
     targets = [
@@ -1308,6 +1379,10 @@ async def _create_vm_core(
     归属、审计、通知、创建时间、克隆覆盖全部留在这条路径上，避免批量版本成为
     第二套实现而慢慢长歪。
     """
+    # 批量入口的额度是「总量预检」，逐台的容量冲突只有到这里才知道；单台入口
+    # 在前面已查过一次，这里走 60 秒缓存，不会多打一次 PVE。
+    await _ensure_spec_disk_fits(payload, client)
+
     # --- 未单独指定 DNS 时套用面板默认 DNS -------------------------------
     # 模板机多为 DHCP，客户机的 NetworkManager 常被路由器 RA 下发的 DNS 带跑；
     # 局域网是"假 IPv6"时那组 DNS 不可达，虚拟机就会完全解析不了域名。
@@ -1583,46 +1658,75 @@ async def _resize_cloned_rootfs(
     vmid: int,
     target_gb: int,
     interface_hint: str = "",
-) -> str:
-    """克隆完成后把系统盘扩到 ``target_gb``（只增不减），返回一句说明。
+) -> Tuple[str, bool]:
+    """克隆完成后把系统盘扩到 ``target_gb``（只增不减），返回 (说明, 是否达成)。
 
     为什么必须有这一步：模板磁盘是**模板自己**的尺寸，而「资源规格」里的磁盘
     是给新机器用的。少了它，规格里的 100G 只是界面上一个数字 —— 下发出来的
     机器仍是模板的 20G。
 
-    三条边界：
+    四条边界：
 
-    * **只增不减**：PVE 拒绝把卷缩小；目标比模板还小时多半是「就按模板来」，
-      静默跳过比报错更合理；
+    * **只增不减**：PVE 拒绝把卷缩小；目标比模板还小时说明前置守卫失守，
+      如实标成「未达成」，别让用户以为规格生效了；
     * **失败不抛**：机器已经建好了，为一次扩容回滚整个创建更糟 —— 把原因
       如实回给调用方（前端提示），机器仍可用；
-    * **挑系统盘**：给了 ``interface_hint`` 就用它，否则取第一块（PVE 的
-      config 里 scsi0 排在 scsi1 前，接口名排序即可）。
+    * **挑系统盘**：优先用调用方给的 ``interface_hint``，其次按 boot order /
+      盘位判定（见 :func:`diskspec.boot_disk_entry`），不再假定第一块就是系统盘；
+    * **读回校验**：resize 在 PVE 侧是任务，接口返回成功不等于卷已长大；
+      不读回就无法区分「扩了」与「看起来扩了」。
     """
     if target_gb <= 0:
-        return ""
+        return "", True
     try:
         config = await client.qemu_config(node, vmid) or {}
     except ProxmoxError as exc:
-        return f"系统盘未扩容：读不到配置（{exc.message}）"
+        return f"系统盘未扩容：读不到配置（{exc.message}）", False
 
     disks = vmconfig.parse_config_disks(config)
     if not disks:
-        return "系统盘未扩容：未找到磁盘"
+        return "系统盘未扩容：未找到磁盘", False
     disk = next(
         (d for d in disks if interface_hint and d.get("interface") == interface_hint),
-        disks[0],
-    )
+        None,
+    ) or diskspec.boot_disk_entry(config) or disks[0]
     current = vmconfig.disk_size_to_gb(str(disk.get("size") or ""))
-    if current is not None and current >= target_gb:
-        return f"模板磁盘 {current:g}G ≥ 规格 {target_gb}G，保持原样"
+    if current is not None and current > target_gb:
+        logger.warning(
+            "克隆体 %s/%s 的系统盘 %sG 大于规格 %sG：PVE 不支持缩盘，保持原样",
+            node,
+            vmid,
+            current,
+            target_gb,
+        )
+        return (
+            f"模板磁盘 {current:g}G 大于规格 {target_gb}G，保持模板容量"
+            "（缩盘会把分区表截断，机器将无法启动）",
+            False,
+        )
+    if current is not None and current == target_gb:
+        return f"模板磁盘 {current:g}G 与规格一致，无需扩容", True
     try:
         await client.qemu_resize(node, vmid, str(disk["interface"]), f"{target_gb}G")
     except ProxmoxError as exc:
-        return f"系统盘扩容失败：{exc.message}"
+        return f"系统盘扩容失败：{exc.message}", False
+
+    actual: Optional[float] = None
+    try:
+        after = await client.qemu_config(node, vmid) or {}
+        chosen = diskspec.boot_disk_entry(after) or {}
+        actual = vmconfig.disk_size_to_gb(str(chosen.get("size") or ""))
+    except ProxmoxError:
+        actual = None
+    if actual is not None and actual + 0.01 < target_gb:
+        return (
+            f"系统盘扩容后仍为 {actual:g}G（目标 {target_gb}G），"
+            "请检查存储剩余容量与卷状态",
+            False,
+        )
     if current is not None:
-        return f"系统盘已从 {current:g}G 扩到 {target_gb}G"
-    return f"系统盘已扩到 {target_gb}G"
+        return f"系统盘已从 {current:g}G 扩到 {target_gb}G", True
+    return f"系统盘已扩到 {target_gb}G", True
 
 
 async def _create_from_clone(
@@ -1636,6 +1740,37 @@ async def _create_from_clone(
     clone = payload.clone_from
     assert clone is not None
 
+    # 克隆体落哪台节点：优先用请求里显式的 target_node；没有再比对「用户选的目标
+    # 节点」与「模板所在节点」—— 两者不同就意味着跨节点克隆。原先这里直接拿
+    # clone.node，于是「选 node03、模板在 node01」时机器会静默建到 node01 上。
+    target_node = clone.target_node or clone.node
+    if not clone.target_node and payload.node and payload.node != clone.node:
+        target_node = payload.node
+    cross_node = target_node != clone.node
+
+    if cross_node:
+        # 跨节点的前提：模板盘全在共享存储上、且目标节点挂得到（见 cloneguard）。
+        # 不先查，PVE 会在后台任务里失败，前端只看到一句 clone failed。
+        try:
+            await cloneguard.ensure_cross_node_clone(
+                client,
+                kind="qemu",
+                source_node=clone.node,
+                vmid=clone.vmid,
+                target_node=target_node,
+                connection_id=guestguard.call_connection(),
+            )
+        except ProxmoxError as exc:
+            await security.audit(
+                request,
+                user,
+                "vm.clone",
+                target=f"{clone.node}/{clone.vmid} -> {vmid}",
+                result="failed",
+                detail=exc.message,
+            )
+            _raise(exc)
+
     try:
         result = await client.qemu_clone(
             clone.node,
@@ -1644,7 +1779,7 @@ async def _create_from_clone(
             name=payload.name,
             full=clone.full,
             target_storage=clone.target_storage,
-            target_node=clone.target_node,
+            target_node=target_node if cross_node else clone.target_node,
         )
     except ProxmoxError as exc:
         exc.message = explain_clone_error(exc.message, clone.full)
@@ -1655,7 +1790,6 @@ async def _create_from_clone(
         _raise(exc)
 
     upid = result if isinstance(result, str) else (result or {}).get("task", "")
-    target_node = clone.target_node or clone.node
 
     # A full clone can take a while; overrides applied too early are lost.
     if isinstance(upid, str) and upid.startswith("UPID:"):
@@ -1747,11 +1881,14 @@ async def _create_from_clone(
     # 按「资源规格」里的磁盘大小扩容系统盘（只增不减）。放在覆盖配置之后：
     # 两者互不影响，而扩容会改 config，放最后能保证最终 config 就是我们要的。
     disk_note = ""
+    disk_ok = True
+    disk_gb = 0
     if clone.disk_size:
         hint = str(payload.disks[0].interface or "") if payload.disks else ""
-        disk_note = await _resize_cloned_rootfs(
+        disk_note, disk_ok = await _resize_cloned_rootfs(
             client, target_node, vmid, int(clone.disk_size), hint
         )
+        disk_gb = int(clone.disk_size)
 
     # 克隆完成、覆盖配置已应用后按需自动开机（best-effort，失败不影响克隆结果）。
     started = False
@@ -1807,7 +1944,10 @@ async def _create_from_clone(
         "post_steps": [],
         # 系统盘扩容的结果（未请求扩容时为空串）：前端据此提示「已扩到 100G」
         # 或「扩容失败：…」，而不是让人以为规格默默生效了。
+        # disk_ok 是「规格容量是否真的达成」，前端据此决定成功还是警示态。
         "disk_note": disk_note,
+        "disk_ok": disk_ok,
+        "disk_gb": disk_gb,
         "template": False,
     }
 
@@ -2464,6 +2604,24 @@ async def clone_vm(
     await quota.enforce_for_create(user, request, "vm")
     # 资源额度：克隆体照抄来源机器，规格从读数里取（请求体里没有这些数字）
     await quota.enforce_create(user, request, "vm", source=(node, vmid))
+
+    # 跨节点克隆（target_node）要求模板盘在共享存储上、且目标节点挂得到：
+    # 不先查的话 PVE 会在后台任务里失败，返回的只有一句 clone failed。
+    try:
+        await cloneguard.ensure_cross_node_clone(
+            client,
+            kind="qemu",
+            source_node=node,
+            vmid=vmid,
+            target_node=payload.target_node,
+            connection_id=guestguard.call_connection(),
+        )
+    except ProxmoxError as exc:
+        await security.audit(
+            request, user, "vm.clone", target=f"{node}/{vmid} -> {payload.newid}",
+            result="failed", detail=exc.message,
+        )
+        _raise(exc)
 
     try:
         result = await client.qemu_clone(

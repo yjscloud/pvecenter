@@ -9,6 +9,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { App } from './App';
 import { ToastProvider } from './hooks/useToast';
 import { ReinstallWatcher } from './components/ReinstallWatcher';
+import { GuestLiveWatcher } from './components/GuestLiveWatcher';
 import { AuthProvider } from './hooks/useAuth';
 import { StepUpProvider } from './hooks/useStepUp';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -111,6 +112,10 @@ createRoot(container).render(
                   {/* 后台重装作业的通知器（没有界面）：只负责在作业结束 / 失败时
                       弹出提示与日志。挂在这里而不是向导里 —— 向导早被关掉了。 */}
                   <ReinstallWatcher />
+                  {/* 客户机状态实时监听（没有界面）：实时流里状态 / 锁一变，
+                      就把列表与详情页的查询作废，让页面自己刷新 —— 不必在
+                      启动、重装之后手动刷新浏览器。 */}
+                  <GuestLiveWatcher />
                 </StepUpProvider>
               </AuthProvider>
             </ToastProvider>

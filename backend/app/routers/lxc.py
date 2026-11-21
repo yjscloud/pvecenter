@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from .. import (
     batchcreate,
     defaults,
+    diskspec,
     guest_created,
     guestostype,
     guestip,
@@ -601,6 +602,16 @@ async def _create_lxc_core(
     client: Any,
 ) -> Dict[str, Any]:
     """单台容器创建主体（不含范围 / 额度预检），供单台与批量入口共用。"""
+    # 根盘下限：解包系统模板本身就要 1~3G，给到 0 或 1G 时 pct 会在解包阶段
+    # 失败，容器建出来也起不来。规格里的最小盘是 20G，这一项只挡手填。
+    if int(payload.rootfs) < diskspec.MIN_LXC_ROOTFS_GB:
+        raise ProxmoxError(
+            f"容器根盘至少需要 {diskspec.MIN_LXC_ROOTFS_GB}G，"
+            f"当前填写 {int(payload.rootfs)}G —— 系统模板解包后装不下。",
+            status_code=400,
+            code="ct_rootfs_too_small",
+        )
+
     # 与虚拟机同口径：没单独填 DNS 就套面板默认 DNS，免得容器起来后
     # 只拿到路由器 RA 下发的「假 IPv6」DNS，域名全解析不了。
     if payload.setup:

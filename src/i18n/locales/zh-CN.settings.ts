@@ -779,6 +779,14 @@ export const zhSettings = {
   'spec.fieldDisk': '磁盘（GB）',
   'spec.fieldDesc': '说明',
   'spec.descPlaceholder': '如：常规业务、小型数据库',
+  'spec.addRow': '添加规格',
+  'spec.presetsAdd': '添加常用规格',
+  'spec.presetsAdded': '已添加 {n} 条常用规格',
+  'spec.presetsAddedHint': '确认无误后点「保存」写入；重复的组合会自动跳过',
+  'spec.presetsNone': '常用规格都已存在',
+  'spec.presetsFailed': '读取常用规格失败',
+  'spec.diskMatchHint':
+    '这里的「磁盘」是系统盘容量：小于模板所需容量时，该规格会在下单页被禁用 —— 缩盘会截断模板分区表，虚拟机将无法启动。',
   /* ------------------------------------------------------ 零散组件的界面文案 */
   'permPicker.loading': '正在加载权限目录…',
   'permPicker.selectAll': '全选',

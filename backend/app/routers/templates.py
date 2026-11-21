@@ -24,7 +24,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from .. import (
+    cloneguard,
     defaults,
+    diskspec,
     guestguard,
     ownership,
     pvecache,
@@ -125,37 +127,67 @@ async def _await(client: Any, result: Any, timeout: float = 600.0) -> str:
 
 
 # ------------------------------------------------------------------ listing
-#: 模板 ostype 的缓存时长。模板重建（同一 VMID 换系统）是低频操作，5 分钟足够；
-#: 换来的是每次打开模板页 / 创建向导都不必再逐台读 config。
-TEMPLATE_OSTYPE_TTL = 300.0
+#: 模板元信息（ostype + 磁盘所在存储）的缓存时长。
+#:
+#: 模板重建（同一 VMID 换系统）是低频操作，5 分钟足够；换来的是每次打开模板页 /
+#: 创建向导都不必再逐台读 config。
+TEMPLATE_META_TTL = 300.0
+
+#: 读不到 config 时用的空值。``storages`` 必须是空列表而不是 None：前端拿它做
+#: 「能不能跨节点克隆」的判定，None 会被当成「未知」而误判成可以。
+#: ``rootfs_gb`` 用 None 表示「不知道」（详见 diskspec.root_disk_gb）。
+_EMPTY_TEMPLATE_META: Dict[str, Any] = {
+    "ostype": "",
+    "storages": [],
+    "rootfs_gb": None,
+}
 
 
-async def _template_ostype(
+async def _template_meta(
     client: Any, kind: str, node: str, vmid: int, cid: str
-) -> str:
-    """模板客户机的 ``ostype``（``l26`` / ``win11`` / ``debian`` …），读不到留空。
+) -> Dict[str, Any]:
+    """模板的 ``ostype`` 与**磁盘所在存储**，一次 config 读取。
 
-    为什么要它：**不同节点上的模板可以同名，而系统并不相同**（两台 PVE 上各有
-    一台叫 ``ubuntu24`` 的模板，其中一台其实是 Windows）。前端只靠名称猜家族时，
-    同名必然把图标配错；ostype 是 PVE 自己认的类型，用来兜底比名称可靠。
+    为什么要 ostype：不同节点上的模板可以同名而系统不同（两台 PVE 上各有一台
+    叫 ``ubuntu24`` 的模板，其中一台其实是 Windows），图标只能靠 PVE 自己认的
+    类型兜底。
+
+    为什么要 storages：跨节点克隆的前提是「模板的盘在共享存储上，且目标节点挂
+    得到这块存储」。不把存储名带出去，前端就只能把候选锁死在同节点 —— 共享存储
+    上的模板因此永远跨不过去（这正是「模板明明在共享存储上，却提示目标节点没有
+    模板」的由来）。判定见 :mod:`app.cloneguard`。
     """
     if not node or not vmid:
-        return ""
+        return dict(_EMPTY_TEMPLATE_META)
 
-    async def _load() -> str:
+    async def _load() -> Dict[str, Any]:
         cfg = await client.get(f"/nodes/{node}/{kind}/{vmid}/config")
-        return str((cfg or {}).get("ostype") or "")
+        return {
+            "ostype": str((cfg or {}).get("ostype") or ""),
+            "storages": cloneguard.config_volume_storages(cfg or {}, kind),
+            # 系统盘容量（GB）：选规格时据此判断「装不装得下」。容器模板是
+            # tar 文件、没有系统盘，这里留 None（容器走 min_rootfs_gb）。
+            "rootfs_gb": diskspec.root_disk_gb(cfg or {}) if kind == "qemu" else None,
+        }
 
     try:
         value = await pvecache.cached(
-            f"templates:ostype:{cid}:{kind}:{node}:{vmid}",
-            TEMPLATE_OSTYPE_TTL,
+            f"templates:meta:{cid}:{kind}:{node}:{vmid}",
+            TEMPLATE_META_TTL,
             _load,
         )
     except ProxmoxError:
         # 模板刚好被删 / 节点离线：图标退化成按名称判断，不该让整份列表失败
-        return ""
-    return value if isinstance(value, str) else ""
+        return dict(_EMPTY_TEMPLATE_META)
+    if not isinstance(value, dict):
+        return dict(_EMPTY_TEMPLATE_META)
+    storages = value.get("storages")
+    rootfs = value.get("rootfs_gb")
+    return {
+        "ostype": str(value.get("ostype") or ""),
+        "storages": [str(s) for s in storages] if isinstance(storages, list) else [],
+        "rootfs_gb": int(rootfs) if isinstance(rootfs, int) and rootfs > 0 else None,
+    }
 
 
 @router.get("/templates")
@@ -238,8 +270,14 @@ async def list_templates(
                 "pool": vm.get("pool"),
                 "connection_id": cid,
                 "connection_name": label,
-                # 下面并发读 config 补齐；读不到就是空串
+                # 下面并发读 config 补齐；读不到就是空串 / 空列表。
+                # storages 是模板磁盘所在的存储名：前端据此判断「目标节点挂得到
+                # 这块共享存储吗」，决定要不要放进跨节点克隆的候选。
                 "ostype": "",
+                "storages": [],
+                # 系统盘容量（GB）：前端选规格时用它判断装不装得下；
+                # 下面读 config 时补准，读不到就按 maxdisk（字节）兜底。
+                "rootfs_gb": None,
             }
             output.append(row)
             lookups.append(
@@ -255,16 +293,27 @@ async def list_templates(
 
     if lookups:
         # 模板数量通常是几张到几十张，逐个串行读 config 会让模板页多等几百毫秒；
-        # parallel 限流 8，失败的那一项返回异常对象（下面当空串处理）。
-        ostypes = await parallel(
+        # parallel 限流 8，失败的那一项返回异常对象（下面当空值处理）。
+        metas = await parallel(
             (
-                _template_ostype(client, kind, node, vmid, cid)
+                _template_meta(client, kind, node, vmid, cid)
                 for _row, client, kind, node, vmid, cid in lookups
             ),
             limit=8,
         )
-        for (row, *_rest), value in zip(lookups, ostypes):
-            row["ostype"] = value if isinstance(value, str) else ""
+        for (row, *_rest), value in zip(lookups, metas):
+            if not isinstance(value, dict):
+                continue
+            row["ostype"] = str(value.get("ostype") or "")
+            storages = value.get("storages")
+            row["storages"] = (
+                [str(s) for s in storages] if isinstance(storages, list) else []
+            )
+            # config 里没有 size= 的存储（如部分 LVM）退回 maxdisk；
+            # 两处都读不到就保持 None —— 前端按「未知」处理，不做拦截。
+            row["rootfs_gb"] = value.get("rootfs_gb") or diskspec.root_disk_gb(
+                {}, row.get("maxdisk")
+            )
 
     if not output and failure is not None:
         _raise(failure)
@@ -427,6 +476,9 @@ async def _scan_vztmpl(targets: List[Any]) -> List[Dict[str, Any]]:
                     "volid": volid,
                     "name": volid.split("/")[-1] if "/" in volid else volid,
                     "size": item.get("size"),
+                    # 解包后大约要多大根盘（估算）：前端据此提示「该模板建议
+                    # 至少 N G」，避免把 rootfs 填到解包都装不下。
+                    "min_rootfs_gb": diskspec.estimate_rootfs_gb(item.get("size")),
                     "ctime": item.get("ctime"),
                     # 共享存储上的模板在集群任何节点都能用，界面据此
                     # 显示「共享」而不是其中一个节点名（见前端卡片）
@@ -804,6 +856,20 @@ async def clone_template(
             _raise(exc)
 
     target_node = payload.target_node or payload.source_node
+
+    # 跨节点克隆的前提是「模板盘在共享存储上、且目标节点挂得到」。不先查这一步，
+    # PVE 会在后台任务里失败，用户只能看到一句 clone failed（见 cloneguard）。
+    try:
+        await cloneguard.ensure_cross_node_clone(
+            client,
+            kind="qemu",
+            source_node=payload.source_node,
+            vmid=payload.source_vmid,
+            target_node=payload.target_node,
+            connection_id=guestguard.call_connection(),
+        )
+    except ProxmoxError as exc:
+        _raise(exc)
 
     try:
         upid = await _await(

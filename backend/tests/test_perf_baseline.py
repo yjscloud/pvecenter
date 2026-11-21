@@ -199,6 +199,21 @@ def _clear_cache():
 
 
 # ----------------------------------------------------------- 指标 WS 单例采集
+def _metrics_resources() -> list[dict]:
+    """一帧 ``/cluster/resources``：一个节点 + 两台客户机（虚拟机 / 容器）。"""
+    return [
+        {"type": "node", "node": "pve1", "status": "online", "cpu": 0.1, "mem": 1, "maxmem": 2},
+        {"type": "qemu", "node": "pve1", "vmid": 100, "status": "running", "cpu": 0.2, "mem": 10},
+        {
+            "type": "lxc",
+            "node": "pve1",
+            "vmid": 101,
+            "status": "stopped",
+            "lock": "backup",
+        },
+    ]
+
+
 def test_metrics_hub_samples_once_for_many_subscribers(monkeypatch) -> None:
     """N 个订阅者只触发 1 路采集：这是「多开标签页 = 1 份 PVE 请求」的断言。"""
     from app.routers import tasks as tasks_router
@@ -206,19 +221,18 @@ def test_metrics_hub_samples_once_for_many_subscribers(monkeypatch) -> None:
     calls: list[int] = []
 
     class FakeClient:
-        async def nodes(self):
+        async def cluster_resources(self, rtype=None):
             calls.append(1)
-            return [
-                {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 1, "maxmem": 2}
-            ]
+            return _metrics_resources()
 
     monkeypatch.setattr(tasks_router, "get_client", lambda: FakeClient())
     monkeypatch.setattr(tasks_router, "METRICS_TICK", 0.05)
+    monkeypatch.setattr(tasks_router.guestguard, "call_connection", lambda *a: "")
 
     async def _run():
         hub = tasks_router._MetricsHub()
-        first_queue = hub.subscribe()
-        second_queue = hub.subscribe()
+        first_queue = hub.subscribe(can_node=True, can_vm=True, can_ct=True)
+        second_queue = hub.subscribe(can_node=True, can_vm=True, can_ct=True)
         first = await asyncio.wait_for(first_queue.get(), 2)
         second = await asyncio.wait_for(second_queue.get(), 2)
         sampled = len(calls)
@@ -230,8 +244,48 @@ def test_metrics_hub_samples_once_for_many_subscribers(monkeypatch) -> None:
     first, second, sampled = asyncio.run(_run())
     assert first["type"] == "metrics"
     assert first["nodes"][0]["node"] == "pve1"
+    assert {g["vmid"] for g in first["guests"]} == {100, 101}
     assert first == second  # 同一份快照投递给所有人
     assert sampled == 1  # 两个订阅者共用一次采集
+
+
+def test_metrics_hub_filters_guests_per_subscriber(monkeypatch) -> None:
+    """客户机条目按权限与归属逐订阅者裁剪，不能在共享层发全量。"""
+    from app.routers import tasks as tasks_router
+
+    class FakeClient:
+        async def cluster_resources(self, rtype=None):
+            return _metrics_resources()
+
+    class FakeScope:
+        """只放行 vmid=100 的范围（等价于「自己名下的机器」）。"""
+
+        def allows_guest(self, connection_id, node, vmid):
+            return int(vmid or 0) == 100
+
+    monkeypatch.setattr(tasks_router, "get_client", lambda: FakeClient())
+    monkeypatch.setattr(tasks_router, "METRICS_TICK", 0.05)
+    monkeypatch.setattr(tasks_router.guestguard, "call_connection", lambda *a: "")
+
+    async def _run():
+        hub = tasks_router._MetricsHub()
+        limited = hub.subscribe(scope=FakeScope(), can_node=False, can_vm=True, can_ct=True)
+        ct_only = hub.subscribe(scope=None, can_node=False, can_vm=False, can_ct=True)
+        limited_frame = await asyncio.wait_for(limited.get(), 2)
+        ct_frame = await asyncio.wait_for(ct_only.get(), 2)
+        hub.unsubscribe(limited)
+        hub.unsubscribe(ct_only)
+        await asyncio.sleep(0.12)
+        return limited_frame, ct_frame
+
+    limited_frame, ct_frame = asyncio.run(_run())
+    # 归属过滤：只剩自己名下那一台
+    assert [g["vmid"] for g in limited_frame["guests"]] == [100]
+    # 没有 node.view：不带节点
+    assert "nodes" not in limited_frame
+    # 只有 ct.view：只发容器，且锁状态照实带出
+    assert [g["vmid"] for g in ct_frame["guests"]] == [101]
+    assert ct_frame["guests"][0]["lock"] == "backup"
 
 
 def test_task_hub_filters_per_subscriber(monkeypatch) -> None:

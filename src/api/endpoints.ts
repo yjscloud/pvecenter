@@ -451,6 +451,11 @@ export const configApi = {
   saveSpecs: (specs: ResourceSpec[]) =>
     put<{ specs: ResourceSpec[] }>('/config/specs', specs),
   /**
+   * 内置的一组常用规格（只读）。`getSpecs` 给的是「当前生效的配置」——老部署里早已
+   * 存了自己的那套，内置表就读不到了；设置页的「添加常用规格」用它兜住这批部署。
+   */
+  getSpecPresets: () => get<{ specs: ResourceSpec[] }>('/config/specs/presets'),
+  /**
    * 登录页的验证方式：关闭 / 图形验证码 / 拖动滑块。
    * 读取只要求登录（设置页要显示当前值）；写入需要 settings.manage + 二次确认。
    */

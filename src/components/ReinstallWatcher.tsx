@@ -21,10 +21,13 @@ import { Notice } from './ui/EmptyState';
 import type { ReinstallJob } from '../api/types';
 
 /**
- * 轮询间隔：重装是**分钟级**事件（建盘 + 拷贝 + 校验），15 秒足够及时；
+ * 轮询间隔：重装是**分钟级**事件（建盘 + 拷贝 + 校验），10 秒足够及时；
  * 原先 5 秒换不来任何体验，只是把作业列表接口多敲三倍。
+ *
+ * 这里只管「作业完成没有」这一件事（结果通知）。机器在重装期间的状态变化
+ * （被停掉、锁住、重新启动）由实时流负责，见 components/GuestLiveWatcher。
  */
-const POLL_MS = 15_000;
+const POLL_MS = 10_000;
 
 export function ReinstallWatcher() {
   const t = useT();
@@ -64,8 +67,12 @@ export function ReinstallWatcher() {
       /* 机器刚被整个重建过：它自己的详情、列表里的状态、卷与 IP 都可能变了。
          这里**只**失效这几类 key，不写空参的 invalidateQueries()：那会把全站
          所有已挂载 / 已缓存的 query 一起重取（含仪表盘那几条全量请求），一次
-         重装落定就变成一场请求风暴。 */
-      for (const key of ['reinstall-jobs', 'vms', 'lxc']) {
+         重装落定就变成一场请求风暴。
+
+         ``vm`` / ``lxc`` 是详情页自己的键（``['vm', node, vmid]``）：少了它，
+         用户正停在详情页时看不到「已经重装完了」，得手动刷新 —— 那正是这次
+         要消灭的行为。``dashboard`` 只管几个计数，代价很小。 */
+      for (const key of ['reinstall-jobs', 'vms', 'lxc', 'vm', 'dashboard']) {
         void queryClient.invalidateQueries({ queryKey: [key] });
       }
     }

@@ -6181,67 +6181,388 @@ body.is-col-resizing * {
 }
 
 /* ---------------------------------------------------------------------------
-   资源规格卡片（创建弹窗里的「快速部署」模式）：一眼看出几核几 G 多大盘，点一下选中
+   资源规格选择器（创建弹窗里的「快速部署」模式）
+
+   与「系统模板选择器」共用同一套列表骨架（.os-pick / .os-row / .os-chip），
+   这里只做三件事：
+   · 换一份列模板：圆点 / 档位图标 / 名称 / 核 / 内存 / 磁盘 / 说明 / 标记；
+   · 给四个档位分配色（同 [data-os] 的做法：一处定义，chip 与分组带同时生效）；
+   · 窄屏塌成两行（名称一行、数字一行），表格列不再横向挤压。
    --------------------------------------------------------------------------- */
-.spec-cards {
+
+/* ---- 档位色 ---- */
+.spec-pick [data-tier='basic'] {
+  --os-color: #0f766e;
+  --os-tint: rgba(15, 118, 110, 0.1);
+}
+
+.spec-pick [data-tier='standard'] {
+  --os-color: #2f6fd0;
+  --os-tint: rgba(47, 111, 208, 0.12);
+}
+
+.spec-pick [data-tier='performance'] {
+  --os-color: #6b4ee6;
+  --os-tint: rgba(107, 78, 230, 0.11);
+}
+
+.spec-pick [data-tier='ultra'] {
+  --os-color: #b45309;
+  --os-tint: rgba(180, 83, 9, 0.11);
+}
+
+/* 深色下换成同色系的浅调：分组带与 chip 的文字压在深底上，用上面那组会糊成一片 */
+:root[data-theme='dark'] .spec-pick [data-tier='basic'] {
+  --os-color: #4fd1b5;
+  --os-tint: rgba(79, 209, 181, 0.12);
+}
+
+:root[data-theme='dark'] .spec-pick [data-tier='standard'] {
+  --os-color: #79aaff;
+  --os-tint: rgba(121, 170, 255, 0.14);
+}
+
+:root[data-theme='dark'] .spec-pick [data-tier='performance'] {
+  --os-color: #b3a4ff;
+  --os-tint: rgba(179, 164, 255, 0.13);
+}
+
+:root[data-theme='dark'] .spec-pick [data-tier='ultra'] {
+  --os-color: #f0b071;
+  --os-tint: rgba(240, 176, 113, 0.12);
+}
+
+/* ---- 列模板：比模板列表多一列数字，所以自己定一份 ----
+   高度不再单写：与同一个弹窗里的模板列表共用 .os-pick.is-compact 那档
+   （clamp(168px, 24vh, 256px)），两块并排时不会一个高一个矮。 */
+.spec-pick .os-pick-list {
+  /* 数字列与标记列必须**定宽**：每一行是独立的 grid，`auto` 会按各自内容算宽 ——
+     带「推荐」那一行的标签列被撑到 34px，数字与说明就整体左移，和列头、和其它
+     行对不上。200px = 48+64+72 + 两个 8px 间距（见 .spec-pick-nums）；
+     88px 够「推荐 + 磁盘不足」两个标签并排。 */
+  --os-row-cols: 15px 16px minmax(110px, 1.6fr) 200px minmax(0, 1fr) 88px;
+}
+
+/* ---- 档位分组的色带：比模板列表再浓一点 ----
+   规格只有四组，靠颜色一眼分块的价值更高；10% 在浅色下几乎看不出边界。 */
+.spec-pick .os-pick-group-head {
+  background: color-mix(in srgb, var(--os-color) 14%, var(--bg-surface));
+}
+
+.spec-pick .os-pick-group-head:hover {
+  background: color-mix(in srgb, var(--os-color) 20%, var(--bg-surface));
+}
+
+/* 三个数字共用一套内层网格：列名与数据行各写一遍同样的三列，才不会错位 */
+.spec-pick-colnums,
+.spec-pick-nums {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-  gap: 10px;
+  grid-template-columns: 48px 64px 72px;
+  gap: var(--os-row-gap);
+  align-items: center;
 }
 
-.spec-card {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 12px 14px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  text-align: left;
-  cursor: pointer;
-  transition:
-    border-color var(--transition),
-    background var(--transition);
+.spec-pick-colnums {
+  text-align: right;
 }
 
-.spec-card:hover {
-  border-color: var(--accent-border);
-}
-
-.spec-card:focus-visible {
-  outline: 2px solid var(--accent-border);
-  outline-offset: 2px;
-}
-
-.spec-card.is-selected {
-  border-color: var(--accent);
-  background: var(--accent-dim);
-}
-
-.spec-card-name {
-  font-weight: 600;
-  font-size: 13px;
-}
-
-.spec-card-spec {
-  font-size: 12px;
+.spec-pick-num {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
-.spec-card-spec b {
-  font-size: 13px;
+/* 选中行的数字跟着提亮：整行都在强调，数字不该还是灰的 */
+.spec-pick-row.is-on .spec-pick-num {
   color: var(--text-primary);
 }
 
-.spec-card-desc {
-  font-size: 11px;
+/* 单位只在窄屏出现：桌面端列名里已经写了（核 / 内存 G / 磁盘 G） */
+.spec-pick-num i {
+  display: none;
+  margin-left: 1px;
+  font-style: normal;
+  font-size: 10px;
   color: var(--text-muted);
+}
+
+/* 核数的单位常显（写全「4核」）；内存 / 磁盘仍靠列名的 (G) */
+.spec-pick-num i.spec-pick-unit-core {
+  display: inline;
+}
+
+/* 说明列：左边多让出一点。
+   磁盘是右对齐的数字、说明是左对齐的文字，两者之间的实际留白只有列间距 8px，
+   读起来像是贴在一起；数字列越宽越明显。列名与数据行同时加，保证上下对齐。 */
+.spec-pick-note,
+.spec-pick-colnote {
+  padding-left: 14px;
+}
+
+.spec-pick-note {
+  overflow: hidden;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 档位图标：位置与模板列表里的系统 logo 相同，颜色由 --os-color 决定 */
+.spec-tier-mark {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  color: var(--os-color, var(--text-muted));
+}
+
+/* chip 里的图标跟着 chip 文字色（未选中是档位色，选中是强调色） */
+.os-chip .spec-tier-mark {
+  color: inherit;
+}
+
+/* ---- 分类 chip 的档位配色：选中态仍走全局强调色，不与列表里的选中行抢 ---- */
+.spec-pick .os-pick-chips .os-chip[data-tier] {
+  background: var(--os-tint);
+  border-color: color-mix(in srgb, var(--os-color) 22%, transparent);
+  /* 直接用档位色，不再跟正文色混 —— 混过之后蓝色会被冲淡成灰蓝，
+     四个 chip 里就它看起来「没上色」 */
+  color: var(--os-color);
+  font-weight: 600;
+}
+
+.spec-pick .os-pick-chips .os-chip[data-tier] .os-chip-count {
+  background: color-mix(in srgb, var(--os-color) 14%, transparent);
+  color: var(--os-color);
+  font-weight: 600;
+}
+
+.spec-pick .os-pick-chips .os-chip[data-tier]:hover {
+  background: color-mix(in srgb, var(--os-color) 16%, transparent);
+  color: var(--os-color);
+}
+
+.spec-pick .os-pick-chips .os-chip[data-tier].is-on {
+  background: var(--accent-dim);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.spec-pick .os-pick-chips .os-chip[data-tier].is-on .os-chip-count {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* 只读（没有下发权限）时整列不可点，但数字仍要看得清 */
+.spec-pick-row.is-disabled {
+  cursor: not-allowed;
+}
+
+.spec-pick-row.is-disabled:hover {
+  background: transparent;
+}
+
+.spec-pick-row.is-disabled .os-row-name {
+  color: var(--text-secondary);
+}
+
+/* ---- 窄屏（≤559px）：表格塌成两行 ----
+   列名收起（没有列名，数字就靠单位说话），行内改成 grid-template-areas：
+   第一行「名称 + 标记」，第二行三个数字。说明列在窄屏没有位置，直接不显示。
+   断点取 559 而不是 767：弹窗内容区在 ~600px 宽时表格仍然排得下（名称 110 +
+   三列数字 180 + 说明），提早塌成两行会让桌面端失去「一行比一列」的对比能力。 */
+@media (max-width: 559px) {
+  .spec-pick .os-pick-colhead {
+    display: none;
+  }
+
+  .spec-pick .os-pick-group-head {
+    /* 列名没了，分组头就是第一层吸顶 */
+    top: 0;
+  }
+
+  /* 手机上两行一档、行更高，列表相应给高一点（多一个 !important 都没有的选择器
+     写法：串上 .is-compact，压过那条 clamp(168px, 24vh, 256px)） */
+  .spec-pick.os-pick.is-compact .os-pick-list {
+    max-height: clamp(220px, 45vh, 380px);
+  }
+
+  .spec-pick .spec-pick-row {
+    /* 标记列用 max-content 而不是 auto：auto 在这套结构里会被 fr 列挤成 0，
+       「推荐」「超出额度」直接看不见 */
+    grid-template-columns: 15px 16px minmax(0, 1fr) max-content;
+    grid-template-areas:
+      'radio mark name tags'
+      '.     .    nums nums';
+    row-gap: 3px;
+    height: auto;
+    min-height: 46px;
+    padding: 7px 8px;
+  }
+
+  .spec-pick .spec-pick-row .os-row-radio {
+    grid-area: radio;
+  }
+
+  .spec-pick .spec-pick-row .spec-tier-mark {
+    grid-area: mark;
+  }
+
+  .spec-pick .spec-pick-row .os-row-name {
+    grid-area: name;
+  }
+
+  .spec-pick .spec-pick-row .os-row-tags {
+    grid-area: tags;
+    /* 模板列表在 ≤520px 会整列收起标签（那里标签可有可无）；规格的「推荐 /
+       超出额度」是决定信息，必须留着 —— 只把这一处显式放开 */
+    display: flex;
+  }
+
+  .spec-pick .spec-pick-row .spec-pick-nums {
+    grid-area: nums;
+    grid-template-columns: repeat(3, minmax(0, auto));
+    justify-content: start;
+    gap: 10px;
+  }
+
+  .spec-pick .spec-pick-row .spec-pick-note {
+    display: none;
+  }
+
+  .spec-pick .spec-pick-num {
+    text-align: left;
+  }
+
+  .spec-pick .spec-pick-num i {
+    display: inline;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   滚动区（ui/ScrollArea）：悬停才现身的自绘滚动条
+
+   为什么不用原生滚动条：Windows 是常驻的 15px 灰条、macOS 只有滚动时才浮出来，
+   和这套控制台对不上；更要紧的是**原生覆盖式滚动条鼠标划过时不出现**，长列表
+   第一眼看不出还能不能往下翻。
+
+   这里把原生的藏掉，自己画一根 6px 的 pill 滑块：鼠标移进区域时淡入，按住可拖；
+   滚轮 / 触控板 / 方向键仍由浏览器原生滚动处理（同一个 overflow-y: auto），
+   惯性和回弹都还是系统手感。
+
+   **轨道不吃鼠标事件**（pointer-events: none）：否则右边缘的表单输入框会被一条
+   看不见的 12px 条挡住，点了没反应 —— 这种 bug 极难查。只有滑块收事件。
+   --------------------------------------------------------------------------- */
+.scrollarea {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.scrollarea-view {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* 原生滚动条整条藏掉（Firefox 读这条，Chromium 读下面那条伪元素） */
+  scrollbar-width: none;
+}
+
+.scrollarea-view::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* 键盘滚到这里时给个焦点环：没有原生滚动条，也得看得出「现在键盘滚的是这块」 */
+.scrollarea-view:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.scrollarea-bar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 12px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition-fast);
+}
+
+/* 鼠标移进来（或键盘聚焦）→ 淡入；拖动时即使在区域外也保持可见 */
+.scrollarea:hover .scrollarea-bar,
+.scrollarea:focus-within .scrollarea-bar,
+.scrollarea-bar[data-dragging='true'] {
+  opacity: 1;
+}
+
+.scrollarea-thumb {
+  position: absolute;
+  right: 3px;
+  width: 6px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--text-muted) 42%, transparent);
+  pointer-events: auto;
+  cursor: grab;
+  transition: background-color var(--transition-fast);
+}
+
+.scrollarea-thumb:hover {
+  background: color-mix(in srgb, var(--text-muted) 62%, transparent);
+}
+
+.scrollarea-thumb:active {
+  background: color-mix(in srgb, var(--text-muted) 82%, transparent);
+  cursor: grabbing;
+}
+
+/* 触屏没有「悬停」，条只会挡住内容；手指本来就能直接推 */
+@media (hover: none) {
+  .scrollarea-bar {
+    display: none;
+  }
+}
+
+/* 资源规格列表用滚动区装：条数一多（「添加常用规格」一次进 12 条）就把整页顶得
+   很长，下面的「添加规格」按钮要翻好几屏才够得到。这里给个高度上限，滚只发生在
+   列表内部（overscroll-behavior: contain 防止滚到底再把整页带走）。 */
+.spec-edit-list {
+  /* 300px ≈ 两张卡片，640px 上限约 4 张；矮屏按 52vh 收，别把「添加」按钮挤出视野 */
+  max-height: clamp(300px, 52vh, 640px);
+}
+
+.spec-edit-list .scrollarea-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 2px;
+}
+
+/* 窄屏：卡片竖着堆、一屏只放得下一两张，再套一层内滚动会变成「滚中滚」，
+   手指容易卡在里面。手机上取消高度上限，交给整页滚动。 */
+@media (max-width: 767px) {
+  .spec-edit-list {
+    max-height: none;
+  }
+
+  .spec-edit-list .scrollarea-view {
+    overflow: visible;
+  }
 }
 
 /* ---------------------------------------------------------------------------
    资源规格编辑行（设置 → 资源规格）
    一行一个规格：头部是预览徽标 + 删除，下面是名称 / 适用 / 核 / 内存 / 磁盘 / 说明
    --------------------------------------------------------------------------- */
+
 .spec-row {
   display: flex;
   flex-direction: column;

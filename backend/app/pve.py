@@ -115,6 +115,16 @@ def explain_clone_error(message: str, full: bool) -> str:
             "链接加 &force=1 重跑即可换成 root 令牌，或手动执行 pveum acl modify / "
             "--users <账号> --roles PVEVMAdmin,PVEDatastoreAdmin）"
         )
+    # 跨节点克隆被拒最常见的两种原话：磁盘不在共享存储上，或目标节点根本没挂载
+    # 这块存储。这两句原文（`not on shared storage` / `storage 'x' is not available
+    # on node 'y'`）对用户等于天书，而且指向的修法很具体。
+    if "shared storage" in low or "is not available on node" in low:
+        return (
+            text
+            + "（跨节点克隆要求模板的磁盘全在共享存储上，且目标节点已挂载这块存储："
+            "在 PVE 的「数据中心 → 存储 → 编辑 → 节点」里确认该存储覆盖了目标节点；"
+            "若模板盘在本地存储上，只能克隆到模板所在节点，或先把模板迁到共享存储）"
+        )
     if not full:
         return text + "（链接克隆失败：请确认源磁盘所在存储支持链接克隆，或改用「完整克隆」重试）"
     return text

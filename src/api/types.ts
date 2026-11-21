@@ -1871,6 +1871,10 @@ export interface BatchCreateItemResult extends BulkItemResult {
   skipped?: boolean;
   post_steps?: string[];
   disk_note?: string;
+  /** 规格的系统盘容量是否真的达成（扩容失败 / 规格小于模板时为 false） */
+  disk_ok?: boolean;
+  /** 规格要求的系统盘容量（GB）；未走规格时为 0 */
+  disk_gb?: number;
   template?: boolean;
 }
 
@@ -2067,7 +2071,13 @@ export interface CloudInitConfig {
   user?: string;
   password?: string;
   ssh_keys?: string;
-  ip_configs?: Array<{ ip: string; gateway: string }>;
+  /**
+   * 逐张网卡的地址。
+   *
+   * `pool_id` 只在 `ip === 'dhcp'` 时有意义：克隆模式下网卡沿用模板（请求体里
+   * 没有 networks），网段只能从这里带 —— 不带的话后端只能按网桥猜一个池。
+   */
+  ip_configs?: Array<{ ip: string; gateway: string; pool_id?: string }>;
   nameserver?: string;
   searchdomain?: string;
 }
@@ -2718,12 +2728,28 @@ export interface TemplateItem {
   maxmem?: number;
   maxdisk?: number;
   disk?: number;
+  /**
+   * 系统盘容量（GB，整数）。选资源规格时据此判断「装不装得下」：规格盘小于它
+   * 时克隆出来的机器会背着模板那块盘，缩盘又会把分区表截断。
+   *
+   * `null` / `undefined` = 读不到（节点离线、模板刚被删）—— 按「未知」处理，
+   * 不拦截，由后端在创建时再判一次。
+   */
+  rootfs_gb?: number | null;
   tags?: string;
   uptime?: number;
   pool?: string;
   /** 所属 PVE 连接：多主机场景下节点名与 VMID 可能重复，必须靠它区分 */
   connection_id?: string;
   connection_name?: string;
+  /**
+   * 模板磁盘所在的存储名（去重）。
+   *
+   * 用来判断「能不能把模板克隆到另一台节点」：跨节点克隆要求这些存储既是
+   * **共享**存储、又在目标节点上挂着（PVE 的 clone 接口带 `target` 时的限制）。
+   * 空数组表示没读到配置 —— 此时按「未知」处理，不据此拦候选。
+   */
+  storages?: string[];
 }
 
 /**
@@ -2744,6 +2770,8 @@ export interface CtSystemTemplate {
   volid: string;
   name: string;
   size?: number;
+  /** 解包后大约需要的根盘（GB）：容器 rootfs 低于它会在解包阶段失败 */
+  min_rootfs_gb?: number;
   ctime?: number;
   /**
    * 所在的存储是共享存储（CephFS / NFS 这类）。
@@ -3009,6 +3037,17 @@ export interface VmCreateRequest {
     node: string;
     full: boolean;
     target_storage?: string;
+    /**
+     * 克隆体落到哪台节点。
+     *
+     * `node` 是**模板**所在的节点，两者不同就是跨节点克隆。不传时后端按 `node`
+     * 落点 —— 所以「模板在 node01、要建到 node03」时必须显式带上它，否则机器
+     * 会静静建在模板那台节点上。
+     *
+     * 跨节点要求模板的磁盘全在共享存储上、且目标节点挂得到（后端会先校验，
+     * 见 app/cloneguard.py）。
+     */
+    target_node?: string;
     /** 克隆完成后是否自动开机（默认 true） */
     start?: boolean;
     /**
@@ -3046,6 +3085,15 @@ export interface VmCreateResponse {
    * 100G」；失败（存储不支持、模板盘更大等）如实写明原因。
    */
   disk_note?: string;
+  /**
+   * 规格的系统盘容量是否真的达成。
+   *
+   * `false` 表示机器建出来了但**没有**达到规格容量（扩容失败，或规格小于模板
+   * 盘而 PVE 不支持缩盘）：这时候不能报成功，否则用户以为买的是 20G / 100G。
+   */
+  disk_ok?: boolean;
+  /** 规格要求的系统盘容量（GB）；未走规格时缺省 */
+  disk_gb?: number;
   /**
    * 建机成功了、但结果可能不可用时的警告。
    *

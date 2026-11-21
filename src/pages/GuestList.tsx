@@ -64,6 +64,7 @@ import { QuotaChip } from '../components/QuotaChip';
 import { PveQueryError } from '../components/SetupRequired';
 import { usePveReady } from '../hooks/usePveStatus';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
+import { guestLiveKey, useMetricsStream } from '../hooks/useMetricsStream';
 import { ConfirmDialog, useConfirm } from '../components/ui/ConfirmDialog';
 import { UserSelect } from '../components/ui/UserSelect';
 import { OwnerAssignDialog } from '../components/OwnerAssignDialog';
@@ -699,6 +700,17 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   /* 「加载全部」是一次性动作：切换后重新拉一份不带 limit 的清单。 */
   const [loadAllGuests, setLoadAllGuests] = useState(false);
 
+  /* ---- 实时读数 ----
+     状态 / CPU / 内存 / 运行时长改为跟着实时流走（后端 3 秒一帧），不再只等
+     「数据刷新间隔」那一轮 HTTP —— 那是默认 30 秒、还可能被用户关掉。
+
+     这条流是全标签页共享的（见 hooks/useMetricsStream），仪表盘与全站状态
+     监听用的是同一条连接，这里只是多一个订阅者。
+
+     注意只**覆盖**这几个易变字段：IP、归属、来源模板之类仍以服务端清单为准，
+     实时帧里没有它们，硬改会把列表改出一堆空格子。 */
+  const live = useMetricsStream(pveReady);
+
   const guestsQuery = useQuery({
     queryKey: isLxc
       ? ['lxc', 'with-ip', connFilter || 'all', nodeFilter || 'all', loadAllGuests]
@@ -929,12 +941,40 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
     ];
   }, [nodesQuery.data, t]);
 
-  /* ---- 过滤 ---- */
-  /* 搜索统一匹配「名称 / VMID / 节点 / IP / 标签 / 来源 PVE」。
-     列表页的搜索框是「我只记得这台机器的一部分」时唯一的入口，只认名称等于
-     逼用户先猜对字段名；IP 尤其重要 —— 排障时手里往往只有个地址。
-     空格分隔按「与」处理：多敲一个词只会缩小范围，不会突然放宽。 */
-  const guestRows = guestsQuery.data?.data ?? [];
+  /* 清单 + 实时读数：只替换真的变了的那几行，其余保持原对象引用 —— 表格的
+     行是 memo 的，引用不变就不会白白重渲染一遍整页。断线时原样用轮询数据。 */
+  const guestRows = useMemo(() => {
+    const rows = guestsQuery.data?.data ?? [];
+    if (!live.connected) return rows;
+    let patched = false;
+    const next = rows.map((vm) => {
+      const hit = live.guests[guestLiveKey(vm.connection_id, vm.node, vm.vmid)];
+      if (!hit) return vm;
+      const lock = hit.lock ?? undefined;
+      if (
+        hit.status === vm.status &&
+        hit.cpu === vm.cpu &&
+        hit.mem === vm.mem &&
+        hit.maxmem === vm.maxmem &&
+        hit.uptime === vm.uptime &&
+        lock === vm.lock
+      ) {
+        return vm;
+      }
+      patched = true;
+      return {
+        ...vm,
+        status: hit.status ?? vm.status,
+        cpu: hit.cpu ?? vm.cpu,
+        maxcpu: hit.maxcpu ?? vm.maxcpu,
+        mem: hit.mem ?? vm.mem,
+        maxmem: hit.maxmem ?? vm.maxmem,
+        uptime: hit.uptime ?? vm.uptime,
+        lock,
+      };
+    });
+    return patched ? next : rows;
+  }, [guestsQuery.data, live]);
   const guestTotal = guestsQuery.data?.total ?? guestRows.length;
   const guestTruncated = guestTotal > guestRows.length;
 
@@ -948,6 +988,11 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
     [],
   );
 
+  /* ---- 过滤 ---- */
+  /* 搜索统一匹配「名称 / VMID / 节点 / IP / 标签 / 来源 PVE」。
+     列表页的搜索框是「我只记得这台机器的一部分」时唯一的入口，只认名称等于
+     逼用户先猜对字段名；IP 尤其重要 —— 排障时手里往往只有个地址。
+     空格分隔按「与」处理：多敲一个词只会缩小范围，不会突然放宽。 */
   const filtered = useMemo(() => {
     const list = guestRows;
     const tokens = search.trim().toLowerCase().split(/\s+/).filter(Boolean);

@@ -1583,8 +1583,21 @@ async def put_vm_defaults(
 async def get_specs(
     user: Dict[str, Any] = Depends(security.get_current_user),
 ) -> Dict[str, Any]:
-    """全量资源规格。从未保存过时返回默认那几档（1C2G / 2C4G / 4C8G / 8C16G）。"""
+    """全量资源规格。从未保存过时返回内置那几档（见 :data:`app.specs.DEFAULT_SPECS`）。"""
     return {"specs": await specs.list_specs()}
+
+
+@router.get("/config/specs/presets")
+async def get_spec_presets(
+    user: Dict[str, Any] = Depends(security.get_current_user),
+) -> Dict[str, Any]:
+    """内置的常用规格（只读）。
+
+    和 ``GET /config/specs`` 的区别：那份是**当前生效的配置**，老部署里早就存了
+    自己的一套，内置表读不到了。设置页的「添加常用规格」要把内置表并进草稿，
+    所以单开这条 —— 纯静态数据，不碰库，也不含任何敏感信息，读权限与上面一致。
+    """
+    return {"specs": specs.presets()}
 
 
 @router.put("/config/specs")

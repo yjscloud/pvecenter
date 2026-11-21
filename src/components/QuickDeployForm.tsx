@@ -49,21 +49,16 @@ import { invalidateQuota } from '../hooks/quotaCache';
 import { getGlobalScope } from '../api/scope';
 import { checkGuestSpec, remainingSummary, type QuotaViolation } from '../utils/quotaSpec';
 import { Card, CardHeader } from './ui/Card';
-import { Badge } from './ui/Badge';
 import { Button, IconButton } from './ui/Button';
-import {
-  Field,
-  Input,
-  SegmentedControl,
-  Select,
-  Switch,
-} from './ui/Input';
+import { Field, Input, Select, Switch } from './ui/Input';
 import { Notice } from './ui/EmptyState';
 import { Spinner } from './ui/Spinner';
 import { NodePicker } from './NodePicker';
 import { SystemTemplatePicker } from './SystemTemplatePicker';
 import {
+  clonePlacement,
   ctTemplatePickItems,
+  elsewhereTemplatesHint,
   vmTemplatePickItems,
 } from '../utils/templatePick';
 import { isPathDisabled, SSH_SECURITY_NAV_PATH } from './Sidebar';
@@ -75,8 +70,10 @@ import { useAuth } from '../hooks/useAuth';
 import { useNodeStorages } from '../hooks/useNodeStorages';
 import { useT, type MessageKey } from '../i18n';
 import { formatBytes } from '../utils/format';
-import { fitsPools } from '../utils/ippool';
+import { parseVlan, vlanInvalid } from '../utils/vlan';
 import { BatchCreateProgress } from './BatchCreateProgress';
+import { NicSegmentFields, type IpMode } from './NicSegmentFields';
+import { SpecPicker } from './SpecPicker';
 import type {
   BatchCreateResponse,
   LxcCreateRequest,
@@ -86,10 +83,29 @@ import type {
 /** 客户机类型：与向导的 kind 对齐（qemu = 虚拟机，lxc = 容器） */
 export type QuickDeployKind = 'qemu' | 'lxc';
 
-type IpMode = 'dhcp' | 'static';
-
 /** GB → MB（规格里存 MB，界面上说 GB） */
 const gb = (mb: number) => Math.round(mb / 1024);
+
+/* 上次用过的那一档规格：只记在本机（机房里的机器很杂，同一套规格不会到处通用），
+   用于「推荐」标记 —— 不替用户选中，只在他犹豫时给一个默认答案。
+   localStorage 在隐私模式下会抛，读写都包一层：记不住也不能影响下单。 */
+const LAST_SPEC_KEY = 'pvecenter:last-spec';
+
+function readLastSpec(kind: QuickDeployKind): string {
+  try {
+    return localStorage.getItem(`${LAST_SPEC_KEY}:${kind}`) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function writeLastSpec(kind: QuickDeployKind, specId: string) {
+  try {
+    localStorage.setItem(`${LAST_SPEC_KEY}:${kind}`, specId);
+  } catch {
+    /* 忽略 */
+  }
+}
 
 /**
  * 越界维度 → 界面词条。
@@ -142,17 +158,6 @@ function blankNic(ipMode: IpMode = 'static'): QuickNic {
     gateway: '',
     poolId: '',
   };
-}
-
-/** VLAN 标签：留空 = 不划；1~4094 的整数（PVE 的 tag 取值域） */
-function parseVlan(value: string): number | undefined {
-  const tag = Number(value.trim());
-  return Number.isInteger(tag) && tag >= 1 && tag <= 4094 ? tag : undefined;
-}
-
-/** 填了但不是 1~4094 的整数 —— 留空合法，写错要拦在提交前 */
-function vlanInvalid(value: string): boolean {
-  return Boolean(value.trim()) && parseVlan(value) === undefined;
 }
 
 /** 批量命名的序号从 1 开始；``{i:02}`` 表示至少两位、不足补零 */
@@ -213,6 +218,9 @@ export function QuickDeployForm({
      这台机器与模板彻底脱钩（模板删改都不影响它）。与自定义部署是同一件事。
      初值不是写死的 false：打开时按面板默认（见下面的预填效果）落一次。 */
   const [fullClone, setFullClone] = useState(false);
+  /* 用户亲手拨过「完整克隆」开关没有。规格需要扩容时会**自动**打开它一次，
+     但用户随后手动关掉就说明他知道自己在做什么 —— 不能再抢回来。 */
+  const fullCloneTouchedRef = useRef(false);
   /* 默认静态：机器一般要固定地址；网段与地址由下面的 effect 自动挑 */
   const [nics, setNics] = useState<QuickNic[]>(() => [blankNic()]);
   const [ciUser, setCiUser] = useState('root');
@@ -232,7 +240,6 @@ export function QuickDeployForm({
   const manageOn = manage && !sshNavOff;
 
   /** 用户自己点过 IP 获取方式：之后不再被「有没有可用网段」的自动判断覆盖 */
-  const ipModeTouchedRef = useRef(false);
 
   /** 用户自己挑过模板：之后不再被「默认选中第一张」覆盖（与自定义部署同一规则） */
   const templateTouchedRef = useRef(false);
@@ -248,11 +255,6 @@ export function QuickDeployForm({
 
   const updateNic = (index: number, patch: Partial<QuickNic>) => {
     setNics((prev) => prev.map((n, i) => (i === index ? { ...n, ...patch } : n)));
-  };
-
-  const pickIpMode = (index: number, next: IpMode) => {
-    if (index === 0) ipModeTouchedRef.current = true;
-    updateNic(index, { ipMode: next });
   };
 
   const addNic = () => setNics((prev) => [...prev, blankNic('dhcp')]);
@@ -282,7 +284,7 @@ export function QuickDeployForm({
        上一次开了完整克隆就悄悄沿用下去，等于替用户改了磁盘语义 */
     setFullClone(false);
     cloneDefaultRef.current = false;
-    ipModeTouchedRef.current = false;
+    fullCloneTouchedRef.current = false;
     templateTouchedRef.current = false;
     /* targetConn 不清：保留上次选的主机（多台 PVE 时省一次选择），下面那个
        effect 只在它为空时兜底选当前连接 */
@@ -331,14 +333,13 @@ export function QuickDeployForm({
     staleTime: 60_000,
   });
 
-  /* 两处需要选存储：容器建 rootfs；虚拟机开了「完整克隆」时磁盘要有落点
-     （链接克隆不写任何存储，那条路就不白读一次）。
+  /* 两处需要选存储：容器建 rootfs；虚拟机开了「完整克隆」时磁盘要有落点。
+     虚拟机那条**即使链接克隆也要读**：候选模板里可能有别的节点上、盘在共享存储
+     的模板，要不要让它跨过来，取决于所选节点有没有挂载那块存储（见
+     utils/templatePick 的 clonePlacement）。多一次请求换「共享存储模板看不见」
+     这个坑，值得。
      候选只列**所选节点上**的存储池（含显式带连接，见 useNodeStorages）。 */
-  const storagesQuery = useNodeStorages(
-    node,
-    targetConn,
-    open && (!isVm || fullClone),
-  );
+  const storagesQuery = useNodeStorages(node, targetConn, open);
 
   /* 网桥候选：与新建虚拟机 / 新建容器 / 重装共用同一套筛选（见 useNodeBridges）。
      静态地址与 DHCP 都用这块网卡，所以两种模式下候选完全相同。 */
@@ -458,179 +459,11 @@ export function QuickDeployForm({
     if (first) setStorage(first.storage);
   }, [storage, storagesQuery.data, isVm]);
 
-  /* 可选网段：网桥与节点都要对得上（集群里同一个 vmbr0 在不同节点上常常是不同
-     网段，只看网桥会在错误的节点上把池列出来 —— 判定见 utils/ippool） */
-  const usablePools = useMemo(
-    () =>
-      fitsPools(poolsQuery.data?.pools ?? [], {
-        bridge: primaryNic?.bridge,
-        /* 池记着自己的 VLAN：网卡已经明确划了另一个 tag 时，这个池的地址就不在
-           那个二层网络里了（网卡还没划 tag 时不排除 —— 选中池会把 tag 带过来） */
-        vlan: parseVlan(primaryNic?.vlan ?? '') ?? null,
-        node,
-        /* 连接也要带上：多套 PVE 上同名节点是常态，只有它能区分「哪一台上的
-           那个节点」（池的适用 PVE 就是按连接 id 记的） */
-        connection: targetConn,
-      }),
-    [poolsQuery.data, primaryNic?.bridge, primaryNic?.vlan, node, targetConn],
-  );
+  /* 网段 / 地址的判定与联动整块都在 NicSegmentFields 里（与自定义部署共用同一
+     份实现）：池的适用范围、选网段对齐网桥与 VLAN、没池时退回 DHCP，一处实现，
+     三个入口不会各说各话。这里只负责把池清单与当前网卡值喂给它。 */
 
-  /* DHCP 可选的「网段」：**不按当前网桥/VLAN 过滤** —— 用户正是要先选网段，再把
-     网桥与 VLAN 对齐过去；按当前网桥过滤的话，挂在另一块桥上的网段根本选不到。
-     节点与连接仍然要看：同一个 vmbr0 在不同节点上常常是不同网段。 */
-  const segmentPools = useMemo(
-    () =>
-      fitsPools(poolsQuery.data?.pools ?? [], {
-        node,
-        connection: targetConn,
-      }),
-    [poolsQuery.data, node, targetConn],
-  );
 
-  /* 网段下拉只列真实网段：DHCP 的目的是「从某个网段拿地址」，摆一个
-     「跟随网桥（不指定）」的默认项，等于允许一个语义上说不清的选择 ——
-     用户既然选了 DHCP，就该说清请求从哪条二层网络出去。 */
-  const segmentOptions = useMemo(
-    () =>
-      segmentPools.map((p) => ({
-        label: `${t('quickDeploy.segmentOption', {
-          name: p.name,
-          subnet: p.subnet,
-        })}${p.vlan != null ? ` · ${t('ippool.colVlan')} ${p.vlan}` : ''}`,
-        value: p.id,
-      })),
-    [segmentPools, t],
-  );
-
-  /**
-   * 手改网桥 / VLAN。
-   *
-   * DHCP 的网段下拉没有「不指定」这一档，不能把选择清空：改为换到一个与新的
-   * 二层网络匹配的网段（已选的那个仍匹配就保持不动）。一个都不匹配时保留原
-   * 选择 —— 那是用户明确覆盖的，提交时用的仍是网桥 / VLAN 本身。
-   * 静态模式不用管：usablePools 会按新网桥重筛，下面的 effect 会重挑。
-   */
-  const editNicLink = (index: number, patch: Partial<QuickNic>) => {
-    const nic = nics[index];
-    if (!nic || nic.ipMode !== 'dhcp') {
-      updateNic(index, patch);
-      return;
-    }
-    const nextBridge = patch.bridge ?? nic.bridge;
-    const nextVlan =
-      patch.vlan !== undefined ? parseVlan(patch.vlan) : parseVlan(nic.vlan);
-    const candidates = fitsPools(segmentPools, {
-      bridge: nextBridge,
-      vlan: nextVlan ?? null,
-      node,
-      connection: targetConn,
-    });
-    const fit = candidates.find((p) => p.id === nic.poolId) ?? candidates[0];
-    if (!fit || fit.id === nic.poolId) {
-      updateNic(index, patch);
-      return;
-    }
-    updateNic(index, {
-      ...patch,
-      poolId: fit.id,
-      /* 换了网段就把 VLAN 跟上（与下拉里选网段同一口径）；这次改的正是 VLAN
-         时以用户输入为准 */
-      vlan: patch.vlan ?? (fit.vlan != null ? String(fit.vlan) : nic.vlan),
-    });
-  };
-
-  /* 换节点 / 换 PVE 连接后，原来那个网段可能已经不适用于这台主机：下拉里没有
-     对应选项时值会变成空白，但状态里还留着一个旧 id —— 提交时它不会生效，却
-     让人以为选好了。这里统一清掉（静态模式随后由下面的 effect 重挑）。 */
-  useEffect(() => {
-    if (!open || !poolsQuery.data) return;
-    const ids = new Set(segmentPools.map((p) => p.id));
-    setNics((prev) => {
-      const next = prev.map((n) =>
-        /* 地址也一起清：它属于刚被丢掉的那个网段，留着会被当成「已填好」提交 */
-        n.poolId && !ids.has(n.poolId)
-          ? { ...n, poolId: '', ip: '', gateway: '' }
-          : n,
-      );
-      return next.some((n, i) => n !== prev[i]) ? next : prev;
-    });
-  }, [open, poolsQuery.data, segmentPools]);
-
-  /* DHCP 网段没有「不指定」这一档：切到 DHCP、或刚换过节点（上面的 effect 把
-     旧选择清掉了）时，自动挑一个网段 —— 优先与当前网桥 / VLAN 匹配的那个，
-     否则列表里的第一个，并把网卡的网桥与 VLAN 对齐过去。 */
-  useEffect(() => {
-    if (!open || segmentPools.length === 0) return;
-    setNics((prev) => {
-      let changed = false;
-      const next = prev.map((n) => {
-        if (n.ipMode !== 'dhcp') return n;
-        if (n.poolId && segmentPools.some((p) => p.id === n.poolId)) return n;
-        const fits = fitsPools(segmentPools, {
-          bridge: n.bridge,
-          vlan: parseVlan(n.vlan) ?? null,
-          node,
-          connection: targetConn,
-        });
-        const pick = fits[0] ?? segmentPools[0];
-        changed = true;
-        return {
-          ...n,
-          poolId: pick.id,
-          bridge: pick.bridge || n.bridge,
-          vlan: pick.vlan != null ? String(pick.vlan) : n.vlan,
-        };
-      });
-      return changed ? next : prev;
-    });
-    /* nics 也要跟着看：从「静态」切到「DHCP」时 poolId 可能还是空的，
-       光靠节点 / 网段变化触发不到 */
-  }, [open, nics, segmentPools, node, targetConn]);
-
-  const poolOptions = useMemo(
-    () => [
-      { label: t('quickDeploy.selectPool'), value: '' },
-      ...usablePools.map((p) => ({
-        /* 池标了自己的 VLAN 就一并显示：同一个网桥下可能挂着好几个 VLAN 网段，
-           只写「名称 · 子网」的话，两个池看起来像重复的 */
-        label: `${t('quickDeploy.poolOption', {
-          name: p.name,
-          subnet: p.subnet,
-          n: p.free_count,
-        })}${p.vlan != null ? ` · ${t('ippool.colVlan')} ${p.vlan}` : ''}`,
-        value: p.id,
-      })),
-    ],
-    [usablePools, t],
-  );
-
-  /* 主网卡没选网段（或所选网段已不适用，例如换了网桥）时自动挑一个：用户不必
-     先知道「哪台机器的 IP 池在哪」。挑完由下一个 effect 填具体地址。 */
-  useEffect(() => {
-    if (!open || !primaryNic || primaryNic.ipMode !== 'static' || !poolsQuery.data) return;
-    if (usablePools.some((p) => p.id === primaryNic.poolId)) return;
-    const first = usablePools.find((p) => p.free_count > 0) ?? usablePools[0];
-    if (!first) return;
-    updateNic(0, { poolId: first.id, ip: '' });
-  }, [open, primaryNic, usablePools, poolsQuery.data]);
-
-  /* 选好网段但主网卡还没填地址：取该网段的第一个空闲地址，用户仍可改 */
-  useEffect(() => {
-    if (!primaryNic || primaryNic.ipMode !== 'static' || !primaryNic.poolId) return;
-    if (primaryNic.ip.trim()) return;
-    const pool = (poolsQuery.data?.pools ?? []).find((p) => p.id === primaryNic.poolId);
-    const next = pool?.free?.[0];
-    if (!next) return;
-    updateNic(0, { ip: next, gateway: pool?.gateway || primaryNic.gateway });
-  }, [primaryNic, poolsQuery.data]);
-
-  /* 一个可用网段都没有（没配 IP 池、或池已满）：静态无从选起，退回 DHCP，
-     而不是让用户对着空下拉框找原因。用户手动选过静态就不再干预。 */
-  useEffect(() => {
-    if (!open || ipModeTouchedRef.current || !primaryNic) return;
-    if (primaryNic.ipMode !== 'static' || !poolsQuery.data) return;
-    if (usablePools.length === 0) updateNic(0, { ipMode: 'dhcp' });
-  }, [open, primaryNic, poolsQuery.data, usablePools]);
 
   /* 批量下发时每台拿到的是同一份网络配置。主网卡可以静态，但地址必须由 IP 池
      按台分配；附加网卡没有第二套池可用，统一走 DHCP —— 否则 N 台会在第二张
@@ -729,14 +562,68 @@ export function QuickDeployForm({
   const globalQuotaBlocked = Boolean(quota && !quota.can_create);
   const quotaBlocked = globalQuotaBlocked || quotaOver.length > 0;
 
+  /* 当前额度下建不了的规格：卡片上标「超出额度」，让人在挑的时候就看得见，
+     不必点进去、再被下面那条警告顶回来。读数不可信时（error）不下结论 ——
+     与 checkGuestSpec 的纪律一致：不替后端猜，也不给人错误的灰名单。 */
+  const blockedSpecIds = useMemo(() => {
+    const out = new Set<string>();
+    if (!myGroup || myGroup.error) return out;
+    for (const item of specs) {
+      if (
+        checkGuestSpec(myGroup, {
+          count: 1,
+          cores: item.cores,
+          memory_mb: item.memory,
+          disk_gb: item.disk,
+        }).length > 0
+      ) {
+        out.add(item.id);
+      }
+    }
+    return out;
+  }, [specs, myGroup]);
+
+  /* 「推荐」标哪一档（只加标记，不替用户选中）：
+     1. 额度有限额 → 额度内最大的一档，点了就能直接下发；
+     2. 没限额 → 上次用过的那档（同一个人通常反复开同一规格）；
+     3. 都没有 → 中间档，两头（最小 / 最大）最容易选错。
+     额度有限但一档都装不下时不给推荐 —— 那时任何一档都需要找管理员调额度。 */
+  const recommendedSpecId = useMemo(() => {
+    if (!specs.length) return '';
+    const limited = Boolean(
+      myGroup &&
+        !myGroup.error &&
+        myGroup.remaining &&
+        Object.values(myGroup.remaining).some((v) => typeof v === 'number'),
+    );
+    if (limited) {
+      const fit = specs
+        .filter((item) => !blockedSpecIds.has(item.id))
+        .sort((a, b) => b.cores - a.cores || b.memory - a.memory || b.disk - a.disk);
+      return fit[0]?.id ?? '';
+    }
+    const last = readLastSpec(kind);
+    if (last && specs.some((item) => item.id === last)) return last;
+    const sorted = [...specs].sort(
+      (a, b) => a.cores - b.cores || a.memory - b.memory || a.disk - b.disk,
+    );
+    return sorted[Math.floor((sorted.length - 1) / 2)]?.id ?? '';
+  }, [specs, blockedSpecIds, myGroup, kind]);
+
   /* 模板选择器的候选：只有「属于当前连接」这一层过滤是快速部署自己的业务，
      其余映射（名称 / 两列容量 / 标签 / 摘要说明）与自定义部署共用同一份
      （见 utils/templatePick）。
 
-     还要按**节点**过滤：虚拟机克隆的磁盘来自模板自身，模板在 pve9-1 上就克隆不到
-     pve9-2 去（除非那块盘在共享存储上，而模板本身也不保证）。原先只按连接过滤，
-     选了没模板的节点照样列出别的节点的模板 —— 用户挑完、提交，才在 PVE 那边吃
-     一个「模板不存在 / 无法访问」。宁可当场说「这个节点没有模板」。 */
+     原来这里还要求「模板必须与目标节点同节点」—— 理由是模板的盘在模板那台机器
+     上。这对本地存储成立，但**共享存储上的模板本来就能跨节点克隆**（PVE 的 clone
+     接口带 target 即可），一视同仁地挡掉，就变成「模板明明在 Ceph 上、却提示这个
+     节点没有模板」。现在按盘判定：别节点的模板，只要磁盘全在共享存储上、且本节点
+     挂得到，就允许选（克隆体落到本节点）。 */
+  const placementStorages = useMemo(
+    () => (storagesQuery.isLoading || storagesQuery.error ? undefined : storagesQuery.data),
+    [storagesQuery.isLoading, storagesQuery.error, storagesQuery.data],
+  );
+
   const vmPickItems = useMemo(
     () =>
       vmTemplatePickItems(
@@ -745,16 +632,66 @@ export function QuickDeployForm({
             (!targetConn ||
               !tpl.connection_id ||
               tpl.connection_id === targetConn) &&
-            (!node || tpl.node === node),
+            (!node || clonePlacement(tpl, node, placementStorages).kind !== 'blocked'),
         ),
         t,
+        node,
       ),
-    [templatesQuery.data, targetConn, node, t],
+    [templatesQuery.data, targetConn, node, t, placementStorages],
   );
 
-  /* 别的节点上有什么 —— 只用于把「这台节点没有，那 pve9-1 上有」讲清楚。
-     直接列出来的话用户会以为模板就在本机（模板的盘在本机，克隆不过去），
-     所以只点名，不进候选。 */
+  /* 当前模板的系统盘容量（GB）：规格的硬盘不得小于它。
+     模板的分区表是按这块盘记录的，缩盘会把分区截断（机器停在 "Boot failed"）；
+     而静默按模板建又会让规格、额度同时失真。null = 后端读不到，按未知放行。 */
+  const requiredDiskGb = useMemo(() => {
+    if (!isVm || !templateRef) return null;
+    return vmPickItems.find((item) => item.value === templateRef)?.minDiskGb ?? null;
+  }, [isVm, templateRef, vmPickItems]);
+
+  /* 装不下当前模板的规格：行内置灰 + 写明原因（见 SpecPicker.unfitReasons）。 */
+  const diskUnfitReasons = useMemo(() => {
+    const out: Record<string, string> = {};
+    if (!requiredDiskGb) return out;
+    for (const item of specs) {
+      if (item.disk < requiredDiskGb) {
+        out[item.id] = t('quickDeploy.specDiskTooSmallHint', {
+          required: requiredDiskGb,
+        });
+      }
+    }
+    return out;
+  }, [requiredDiskGb, specs, t]);
+
+  /* 换模板后已选规格装不下：自动切到「满足条件里最小的一档」，别让用户停在
+     一个建不出来的组合上。一档都没有时清空，由下面的 validate 说清怎么办。 */
+  useEffect(() => {
+    if (!open || !isVm || !requiredDiskGb || !specId) return;
+    const current = specs.find((item) => item.id === specId);
+    if (current && current.disk >= requiredDiskGb) return;
+    const fit = specs
+      .filter((item) => item.disk >= requiredDiskGb)
+      .sort((a, b) => a.cores - b.cores || a.memory - b.memory || a.disk - b.disk)[0];
+    if (!fit) {
+      setSpecId('');
+      return;
+    }
+    setSpecId(fit.id);
+    toast.info(t('quickDeploy.specAutoSwitched', { name: fit.name }));
+  }, [open, isVm, requiredDiskGb, specId, specs, t, toast]);
+
+  /* 规格盘 > 模板盘：必须完整克隆才能扩容（链接克隆的卷挂在模板上，扩它不安全）。
+     用户没动过开关时替他打开一次并说明；他手动关掉则交给 validate 拦。 */
+  const needsFullClone = Boolean(
+    isVm && requiredDiskGb && spec && spec.disk > requiredDiskGb,
+  );
+  useEffect(() => {
+    if (!open || !needsFullClone || fullClone || fullCloneTouchedRef.current) return;
+    setFullClone(true);
+    toast.info(t('quickDeploy.fullCloneAutoOn'));
+  }, [open, needsFullClone, fullClone, t, toast]);
+
+  /* 别的节点上有什么、为什么用不了 —— 只用于把话说清楚，不进候选。
+     「缺共享存储」与「本地盘」是两种修法，必须分开讲（见 elsewhereTemplatesHint）。 */
   const vmTemplatesElsewhere = useMemo(() => {
     const list = (templatesQuery.data ?? []).filter(
       (tpl) =>
@@ -765,8 +702,22 @@ export function QuickDeployForm({
         tpl.node !== node,
     );
     const nodes = Array.from(new Set(list.map((tpl) => tpl.node)));
-    return { count: list.length, nodes };
-  }, [templatesQuery.data, targetConn, node]);
+    const missing: string[] = [];
+    const local: string[] = [];
+    let blocked = 0;
+    for (const tpl of list) {
+      const placement = clonePlacement(tpl, node, placementStorages);
+      if (placement.kind !== 'blocked') continue;
+      blocked += 1;
+      for (const name of placement.missing) {
+        if (!missing.includes(name)) missing.push(name);
+      }
+      for (const name of placement.local) {
+        if (!local.includes(name)) local.push(name);
+      }
+    }
+    return { count: list.length, nodes, blocked, missing, local };
+  }, [templatesQuery.data, targetConn, node, placementStorages]);
 
   const ctPickItems = useMemo(
     () => ctTemplatePickItems(osTemplatesQuery.data ?? []),
@@ -851,6 +802,17 @@ export function QuickDeployForm({
       }
     }
     if (!spec) return t('quickDeploy.errSpec');
+    /* 规格盘 < 模板系统盘：装不下。规格行已经禁用，这里兜住残留状态与批量路径。 */
+    if (isVm && requiredDiskGb && spec.disk < requiredDiskGb) {
+      return t('quickDeploy.errSpecDiskSmall', {
+        required: requiredDiskGb,
+        selected: spec.disk,
+      });
+    }
+    /* 规格盘 > 模板盘：链接克隆的卷挂在模板上，扩容不安全，必须完整克隆。 */
+    if (needsFullClone && !fullClone) {
+      return t('quickDeploy.errCloneFullRequired');
+    }
     if (!node) return t('quickDeploy.errNode');
     if (isVm && !templateRef) return t('quickDeploy.errTemplate');
     if (!isVm && !osTemplate) return t('quickDeploy.errOsTemplate');
@@ -878,6 +840,9 @@ export function QuickDeployForm({
     nics,
     node,
     isVm,
+    requiredDiskGb,
+    needsFullClone,
+    fullClone,
     templateRef,
     osTemplate,
     storageNeeded,
@@ -967,6 +932,9 @@ export function QuickDeployForm({
              多占一份空间，换来的是这台机器与模板彻底脱钩。 */
           full: fullClone,
           target_storage: fullClone ? storage : undefined,
+          /* 模板在别的节点（盘在共享存储上）时必须显式给落点，否则后端只能按
+             `node`（模板那台）落点，克隆体会悄悄建到模板所在节点上。 */
+          target_node: tplNode && tplNode !== node ? node : undefined,
           /* 规格里的磁盘是给新机器用的：模板盘更小时由后端扩容系统盘 */
           disk_size: spec.disk > 0 ? spec.disk : undefined,
         },
@@ -1039,6 +1007,8 @@ export function QuickDeployForm({
               targetConn,
             );
         setBatchResult(result);
+        /* 记住这一档：下次打开时它就是「推荐」（见 recommendedSpecId） */
+        writeLastSpec(kind, spec.id);
         queryClient.invalidateQueries({ queryKey: [isVm ? 'vms' : 'lxc'] });
         invalidateQuota(queryClient);
         toast.success(
@@ -1054,13 +1024,16 @@ export function QuickDeployForm({
           targetConn,
         );
         /* 扩容结果如实带出来：「模板盘 20G ≥ 规格 20G」和「已扩到 100G」
-           必须让人看到，否则规格是否生效只能靠猜 */
-        toast.success(
-          t('quickDeploy.created'),
-          result.disk_note
-            ? `${t('quickDeploy.createdVmHint', { vmid: result.vmid ?? '-' })} · ${result.disk_note}`
-            : t('quickDeploy.createdVmHint', { vmid: result.vmid ?? '-' }),
-        );
+           必须让人看到，否则规格是否生效只能靠猜。disk_ok=false 时说明机器
+           建出来了、但系统盘没达到规格容量，不能报成一次干净的创建。 */
+        const createdHint = result.disk_note
+          ? `${t('quickDeploy.createdVmHint', { vmid: result.vmid ?? '-' })} · ${result.disk_note}`
+          : t('quickDeploy.createdVmHint', { vmid: result.vmid ?? '-' });
+        if (result.disk_ok === false) {
+          toast.info(t('quickDeploy.createdDiskMismatch'), createdHint);
+        } else {
+          toast.success(t('quickDeploy.created'), createdHint);
+        }
         queryClient.invalidateQueries({ queryKey: ['vms'] });
         /* 多了一台机器 = 名下用量变了。额度读数有**好几份**（我的额度、平台台数、
            用户/角色额度…），只刷 ['quota'] 会漏掉其余几份 —— 统一走 invalidateQuota。 */
@@ -1082,6 +1055,7 @@ export function QuickDeployForm({
         onCreated?.(result.vmid ?? 0);
         onClose();
       }
+      writeLastSpec(kind, spec.id);
     } catch (err) {
       toast.error(t('quickDeploy.createFailed'), errorMessage(err));
     } finally {
@@ -1242,32 +1216,19 @@ export function QuickDeployForm({
             /* 空态已在上面用 Notice 说明；这里不重复占位 */
             null
           ) : (
-            <div className="spec-cards">
-              {specs.map((item) => {
-                const selected = item.id === specId;
-                return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    className={`spec-card ${selected ? 'is-selected' : ''}`}
-                    aria-pressed={selected}
-                    onClick={() => setSpecId(item.id)}
-                  >
-                    <span className="spec-card-name">{item.name}</span>
-                    <span className="spec-card-spec">
-                      <b>{item.cores}</b> {t('quickDeploy.specUnitCores')} ·{' '}
-                      <b>{gb(item.memory)}</b> {t('quickDeploy.specUnitMem')} ·{' '}
-                      <b>{item.disk}</b> {t('quickDeploy.specUnitDisk')}
-                    </span>
-                    {item.description ? (
-                      <span className="spec-card-desc">{item.description}</span>
-                    ) : null}
-                  </button>
-                );
-              })}
-            </div>
+            /* 与「系统镜像」同一套列表：一行一档、字段成列，档位分组带色。
+               规格多了才有搜索 / 档位 chip / 分组，见 SpecPicker。 */
+            <SpecPicker
+              specs={specs}
+              value={specId}
+              onChange={setSpecId}
+              recommendedId={recommendedSpecId}
+              blockedIds={blockedSpecIds}
+              /* 装不下模板系统盘的档位：禁用 + 行内写明差多少 */
+              unfitReasons={diskUnfitReasons}
+              disabled={!canCreate}
+            />
           )}
-
         </Card>
 
         {/* ---- 3. 部署位置 ---- */}
@@ -1329,16 +1290,11 @@ export function QuickDeployForm({
                   ? errorMessage(templatesQuery.error)
                   : vmPickItems.length
                     ? t('templatePicker.vmHint')
-                    : /* 这台节点没有模板时，点名「哪台节点上有几个」：用户刚在
-                         截图里见过 ubuntu24，不点名他会以为列表坏了，反复刷新。
-                         共享存储的模板本来能跨节点克隆，这句也把出路写出来。 */
-                      vmTemplatesElsewhere.count
-                      ? t('templatePicker.vmEmptyOnNode', {
-                          node,
-                          others: vmTemplatesElsewhere.nodes.join(' / '),
-                          n: vmTemplatesElsewhere.count,
-                        })
-                      : t('templatePicker.vmEmptyHint')
+                    : /* 这台节点没有可用模板时，点名「哪台节点上有几个、为什么用不了」：
+                         用户刚在截图里见过 ubuntu24，不点名他会以为列表坏了；
+                         共享存储没挂到本节点与「模板盘在本地」是两种不同的修法。 */
+                      (elsewhereTemplatesHint(t, node, vmTemplatesElsewhere) ??
+                        t('templatePicker.vmEmptyHint'))
                 : osTemplatesQuery.isError
                   ? errorMessage(osTemplatesQuery.error)
                   : ctPickItems.length || !node
@@ -1371,7 +1327,12 @@ export function QuickDeployForm({
               <div className="field-toggle">
                 <Switch
                   checked={fullClone}
-                  onChange={setFullClone}
+                  onChange={(value) => {
+                    /* 用户亲手拨过：规格容量不足时不再自动改回完整克隆，
+                       改由提交前校验把原因说清楚。 */
+                    fullCloneTouchedRef.current = true;
+                    setFullClone(value);
+                  }}
                   label={t('quickDeploy.fullClone')}
                 />
               </div>
@@ -1443,7 +1404,7 @@ export function QuickDeployForm({
                     <Select
                       label={t('quickDeploy.labelBridge')}
                       value={nic.bridge}
-                      onChange={(e) => editNicLink(index, { bridge: e.target.value })}
+                      onChange={(e) => updateNic(index, { bridge: e.target.value })}
                       options={
                         bridgeOptions.length
                           ? bridgeOptions
@@ -1461,7 +1422,7 @@ export function QuickDeployForm({
                       min={1}
                       max={4094}
                       value={nic.vlan}
-                      onChange={(e) => editNicLink(index, { vlan: e.target.value })}
+                      onChange={(e) => updateNic(index, { vlan: e.target.value })}
                       placeholder={t('quickDeploy.vlanPlaceholder')}
                     />
                     <Input
@@ -1475,134 +1436,30 @@ export function QuickDeployForm({
                     />
                   </div>
 
-                  <div
-                    className={`dyn-row mt-12 qd-nic-mode${
-                      batchMode && index > 0 ? ' qd-nic-mode-wide' : ''
-                    }`}
-                  >
-                    <Field label={t('quickDeploy.labelIpMode')}>
-                      {batchMode && index > 0 ? (
-                        /* 附加网卡没有第二套池可分配，批量时只能是 DHCP：
-                           不给一个点不动的静态按钮，直接说清原因 */
-                        <div className="flex items-center gap-8 flex-wrap">
-                          <Badge variant="info">DHCP</Badge>
-                          <span className="fs-sm text-muted">
-                            {t('quickDeploy.batchDhcpOnly')}
-                          </span>
-                        </div>
-                      ) : (
-                        <SegmentedControl<IpMode>
-                          value={nic.ipMode}
-                          onChange={(next) => pickIpMode(index, next)}
-                          ariaLabel={t('quickDeploy.labelIpMode')}
-                          options={[
-                            { label: t('quickDeploy.ipModeStatic'), value: 'static' },
-                            { label: 'DHCP', value: 'dhcp' },
-                          ]}
-                        />
-                      )}
-                    </Field>
-                  </div>
-
-                  {nic.ipMode === 'static' ? (
-                    <div
-                      className={`dyn-row mt-12${
-                        batchMode && index === 0 ? ' qd-nic-batch-pool' : ''
-                      }`}
-                    >
-                      {/* 只有主网卡能自动挑 IP 池：附加网卡手填地址 */}
-                      {index === 0 ? (
-                        <Select
-                          label={t('quickDeploy.labelPool')}
-                          value={nic.poolId}
-                          onChange={(e) => {
-                            /* 池记着它属于哪个二层网络（网桥 + VLAN）：选中后把这两项
-                               一起带到网卡上，省得用户再对一遍 —— 对不上的池本来也
-                               选不到（判定见 usablePools）。池没写 VLAN 时保留网卡
-                               当前的值，不擅自清掉。 */
-                            const picked = usablePools.find(
-                              (p) => p.id === e.target.value,
-                            );
-                            updateNic(index, {
-                              poolId: e.target.value,
-                              ip: '',
-                              ...(picked
-                                ? {
-                                    bridge: picked.bridge || nic.bridge,
-                                    vlan:
-                                      picked.vlan != null
-                                        ? String(picked.vlan)
-                                        : nic.vlan,
-                                  }
-                                : {}),
-                            });
-                          }}
-                          options={poolOptions}
-                          hint={
-                            poolsQuery.isError
-                              ? errorMessage(poolsQuery.error)
-                              : t('quickDeploy.poolHint')
-                          }
-                        />
-                      ) : null}
-                      {/* 批量时主网卡的地址由池子按台分配，手填一个地址只会
-                          误导（它不会生效）—— 这一格改成展示本批的分配结果 */}
-                      {batchMode && index === 0 ? null : (
-                        <>
-                          <Input
-                            label={t('quickDeploy.labelIp')}
-                            required
-                            value={nic.ip}
-                            onChange={(e) => updateNic(index, { ip: e.target.value })}
-                            placeholder={t('quickDeploy.ipPlaceholder')}
-                          />
-                          <Input
-                            label={t('quickDeploy.labelGateway')}
-                            value={nic.gateway}
-                            onChange={(e) =>
-                              updateNic(index, { gateway: e.target.value })
-                            }
-                            placeholder={t('quickDeploy.gatewayPlaceholder')}
-                          />
-                        </>
-                      )}
-                    </div>
-                  ) : segmentPools.length > 0 ? (
-                    /* DHCP：同样要能指定「从哪个网段拿地址」。选中后把网桥与 VLAN
-                       对齐到该网段 —— DHCP 服务器按二层网络分地址，选网段就是选出
-                       哪个 VLAN / 网桥，这也是唯一能控制「拿到哪个网段」的手段。
-                       下拉里不设「不指定」：池都没配时干脆不摆这个框，避免出现
-                       一个点不出任何东西的空壳。 */
-                    <div
-                      className={`dyn-row mt-12${
-                        batchMode && index === 0 ? ' qd-nic-batch-pool' : ''
-                      }`}
-                    >
-                      <Select
-                        label={t('quickDeploy.labelSegment')}
-                        value={nic.poolId}
-                        onChange={(e) => {
-                          const picked = segmentPools.find(
-                            (p) => p.id === e.target.value,
-                          );
-                          updateNic(index, {
-                            poolId: e.target.value,
-                            ...(picked
-                              ? {
-                                  bridge: picked.bridge || nic.bridge,
-                                  vlan:
-                                    picked.vlan != null
-                                      ? String(picked.vlan)
-                                      : nic.vlan,
-                                }
-                              : {}),
-                          });
-                        }}
-                        options={segmentOptions}
-                        hint={t('quickDeploy.segmentHint')}
-                      />
-                    </div>
-                  ) : null}
+                  {/* 网段 / IP：与自定义部署共用同一块界面（NicSegmentFields）。
+                      批量时主网卡仍可选网段，但地址由池按台分配，所以这里关掉手填。 */}
+                  <NicSegmentFields
+                    value={{
+                      bridge: nic.bridge,
+                      vlan: nic.vlan,
+                      ipMode: nic.ipMode,
+                      ip: nic.ip,
+                      gateway: nic.gateway,
+                      poolId: nic.poolId,
+                    }}
+                    onChange={(patch) => updateNic(index, patch)}
+                    node={node}
+                    connection={targetConn}
+                    pools={poolsQuery.data?.pools ?? []}
+                    ready={Boolean(poolsQuery.data)}
+                    poolError={
+                      poolsQuery.isError ? errorMessage(poolsQuery.error) : undefined
+                    }
+                    /* 附加网卡没有第二套池可分配：批量时只能是 DHCP */
+                    forceDhcp={batchMode && index > 0}
+                    showPool={index === 0}
+                    hideAddress={batchMode && index === 0}
+                  />
 
                   {batchMode && index === 0 && nic.ipMode === 'static'
                     ? nic.poolId
