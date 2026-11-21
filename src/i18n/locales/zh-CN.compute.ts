@@ -1661,8 +1661,6 @@ export const zhCompute = {
   'quickDeploy.errQuotaSpec': '当前规格超出你名下的资源额度，请换小一号的规格。',
   'quickDeploy.errSpecDiskSmall':
     '模板系统盘为 {required}G，当前规格只有 {selected}G，装不下模板分区。请换不小于 {required}G 的规格。',
-  'quickDeploy.errCloneFullRequired':
-    '该规格的系统盘大于模板，链接克隆无法安全扩容，请开启「完整克隆」。',
   'quickDeploy.quotaFallback': '该类',
   'quickDeploy.quotaSpecTitle': '{label}超出你名下的资源额度',
   'quickDeploy.quotaSpecBody':
@@ -1730,7 +1728,6 @@ export const zhCompute = {
   'quickDeploy.specSubtitle': '由管理员定义；系统盘按规格大小扩容',
   'quickDeploy.specDiskTooSmallHint': '需 ≥{required}G（模板系统盘 {required}G）',
   'quickDeploy.specAutoSwitched': '已切换为满足模板容量的「{name}」',
-  'quickDeploy.fullCloneAutoOn': '该规格的系统盘大于模板，已开启完整克隆',
   'quickDeploy.specUnitCores': '核',
   'quickDeploy.specUnitMem': 'G 内存',
   'quickDeploy.specUnitDisk': 'G 磁盘',
@@ -1775,7 +1772,7 @@ export const zhCompute = {
   'quickDeploy.fullCloneNote':
     '完整克隆：磁盘复制到上面的存储，系统盘扩到规格的 {n}G；与模板彻底脱钩。',
   'quickDeploy.linkedCloneNote':
-    '链接克隆：磁盘留在模板所在存储（秒级、不额外占空间），系统盘扩到规格的 {n}G；模板被删则这些机器起不来。',
+    '链接克隆：磁盘留在模板所在存储（秒级、不额外占空间），系统盘扩到规格的 {n}G —— 能否扩容取决于存储，扩不动时会提示，但机器仍可按模板大小启动；模板被删则这些机器起不来。',
   'quickDeploy.sectionNetwork': '网络',
   'quickDeploy.networkSubtitleVm':
     '可加多张网卡；静态地址从「网络 → IP 地址池」自动挑，可改；DHCP 也能指定网段',

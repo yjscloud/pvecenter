@@ -1132,9 +1132,10 @@ async def _template_rootfs_gb(client: Any, node: str, vmid: int) -> Optional[int
 async def _ensure_spec_disk_fits(payload: VmCreateRequest, client: Any) -> None:
     """规格盘与模板系统盘的容量守卫（单台 / 批量共用）。
 
-    必须在任何 PVE 写操作之前：规格小于模板时直接 400，不产出半成品；规格大于
-    模板却用链接克隆时，要求改用完整克隆（共享底层卷不能安全扩容）。开关关闭或
-    模板容量读不到时放行 —— 「不知道」不能变成「不让建」。
+    必须在任何 PVE 写操作之前：规格小于模板时直接 400，不产出半成品。规格大于
+    模板时照常创建 —— 用链接克隆还是完整克隆是用户的选择，能不能扩得动由存储
+    决定，扩不动会在 ``disk_note`` / ``disk_ok`` 里如实回报。开关关闭或模板容量
+    读不到时放行 —— 「不知道」不能变成「不让建」。
     """
     clone = payload.clone_from
     if not clone or not clone.disk_size:
@@ -1142,7 +1143,7 @@ async def _ensure_spec_disk_fits(payload: VmCreateRequest, client: Any) -> None:
     if not await diskspec.guard_enabled():
         return
     required = await _template_rootfs_gb(client, clone.node, clone.vmid)
-    problem = diskspec.check_clone_disk(int(clone.disk_size), required, clone.full)
+    problem = diskspec.check_clone_disk(int(clone.disk_size), required)
     if problem:
         raise ProxmoxError(
             str(problem["message"]),
@@ -1658,6 +1659,7 @@ async def _resize_cloned_rootfs(
     vmid: int,
     target_gb: int,
     interface_hint: str = "",
+    linked_clone: bool = False,
 ) -> Tuple[str, bool]:
     """克隆完成后把系统盘扩到 ``target_gb``（只增不减），返回 (说明, 是否达成)。
 
@@ -1719,9 +1721,16 @@ async def _resize_cloned_rootfs(
     except ProxmoxError:
         actual = None
     if actual is not None and actual + 0.01 < target_gb:
+        # 链接克隆能否扩容取决于存储实现（qcow2 backing / LVM-thin 差异）。
+        # 失败时把可行的补救方向一起说了，用户自己决定要不要改完整克隆。
+        hint = (
+            "；链接克隆的系统盘与模板共享底层卷，部分存储不支持扩容，"
+            "可改用完整克隆后重建"
+            if linked_clone
+            else "，请检查存储剩余容量与卷状态"
+        )
         return (
-            f"系统盘扩容后仍为 {actual:g}G（目标 {target_gb}G），"
-            "请检查存储剩余容量与卷状态",
+            f"系统盘扩容后仍为 {actual:g}G（目标 {target_gb}G）{hint}",
             False,
         )
     if current is not None:
@@ -1886,7 +1895,12 @@ async def _create_from_clone(
     if clone.disk_size:
         hint = str(payload.disks[0].interface or "") if payload.disks else ""
         disk_note, disk_ok = await _resize_cloned_rootfs(
-            client, target_node, vmid, int(clone.disk_size), hint
+            client,
+            target_node,
+            vmid,
+            int(clone.disk_size),
+            hint,
+            linked_clone=not bool(clone.full),
         )
         disk_gb = int(clone.disk_size)
 

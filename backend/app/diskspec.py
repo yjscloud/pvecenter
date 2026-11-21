@@ -8,8 +8,9 @@ disk``）。所以判定必须放在**创建之前**：
 
 * 规格 < 模板 —— 拒绝（装不下，缩盘不可行）；
 * 规格 = 模板 —— 直接克隆，不需要扩容；
-* 规格 > 模板 —— 允许，但要求**完整克隆**：链接克隆的系统盘挂在模板的 backing
-  file 上，扩它既依赖存储实现，也可能动到模板链；完整克隆才是独立卷。
+* 规格 > 模板 —— 允许，**克隆方式（链接 / 完整）由用户自己决定**。链接克隆能不能
+  扩得动取决于存储实现（qcow2 backing 与 LVM-thin 的差异），扩不动时就按实际情况
+  回报（``disk_ok=false`` + 原因），不替用户改选项、也不因此拒绝创建。
 
 只读逻辑放这里（纯函数 + 一个开关读取），PVE 往返由调用方负责，方便单测。
 """
@@ -129,9 +130,10 @@ def estimate_rootfs_gb(size_bytes: Optional[Any]) -> int:
 def check_clone_disk(
     requested_gb: Optional[int],
     required_gb: Optional[int],
-    full_clone: bool,
 ) -> Optional[Dict[str, Any]]:
     """克隆前判定。返回 ``None`` 表示可以建；否则返回错误字典。
+
+    只看「装不装得下」：链接克隆还是完整克隆是用户的选择，不在判定范围内。
 
     同时服务两处：路由层据此抛 400，单测里直接断言字典内容。
     """
@@ -148,17 +150,6 @@ def check_clone_disk(
                 f"所选规格的系统盘 {requested}G 小于模板所需 {required}G，"
                 "模板分区装不下，虚拟机无法正常启动。请选择不小于 "
                 f"{required}G 的规格，或换一个更小的模板。"
-            ),
-            "required_gb": required,
-            "selected_gb": requested,
-        }
-    if requested > required and not full_clone:
-        return {
-            "code": "clone_full_required",
-            "message": (
-                f"规格系统盘 {requested}G 大于模板的 {required}G：链接克隆的系统盘"
-                "与模板共享底层卷，无法安全扩容。请改用完整克隆，或选择 "
-                f"{required}G 的规格。"
             ),
             "required_gb": required,
             "selected_gb": requested,

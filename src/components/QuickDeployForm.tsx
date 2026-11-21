@@ -218,9 +218,6 @@ export function QuickDeployForm({
      这台机器与模板彻底脱钩（模板删改都不影响它）。与自定义部署是同一件事。
      初值不是写死的 false：打开时按面板默认（见下面的预填效果）落一次。 */
   const [fullClone, setFullClone] = useState(false);
-  /* 用户亲手拨过「完整克隆」开关没有。规格需要扩容时会**自动**打开它一次，
-     但用户随后手动关掉就说明他知道自己在做什么 —— 不能再抢回来。 */
-  const fullCloneTouchedRef = useRef(false);
   /* 默认静态：机器一般要固定地址；网段与地址由下面的 effect 自动挑 */
   const [nics, setNics] = useState<QuickNic[]>(() => [blankNic()]);
   const [ciUser, setCiUser] = useState('root');
@@ -284,7 +281,6 @@ export function QuickDeployForm({
        上一次开了完整克隆就悄悄沿用下去，等于替用户改了磁盘语义 */
     setFullClone(false);
     cloneDefaultRef.current = false;
-    fullCloneTouchedRef.current = false;
     templateTouchedRef.current = false;
     /* targetConn 不清：保留上次选的主机（多台 PVE 时省一次选择），下面那个
        effect 只在它为空时兜底选当前连接 */
@@ -679,16 +675,8 @@ export function QuickDeployForm({
     toast.info(t('quickDeploy.specAutoSwitched', { name: fit.name }));
   }, [open, isVm, requiredDiskGb, specId, specs, t, toast]);
 
-  /* 规格盘 > 模板盘：必须完整克隆才能扩容（链接克隆的卷挂在模板上，扩它不安全）。
-     用户没动过开关时替他打开一次并说明；他手动关掉则交给 validate 拦。 */
-  const needsFullClone = Boolean(
-    isVm && requiredDiskGb && spec && spec.disk > requiredDiskGb,
-  );
-  useEffect(() => {
-    if (!open || !needsFullClone || fullClone || fullCloneTouchedRef.current) return;
-    setFullClone(true);
-    toast.info(t('quickDeploy.fullCloneAutoOn'));
-  }, [open, needsFullClone, fullClone, t, toast]);
+  /* 规格盘 > 模板盘时要不要完整克隆，交给用户自己拨 —— 这里不自动改开关，
+     也不拦提交。链接克隆扩不动时后端会在 disk_note 里说明。 */
 
   /* 别的节点上有什么、为什么用不了 —— 只用于把话说清楚，不进候选。
      「缺共享存储」与「本地盘」是两种修法，必须分开讲（见 elsewhereTemplatesHint）。 */
@@ -809,10 +797,6 @@ export function QuickDeployForm({
         selected: spec.disk,
       });
     }
-    /* 规格盘 > 模板盘：链接克隆的卷挂在模板上，扩容不安全，必须完整克隆。 */
-    if (needsFullClone && !fullClone) {
-      return t('quickDeploy.errCloneFullRequired');
-    }
     if (!node) return t('quickDeploy.errNode');
     if (isVm && !templateRef) return t('quickDeploy.errTemplate');
     if (!isVm && !osTemplate) return t('quickDeploy.errOsTemplate');
@@ -841,8 +825,6 @@ export function QuickDeployForm({
     node,
     isVm,
     requiredDiskGb,
-    needsFullClone,
-    fullClone,
     templateRef,
     osTemplate,
     storageNeeded,
@@ -1327,12 +1309,7 @@ export function QuickDeployForm({
               <div className="field-toggle">
                 <Switch
                   checked={fullClone}
-                  onChange={(value) => {
-                    /* 用户亲手拨过：规格容量不足时不再自动改回完整克隆，
-                       改由提交前校验把原因说清楚。 */
-                    fullCloneTouchedRef.current = true;
-                    setFullClone(value);
-                  }}
+                  onChange={setFullClone}
                   label={t('quickDeploy.fullClone')}
                 />
               </div>

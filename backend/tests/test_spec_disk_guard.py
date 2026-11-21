@@ -57,25 +57,21 @@ class TestRootDisk:
 
 class TestCheckCloneDisk:
     def test_smaller_is_rejected(self) -> None:
-        problem = diskspec.check_clone_disk(20, 100, full_clone=True)
+        problem = diskspec.check_clone_disk(20, 100)
         assert problem is not None
         assert problem["code"] == "spec_disk_too_small"
         assert problem["required_gb"] == 100
 
-    def test_equal_needs_no_full_clone(self) -> None:
-        assert diskspec.check_clone_disk(100, 100, full_clone=False) is None
+    def test_equal_is_fine(self) -> None:
+        assert diskspec.check_clone_disk(100, 100) is None
 
-    def test_larger_requires_full_clone(self) -> None:
-        problem = diskspec.check_clone_disk(200, 100, full_clone=False)
-        assert problem is not None
-        assert problem["code"] == "clone_full_required"
-
-    def test_larger_with_full_clone_is_fine(self) -> None:
-        assert diskspec.check_clone_disk(200, 100, full_clone=True) is None
+    def test_larger_is_fine_regardless_of_clone_mode(self) -> None:
+        """链接克隆 / 完整克隆由用户决定，判定只看装不装得下。"""
+        assert diskspec.check_clone_disk(200, 100) is None
 
     def test_unknown_template_or_missing_spec_passes(self) -> None:
-        assert diskspec.check_clone_disk(20, None, full_clone=False) is None
-        assert diskspec.check_clone_disk(None, 100, full_clone=False) is None
+        assert diskspec.check_clone_disk(20, None) is None
+        assert diskspec.check_clone_disk(None, 100) is None
 
 
 class TestEstimateRootfs:
@@ -157,6 +153,19 @@ class TestResizeClonedRootfs:
         assert ok is False
         assert "仍为" in note
 
+    def test_linked_clone_failure_points_at_full_clone(self) -> None:
+        """链接克隆扩不动时，说明里要给出可行的补救方向，而不是只说失败。"""
+        from app.routers import vms
+
+        client = _FakeCloneClient(20, grow=False)
+        note, ok = asyncio.run(
+            vms._resize_cloned_rootfs(
+                client, "pve", 110, 100, "", linked_clone=True
+            )
+        )
+        assert ok is False
+        assert "完整克隆" in note
+
     def test_never_shrinks(self) -> None:
         from app.routers import vms
 
@@ -210,15 +219,14 @@ class TestEnsureSpecDiskFits:
         assert exc.value.code == "spec_disk_too_small"
         assert exc.value.status_code == 400
 
-    def test_requires_full_clone_for_growth(self, monkeypatch) -> None:
+    def test_growth_is_allowed_with_linked_clone(self, monkeypatch) -> None:
+        """链接克隆 + 规格大于模板：不拦，扩不扩得动由存储决定并如实回报。"""
         from app.routers import vms
 
         self._patch(monkeypatch, True, 100)
-        with pytest.raises(ProxmoxError) as exc:
-            asyncio.run(vms._ensure_spec_disk_fits(self._payload(200), object()))
-        assert exc.value.code == "clone_full_required"
+        asyncio.run(vms._ensure_spec_disk_fits(self._payload(200), object()))
 
-    def test_full_clone_allows_growth(self, monkeypatch) -> None:
+    def test_growth_is_allowed_with_full_clone(self, monkeypatch) -> None:
         from app.routers import vms
 
         self._patch(monkeypatch, True, 100)

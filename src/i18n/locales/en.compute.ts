@@ -1981,8 +1981,6 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'quickDeploy.errQuotaSpec': 'This spec exceeds your own resource quota — pick a smaller one.',
   'quickDeploy.errSpecDiskSmall':
     'The template system disk is {required}G but this plan only has {selected}G — pick a plan of at least {required}G.',
-  'quickDeploy.errCloneFullRequired':
-    'This plan’s disk is larger than the template; linked clones cannot grow safely — turn on “Full clone”.',
   'quickDeploy.quotaFallback': 'selected',
   'quickDeploy.quotaSpecTitle': '{label} exceeds your own resource quota',
   'quickDeploy.quotaSpecBody':
@@ -2062,7 +2060,6 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'quickDeploy.specSubtitle': 'Defined by an administrator; the system disk is grown to the plan size',
   'quickDeploy.specDiskTooSmallHint': 'Needs ≥{required}G (template disk is {required}G)',
   'quickDeploy.specAutoSwitched': 'Switched to “{name}”, which fits the template disk',
-  'quickDeploy.fullCloneAutoOn': 'This plan needs a larger disk than the template — full clone enabled',
   'quickDeploy.specUnitCores': 'cores',
   'quickDeploy.specUnitMem': 'G memory',
   'quickDeploy.specUnitDisk': 'G disk',
@@ -2108,7 +2105,7 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'quickDeploy.fullCloneNote':
     'Full clone: disks are copied to the storage above and the system disk grows to the plan’s {n}G; the VM is fully detached from the template.',
   'quickDeploy.linkedCloneNote':
-    'Linked clone: disks stay on the template’s storage (instant, no extra space) and the system disk grows to the plan’s {n}G; these machines break if the template is deleted.',
+    'Linked clone: disks stay on the template’s storage (instant, no extra space) and the system disk grows to the plan’s {n}G — whether the growth succeeds depends on the storage; if not, you are told and the VM still boots at the template size. These machines break if the template is deleted.',
   'quickDeploy.sectionNetwork': 'Network',
   'quickDeploy.networkSubtitleVm':
     'Add as many NICs as you need; static addresses are auto-picked from “Network → IP pools”, and DHCP can target a subnet too',
