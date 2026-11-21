@@ -6266,6 +6266,14 @@ body.is-col-resizing * {
   text-align: right;
 }
 
+/* 内存 / 磁盘两列居中：这两格只有 2~5 个字符，右对齐时列名与数字都贴着格子
+   右缘，左边空出来的一大块会让「内存（G）」看着像挂在下一列上。核数那列仍
+   右对齐 ——「2核」自带单位，和列名 vCPU 一起靠右才是一条线。
+   权重与窄屏那条 `text-align: left` 相同、但更早，所以手机上照旧左对齐。 */
+.spec-pick-colnums > span:nth-child(n + 2) {
+  text-align: center;
+}
+
 .spec-pick-num {
   overflow: hidden;
   font-family: var(--font-mono);
@@ -6274,6 +6282,12 @@ body.is-col-resizing * {
   text-align: right;
   color: var(--text-secondary);
   white-space: nowrap;
+}
+
+/* 内存 / 磁盘的数字跟着列名居中（理由见上面 .spec-pick-colnums 那一段）。
+   选择器权重与窄屏的 `text-align: left` 持平，靠源码顺序让窄屏仍走左对齐。 */
+.spec-pick-num:nth-child(n + 2) {
+  text-align: center;
 }
 
 /* 选中行的数字跟着提亮：整行都在强调，数字不该还是灰的 */
@@ -10606,7 +10620,7 @@ button.pbs-task-row:focus-visible {
    的模板选择器因此是同一个高度、同一种留白，不会再一个胖一个瘦。 */
 
 .os-pick.is-compact {
-  gap: 6px;
+  gap: 8px;
   padding: 0;
   background: none;
   border: 0;
@@ -10617,6 +10631,13 @@ button.pbs-task-row:focus-visible {
   /* 比重装那套再矮一档：168px ≈ 列名 + 一个分组头 + 3 行；256px 上限约 5 行。
      屏幕矮（1366×768 的笔记本）时按 24vh 收，列表自己滚动，弹窗不跟着长。 */
   max-height: clamp(168px, 24vh, 256px);
+}
+
+/* 创建流程的模板选择器（SystemTemplatePicker）单独抬高：240px ≈ 列名 + 一个
+   分组头 + 5 行，320px 上限约 7 行。168 的底线只够 3 行，模板一多就得边筛边滚 ——
+   24vh 在 1366×768 上更是只剩半截 CentOS10。弹窗里的 SourceTemplatePicker 不受影响。 */
+.os-pick.is-tpl .os-pick-list {
+  max-height: clamp(240px, 32vh, 320px);
 }
 
 .os-pick.is-compact .os-pick-foot {
@@ -10666,7 +10687,8 @@ button.pbs-task-row:focus-visible {
 }
 
 .os-pick-search {
-  width: 200px;
+  /* 230px：中文占位「搜索名称 / 版本 / 节点」刚好一行，200px 会把最后两个字吃掉 */
+  width: 230px;
   max-width: 100%;
   margin-left: auto;
 }
@@ -10692,21 +10714,27 @@ button.pbs-task-row:focus-visible {
 .os-pick-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   flex: 1 1 auto;
   min-width: 0;
 }
 
 /* chip 沿用模板页那套（含系统 logo），这里只收紧 2px 高度 */
 .os-pick-chips .os-chip {
-  height: 26px;
-  padding: 0 9px;
-  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  gap: 6px;
   font-size: 12px;
 }
 
 .os-pick-chips .os-chip-count {
-  font-size: 10px;
+  font-size: 10.5px;
+}
+
+/* 禁用：chip 也不能只靠 pointer-events 假装点不了 */
+.os-pick-chips .os-chip:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .os-pick-toggle {
@@ -10731,7 +10759,7 @@ button.pbs-task-row:focus-visible {
   /* 行模板写成变量：列名与数据行共用一套，媒体查询里只改一处也不会错位 */
   --os-row-cols: 16px 18px minmax(120px, 1.5fr) 48px minmax(90px, 1fr) 64px 56px minmax(0, auto);
   --os-row-gap: 8px;
-  --os-colhead-h: 24px;
+  --os-colhead-h: 22px;
 
   position: relative;
   /* 228px ≈ 列名 + 两组头 + 4 行；再小的屏幕也没有意义，交给外层滚动 */
@@ -10752,6 +10780,20 @@ button.pbs-task-row:focus-visible {
   border-radius: var(--radius-sm);
   /* 底部内阴影：提示「下面还有」，同时柔化被裁切的那一行 */
   box-shadow: inset 0 -10px 12px -12px rgba(15, 23, 42, 0.28);
+}
+
+/* 创建流程的 7 列（版本列已去掉：名字里本来就有 v11 / v24，再列一列只是把
+   同一句话写两遍）。省下的 48px 分给名称、内存、磁盘，VMID 不再贴着磁盘挤成一列。
+   只作用在 .is-tpl 上 —— 重装 / 更换模板那两个选择器仍是 8 列。
+
+   用 :where() 把选择器权重压回 0,1,0（与 .os-pick-list 相同），下面的窄屏
+   媒体查询才能照旧覆盖列宽：否则 3 个类的权重会一直赢，840px 以下仍是 7 列宽
+   版式，列表横向溢出被 overflow-x: hidden 裁掉。 */
+:where(.os-pick.is-tpl) .os-pick-list {
+  /* 末列写死 76px，不用 auto：表头那一格是空的，auto 会算成 0，数据行却有 VMID
+     徽标撑着 —— 两套网格各自算一次，内存 / 磁盘的列名就会整整右移 60 多像素。 */
+  --os-row-cols: 16px 18px minmax(120px, 1.6fr) minmax(90px, 1fr) 76px 68px 76px;
+  --os-row-gap: 10px;
 }
 
 /* 滑块比全局那条更实一点：这个列表是「挑东西」的地方，滚动条要像可拖的控件，
@@ -10784,12 +10826,12 @@ button.pbs-task-row:focus-visible {
   align-items: center;
   gap: var(--os-row-gap);
   height: var(--os-colhead-h);
-  padding: 0 8px;
+  padding: 0 12px;
   background: var(--bg-surface);
   border-bottom: 1px solid var(--border);
-  font-size: 10px;
+  font-size: 10.5px;
   letter-spacing: 0.04em;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .os-pick-colhead .is-disk,
@@ -10798,16 +10840,17 @@ button.pbs-task-row:focus-visible {
 }
 
 /* ---- 分组头（可折叠，吸在列名下方） ---- */
-/* 分组头 = 一条「分类带」，不是一条分隔线。
+/* 分组头 = 书签，不是横幅。
 
-   之前它只有 26px 高、12px 常规字重、浅灰底 + 一条渐隐细线，扫一眼像是表格里
-   多出来的一行空行 —— 模板一多，用户根本分不清「哪几行属于 CentOS」。现在：
+   10% 家族色底 + 700 彩色字的组合，让三条分类带成了全页最响的元素，比真正
+   被选中的行还抢眼；TencentOS 的家族色又与强调色同为 #0052d9，选中它的时候
+   行和分组几乎同色。现在把它降成「书签」：
 
-   · 底色用该系统的家族色（10% 混合白底），每个分类是一条有颜色的带子，
-     扫视时靠颜色就能分块；
-   · 左侧 2px 家族色竖条 + 分类名同色加粗，与已选中行的强调条同一套语汇；
-   · 计数胶囊也换成家族色，不再是被冲淡的灰；
-   · 高度 26 → 30px，给文字和 logo 留出呼吸，同时仍是一行的高度。 */
+   · 底色 5% 家族色（仍不透明，吸顶时不透行）+ 2px 家族色左条 —— 颜色留在
+     标记上，不铺满整条；
+   · 分类名改中性色 12px/600：分类本身不需要喊，用户要读的是行；
+   · 去掉了分组头的计数（与标题旁、chip 上重复第三遍）；
+   · 高度 28px，比数据行略矮，层级低于行而不是高于行。 */
 .os-pick-group-head {
   position: sticky;
   top: var(--os-colhead-h);
@@ -10816,16 +10859,17 @@ button.pbs-task-row:focus-visible {
   align-items: center;
   gap: 8px;
   width: 100%;
-  height: 30px;
+  height: 28px;
   margin: 0;
-  padding: 0 8px;
+  padding: 0 12px;
   border: 0;
-  border-top: 1px solid color-mix(in srgb, var(--os-color) 16%, transparent);
-  border-bottom: 1px solid color-mix(in srgb, var(--os-color) 22%, transparent);
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
   /* 底色必须**不透明**：这条带子是吸顶的，行会从它下面滚过去。
-     --os-tint 是 10% alpha 的家族色，直接当背景会把滚过去的行名透出来，
-     看起来像两行字叠在一起。所以用 10% 家族色去混白底，既有颜色又不透。 */
-  background: color-mix(in srgb, var(--os-color) 10%, var(--bg-surface));
+     先垫一层 --bg-surface 兜底：某些入口若没带上家族色变量，color-mix 整条
+     声明会失效，吸顶带变透明，下面的行就会透上来叠字。 */
+  background: var(--bg-surface);
+  background: color-mix(in srgb, var(--os-color) 5%, var(--bg-surface));
   box-shadow: inset 2px 0 0 var(--os-color);
   color: inherit;
   font: inherit;
@@ -10836,7 +10880,8 @@ button.pbs-task-row:focus-visible {
 
 /* hover 也要保持不透明，否则鼠标一移到分类带上，下面的行又会透出来 */
 .os-pick-group-head:hover {
-  background: color-mix(in srgb, var(--os-color) 16%, var(--bg-surface));
+  background: var(--bg-surface);
+  background: color-mix(in srgb, var(--os-color) 9%, var(--bg-surface));
 }
 
 .os-pick-group-head:focus-visible {
@@ -10858,10 +10903,10 @@ button.pbs-task-row:focus-visible {
 
 .os-pick-group-name {
   flex: none;
-  font-size: 13px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 600;
   letter-spacing: 0.01em;
-  color: var(--os-color);
+  color: var(--text-secondary);
 }
 
 .os-pick-group-rule {
@@ -10875,31 +10920,22 @@ button.pbs-task-row:focus-visible {
   );
 }
 
-/* 计数胶囊：家族色而不是被冲淡的灰，和左边的分类名是同一档强度 */
+/* 计数回到中性：分类名已经是弱化的 12px，计数再上家族色就又把它喊回去了 */
 .os-pick-group-head .os-pick-group-count {
   margin-left: 1px;
-  background: color-mix(in srgb, var(--os-color) 14%, transparent);
-  color: var(--os-color);
-  font-weight: 700;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-weight: 600;
 }
 
-/* ---- 分类 chip：和分组头同一套家族色 ----
-   7 个系统并排时，光靠 13px 的 logo 认不出谁是谁；给未选中的 chip 也铺一层
-   极浅家族色（10%），颜色本身就是区分依据。选中态仍是全局强调色，不和列表里
-   的选中行抢同一套色。
-   「全部」没有 data-os，色值要有兜底，否则 var() 解析失败、整块底就没了。 */
+/* ---- 分类 chip：中性描边，颜色只由 logo 提供 ----
+   之前每个未选中的 chip 也铺 10% 家族色 + 家族色描边 + 家族色字，一行 chip
+   就出现五六种颜色，和下面的分组带一起把注意力从行上拽走。现在未选中一律
+   白底中性描边，系统的身份交给 13px 的 logo；只有「当前筛选」用强调色。 */
 .os-pick-chips .os-chip {
-  background: var(--os-tint, var(--bg-surface));
-  border-color: color-mix(
-    in srgb,
-    var(--os-color, var(--border)) 22%,
-    transparent
-  );
-  color: color-mix(
-    in srgb,
-    var(--os-color, var(--text-secondary)) 80%,
-    var(--text-primary)
-  );
+  background: var(--bg-surface);
+  border-color: var(--border);
+  color: var(--text-secondary);
   font-weight: 600;
 }
 
@@ -10916,21 +10952,14 @@ button.pbs-task-row:focus-visible {
 }
 
 .os-pick-chips .os-chip:hover {
-  background: color-mix(
-    in srgb,
-    var(--os-color, var(--text-muted)) 16%,
-    transparent
-  );
-  color: var(--os-color, var(--text-primary));
+  background: var(--bg-hover);
+  border-color: color-mix(in srgb, var(--border) 60%, var(--text-muted));
+  color: var(--text-primary);
 }
 
 .os-pick-chips .os-chip .os-chip-count {
-  background: color-mix(
-    in srgb,
-    var(--os-color, var(--text-muted)) 14%,
-    transparent
-  );
-  color: var(--os-color, var(--text-muted));
+  background: var(--bg-hover);
+  color: var(--text-muted);
   font-weight: 600;
 }
 
@@ -10951,9 +10980,9 @@ button.pbs-task-row:focus-visible {
   grid-template-columns: var(--os-row-cols);
   align-items: center;
   gap: var(--os-row-gap);
-  height: 38px;
-  padding: 0 8px;
-  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  height: 40px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border-muted);
   cursor: pointer;
   transition: background var(--transition-fast), box-shadow var(--transition-fast);
 }
@@ -10966,13 +10995,30 @@ button.pbs-task-row:focus-visible {
   background: var(--bg-hover);
 }
 
+/* 选中行是全页唯一的高对比焦点：白底 + 3px 竖条 + 加粗行名。
+   原来铺 8% 蓝底，整行变成色块，反而和彩色分组带混在一起 —— 颜色用得越少，
+   那一道竖条越像「就是它」。 */
 .os-row.is-on {
-  background: var(--accent-dim);
-  box-shadow: inset 2px 0 0 var(--accent);
+  background: var(--bg-surface);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.os-row.is-on .os-row-name {
+  font-weight: 700;
 }
 
 .os-row.is-on:hover {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  background: color-mix(in srgb, var(--accent) 4%, var(--bg-surface));
+}
+
+/* 禁用：整行失去可点感，而不是只把 radio 变灰（行仍是 pointer 时看起来照旧能点） */
+.os-row.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.os-row.is-disabled:hover {
+  background: transparent;
 }
 
 .os-row:focus-within {
@@ -10993,13 +11039,13 @@ button.pbs-task-row:focus-visible {
   white-space: nowrap;
 }
 
-/* 单选圆点：未选中是细描边，选中是实心 —— 与左侧竖条、行底色一起构成三层信号 */
+/* 单选圆点：未选中是细描边，选中是实心 —— 与左侧竖条一起构成两层信号 */
 .os-row-radio {
   position: relative;
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
-  border: 1.5px solid var(--border);
+  border: 2px solid var(--border);
   background: var(--bg-surface);
   transition: border-color var(--transition-fast);
 }
@@ -11029,7 +11075,7 @@ button.pbs-task-row:focus-visible {
 }
 
 .os-row-name {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-primary);
   overflow: hidden;
@@ -11037,30 +11083,23 @@ button.pbs-task-row:focus-visible {
   white-space: nowrap;
 }
 
-.os-row-ver,
+/* 数字列：12px 等宽、tabular-nums —— 一列数字纵向对齐，扫读时不用逐个对位。
+   内存与磁盘各自独立列宽，不再挤在 130px 里和 VMID 粘成一团。 */
 .os-row-disk,
 .os-row-used {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.os-row-disk,
-.os-row-used {
   text-align: right;
 }
 
-.os-row-used {
-  color: var(--text-muted);
-}
-
 .os-row-scene {
-  font-size: 11.5px;
-  color: var(--text-muted);
+  font-size: 12px;
+  color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -11075,18 +11114,19 @@ button.pbs-task-row:focus-visible {
   overflow: hidden;
 }
 
-/* 行内标签刻意不用 .badge：18px 高的胶囊在 38px 的行里会顶满整行 */
+/* 行内标签刻意不用 .badge：18px 高的胶囊在 40px 的行里会顶满整行。
+   VMID 改成描边徽标：它是个「坐标」，不是一条状态，透明底才不会和磁盘数值抢灰度。 */
 .os-row-tag {
   flex: none;
   display: inline-flex;
   align-items: center;
-  height: 16px;
-  padding: 0 5px;
-  border: 1px solid transparent;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
   border-radius: 3px;
-  background: var(--bg-hover);
+  background: transparent;
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 11px;
   line-height: 1;
   white-space: nowrap;
 }
@@ -11131,7 +11171,7 @@ button.pbs-task-row:focus-visible {
   gap: 6px;
   min-height: 18px;
   padding: 0 2px;
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
@@ -11160,7 +11200,7 @@ button.pbs-task-row:focus-visible {
 .os-pick-foot-meta {
   min-width: 0;
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 11px;
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -11188,18 +11228,25 @@ button.pbs-task-row:focus-visible {
 
 .os-pick-empty-body {
   margin-top: 3px;
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
 /* ---------------------------------------------------------------------------
-   窄屏：按「场景 → 已用 → 版本 → 标签」的顺序逐级收起。
+   窄屏：按「场景 → 已用 → VMID」的顺序逐级收起。
    列名与数据行同时隐藏同一列，靠 auto-placement 保持对齐；
    名字列永远保留 —— 它是选择依据本身。
+
+   末列仍用固定宽度而不是 auto：表头那格是空的，auto 在表头里算成 0、在数据行里
+   却是 VMID 徽标的宽度，两套网格各算一次，前面的列名就会整体右移。
    --------------------------------------------------------------------------- */
 @media (max-width: 840px) {
   .os-pick-list {
-    --os-row-cols: 16px 18px minmax(110px, 1fr) 48px 64px 56px minmax(0, auto);
+    --os-row-cols: 16px 18px minmax(110px, 1fr) 76px 68px minmax(0, auto);
+  }
+
+  :where(.os-pick.is-tpl) .os-pick-list {
+    --os-row-cols: 16px 18px minmax(110px, 1fr) 76px 68px 76px;
   }
 
   .os-pick-colhead .is-scene,
@@ -11210,7 +11257,11 @@ button.pbs-task-row:focus-visible {
 
 @media (max-width: 720px) {
   .os-pick-list {
-    --os-row-cols: 16px 18px minmax(110px, 1fr) 48px 64px minmax(0, auto);
+    --os-row-cols: 16px 18px minmax(110px, 1fr) 76px minmax(0, auto);
+  }
+
+  :where(.os-pick.is-tpl) .os-pick-list {
+    --os-row-cols: 16px 18px minmax(110px, 1fr) 76px 76px;
   }
 
   .os-pick-colhead .is-used,
@@ -11221,11 +11272,12 @@ button.pbs-task-row:focus-visible {
 
 @media (max-width: 620px) {
   .os-pick-list {
-    --os-row-cols: 16px 18px minmax(100px, 1fr) 64px minmax(0, auto);
+    --os-row-cols: 16px 18px minmax(100px, 1fr) 76px;
   }
 
-  .os-pick-colhead .is-ver,
-  .os-row-ver {
+  /* 版本列已经整列去掉，620 这一档改为收起行尾的 VMID 徽标 */
+  .os-pick-colhead > span:last-child,
+  .os-row-tags {
     display: none;
   }
 
@@ -11249,12 +11301,7 @@ button.pbs-task-row:focus-visible {
 
 @media (max-width: 520px) {
   .os-pick-list {
-    --os-row-cols: 16px 18px minmax(0, 1fr) 62px;
-  }
-
-  .os-pick-colhead > span:last-child,
-  .os-row-tags {
-    display: none;
+    --os-row-cols: 16px 18px minmax(0, 1fr) 68px;
   }
 
   .os-pick-search {
@@ -11374,18 +11421,20 @@ button.pbs-task-row:focus-visible {
 }
 
 /* ---- 列表工具条里的「收起」：文字按钮，不抢搜索框的位置 ---- */
+/* 收起是一个「动作」，不是一个链接：图标按钮和搜索框同高，不抢工具的视觉重量 */
 .os-pick-collapse {
   flex: none;
   display: inline-flex;
   align-items: center;
-  height: 26px;
-  padding: 0 6px;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font: inherit;
-  font-size: 11.5px;
   cursor: pointer;
   white-space: nowrap;
 }

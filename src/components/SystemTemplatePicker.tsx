@@ -28,7 +28,12 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Button } from './ui/Button';
 import { Input } from './ui/Input';
-import { IconCheck, IconChevronRight, IconSearch } from './Icons';
+import {
+  IconCheck,
+  IconChevronRight,
+  IconChevronUp,
+  IconSearch,
+} from './Icons';
 import { OsLogo } from './OsLogo';
 import { useT } from '../i18n';
 import {
@@ -63,6 +68,18 @@ const GROUP_PREVIEW = 5;
 function versionOf(name: string): string {
   const hit = /\d+(?:\.\d+)*/.exec(String(name ?? ''));
   return hit ? hit[0] : '';
+}
+
+/**
+ * 容量文本统一成 `100 GB`：模板来源不同，`sizeText` 可能是 `100G`、`100 GB`
+ * 或 `8 GB`，同一列里混着两种写法、右对齐后就对不齐了。
+ */
+function normalizeSize(text?: string | null): string {
+  const raw = String(text ?? '').trim();
+  if (!raw) return '—';
+  const hit = /^([\d.]+)\s*([KMGT])(?:B)?$/i.exec(raw);
+  if (!hit) return raw;
+  return `${hit[1]} ${hit[2].toUpperCase()}B`;
 }
 
 export function SystemTemplatePicker({
@@ -153,8 +170,11 @@ export function SystemTemplatePicker({
     const row = input?.closest('label');
     if (!list || !row) return;
     const top = (row as HTMLElement).offsetTop;
-    if (top > list.clientHeight - 48) {
-      list.scrollTop = Math.max(0, top - list.clientHeight / 2);
+    const rowH = (row as HTMLElement).offsetHeight;
+    /* 只滚到「刚好露出」而不是居中：居中会把上方两组分类推进吸顶区，
+       一打开列表就看到两个分组头贴在一起，像两个空分类。 */
+    if (top + rowH > list.clientHeight - 8) {
+      list.scrollTop = Math.max(0, top - list.clientHeight + rowH + 40);
     }
   }, [showList]);
 
@@ -192,8 +212,12 @@ export function SystemTemplatePicker({
             </div>
             <div className="os-current-meta">
               {osFamilyLabel(family, t)}
-              {selected.sizeText ? ` · ${sizeLabel} ${selected.sizeText}` : ''}
-              {selected.metaText ? ` · ${metaLabel} ${selected.metaText}` : ''}
+              {selected.sizeText
+                ? ` · ${sizeLabel} ${normalizeSize(selected.sizeText)}`
+                : ''}
+              {selected.metaText
+                ? ` · ${metaLabel} ${normalizeSize(selected.metaText)}`
+                : ''}
             </div>
             <div className="os-current-scene">
               {selected.note ?? osFamilyScene(family, t)}
@@ -221,11 +245,12 @@ export function SystemTemplatePicker({
   const renderRow = (item: TemplatePickItem) => {
     const family = templateFamily(item);
     const checked = item.value === value;
-    const version = versionOf(item.name);
     return (
       <label
         key={item.value}
-        className={`os-row${checked ? ' is-on' : ''}`}
+        className={`os-row${checked ? ' is-on' : ''}${
+          disabled ? ' is-disabled' : ''
+        }`}
         data-os={family.key}
       >
         <input
@@ -245,12 +270,12 @@ export function SystemTemplatePicker({
         <span className="os-row-name" title={item.name}>
           {item.name}
         </span>
-        <span className="os-row-ver">{version ? `v${version}` : ''}</span>
+        {/* 版本列已去掉：名字里本来就有 v11 / v24，再列一列只是把同一句话写两遍 */}
         <span className="os-row-scene" title={osFamilyScene(family, t)}>
           {osFamilyScene(family, t)}
         </span>
-        <span className="os-row-disk">{item.sizeText ?? '—'}</span>
-        <span className="os-row-used">{item.metaText ?? '—'}</span>
+        <span className="os-row-disk">{normalizeSize(item.sizeText)}</span>
+        <span className="os-row-used">{normalizeSize(item.metaText)}</span>
         <span className="os-row-tags">
           {(item.tags ?? []).map((tag) => (
             <span className="os-row-tag" key={tag}>
@@ -263,7 +288,9 @@ export function SystemTemplatePicker({
   };
 
   return (
-    <div className="os-pick is-compact">
+    // is-tpl：本选择器的列模板（7 列，无版本列）只在它身上生效 ——
+    // 重装 / 更换模板两个选择器仍是 8 列，共用 .os-pick-list 但不能跟着变
+    <div className="os-pick is-compact is-tpl">
       {/* ---- 工具条：平铺态只留标题与总数，多模板时才给搜索与收起 ---- */}
       <div className="os-pick-bar">
         <span className="os-pick-title">{t('templatePicker.listTitle')}</span>
@@ -289,8 +316,10 @@ export function SystemTemplatePicker({
                 type="button"
                 className="os-pick-collapse"
                 onClick={() => setSwitching(false)}
+                aria-label={t('templatePicker.collapse')}
+                title={t('templatePicker.collapse')}
               >
-                {t('templatePicker.collapse')}
+                <IconChevronUp size={14} />
               </button>
             ) : null}
           </>
@@ -308,6 +337,7 @@ export function SystemTemplatePicker({
             type="button"
             className={`os-chip${activeFamily === 'all' ? ' is-on' : ''}`}
             aria-pressed={activeFamily === 'all'}
+            disabled={disabled}
             onClick={() => {
               setFamilyFilter('all');
               setCollapsed(new Set());
@@ -323,6 +353,7 @@ export function SystemTemplatePicker({
               className={`os-chip${activeFamily === entry.family.key ? ' is-on' : ''}`}
               data-os={entry.family.key}
               aria-pressed={activeFamily === entry.family.key}
+              disabled={disabled}
               onClick={() => {
                 setFamilyFilter(entry.family.key);
                 setCollapsed(new Set());
@@ -348,7 +379,6 @@ export function SystemTemplatePicker({
             <span />
             <span />
             <span>{t('templatePicker.colName')}</span>
-            <span className="is-ver">{t('templatePicker.colVersion')}</span>
             <span className="is-scene">{t('templatePicker.colScene')}</span>
             <span className="is-disk">{sizeLabel}</span>
             <span className="is-used">{metaLabel}</span>
@@ -388,9 +418,7 @@ export function SystemTemplatePicker({
                       <span className="os-pick-group-name">
                         {osFamilyLabel(group.family, t)}
                       </span>
-                      <span className="os-pick-group-count">
-                        {group.items.length}
-                      </span>
+                      {/* 分组计数去掉了：标题旁、chip 上已经各有一遍，第三遍只添噪音 */}
                       <span className="os-pick-group-rule" aria-hidden="true" />
                     </button>
 
@@ -452,8 +480,12 @@ export function SystemTemplatePicker({
           <strong>{selected.name}</strong>
           <span className="os-pick-foot-meta">
             {osFamilyLabel(templateFamily(selected), t)}
-            {selected.sizeText ? ` · ${sizeLabel} ${selected.sizeText}` : ''}
-            {selected.metaText ? ` · ${metaLabel} ${selected.metaText}` : ''}
+            {selected.sizeText
+              ? ` · ${sizeLabel} ${normalizeSize(selected.sizeText)}`
+              : ''}
+            {selected.metaText
+              ? ` · ${metaLabel} ${normalizeSize(selected.metaText)}`
+              : ''}
           </span>
         </div>
       ) : null}
