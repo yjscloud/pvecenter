@@ -19,7 +19,13 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
 from app.config import settings  # noqa: E402
 from app.routers import firewall  # noqa: E402
-from test_api_routes import ADMIN, api, auth_headers, csrf_headers  # noqa: E402,F401
+from test_api_routes import (  # noqa: E402,F401
+    ADMIN,
+    api,
+    auth_headers,
+    csrf_headers,
+    user_with_permissions,
+)
 
 
 def _login(api, username: str, password: str) -> Dict[str, str]:
@@ -397,19 +403,31 @@ class TestPermissions:
         )
         assert denied.status_code == 403
 
-    def test_operator_manages_vm_but_not_cluster(self, api) -> None:
+    def test_operator_is_read_only_by_default(self, api) -> None:
+        """默认租户角色不再带防火墙写权限（审计项 V-15）。"""
         operator = _make_user(api, "fwoperator", "operator")
+        denied = api.post(
+            "/api/firewall/node/rules?node=pve1",
+            headers=operator,
+            json={"type": "in", "action": "ACCEPT", "proto": "tcp", "dport": "22"},
+        )
+        assert denied.status_code == 403
+
+    def test_manager_manages_vm_but_not_cluster(self, api) -> None:
+        manager = user_with_permissions(
+            api, ["firewall.view", "firewall.manage"], "fwmanager"
+        )
         # 节点级规则：属于 firewall.manage，放行
         allowed = api.post(
             "/api/firewall/node/rules?node=pve1",
-            headers=operator,
+            headers=manager,
             json={"type": "in", "action": "ACCEPT", "proto": "tcp", "dport": "22"},
         )
         assert allowed.status_code == 200, allowed.text
         # 集群级要 firewall.cluster
         denied = api.post(
             "/api/firewall/cluster/rules",
-            headers=operator,
+            headers=manager,
             json={"type": "in", "action": "ACCEPT"},
         )
         assert denied.status_code == 403

@@ -18,7 +18,7 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .. import pbs, pve, security
+from .. import pbs, pve, security, ssrfguard
 from ..pve import ProxmoxError
 from ..schemas import ConnectionPauseIn, PbsConfigIn, PbsConnectionTestIn
 
@@ -185,15 +185,49 @@ async def test_config(
     探测项是仓库列表、首个仓库的容量、任务与节点状态 —— 每一项都对应一条独立
     ACL，一次测全才能直接告诉用户「连上了，但缺哪一项权限」。全是 GET，不会
     触发 PBS 侧的备份 / GC / verify 等重活。
+
+    **目标必须可信**：面板与 PBS / PVE 同网段，放任前端指定 host 就等于给了
+    一台内网扫描器。只允许已保存连接登记的 host:port，或
+    ``CONNECTION_TEST_ALLOW_TARGETS`` 里显式放行的地址。
     """
     raw = body.model_dump()
     conn_id = str(raw.get("id") or "").strip()
+    saved = await pbs.load_connections()
+    profile: Dict[str, Any] = {}
+    if conn_id:
+        profile = next(
+            (
+                item
+                for item in saved
+                if str(item.get("id") or "") == conn_id
+            ),
+            {},
+        ) or {}
+
+    try:
+        await ssrfguard.assert_target_allowed(
+            body.host,
+            body.port,
+            registered=ssrfguard.registered_targets(saved, 8007),
+        )
+    except ssrfguard.TargetBlocked as exc:
+        return {"ok": False, "error": exc.message, "code": f"pbs_{exc.code}"}
+
     secret = str(raw.get("token_secret") or "")
     if not secret and conn_id:
-        for item in await pbs.load_connections():
-            if str(item.get("id") or "") == conn_id:
-                secret = str(item.get("token_secret") or "")
-                break
+        # 留空密钥时目标必须就是这条已保存连接：否则等于把面板持有的 Token
+        # 发到调用方指定的主机上。
+        if profile and not ssrfguard.same_target(body.host, body.port, profile, 8007):
+            return {
+                "ok": False,
+                "error": (
+                    "留空 Token Secret 时，目标必须是该连接已保存的 host:port"
+                    "（避免把已存密钥发送到别的地址）。请重新填写 Secret，"
+                    "或先保存这条连接再测试。"
+                ),
+                "code": "pbs_target_mismatch",
+            }
+        secret = str(profile.get("token_secret") or "")
     cfg = pbs.PbsConnection.from_dict({**raw, "token_secret": secret})
     if not cfg.configured:
         return {"ok": False, "error": "pbs_not_configured"}
@@ -269,16 +303,23 @@ async def test_config(
             except ProxmoxError as exc:
                 probe_errors["datastore_status"] = exc.code or f"HTTP {exc.pve_status}"
     except ProxmoxError as exc:
-        # 带上 code 让前端换成人话：后端 message 是给日志看的，
-        # 401 的原样文案（“HTTP 401”）对填表的人没有任何指向性。
-        # 认证失败再附一份“凭据形状”诊断（不含 secret 明文），
-        # 用来区分「填成账号密码」「填成 token ID」「带前缀整行粘贴」。
+        # 只回归一化后的枚举与固定文案：上游正文不外带（否则「连不上 / 不是
+        # TLS / 认证失败」的差异就是一台扫描器）。认证失败再附一份“凭据形状”
+        # 诊断（不含 secret 明文），用来区分「填成账号密码」「填成 token ID」
+        # 「带前缀整行粘贴」。
+        code, message = ssrfguard.classify_failure(exc)
+        if code == "auth_failed":
+            public_code = "pbs_auth_failed"
+        elif code == "forbidden":
+            public_code = "pbs_permission_denied"
+        else:
+            public_code = f"pbs_{code}"
         result: Dict[str, Any] = {
             "ok": False,
-            "error": exc.message,
-            "code": exc.code or "",
+            "error": message,
+            "code": public_code,
         }
-        if exc.code == "pbs_auth_failed":
+        if public_code == "pbs_auth_failed":
             result["diagnostics"] = pbs.diagnose(cfg)
         # 失败也是一次结论：「这台现在连不上」同样要落库，否则刷新页面又回到
         # 「未测试」，看不出刚才测过、也看不出失败原因。

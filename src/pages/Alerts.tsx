@@ -522,7 +522,8 @@ export function Alerts() {
     /* 停在哪个页签就测哪个指标：样例数据也换成那个指标的形状 */
     await run(
       "tpltest",
-      () => alertsApi.testTemplate({ ...template, metric: tplMetric }),
+      // 用户明确点了「测试」，传 false 才会真实投递；默认 dry_run 只渲染。
+      () => alertsApi.testTemplate({ ...template, metric: tplMetric }, false),
       t("alerts.templateTestSent"),
     );
   }
@@ -531,7 +532,7 @@ export function Alerts() {
     await run(
       "test",
       async () => {
-        await alertsApi.test();
+        await alertsApi.test("feishu", false);
         return t("alerts.testPushed");
       },
       t("alerts.sent"),
@@ -563,7 +564,7 @@ export function Alerts() {
     await run(
       "hooktest",
       async () => {
-        await alertsApi.test("webhook");
+        await alertsApi.test("webhook", false);
         return t("alerts.testRequestSent");
       },
       t("alerts.sent"),

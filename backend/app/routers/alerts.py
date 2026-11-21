@@ -260,25 +260,29 @@ async def save_template(
 async def test_template(
     payload: Dict[str, Any],
     request: Request,
+    dry_run: bool = Query(default=True),
     user: Dict[str, Any] = Depends(ALERT_MANAGE),
 ) -> Dict[str, Any]:
     """用当前编辑中的模板发一条样例通知（邮件 + 飞书各一份）。
 
     收的是**还没保存**的模板，所以改完立刻能看效果，不用先保存再等真告警。
     通道开关不参与判断；没配置的通道会如实报错。不写历史、不建站内消息。
+
+    ``dry_run`` 默认 True：只渲染返回，不往真实邮箱 / 群里发。前端点「测试」
+    时显式传 false，空 body / 误调用不会再造成外部投递（审计项 V-14）。
     """
-    ok, detail = await alerting.test_template(payload, _own(user))
+    ok, detail = await alerting.test_template(payload, _own(user), dry_run=dry_run)
     await security.audit(
         request,
         user,
         "alert.template",
         "alerts",
         "success" if ok else "failed",
-        "测试通知模板：" + detail,
+        ("演练：" if dry_run else "测试通知模板：") + detail,
     )
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
-    return {"detail": detail}
+    return {"detail": detail, "dry_run": dry_run}
 
 
 @router.put("/webhook")
@@ -334,18 +338,43 @@ async def save_rule_list(
 async def test_notify(
     request: Request,
     channel: str = Query(default="feishu", pattern="^(feishu|webhook)$"),
+    dry_run: bool = Query(default=True),
     user: Dict[str, Any] = Depends(ALERT_MANAGE),
 ) -> Dict[str, Any]:
-    """发一条测试通知。``channel`` 默认飞书，保持既有前端调用不变。"""
+    """发一条测试通知。``channel`` 默认飞书，保持既有前端调用不变。
+
+    ``dry_run`` 默认 True：只检查通道配置、不实际推送。真实发送必须显式传
+    ``dry_run=false`` —— 这样任何「空 body 顺手打一下」的探测都不会把消息
+    发到真实的飞书群 / Webhook（审计项 V-14）。
+    """
+    owner = _own(user)
     if channel == "webhook":
-        ok, detail = await alerting.send_webhook(
-            i18n.tr("测试通知"),
-            i18n.tr("这是一条来自 pvecenter 的测试消息，收到即表示通用 Webhook 配置正确。"),
-            {"level": "test", "target": "-", "metric": "-", "value": "-"},
-            _own(user),
-        )
+        if dry_run:
+            cfg = await alerting.load_webhook(owner)
+            ok = bool(cfg.get("webhook"))
+            detail = (
+                "演练模式：将向通用 Webhook 推送，未实际发送"
+                if ok
+                else i18n.tr("未配置通用 Webhook")
+            )
+        else:
+            ok, detail = await alerting.send_webhook(
+                i18n.tr("测试通知"),
+                i18n.tr("这是一条来自 pvecenter 的测试消息，收到即表示通用 Webhook 配置正确。"),
+                {"level": "test", "target": "-", "metric": "-", "value": "-"},
+                owner,
+            )
     else:
-        ok, detail = await alerting.send_feishu(alerting.build_test_card(), _own(user))
+        if dry_run:
+            cfg = await alerting.load_feishu(owner)
+            ok = bool(cfg.get("webhook"))
+            detail = (
+                "演练模式：将向飞书推送，未实际发送"
+                if ok
+                else i18n.tr("未配置飞书机器人 Webhook")
+            )
+        else:
+            ok, detail = await alerting.send_feishu(alerting.build_test_card(), owner)
 
     await security.audit(
         request,
@@ -353,11 +382,11 @@ async def test_notify(
         "alert.test",
         "alerts",
         "success" if ok else "failed",
-        f"{channel}：{detail}",
+        ("演练：" if dry_run else "") + f"{channel}：{detail}",
     )
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
-    return {"ok": True, "detail": detail, "channel": channel}
+    return {"ok": True, "detail": detail, "channel": channel, "dry_run": dry_run}
 
 
 @router.post("/check")

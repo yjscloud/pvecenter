@@ -72,13 +72,23 @@ def test_static_like_paths_are_not_spa_fallbacks(api) -> None:
     for path in (
         "/robots.txt",
         "/favicon.ico",
-        "/.well-known/security.txt",
         "/.env",
     ):
         response = api.get(path)
         assert response.status_code == 404, path
         # 不能把首页 HTML 伪装成这些资源
         assert "text/html" not in response.headers.get("content-type", ""), path
+
+
+def test_security_txt_is_served(api) -> None:
+    """漏洞报告渠道要真实存在（审计项 V-16），而不是被 SPA 兜底成首页。"""
+    response = api.get("/.well-known/security.txt")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    body = response.text
+    assert "Contact:" in body
+    assert "Expires:" in body
+    assert "Canonical:" in body
 
 
 # ------------------------------------------------------- BUG-008 CSP 来源
@@ -90,7 +100,7 @@ def test_csp_does_not_allow_arbitrary_websocket_hosts(api) -> None:
     assert "wss:" not in csp
 
 
-# --------------------------------------------------- BUG-009 422 不回显输入
+# ------------------------------------- BUG-009 / CWE-209 422 不回显输入与契约
 def test_validation_error_does_not_echo_the_body(api) -> None:
     secret = "super-secret-body-value"
     response = api.post(
@@ -99,17 +109,135 @@ def test_validation_error_does_not_echo_the_body(api) -> None:
     )
     assert response.status_code == 422
     assert secret not in response.text
-    assert "input" not in response.json()["detail"][0]
-    assert "ctx" not in response.json()["detail"][0]
+    body = response.json()
+    # 不再回 loc / msg / type：那会确认框架、字段名与阈值
+    assert isinstance(body["detail"], str)
+    assert body["code"] == "validation_error"
+    assert body.get("trace_id")
+    assert "input" not in response.text
+    assert "ctx" not in response.text
+    assert response.headers.get("x-trace-id") == body["trace_id"]
 
 
-# ------------------------------------------------- BUG-010 405 + Allow
-def test_wrong_method_returns_405_with_allow(api) -> None:
-    response = api.post("/api/health")
+# --------------------------------------- BUG-010 / V-09 405 不再泄露接口存在性
+def test_wrong_method_is_401_for_anonymous(api) -> None:
+    """匿名时「路径存在但方法不对」与「路径不存在」必须同样是 401。"""
+    assert api.post("/api/health").status_code == 401
+
+
+def test_wrong_method_returns_405_without_allow(api) -> None:
+    """已登录才看得到 405；响应不再带 Allow（那等于接口清单）。"""
+    response = api.post("/api/health", headers=auth_headers(api))
     assert response.status_code == 405
-    allow = response.headers.get("allow", "")
-    assert "GET" in allow
+    assert "allow" not in {name.lower() for name in response.headers}
     assert response.json()["code"] == "method_not_allowed"
+
+
+# ------------------------------------------- 版本 / 上游错误指纹（CWE-497/209）
+def test_version_is_admin_only_and_hides_runtime(api) -> None:
+    operator = user_with_permissions(api, ["node.view"], "ver-ops")
+    assert api.get("/api/version", headers=operator).status_code == 403
+
+    body = api.get("/api/version", headers=auth_headers(api)).json()
+    assert body["version"]
+    # 运行时解释器版本只在启动日志里，不再随接口下发
+    assert "python" not in body
+
+
+def test_pve_error_body_has_no_internal_fields() -> None:
+    """上游状态码与内部 endpoint 只进日志，不回响应（CWE-209）。
+
+    直接调异常处理器：TestClient 默认会把 ProxmoxError 重新抛给测试进程，
+    换 ``raise_server_exceptions=False`` 又会另起事件循环、撞上测试库连接池。
+    """
+    import asyncio
+    import json
+
+    from starlette.requests import Request
+
+    from app.main import proxmox_error_handler
+    from app.pve import ProxmoxError
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/vms",
+            "headers": [],
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": ("127.0.0.1", 1),
+        }
+    )
+    response = asyncio.run(
+        proxmox_error_handler(
+            request,
+            ProxmoxError(
+                "目标 PVE 连接不存在或已被删除（id=../..）",
+                404,
+                endpoint="get_client",
+                pve_status=404,
+            ),
+        )
+    )
+    body = json.loads(response.body)
+    assert "pve_status" not in body
+    assert "endpoint" not in body
+    assert body.get("trace_id")
+    assert response.headers.get("x-trace-id") == body["trace_id"]
+
+
+# --------------------------------------------------- PVE-01 连接清单收敛
+_SAMPLE_CONNECTION = {
+    "id": "c1",
+    "name": "广州机房",
+    "region": "gz",
+    "host": "10.0.0.5",
+    "port": 8006,
+    "token_id": "root@pam!panel",
+    "token_secret": "secret",
+    "console_user": "root@pam",
+    "console_password": "console-secret",
+    "paused": True,
+}
+
+
+def _patch_connections(monkeypatch) -> None:
+    from app import store as store_mod
+
+    monkeypatch.setattr(store_mod, "get_connections", lambda: [dict(_SAMPLE_CONNECTION)])
+    monkeypatch.setattr(store_mod, "get_active_connection", lambda: {"id": "c1"})
+
+
+def test_connections_list_is_minimal_for_operator(api, monkeypatch) -> None:
+    """普通用户只拿 id + 展示名：地址 / 区域 / 状态 / 兜底标记都不下发。"""
+    _patch_connections(monkeypatch)
+    operator = user_with_permissions(api, ["node.view"], "conn-operator")
+    resp = api.get("/api/connections", headers=operator)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == [{"id": "c1", "name": "广州机房"}]
+
+
+def test_connections_list_full_view_is_admin_only(api, monkeypatch) -> None:
+    _patch_connections(monkeypatch)
+    body = api.get("/api/connections", headers=auth_headers(api)).json()
+    assert body[0]["host"] == "10.0.0.5"
+    assert body[0]["region"] == "gz"
+    assert body[0]["paused"] is True
+    assert body[0]["active"] is True
+
+
+def test_connections_list_needs_a_resource_permission(api) -> None:
+    """只拿到 alert.view 的账号没有任何理由读连接清单。"""
+    alert_only = user_with_permissions(api, ["alert.view"], "conn-alert-only")
+    assert api.get("/api/connections", headers=alert_only).status_code == 403
+
+
+def test_connection_status_probe_is_admin_only(api) -> None:
+    """逐台真实探活 + 回报地址 / 节点数，只能给管理员（PVE-01）。"""
+    operator = user_with_permissions(api, ["node.view"], "conn-status-ops")
+    assert api.get("/api/connections/status", headers=operator).status_code == 403
 
 
 # ------------------------------------------------- BUG-017 节点口径一致

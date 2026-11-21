@@ -133,12 +133,15 @@ export function Nodes() {
     retry: false,
   });
 
-  /* 多台 PVE 同时在线：哪台连不上要能说明白，否则「列表里少了一台」会被误当成 bug */
+  /* 多台 PVE 同时在线：哪台连不上要能说明白，否则「列表里少了一台」会被误当成 bug。
+     探测接口会拿库里的凭据逐台打 PVE、并回报主机地址与节点数，只对管理员开放；
+     普通用户仍能在下面看到自己可用的节点。 */
   const connStatusQuery = useQuery({
     queryKey: ['connections', 'status'],
     queryFn: connectionsApi.status,
     refetchInterval: refresh,
     retry: false,
+    enabled: isAdmin,
   });
   const failedConnections = (connStatusQuery.data ?? []).filter((c) => !c.ok);
   /* 连得上但读不到指标 = 令牌权限不足，PVE 会把虚拟机/模板返回成空列表 */
@@ -147,7 +150,9 @@ export function Nodes() {
   );
 
   /* 连接列表：只为「区域标签」而读（节点按「区域 → 连接 → 节点」分组）。
-     这里**不按 isAdmin 关掉** —— 区域分组所有用户都要用，接口本身也只要求登录。 */
+     这里**不按 isAdmin 关掉** —— 普通用户的创建向导也要认连接名；但接口对普通
+     用户只回 id + 名称（PVE-01），区域标签只有管理员拿得到，未分区时这一层会
+     统一落到「未分区」。 */
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
     queryFn: connectionsApi.list,

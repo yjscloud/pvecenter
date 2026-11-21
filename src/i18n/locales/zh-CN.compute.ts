@@ -1940,7 +1940,7 @@ export const zhCompute = {
   'console.fileCmdHint':
     '客户机没有外网、但能访问面板时同样适用；面板使用自签证书时，curl 需要加 -k。',
   /* ------------------------------------------------------ 重置客户机口令 */
-  'guestPw.errMinLength': '口令至少 8 位',
+  'guestPw.errMinLength': '口令至少 12 位',
   'guestPw.errAlnum': '口令需同时包含字母与数字',
   'guestPw.errUsernameRequired': '请填写客户机内的用户名',
   'guestPw.errMismatch': '两次输入的口令不一致',
@@ -1959,7 +1959,7 @@ export const zhCompute = {
   'guestPw.fieldUsername': '客户机内的用户名',
   'guestPw.usernameHint': '容器一般是 root；虚拟机按你机器里实际的账号填',
   'guestPw.fieldPassword': '新口令',
-  'guestPw.passwordPlaceholder': '至少 8 位，含字母与数字',
+  'guestPw.passwordPlaceholder': '至少 12 位，含字母与数字',
   'guestPw.passwordHint': '与面板账号同一套强度要求',
   'guestPw.showPassword': '显示口令',
   'guestPw.hidePassword': '隐藏口令',

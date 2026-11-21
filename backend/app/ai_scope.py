@@ -425,6 +425,20 @@ async def _call(
             await asyncio.sleep(0.15 * attempt + random.random() * 0.1)
 
 
+def _is_connection_failure(exc: BaseException) -> bool:
+    """这次失败能否归因到「整条 PVE 连接不可用」。
+
+    只有「没有拿到 PVE 的应答」才算：超时、连不上、TLS / 代理错误（``_call``
+    会把它们统一包成 502/503/504）。PVE 返回 401/403/500 说明**连接是通的**，
+    只是这次请求被权限或上游问题拒了 —— 把它标成「连接读不到」正是线上那句
+    「PVE 明明正常，AI 页却提示 1 条连接读不到」的来源。
+    """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    status = int(getattr(exc, "pve_status", 0) or 0)
+    return status in (502, 503, 504)
+
+
 def _conn_sem(conn_id: str, limit: int) -> asyncio.Semaphore:
     """按连接取的并发闸门（进程内）。
 
@@ -461,7 +475,18 @@ async def _connection_alive(
             lambda: client.version(), timeout=tune.timeout, retries=tune.retries
         )
         alive = True
-    except Exception:  # noqa: BLE001 - 任何失败都按「这条连接不可用」处理
+    except ProxmoxError as exc:
+        # 401/403 是**令牌权限**问题，不是连接躺下：PVE 已经应答了。把它当成
+        # 「连接不可用」会误报整条 PVE 读不到（实际是令牌读不了 /version）。
+        status = int(getattr(exc, "pve_status", 0) or 0)
+        alive = status in (401, 403)
+        if alive:
+            logger.info(
+                "连接 %s 的令牌无权探活（%s），按可达处理，交给逐台探测判断",
+                conn_id or "default",
+                status,
+            )
+    except Exception:  # noqa: BLE001 - 超时 / 连不上 / TLS 失败才算连接不可用
         alive = False
     _HEALTH[conn_id] = (now, alive)
     if not alive:
@@ -488,7 +513,9 @@ async def _check_uncached(
 
     conn_id = str(host.get("conn_id") or "")
     try:
-        client = pve.client_for_connection(conn_id)
+        # 受管主机行里的 conn_id 可能是「删除后重建连接」留下的旧 id；回落到
+        # 当前连接，别让一台机器因为面板重新配置过而永远不可用。
+        client = pve.client_for_connection(conn_id, fallback_to_active=True)
     except ProxmoxError:
         return False, REASON_UNREACHABLE
     except Exception:  # noqa: BLE001 - 连接配置坏掉也只是这一台不可用
@@ -732,7 +759,7 @@ async def _drop_dead_connections(
 
     async def _probe(conn_id: str) -> bool:
         try:
-            client = pve.client_for_connection(conn_id)
+            client = pve.client_for_connection(conn_id, fallback_to_active=True)
         except Exception:  # noqa: BLE001 - 取不到客户端按整组不可用
             return False
         if client is None:
@@ -820,9 +847,9 @@ async def _batch_statuses(
         if hit and now - hit[0] < HEALTH_TTL and not hit[1]:
             return None
         try:
-            client = pve.client_for_connection(conn_id)
-        except Exception:  # noqa: BLE001 - 取不到客户端按整条连接不可用
-            return None
+            client = pve.client_for_connection(conn_id, fallback_to_active=True)
+        except Exception:  # noqa: BLE001 - 取不到客户端：退回逐台，不判整条连接
+            return _NO_BATCH
         if client is None:
             return None
         if not hasattr(client, "cluster_resources"):
@@ -837,11 +864,11 @@ async def _batch_statuses(
             # 凭据不被允许读集群资源：那是**权限范围**的问题，不是连接断了。
             # 按「这家客户端不能批量读」处理，退回逐台的 status —— 它对只授权到
             # 某几台虚拟机的令牌照样能给出答案，而整组判死会冤枉所有机器。
-            if int(getattr(exc, "pve_status", 0) or 0) in (401, 403):
-                return _NO_BATCH
-            return _down(conn_id)
-        except Exception:  # noqa: BLE001 - 其余失败都按「这条连接不可用」
-            return _down(conn_id)
+            # 其余「PVE 有应答」的错误（4xx / 500）同理：退回逐台，让每台机器
+            # 自己报原因；只有真正的连接层失败才记整条连接读不到。
+            return _down(conn_id) if _is_connection_failure(exc) else _NO_BATCH
+        except Exception as exc:  # noqa: BLE001
+            return _down(conn_id) if _is_connection_failure(exc) else _NO_BATCH
         _HEALTH[conn_id] = (time.monotonic(), True)
         return items or []
 
@@ -1030,6 +1057,32 @@ async def _warm(hosts: List[Dict[str, Any]]) -> None:
                 _WARMING.discard(key)
 
 
+def _recent_down_connections(hosts: Iterable[Dict[str, Any]]) -> int:
+    """本轮候选里，**刚刚**探活失败了的 PVE 连接有几条。
+
+    两个过滤条件都是必要的（线上反馈：PVE 明明正常却一直提示「1 条读不到」）：
+
+    1. 只统计本轮候选主机所属的连接。``_HEALTH`` 是进程级全局表，暂停 / 已删除
+       连接的旧记录原本也会被算进来，于是页面凭空多出一条「读不到」。
+    2. 只认 ``HEALTH_TTL``（5 秒）内的失败，而不是 60 秒。批量取状态偶发一次
+       超时就会写一条 False；如果这一轮所有主机都命中判定缓存、不再探活，这条
+       False 在 60 秒内没有任何机会被成功结果覆盖 —— 用户盯着一句早已恢复的
+       告警，只会去反复检查正常的 PVE。5 秒与探活缓存同寿：真有故障，下一次
+       轮询会重新写 False，提示自己回来。
+    """
+    candidate_conns = {
+        key[0] for host in hosts if (key := _key(host)) is not None
+    }
+    now = time.monotonic()
+    return sum(
+        1
+        for conn_id, (stamp, alive) in _HEALTH.items()
+        if conn_id in candidate_conns
+        and not alive
+        and now - stamp < HEALTH_TTL
+    )
+
+
 async def evaluate_hosts_fast(
     hosts: Iterable[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[Dict[str, Any]], int]:
@@ -1086,13 +1139,7 @@ async def evaluate_hosts_fast(
 
     # 首屏这一轮不探活（那是补探的事），但「哪条 PVE 现在连不上」要如实带出去：
     # 页面据此显示集中提示，而不是让十几台机器各报一条「状态读取失败」。
-    # 60 秒内探活失败的连接都算数：刚失败就消失的提示等于没提示。
-    now = time.monotonic()
-    down = sum(
-        1
-        for stamp, alive in _HEALTH.values()
-        if not alive and now - stamp < 60.0
-    )
+    down = _recent_down_connections(candidates)
     _LAST_STATS.clear()
     _LAST_STATS.update(
         {

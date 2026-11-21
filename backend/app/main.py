@@ -8,18 +8,22 @@ import platform
 import secrets
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import BASE_DIR, settings
 from .pve import (
     ProxmoxError,
+    error_code_headers,
     get_client,
     reset_request_connection,
     reset_request_scope,
@@ -111,6 +115,7 @@ from . import ippool
 from . import metrics as metrics_history
 from . import notifications
 from . import ownership
+from . import panel_url
 from . import password_reset
 from . import prefs
 from . import pvecache
@@ -148,7 +153,12 @@ from . import inspection
 from . import guestip
 # 巡检类阻塞调用的专用线程池，避免占满事件循环的默认 executor
 from . import taskpool
-from .store import get_connections, init_db, purge_expired_tokens
+from .store import (
+    get_connections,
+    init_db,
+    purge_audit_old,
+    purge_expired_tokens,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -527,13 +537,51 @@ class CsrfMiddleware:
 # 注册顺序：CSRF 在限流之后、CORS 之前 —— CORS 会包住两者，403/429 都带 CORS 头。
 app.add_middleware(CsrfMiddleware)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+class StrictCorsMiddleware:
+    """CORS 的一层收口：没有回写 ``Allow-Origin`` 时也不许出现 ``Allow-Credentials``。
+
+    Starlette 的 ``CORSMiddleware`` 会把 ``allow_credentials=True`` 放进
+    ``simple_headers``，只要请求带 ``Origin`` 就无条件写回 —— 即使这个 Origin
+    不在白名单里、响应里根本没有 ``Access-Control-Allow-Origin``。浏览器当下
+    会拒绝，但这等于在每一个响应上埋了一句「本接口接受凭据跨域」：哪天有人为了
+    排查问题把 Origin 放宽成通配，它立刻变成真实的 CORS 凭据泄露通道
+    （审计项 V-06）。这里在响应出口做一次一致性校验：两条头必须同时存在。
+    """
+
+    def __init__(self, app: Any, **kwargs: Any) -> None:
+        self.app = CORSMiddleware(app, **kwargs)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        async def send_without_orphan_credentials(message: Dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                current = list(message.get("headers") or [])
+                names = {name.lower() for name, _ in current}
+                if (
+                    b"access-control-allow-credentials" in names
+                    and b"access-control-allow-origin" not in names
+                ):
+                    current = [
+                        (name, value)
+                        for name, value in current
+                        if name.lower() != b"access-control-allow-credentials"
+                    ]
+                    message = {**message, "headers": current}
+            await send(message)
+
+        await self.app(scope, receive, send_without_orphan_credentials)
+
+
+# 未配置跨域来源时干脆不挂 CORS：同源部署（含反代）根本不需要它，而中间件
+# 本身仍会改写到响应头。只有显式配置了 CORS_ORIGINS（开发 / 独立前端）才启用。
+if settings.cors_origin_list:
+    app.add_middleware(
+        StrictCorsMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 class PveConnectionScopeMiddleware:
@@ -604,7 +652,9 @@ class HttpsEnforcementMiddleware:
     # includeSubDomains：面板常挂在 panel.example.com，而同一张证书 / 同一个
     # 站点下的子域（api.example.com、console.example.com）不该还能走明文 HTTP。
     # 只写 max-age 的 HSTS 对子域不生效，等于给降级攻击留了一个旁路（BUG-007）。
-    HSTS = b"max-age=31536000; includeSubDomains"
+    # preload：把域名提交到浏览器 HSTS 预加载列表后可覆盖「首次访问」的空白期；
+    # 它只是声明，是否真的进列表取决于域名是否提交（审计项 V-05）。
+    HSTS = b"max-age=31536000; includeSubDomains; preload"
 
     def __init__(self, app: Any) -> None:
         self.app = app
@@ -760,6 +810,13 @@ class SecurityHeadersMiddleware:
         ),
         # frame-ancestors 已能挡点击劫持，这条覆盖不支持 CSP 的老浏览器
         (b"x-frame-options", b"DENY"),
+        # 跨源隔离三件套（审计项 V-05）：面板所有资源都同源，不需要任何跨源
+        # 窗口引用 / 资源嵌入。COOP 切断 window.opener，COEP 要求嵌入资源
+        # 显式声明 CORP，CORP 则禁止别的站点把我们的响应当图片 / 脚本加载。
+        # 三者的组合同时让面板进入 crossOriginIsolated 状态。
+        (b"cross-origin-opener-policy", b"same-origin"),
+        (b"cross-origin-embedder-policy", b"require-corp"),
+        (b"cross-origin-resource-policy", b"same-origin"),
     )
 
     def __init__(self, app: Any) -> None:
@@ -817,7 +874,9 @@ class PanelAccessControlMiddleware:
     写成原生 ASGI：拒绝路径极短，且 WebSocket 握手也能直接 close。
     """
 
-    EXEMPT_PATHS = frozenset({"/api/health"})
+    # security.txt 是给外部研究员的公开渠道：把它一起挡住，等于「只允许熟人
+    # 报漏洞」。内容只有联系方式，不含任何面板状态。
+    EXEMPT_PATHS = frozenset({"/api/health", "/.well-known/security.txt"})
     # 被拒日志按 IP 做 60 秒去重：爆破时的日志洪水本身也是一种资源消耗
     _last_log: Dict[str, float] = {}
 
@@ -902,38 +961,117 @@ app.add_middleware(reqmetrics.RequestMetricsMiddleware)
 async def validation_error_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """422 只回「哪个字段、为什么错」，不回显提交内容（BUG-009）。
+    """422 统一为一句通用提示，字段名 / 阈值 / 校验器类型只写服务端日志。
 
-    FastAPI 默认会在每个错误项里带 ``input``（原始提交值）与 ``ctx``（校验器
-    上下文）。登录 / 注册这类接口的 ``input`` 里就是**明文口令**，一个字段长度
-    不合规的 422 会把口令原样回给调用方，也顺手进了反向代理的访问日志。
-    这里只保留定位与原因两个信息，前端仍可按原有的 ``detail[].loc/msg`` 渲染。
+    以前这里回的是 ``detail: [{loc, msg, type}]``：虽然去掉了 ``input``（避免
+    明文口令回显，BUG-009），但 ``loc=query.limit`` + ``less_than_equal`` 仍然
+    把框架（Pydantic）、字段名与阈值一起交了出去，等于把接口契约免费送给扫描器
+    （审计项 CWE-209 / CWE-497）。日志里保留定位信息供运维排查，响应里只给一个
+    不透明的 ``trace_id``。
     """
-    detail: List[Dict[str, Any]] = []
-    for error in exc.errors():
-        detail.append(
-            {
-                "loc": list(error.get("loc") or []),
-                "msg": str(error.get("msg") or ""),
-                "type": str(error.get("type") or ""),
-            }
-        )
-    return JSONResponse(status_code=422, content={"detail": detail})
+    trace_id = secrets.token_hex(8)
+    errors = [
+        {
+            "loc": ".".join(str(part) for part in (error.get("loc") or [])),
+            "msg": str(error.get("msg") or ""),
+            "type": str(error.get("type") or ""),
+        }
+        for error in exc.errors()
+    ]
+    logger.warning(
+        "请求参数校验失败 trace_id=%s %s %s errors=%s",
+        trace_id,
+        request.method,
+        request.url.path,
+        errors,
+    )
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": i18n.pick(
+                "请求参数不合法，请检查后重试", "Invalid request parameters"
+            ),
+            "code": "validation_error",
+            "trace_id": trace_id,
+        },
+        headers={"X-Trace-Id": trace_id},
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    """保持 FastAPI 默认的 JSON 形状，但 405 不再回 ``Allow``。
+
+    RFC 9110 要求 405 带 ``Allow``，代价却是把「这条路径存在、只是方法不对」
+    精确地告诉未授权访问者 —— 拿一份常见方法表逐个打一遍就能把接口存在性摸清
+    （审计项 V-09）。面板的接口集合本身就是攻击地图，宁可牺牲这条自动发现
+    能力：405 仍然如实表示「方法不对」，只是不再列出自以为可用的方法。
+    """
+    headers = dict(exc.headers or {})
+    if exc.status_code == 405:
+        headers.pop("Allow", None)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=headers or None,
+    )
 
 
 @app.exception_handler(ProxmoxError)
 async def proxmox_error_handler(request: Request, exc: ProxmoxError) -> JSONResponse:
-    """Translate Proxmox failures into a consistent JSON shape."""
+    """Translate Proxmox failures into a consistent JSON shape.
+
+    上游状态码、内部函数名（``endpoint``）只写服务端日志：``pve_status: 404`` +
+    ``endpoint: "get_client"`` 等于把「面板怎么调 PVE、错误从哪一层抛出来」交给
+    调用方，是现成的代码路径侦察（审计项 CWE-209）。响应里改回不透明
+    ``trace_id``，排查时按日志里的同一个 id 对上即可。
+    """
     status = exc.status_code if 400 <= exc.status_code < 600 else 500
-    return JSONResponse(status_code=status, content=exc.to_dict())
+    trace_id = secrets.token_hex(8)
+    logger.warning(
+        "PVE 调用失败 trace_id=%s %s %s status=%s pve_status=%s endpoint=%s code=%s detail=%s",
+        trace_id,
+        request.method,
+        request.url.path,
+        status,
+        exc.pve_status,
+        exc.endpoint or "-",
+        exc.code or "-",
+        exc.message,
+    )
+    return JSONResponse(
+        status_code=status,
+        content={
+            "detail": exc.message,
+            # 机器可读原因仍保留：前端靠它区分 428 的两种来源
+            "code": exc.code,
+            "trace_id": trace_id,
+        },
+        headers={"X-Trace-Id": trace_id, **(error_code_headers(exc) or {})},
+    )
 
 
 @app.exception_handler(Exception)
 async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    """未捕获异常：日志留全栈，响应只留通用文案 + trace id。
+
+    此前这里把 ``str(exc)`` 直接拼进 ``detail``（例如 ``KeyError: 'lxc'``、
+    文件路径、SQL 片段）—— 那是最直接的一类内部信息泄露（CWE-209）。
+    """
+    trace_id = secrets.token_hex(8)
+    logger.exception(
+        "未捕获异常 trace_id=%s %s %s", trace_id, request.method, request.url.path
+    )
     return JSONResponse(
         status_code=500,
-        content={"detail": f"服务器内部错误：{exc}"},
+        content={
+            "detail": i18n.pick("服务器内部错误", "Internal server error"),
+            "code": "internal_error",
+            "trace_id": trace_id,
+        },
+        headers={"X-Trace-Id": trace_id},
     )
 
 
@@ -1058,12 +1196,16 @@ if settings.api_docs_enabled:
 
 @app.get("/api/version", tags=["meta"])
 async def version(
-    _user: Dict[str, Any] = Depends(security.get_current_user),
+    _user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
 ) -> Dict[str, Any]:
-    """面板版本（需登录）。
+    """面板版本（仅管理员）。
 
-    原来匿名可读：面板版本 + 前端构建时间等于给扫描器一个「该打哪个已知漏洞」
-    的索引，也让「产物是否陈旧」变成可探测状态（审计：未鉴权接口泄露版本）。
+    原来登录即可读：面板版本 + 前端构建时间 + Python 运行时版本，等于把「该对
+    哪个版本的公开 PoC / 依赖 CVE」直接标好，运行时版本还额外暴露解释器栈
+    （审计项 CWE-497）。前端界面本来就不读这个接口（版本从 ``/api/health``
+    取），所以收成与接口文档同一档：``settings.manage``。
+
+    ``python`` 字段同时删除 —— 运维需要时看启动日志里的「运行环境」即可。
     站名/Logo 这类品牌信息仍在公开的 ``/api/config/site`` 里，登录页照常渲染。
     """
     info = await site.get_site_info()
@@ -1071,9 +1213,6 @@ async def version(
         "name": info["name"],
         "version": __version__,
         "api": "v1",
-        # 实际运行的解释器版本。排查「依赖装到了另一个 Python 上」「面板跑在
-        # 3.9 这类过旧环境里」时，这一项比翻 systemd 单元快得多。
-        "python": platform.python_version(),
         # 前端构建产物的版本与一致性（见 app.buildinfo）：界面据此提示「产物陈旧」
         "frontend": buildinfo.status(),
     }
@@ -1099,7 +1238,7 @@ def _api_404_detail() -> str:
 
 
 def _api_allowed_methods(path: str) -> List[str]:
-    """这个路径在路由表里存在时，允许哪些方法（用于 405 + ``Allow``）。
+    """这个路径在路由表里存在时，允许哪些方法（只用于判定 405，不回 ``Allow``）。
 
     兜底路由把 ``/api/*`` 的所有方法都接了，因此 Starlette 没有机会自己回
     405 —— 必须在兜底里替它算一次。只扫 ``/api`` 路由，并用预编译的正则匹配；
@@ -1140,8 +1279,19 @@ async def api_not_found(
     rest: str = "",
     _user: Optional[Dict[str, Any]] = Depends(security.get_current_user_optional),
 ) -> JSONResponse:
-    # 已知路径但方法不对：405 + Allow，不再伪装成 404（BUG-010）。这一判断
-    # 放在鉴权之前 —— 方法与路径的组合是公开的 HTTP 语义，不需要身份。
+    # 未登录时**所有**未命中的 /api 路径统一 401（BUG-005）：未知路径、存在
+    # 但方法不对的路径，对匿名访问者必须长得一模一样。否则 405 与 401 的差别
+    # 本身就是一份「这条路径存在」的信号（审计项 V-09）。
+    if _user is None:
+        raise HTTPException(
+            status_code=401,
+            detail=i18n.pick("未登录或登录状态已失效", "Not authenticated"),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 已登录用户才看得到 405（BUG-010）：语义是「方法不对」，而不是伪装成
+    # 404 让人去翻请求方法。但**不回 Allow** —— `Allow: GET, POST` 等于把
+    # 「这条路径存在、还支持哪些方法」精确地交出去。
     allowed = _api_allowed_methods(request.url.path)
     if allowed and request.method not in allowed:
         return JSONResponse(
@@ -1150,15 +1300,6 @@ async def api_not_found(
                 "detail": i18n.pick("请求方法不被允许", "Method Not Allowed"),
                 "code": "method_not_allowed",
             },
-            headers={"Allow": ", ".join(allowed)},
-        )
-
-    # 未登录时未知路径统一 401（BUG-005）；只有已认证用户才看得到 404。
-    if _user is None:
-        raise HTTPException(
-            status_code=401,
-            detail=i18n.pick("未登录或登录状态已失效", "Not authenticated"),
-            headers={"WWW-Authenticate": "Bearer"},
         )
 
     # 排查所需的信息只进日志：响应体里不再回显路径、版本状态或「重启」这类
@@ -1172,6 +1313,55 @@ async def api_not_found(
     return JSONResponse(
         status_code=404,
         content={"detail": _api_404_detail(), "code": "not_found"},
+    )
+
+
+def _security_contacts(base: str, request: Request) -> List[str]:
+    """把配置里的联系方式规范成 RFC 9116 的 ``Contact:`` 值。
+
+    支持「邮箱 / mailto: / https 链接」，多个用逗号分隔；纯邮箱自动补
+    ``mailto:``。没配时回落到 ``security@<面板域名>`` —— 总比让研究员只能
+    去公开 issue 区提交要好（审计项 V-16）。
+    """
+    raw = str(getattr(settings, "security_contact", "") or "")
+    items = [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
+    if not items:
+        host = urlsplit(base).hostname or (request.url.hostname or "")
+        if host:
+            items = [f"mailto:security@{host}"]
+    contacts: List[str] = []
+    for item in items:
+        if "://" in item or item.lower().startswith("mailto:"):
+            contacts.append(item)
+        elif "@" in item:
+            contacts.append(f"mailto:{item}")
+        else:
+            contacts.append(item)
+    return contacts
+
+
+@app.get("/.well-known/security.txt", include_in_schema=False)
+async def security_txt(request: Request) -> PlainTextResponse:
+    """漏洞报告渠道（RFC 9116）。
+
+    此前没有任何声明，外部研究员发现漏洞后只能猜联系方式，或者直接开公开
+    issue —— 后者等于把未修复的细节先公开（审计项 V-16）。``Expires`` 按
+    一年滚动生成，避免文件悄悄过期后被判定为无效；``Canonical`` 指向面板
+    自己的对外地址，便于自动化工具去重。
+    """
+    base = (await panel_url.resolve(request)).rstrip("/")
+    contacts = _security_contacts(base, request)
+    expires = datetime.now(timezone.utc) + timedelta(days=365)
+    lines = [f"Contact: {item}" for item in contacts]
+    lines.append(f"Expires: {expires.strftime('%Y-%m-%dT%H:%M:%S.000Z')}")
+    lines.append("Preferred-Languages: zh-CN, en")
+    if base:
+        lines.append(f"Canonical: {base}/.well-known/security.txt")
+    return PlainTextResponse(
+        "\n".join(lines) + "\n",
+        media_type="text/plain; charset=utf-8",
+        # 渠道很少变，但也不该被代理长期据旧；一小时足够。
+        headers={"Cache-Control": "public, max-age=3600"},
     )
 
 
@@ -1487,8 +1677,14 @@ def _frp_summary(result: Any) -> str:
 
 
 async def _purge_audit() -> int:
-    """审计日志保留清理（配置项在 Settings 里，作业只负责把天数传下去）。"""
-    return await store.purge_audit_old(int(settings.audit_retention_days or 0))
+    """审计日志保留清理（配置项在 Settings 里，作业只负责把天数传下去）。
+
+    注意：这里用的是函数级导入，**不是** ``store.xxx``。main 早先为了精简
+    ``from .store import ...`` 只导了几个符号，没导 ``store`` 模块，后台作业
+    一跑就 ``NameError``（该作业此前每轮都失败，页面上显示成「审计日志保留
+    清理 · 失败」）。
+    """
+    return await purge_audit_old(int(settings.audit_retention_days or 0))
 
 
 def _purge_summary(result: Any) -> str:

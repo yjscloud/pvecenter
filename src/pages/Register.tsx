@@ -88,7 +88,7 @@ export function Register() {
 
     if (!password) {
       next.password = t('register.err.passwordRequired');
-    } else if (password.length < 8) {
+    } else if (password.length < 12) {
       next.password = t('register.err.passwordTooShort');
     } else if (!/[a-zA-Z]/.test(password) || !/\d/.test(password)) {
       next.password = t('register.err.passwordWeak');

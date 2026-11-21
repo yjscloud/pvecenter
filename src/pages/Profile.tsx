@@ -49,7 +49,7 @@ function emailError(value: string): string | undefined {
 
 function passwordError(value: string): string | undefined {
   if (!value) return tStatic('profile.pwdRequired');
-  if (value.length < 8) return tStatic('profile.pwdMin');
+  if (value.length < 12) return tStatic('profile.pwdMin');
   if (!/[A-Za-z]/.test(value)) return tStatic('profile.pwdLetter');
   if (!/\d/.test(value)) return tStatic('profile.pwdDigit');
   return undefined;

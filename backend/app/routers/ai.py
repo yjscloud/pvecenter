@@ -51,6 +51,7 @@ from .. import (
     i18n,
     ownership,
     security,
+    sshremote,
     store,
 )
 from ..config import settings
@@ -2056,7 +2057,10 @@ async def terminal_preflight(
     * 自检通过、WebSocket 仍然连不上 → 后端已经确认没问题，剩下的**只可能**
       是反向代理没转发 WebSocket，界面就能给出那句该改的配置。
 
-    只做只读探测（一个 TCP 连接），不建 SSH 会话、不写任何东西。
+    先探 TCP，再做一次**完整的 SSH 建连 + 认证**后立即断开。只探端口会把
+    「网络通、但用户名 / 口令 / 私钥 / sshd 配置不对」误报成通过，用户随后在
+    WebSocket 里只看到一句 ``Authentication failed``。这里复用与终端完全相同的
+    ``sshremote._connect``，把真正原因放进普通 HTTP 响应（只读，不执行命令）。
     """
     checks: List[Dict[str, Any]] = []
 
@@ -2111,15 +2115,37 @@ async def terminal_preflight(
             "checks": checks,
         }
 
+    # 端口通只说明「网络到了」。认证失败（用户名 / 口令 / 私钥 / sshd 禁口令 /
+    # 面板公钥没下发）必须在这里说清楚，否则用户会在 WebSocket 里只看到
+    # 一句没有任何指向性的 Authentication failed。
+    try:
+        auth_ok, auth_detail = await asyncio.wait_for(
+            asyncio.to_thread(sshremote.verify_auth, row), timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        auth_ok, auth_detail = False, i18n.pick(
+            "SSH 握手超时（端口能连上，但 30 秒内没有完成认证）",
+            "SSH handshake timed out (port reachable, but authentication did not "
+            "finish within 30 seconds)",
+        )
+    add("auth", auth_ok, auth_detail)
+    if not auth_ok:
+        return {
+            "ok": False,
+            "reason": i18n.pick("SSH 认证未通过：", "SSH authentication failed: ")
+            + auth_detail,
+            "checks": checks,
+        }
+
     return {"ok": True, "reason": "", "checks": checks}
 
 
 async def _tcp_probe(address: str, port: int, timeout: float = 3.0) -> bool:
     """探一下 TCP 端口通不通。
 
-    刻意用裸 socket 而不是建 SSH 会话：自检要快要轻，握手 + 认证会慢一个数量级，
-    而且真正的连接失败原因（凭据错、指纹不符）由 WebSocket 那条路自己会报。
-    这一步只回答「网络能不能到」。
+    只回答「网络能不能到」；认证 / 指纹 / sshd 配置由调用方随后的
+    ``sshremote.verify_auth`` 回答。两步分开是为了让错误提示能区分
+    「网络不通」与「连上了但认证不过」。
     """
     if not address:
         return False

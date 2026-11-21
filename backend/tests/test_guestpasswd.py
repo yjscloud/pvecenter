@@ -40,7 +40,7 @@ def run(coro):
     return asyncio.run(coro)
 
 
-GOOD_PASSWORD = "Zx9Qw2Ef"
+GOOD_PASSWORD = "Zx9Qw2Ef3Rt5"
 
 
 def ci_drive_config(**extra) -> dict:
@@ -257,7 +257,7 @@ class TestValidation:
                 )
             )
         assert exc.value.status_code == 400
-        assert "8 位" in exc.value.detail
+        assert "12 位" in exc.value.detail
 
     def test_bad_username_rejected_before_any_pve_call(self) -> None:
         client = FakeVmClient()

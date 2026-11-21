@@ -92,14 +92,15 @@ ROLE_PERMISSIONS: Dict[str, List[str]] = {
         "template.clone",
         "storage.view",
         "network.view",
-        # 防火墙：普通用户可以管自己名下虚拟机的规则；集群级（影响所有主机）
-        # 留给了 firewall.cluster，默认只有管理员有。
-        # ct.firewall.* 是容器侧的同一件事（routers/firewall.py 会按目标类型
-        # 选用 vm 还是 ct 的权限点）。
+        # 防火墙：普通用户只读（自己名下虚拟机 / 容器的规则）。
+        #
+        # 写权限（firewall.manage / ct.firewall.manage）**不在**默认租户角色里
+        # （审计项 V-15）：规则写错能把机器从网络上摘下来，也能打开本不该暴露
+        # 的端口；它属于「基础设施运维」而不是「开自己的虚拟机」。需要的账号
+        # 应在自定义角色里单独授予，与 ssh.* / ai.terminal 同一口径。
+        # 集群级（影响所有主机）仍只有 firewall.cluster，默认仅管理员。
         "firewall.view",
-        "firewall.manage",
         "ct.firewall.view",
-        "ct.firewall.manage",
         "node.view",
         "task.view",
         "frp.view",
@@ -151,7 +152,8 @@ ROLE_DESCRIPTIONS: Dict[str, str] = {
     "region_admin": "区域管理员：管理指派区域内（可多个）的全部虚拟机与容器，可指派区域内机器的归属；"
     "不能管理用户、全局连接配置或其它区域。",
     "operator": "普通用户：可创建、开关机、控制台、快照、备份、克隆，并删除「自己创建」的"
-    "虚拟机与容器；只能看到自己名下的机器，不能管理用户、连接配置或宿主机网络。",
+    "虚拟机与容器；只能看到自己名下的机器，不能管理用户、连接配置或宿主机网络。"
+    "防火墙只读；ssh.* / ai.terminal / 防火墙写权限属于基础设施运维，需在自定义角色里单独授予。",
     "viewer": "只读用户：仅可查看自己名下的资源、监控与任务，不能执行任何变更操作。",
 }
 
@@ -545,7 +547,6 @@ _BUILTIN_ROLE_ROUNDS: List[Tuple[str, Dict[str, List[str]]]] = [
                 "ct.config",
                 "ct.delete",
                 "ct.firewall.view",
-                "ct.firewall.manage",
             ],
             "viewer": ["ct.view", "ct.firewall.view"],
         },
@@ -554,6 +555,35 @@ _BUILTIN_ROLE_ROUNDS: List[Tuple[str, Dict[str, List[str]]]] = [
         # 第二轮：迁移从「修改配置」里分出来（vm.migrate / ct.migrate）
         "roles_builtin_migrate_split",
         {"operator": ["vm.migrate", "ct.migrate"]},
+    ),
+]
+
+# 内置角色的**权限回收**轮次（与上面的增量合并分开记标记）。
+#
+# 为什么需要：现网角色的权限行早已落库，改 ``ROLE_PERMISSIONS`` 只影响新建角色；
+# 若只改常量，老部署里的 operator 仍会带着这些高危权限，审计项等于没修。这里
+# 一次性把它们从内置 operator 上摘掉（只摘明确列出的项，不碰其它自定义差异）。
+# 管理员若确实需要，仍可在自定义角色里重新授予。
+_BUILTIN_ROLE_REVOCATIONS: List[Tuple[str, Dict[str, List[str]]]] = [
+    (
+        # 租户最小化（审计项 V-15）：主机级 / 基础设施运维能力不随默认租户角色下发。
+        "roles_operator_infra_revoke",
+        {
+            "operator": [
+                "ssh.view",
+                "ssh.manage",
+                "baseline.view",
+                "baseline.manage",
+                "ports.view",
+                "ports.manage",
+                "ai.exec",
+                "ai.terminal",
+                "ai.vm.read",
+                "ai.vm.write",
+                "firewall.manage",
+                "ct.firewall.manage",
+            ],
+        },
     ),
 ]
 
@@ -581,9 +611,53 @@ async def load_roles() -> Dict[str, List[str]]:
 
 
 async def _upgrade_builtin_roles() -> None:
-    """把 :data:`_BUILTIN_ROLE_ROUNDS` 里各轮的新增权限并进已存在的内置角色。"""
+    """对已存在的内置角色执行各轮「增量合并」与「权限回收」。"""
     for flag, additions in _BUILTIN_ROLE_ROUNDS:
         await _merge_builtin_additions(flag, additions)
+    for flag, removals in _BUILTIN_ROLE_REVOCATIONS:
+        await _revoke_builtin_permissions(flag, removals)
+
+
+async def _revoke_builtin_permissions(
+    flag: str, removals: Dict[str, List[str]]
+) -> None:
+    """某一轮的权限回收：只摘明确列出的项，跑过就记标记。
+
+    与增量合并相反，这里**必须**改已落库的角色行 —— 只改常量对老部署无效。
+    只删除 ``removals`` 里的键，管理员手工加过的其它权限原样保留；``*``
+    （超管）跳过。
+    """
+    try:
+        if await store.get_setting(flag):
+            return
+    except Exception:  # noqa: BLE001 - 读标记失败：宁可多回收一次也不漏
+        pass
+
+    for role_id, perms in removals.items():
+        role = await store.get_role(role_id)
+        if not role:
+            continue
+        current = list(role.get("permissions") or [])
+        if "*" in current:
+            continue
+        dropped = set(perms)
+        next_perms = sorted(item for item in current if item not in dropped)
+        if next_perms == sorted(set(current)):
+            continue
+        await store.save_role(
+            role_id,
+            str(role.get("name") or BUILTIN_ROLE_NAMES.get(role_id, role_id)),
+            str(role.get("description") or ROLE_DESCRIPTIONS.get(role_id, "")),
+            next_perms,
+            builtin=True,
+        )
+        logger.warning(
+            "已从内置角色 %s 回收高危权限：%s", role_id, ", ".join(sorted(dropped))
+        )
+    try:
+        await store.set_setting(flag, "1")
+    except Exception:  # noqa: BLE001
+        logger.warning("写入内置角色回收标记失败，下次启动会重跑", exc_info=True)
 
 
 async def _merge_builtin_additions(
@@ -1655,7 +1729,9 @@ async def revoke_user_credentials(username: str) -> Dict[str, int]:
 
 
 # ------------------------------------------------------------------ passwords
-MIN_PASSWORD_LENGTH = 8
+#: 用户口令最小长度。与管理员建号同一口径（12 位起）：8 位 + 字母数字在离线
+#: 爆破面前并不够，注册 / 改密 / 重置 / 管理端建号都走这一份规则。
+MIN_PASSWORD_LENGTH = 12
 MAX_PASSWORD_LENGTH = 128
 
 # 一眼可猜的口令：即使长度够也不放过。管理员建号、自助注册、改密、重置
@@ -1668,6 +1744,12 @@ _COMMON_WEAK_PASSWORDS = frozenset(
         "password",
         "password1",
         "password123",
+        "password1234",
+        "password12345",
+        "123456789012",
+        "qwertyuiop12",
+        "administrator",
+        "admin1234567",
         "passw0rd",
         "qwerty123",
         "abc12345",

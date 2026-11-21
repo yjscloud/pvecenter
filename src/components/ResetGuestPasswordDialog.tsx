@@ -13,7 +13,7 @@
    写明缺什么），只能走一条就只显示说明，一条都走不了则直接给出缺什么、不提交。
 
    口令强度沿用面板自己那一套规则（后端 security.password_policy_error 是权威，
-   这里只是让用户在按提交之前就看到问题）：至少 8 位，且同时含字母与数字。
+   这里只是让用户在按提交之前就看到问题）：至少 12 位，且同时含字母与数字。
    ========================================================================== */
 
 import { useEffect, useRef, useState } from 'react';
@@ -32,7 +32,7 @@ import type { GuestPasswordMethodId, VmSummary } from '../api/types';
 
 /** 面板账号与客户机账号共用一份口令强度口径（后端 security.password_policy_error） */
 function passwordProblem(password: string, t: TFunc): string {
-  if (password.length < 8) return t('guestPw.errMinLength');
+  if (password.length < 12) return t('guestPw.errMinLength');
   if (!/[A-Za-z]/.test(password) || !/\d/.test(password)) {
     return t('guestPw.errAlnum');
   }

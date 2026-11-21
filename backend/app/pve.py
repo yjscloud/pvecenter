@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import ssl as ssl_module
 import time
@@ -28,6 +29,8 @@ import httpx
 from . import reqmetrics
 from .backup_volid import archive_guest_type
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 # UPID format: UPID:<node>:<pid>:<pstart>:<starttime>:<type>:<id>:<user>:<comment>
 _UPID_RE = re.compile(r"^UPID:(?P<node>[^:]+):")  # 兼容旧调用：只取节点
@@ -70,10 +73,13 @@ class ProxmoxError(Exception):
         super().__init__(message)
 
     def to_dict(self) -> Dict[str, Any]:
+        """给响应用的形状：**不含**上游状态码与内部 endpoint。
+
+        ``pve_status`` / ``endpoint`` 只用于服务端日志；对外只保留可直接展示的
+        文案与机器可读的 ``code``（审计项 CWE-209）。
+        """
         return {
             "detail": self.message,
-            "pve_status": self.pve_status,
-            "endpoint": self.endpoint,
             "code": self.code,
         }
 
@@ -1616,23 +1622,37 @@ def bound_connection() -> str:
     return _request_connection.get()
 
 
-def client_for_connection(conn_id: str) -> ProxmoxClient:
+def client_for_connection(
+    conn_id: str, *, fallback_to_active: bool = False
+) -> ProxmoxClient:
     """按连接 id 取客户端；空串表示「当前连接」。
 
     批量操作里每一台目标机器可能落在不同 PVE 上，靠 ``set_request_connection``
     切换 ContextVar 是行不通的 —— 并发任务共享同一个请求上下文，会互相覆盖。
     这里直接按 id 取客户端（带指纹缓存），各台机器的连接互不干扰。
+
+    ``fallback_to_active=True`` 仅供**内部后台聚合**使用：受管主机行里可能留着
+    一个已经被删除 / 重建的旧连接 id（面板重装、删掉连接再加回来都会换 id），
+    这时硬报「连接不存在」会让整条连接被判故障 —— 用户看到「PVE 正常，但 AI
+    说有 1 条连接读不到」。回落到当前连接后，节点 / VMID 是否真的存在由后续
+    查询自己回答；带 ``X-PVE-Connection`` 的请求**不会**走这条回落，未知 id
+    仍然如实 404。
     """
     if not conn_id:
         return get_client()
     client = _scoped_client(conn_id)
-    if client is None:
-        raise ProxmoxError(
-            f"目标 PVE 连接不存在或已被删除（id={conn_id}）",
-            status_code=404,
-            endpoint="client_for_connection",
+    if client is not None:
+        return client
+    if fallback_to_active:
+        logger.warning(
+            "连接 %s 已不存在（多为删除后重建导致的旧 id），回落到当前连接", conn_id
         )
-    return client
+        return get_client()
+    raise ProxmoxError(
+        f"目标 PVE 连接不存在或已被删除（id={conn_id}）",
+        status_code=404,
+        endpoint="client_for_connection",
+    )
 
 
 def all_connection_clients() -> List[Tuple[Dict[str, Any], ProxmoxClient]]:

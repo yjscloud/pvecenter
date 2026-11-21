@@ -34,7 +34,6 @@ pvecenter 由个人维护。它帮你省下时间的话，欢迎自愿赞赏，�
 
 ## 界面预览
 
-> 截图统一放在 `docs/screenshots/`，建议 **1600×900**（16:9）。下面的文件名可直接替换；文件不存在时 GitHub 显示替代文字，放进去就自动显示。
 
 <!--
 截图占位清单（放入 docs/screenshots/ 后自动显示）：
@@ -273,7 +272,7 @@ FORWARDED_ALLOW_IPS=127.0.0.1
 12. **API Token 有效期上限 365 天**，不支持「永不过期」：令牌是无人值守凭据，泄漏后靠到期兜底。长期自动化就在到期前重新签发（列表里能看到剩余天数）。
 13. **不回显组件版本**：应用不再发 `Server` / `X-Powered-By`（`run.py` 的 `server_header=False` + 安全头中间件兜底）；nginx 侧用 `server_tokens off;` 只留 `Server: nginx`。
 14. **生产不发布 sourcemap**：`vite.config.ts` 里 `build.sourcemap=false` —— `.map` 的 `sourcesContent` 就是完整 TS 源码。nginx 再对 `*.map` 返回 404 兜底，防止误传旧产物。要排障用 `npm run dev`。
-15. **版本与 RBAC 清单需登录**：`/api/version`、`/api/auth/permissions` 已加登录依赖；只有 `/api/config/site`（站点名、Logo、备案号）保持匿名，供登录页与官网渲染。
+15. **版本与 RBAC 清单需登录**：`/api/auth/permissions` 需登录，`/api/version` 进一步收紧为仅管理员（`settings.manage`）；只有 `/api/config/site`（站点名、Logo、备案号）保持匿名，供登录页与官网渲染。
 
 需要客户端证书（mTLS）时，在 Nginx 的 server 块里加：
 
@@ -539,6 +538,7 @@ PVE 里把 PBS 注册成存储之后，存储页就会显示 PBS 徽标、最近
 | `STEP_UP_REQUIRED` / `STEP_UP_WINDOW_MINUTES` | `true` / `5` | 危险操作是否要二次确认，以及确认的有效窗口 |
 | `FRP_ALLOW_LOCAL_CIDRS` / `FRP_BLOCK_PANEL_SUBNET` | 空 / `true` | 穿透目标白名单：普通用户只能指向自己名下的虚机 / 容器 IP，这里可再放行网段（也能在穿透页按人放行具体 IP）；默认还禁止指向面板自身网段 |
 | `FRP_REMOTE_PORT_MIN` / `FRP_REMOTE_PORT_MAX` | `40000` / `50000` | 穿透公网端口区间的初始值 / 兜底。管理员可在页面上改成 frps 实际可用的那一段（改完即时生效并写库，以页面为准）；22 / 80 / 443 / 7000 / 7001 / 8006 始终不可占用 |
+| `CONNECTION_TEST_ALLOW_TARGETS` | 空 | 「测试连接」的出站目标白名单（IP / CIDR / 主机名，逗号分隔）。默认只允许测试已保存连接里登记的 host:port，新增连接需先保存再测；填这里可在保存前放行。私网与回环需登记或白名单，链路本地（含云元数据）、组播、保留地址始终拒绝 |
 | `PVE_HOST` / `PVE_PORT` | 空 / `8006` | Proxmox 地址（不带协议）与 API 端口 |
 | `PVE_TOKEN_ID` / `PVE_TOKEN_SECRET` | 空 | 形如 `panel@pve!panel` 与 Token 的 UUID |
 | `PVE_DEFAULT_NODE` | 空 | 节点作用域接口的默认节点；多节点时用于兜底 |
@@ -658,7 +658,7 @@ qemu-img dd -f qcow2 if=<卷路径> bs=512 count=1 of=/tmp/mbr.bin && hexdump -C
 
 **Docker 部署，容器起不来或反复重启**：多半是数据库口令对不上。`docker compose logs panel | tail -30` 找 `Access denied` / `Can't connect`，改法见 [Docker 部署](#docker-部署) 里那两条注意事项。
 
-**面板跑在 Python 3.9 / 3.10 上，某些功能不正常（典型：告警邮件发不出、更新失败）。** 整套依赖按 Python 3.11+ 固定，最硬的限制是 Pillow 12 要求 ≥3.10 —— 3.9 上 `pip install -r backend/requirements.txt` 直接解析失败，依赖停在旧版本，一键更新也卡在装依赖这步。新版 `start-prod.sh` / `run.py` 会直接拒绝低版本解释器并给出安装命令；登录后访问 `/api/version` 能看到实际运行的 Python 版本。装好 3.11+ 后 `rm -rf .venv` 再启动即可（数据库与配置不受影响）。
+**面板跑在 Python 3.9 / 3.10 上，某些功能不正常（典型：告警邮件发不出、更新失败）。** 整套依赖按 Python 3.11+ 固定，最硬的限制是 Pillow 12 要求 ≥3.10 —— 3.9 上 `pip install -r backend/requirements.txt` 直接解析失败，依赖停在旧版本，一键更新也卡在装依赖这步。新版 `start-prod.sh` / `run.py` 会直接拒绝低版本解释器并给出安装命令；启动日志里的「运行环境：Python x.y.z」会写出实际解释器版本。装好 3.11+ 后 `rm -rf .venv` 再启动即可（数据库与配置不受影响）。
 
 **主机安全页面读不到数据**：容器里 `/var/log`、`/proc` 属于容器而不是宿主机，页面会说明，需要时按 `docker-compose.yml` 里注释的挂载项只读挂进去。
 

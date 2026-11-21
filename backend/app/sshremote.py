@@ -1279,10 +1279,19 @@ def _connect(row: Dict[str, Any], trust_first: bool = False) -> Tuple[paramiko.S
             "该主机保存的 SSH 凭据无法解密（SECRET_KEY 变更过？），"
             "请到「受管主机」重新填写私钥或口令"
         )
-    if str(row.get("auth_type")) == "password":
+    auth_type = str(row.get("auth_type") or "key").strip().lower()
+    looks_like_key = "PRIVATE KEY" in secret
+    if auth_type == "password":
         if not secret:
             raise ValueError(
                 "该主机使用口令登录，但没有保存口令；请到「受管主机」重新填写"
+            )
+        if looks_like_key:
+            # 很常见的误配：先按密钥建的主机改成「口令」，私钥没换就直接测连接。
+            # 直接把私钥当口令发出去，服务端只会回一句 Authentication failed。
+            raise ValueError(
+                "该主机的登录方式被设为「口令」，但保存的内容是私钥；"
+                "请重新填写登录口令，或把登录方式改回「密钥」"
             )
         kwargs["password"] = secret
     else:
@@ -1290,12 +1299,42 @@ def _connect(row: Dict[str, Any], trust_first: bool = False) -> Tuple[paramiko.S
             raise ValueError(
                 "该主机使用密钥登录，但没有保存私钥；请到「受管主机」重新填写"
             )
+        if not looks_like_key:
+            raise ValueError(
+                "该主机的登录方式被设为「密钥」，但保存的内容不是私钥；"
+                "请粘贴以 -----BEGIN ... PRIVATE KEY----- 开头的私钥，"
+                "或把登录方式改为「口令」"
+            )
         kwargs["pkey"] = _load_key(secret)
     try:
         client.connect(**kwargs)
     except FingerprintMismatch:
         client.close()
         raise
+    except paramiko.AuthenticationException as exc:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        # paramiko 只会给一句英文 “Authentication failed.”，用户完全不知道该改
+        # 什么。把最常见的四种原因摆出来（审计/使用反馈：终端只显示这一句时，
+        # 用户会误以为是面板故障）。
+        raise RuntimeError(
+            i18n.pick(
+                "SSH 认证失败：目标机拒绝了用户名 / 口令或私钥。请依次核对："
+                "①「受管主机」里的用户名是否正确；"
+                "② 登录口令是否改过；"
+                "③ 服务器是否禁用了口令登录（sshd 的 PasswordAuthentication no）；"
+                "④ 面板下发的虚拟机是否还信任当前面板公钥"
+                "（轮换过面板密钥的需要重新下发公钥）。",
+                "SSH authentication failed: the target rejected the username, "
+                "password, or key. Check: (1) the username saved for this managed "
+                "host; (2) whether the password changed; (3) whether the server "
+                "disables password auth (PasswordAuthentication no); (4) whether a "
+                "panel-provisioned VM still trusts the current panel public key "
+                "(re-deploy the key after rotating it).",
+            )
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         try:
             client.close()
@@ -1322,6 +1361,28 @@ def _connect(row: Dict[str, Any], trust_first: bool = False) -> Tuple[paramiko.S
     except Exception:  # noqa: BLE001 - 设置失败不影响本次连接
         logger.debug("设置 SSH keepalive 失败", exc_info=True)
     return client, fingerprint
+
+
+def verify_auth(row: Dict[str, Any]) -> Tuple[bool, str]:
+    """完整做一次 SSH 建连（认证 + 指纹策略），成功返回 ``(True, 指纹)``。
+
+    给终端预检用：只探 TCP 端口会得出「网络通」，但真正打开终端时才在
+    ``Authentication failed`` 上失败 —— 用户看到的是 WebSocket 一句笼统的错误，
+    根本不知道是用户名、口令、私钥还是 sshd 配置的问题。这里复用与终端**完全
+    相同**的 :func:`_connect`，把原因在普通 HTTP 响应里说清楚。
+    """
+    client: Optional[paramiko.SSHClient] = None
+    try:
+        client, fingerprint = _connect(row)
+        return True, fingerprint
+    except Exception as exc:  # noqa: BLE001 - 预检就是把异常翻译成可读原因
+        return False, str(exc)
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _sudo_prefix(row: Dict[str, Any]) -> str:

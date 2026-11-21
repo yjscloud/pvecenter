@@ -1870,7 +1870,9 @@ async def dispatch(
 SAMPLE_TARGET = "web-1"
 
 
-async def test_template(cfg: Dict[str, Any], owner: str) -> Tuple[bool, str]:
+async def test_template(
+    cfg: Dict[str, Any], owner: str, *, dry_run: bool = False
+) -> Tuple[bool, str]:
     """用**编辑中**（可能还没保存）的模板发一条样例通知，邮件 + 飞书各一份。
 
     刻意不看通道开关：点「测试」就是想看效果，被自己的开关拦下只会让人以为
@@ -1967,6 +1969,21 @@ async def test_template(cfg: Dict[str, Any], owner: str) -> Tuple[bool, str]:
     card = build_card("warning", title, rule, card_fields, _now_text(now))
     feishu = await load_feishu(owner)
     email_cfg = await load_alert_email(owner)
+    if dry_run:
+        # 只渲染、不投递：把标题与正文回给调用方，既能看到模板效果，又不会
+        # 往真实群 / 邮箱里灌消息（审计项 V-14）。
+        channels = i18n.pick("飞书", "Feishu") if feishu.get("webhook") else ""
+        if await resolve_email_recipients(owner):
+            channels = (
+                channels + i18n.pick(" / 邮件", " / email")
+                if channels
+                else i18n.pick("邮件", "email")
+            )
+        return True, i18n.pick(
+            f"演练模式：未实际推送（{channels or '无已配置通道'}）。标题：{title}；正文：{text}",
+            f"Dry run: nothing was sent ({channels or 'no channel configured'}). "
+            f"Title: {title}; body: {text}",
+        )
     return await dispatch(
         owner,
         {**feishu, "enabled": True},

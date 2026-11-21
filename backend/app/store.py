@@ -511,6 +511,16 @@ async def count_users_with_role(role_id: str) -> int:
         return int(count)
 
 
+async def count_users_with_status(status: str) -> int:
+    """按审批状态计数（注册队列容量兜底用）。"""
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM users WHERE status = ?", (status,)
+        )
+        (count,) = await cursor.fetchone()
+        return int(count)
+
+
 def _row_to_role(row: database.Row) -> Dict[str, Any]:
     try:
         perms = json.loads(row["permissions"] or "[]")
@@ -1772,24 +1782,18 @@ def public_connection_config(config: Optional[Dict[str, Any]] = None) -> Dict[st
 
 
 def public_connection_brief(config: Dict[str, Any]) -> Dict[str, Any]:
-    """连接的**精简视图**：只有标识、名称与区域。
+    """连接的**最小视图**：只保留标识与展示名。
 
-    普通用户也需要连接列表 —— 节点列表按「区域 → 连接 → 节点」分组、创建向导要
-    选目标 PVE、地址池要按连接限定适用范围 —— 但这些只需要「认得出是哪台」，不
-    需要它的地址、令牌或控制台凭据。
+    普通用户确实需要连接列表 —— 节点列表按来源 PVE 分组、创建向导要选目标、
+    地址池要按连接限定适用范围 —— 但这些只需要「认得出是哪台」，既不需要地址、
+    令牌、控制台凭据，也不需要区域 / 暂停 / 配置完成度 / 兜底标记这些基础设施
+    状态（审计项 PVE-01）。
 
-    连接配置描述的是「面板能碰哪些集群、拿什么凭据碰」，属于管理信息，不该跟着
-    ``node.view`` 之类的权限扩散出去（裁剪点见 routers/config.list_connections）。
+    能认出来就够了：详细的拓扑与运行状态仍只在管理员的完整视图里。
     """
     return {
         "id": str(config.get("id", "")),
         "name": str(config.get("name", "")),
-        "region": str(config.get("region", "")),
-        # 精简视图也要带暂停标记：节点页/筛选器据此把这台标成「已暂停」
-        "paused": bool(config.get("paused")),
-        "configured": bool(
-            config.get("host") and config.get("token_id") and config.get("token_secret")
-        ),
     }
 
 

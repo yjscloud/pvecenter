@@ -300,8 +300,8 @@ export const NAV_SECTIONS: NavSection[] = [
     ],
   },
   {
-    /* 只留「防」与「查」：网络策略（防火墙）、主机加固与体检（SSH 安全 /
-       安全基线 / 端口进程）、追溯（登录审计）。
+    /* 只留「防」与「查」：主机接入与体检（SSH 安全 / 端口进程 / 安全基线）、
+       追溯（登录审计）、网络策略（访问控制 / 防火墙）。
        两次外移把这组收回 5 项：处置类（应急响应）在「数据保护」，
        解读类（AI 排查助手）在「观测与集成」。
 
@@ -322,14 +322,6 @@ export const NAV_SECTIONS: NavSection[] = [
         permission: 'ssh.view',
       },
       {
-        /* 页面里虚拟机与容器是两个独立作用域、两套权限：哪一侧都能进
-           （只授予容器权限的自定义角色照样要能配容器防火墙） */
-        to: '/firewall',
-        labelKey: 'nav.firewall',
-        icon: <IconLock size={18} />,
-        permissions: ['firewall.view', 'ct.firewall.view'],
-      },
-      {
         /* 端口进程和安全基线问的都是「这台机器有没有问题」：端口管运行面
            （谁在监听、进程可不可疑），基线管配置面（口令、补丁、内核参数）。
            先列运行面、再列配置面，从看得见的连接走到底层配置。 */
@@ -339,9 +331,9 @@ export const NAV_SECTIONS: NavSection[] = [
         permission: 'ports.view',
       },
       {
+        /* 盾牌 + 对勾：和「体检 / 达标」的语义对上，而不是一个通用对勾 */
         to: '/security-baseline',
         labelKey: 'nav.securityBaseline',
-        /* 盾牌 + 对勾：和「体检 / 达标」的语义对上，而不是一个通用对勾 */
         icon: <IconShieldCheck size={18} />,
         permission: 'baseline.view',
       },
@@ -350,6 +342,15 @@ export const NAV_SECTIONS: NavSection[] = [
         labelKey: 'nav.hostAudit',
         icon: <IconClock size={18} />,
         permission: 'ssh.view',
+      },
+      {
+        /* 访问控制排在这一组末尾：主机侧的接入、体检与追溯都看完之后，再看
+           网络策略。页面里虚拟机与容器是两个独立作用域、两套权限，哪一侧都能进
+           （只授予容器权限的自定义角色照样要能配容器防火墙） */
+        to: '/firewall',
+        labelKey: 'nav.firewall',
+        icon: <IconLock size={18} />,
+        permissions: ['firewall.view', 'ct.firewall.view'],
       },
     ],
   },

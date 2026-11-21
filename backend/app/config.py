@@ -117,6 +117,11 @@ class Settings(BaseSettings):
     # 放在 VPN / 零信任网关之后仍建议配置，作为第二道闸；直接暴露公网时
     # 至少要配合 TOTP_REQUIRED_ROLES=admin（见 .env.example）。
     panel_allow_cidrs: str = ""
+    # 漏洞报告渠道，写进 /.well-known/security.txt（RFC 9116）。可填邮箱
+    # （自动补 mailto:）或 https 链接，多个用逗号分隔。留空时回落到
+    # `mailto:security@<面板域名>`，至少让安全研究员知道该找谁，而不是只能
+    # 去公开 issue 区提交（审计项 V-16）。
+    security_contact: str = ""
     # 新来源 IP 登录告警：某个账号第一次从某 IP 成功登录时，给管理员发
     # 站内消息 + 邮件（邮件未配置时只发站内消息）。用于尽早发现凭据泄露。
     login_ip_alert: bool = True
@@ -153,6 +158,11 @@ class Settings(BaseSettings):
     # （可在「设置 → 登录验证」里切换成图形验证码或关闭，见 app/captcha.py）。
     # 内网纯人用或自动化联调时可设 LOGIN_CAPTCHA=0 彻底关闭。
     login_captcha: bool = True
+
+    # 待审批注册队列的上限（审计项 M-02）：待审批账号堆到这个数就自动拒绝新的
+    # 注册请求（429 + 审计含来源 IP），避免匿名脚本把审批队列刷爆、把管理员
+    # 淹没。管理员清理后自然恢复；设为 0 表示不限制（不推荐）。
+    register_pending_limit: int = 100
 
     # --- 登录失败锁定 ------------------------------------------------------
     # 验证码可以被关掉，光靠它挡不住脚本。这里按「账号」和「来源 IP」双计数：
@@ -202,6 +212,23 @@ class Settings(BaseSettings):
     # 22 / 80 / 443 / 7000 / 7001 / 8006 等关键端口始终不可占用，与区间无关。
     frp_remote_port_min: int = 40000
     frp_remote_port_max: int = 50000
+
+    # --- 「测试连通性」目标白名单（SSRF 兜底）-----------------------------
+    # `/api/config/connection/test` 与 `/api/pbs/config/test` 会让面板后端向
+    # 请求体里的 host:port 发起出站请求。面板通常与 PVE / PBS / 跳板机同处一个
+    # 内网段，若放任前端决定目标，这两个接口就等于「以面板为跳板的内网探测器」。
+    #
+    # 默认策略（留空即最严）：只允许测试**已保存连接**里登记的 host:port。
+    # 新增连接在保存前的「测试」会被拒绝 —— 先保存再测；确实要在保存前测试时，
+    # 在这里显式放行（逗号分隔的 IP / CIDR / 主机名，例如
+    #   CONNECTION_TEST_ALLOW_TARGETS=172.16.149.0/24,pve.example.com
+    # ）。
+    #
+    # RFC1918 私网与回环只有「已登记 / 已白名单」才允许 —— 面板连内网 PVE、
+    # 甚至与 PVE 同机部署（127.0.0.1）都是正常业务，不能一刀切。链路本地
+    # （含云元数据 169.254.169.254）、组播、保留、未指定地址则始终拒绝，
+    # 即使出现在这份名单里也不放行。
+    connection_test_allow_targets: str = ""
 
     # --- 个人 API Token ----------------------------------------------------
     # 允许用户自助创建长期令牌，供脚本 / 外部系统调用（见 apitokens.py）。

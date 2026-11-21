@@ -55,7 +55,7 @@ export function ScopeSelect() {
   const adoptedPrefRef = useRef(false);
 
   /* 连接列表：与节点页 / 连接管理 / 设置页共用同一份缓存（queryKey 一致）。
-     普通用户拿到的是精简版（只有 id / 名称 / 区域），够用来选。 */
+     普通用户只拿到 id / 名称；切换器本身也只对管理员显示。 */
   const connectionsQuery = useQuery({
     queryKey: ['connections'],
     queryFn: connectionsApi.list,

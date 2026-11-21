@@ -568,9 +568,15 @@ export const mailApi = {
   get: () => get<MailConfig>('/config/mail'),
   /** 保存配置，需要 settings.manage；password 留空 = 沿用旧值 */
   save: (body: MailConfigInput) => put<MailConfig>('/config/mail', body),
-  /** 发一封测试邮件。to 留空时发给「管理员收件人」 */
-  test: (to = '') =>
-    post<{ ok: boolean; detail: string }>('/config/mail/test', { to }),
+  /**
+   * 发一封测试邮件。to 留空时发给「管理员收件人」。
+   * `dryRun` 默认 true：后端只校验配置与收件人、不实际投递；确认要真发时传 false。
+   */
+  test: (to = '', dryRun = true) =>
+    post<{ ok: boolean; detail: string; dry_run: boolean }>('/config/mail/test', {
+      to,
+      dry_run: dryRun,
+    }),
 };
 
 /* ---------------------------------------------------------------------------
@@ -2096,9 +2102,15 @@ export const alertsApi = {
       "/alerts/template",
       cfg,
     ),
-  /** 用编辑中的模板发一条样例通知（邮件 + 飞书），不落库 */
-  testTemplate: (cfg: AlertTemplate) =>
-    post<{ detail: string }>("/alerts/template/test", cfg),
+  /**
+   * 用编辑中的模板发一条样例通知（邮件 + 飞书），不落库。
+   * `dryRun` 默认 true：只渲染返回、不实际投递；确认要真发时传 false。
+   */
+  testTemplate: (cfg: AlertTemplate, dryRun = true) =>
+    post<{ detail: string; dry_run: boolean }>(
+      `/alerts/template/test?dry_run=${dryRun}`,
+      cfg,
+    ),
   saveFeishu: (cfg: any) => put<any>("/alerts/feishu", cfg),
   /** 推送来源开关（全局，管理员）。只传要改的来源即可，其余保持不变。 */
   saveNotifySources: (cfg: Record<string, boolean>) =>
@@ -2112,9 +2124,12 @@ export const alertsApi = {
   saveEmail: (cfg: AlertEmailConfig) =>
     put<{ email: AlertEmailConfig; mail_ready: boolean }>("/alerts/email", cfg),
   saveRules: (rules: AlertRule[]) => put<{ rules: AlertRule[] }>("/alerts/rules", rules),
-  /** 发测试通知；channel 默认飞书，通用 Webhook 传 "webhook" */
-  test: (channel: "feishu" | "webhook" = "feishu") =>
-    post<any>(`/alerts/test?channel=${channel}`),
+  /**
+   * 发测试通知；channel 默认飞书，通用 Webhook 传 "webhook"。
+   * `dryRun` 默认 true：只检查通道配置、不实际推送；确认要真发时传 false。
+   */
+  test: (channel: "feishu" | "webhook" = "feishu", dryRun = true) =>
+    post<any>(`/alerts/test?channel=${channel}&dry_run=${dryRun}`),
   check: () => post<{ fired: AlertRecord[]; count: number }>("/alerts/check"),
   clearHistory: () =>
     del<{ removed: number; detail: string }>("/alerts/history"),

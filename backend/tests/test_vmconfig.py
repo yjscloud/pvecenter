@@ -1031,7 +1031,11 @@ class TestPermissions:
         assert security.has_permission("operator", "ct.power")
         assert security.has_permission("operator", "ct.console")
         assert security.has_permission("operator", "ct.delete")
-        assert security.has_permission("operator", "ct.firewall.manage")
+        # 容器防火墙：默认租户角色只读，写权限属基础设施运维（审计项 V-15），
+        # 需要时在自定义角色里单独授予。
+        assert security.has_permission("operator", "ct.firewall.view")
+        assert not security.has_permission("operator", "ct.firewall.manage")
+        assert not security.has_permission("operator", "firewall.manage")
         assert security.has_permission("viewer", "ct.view")
         assert not security.has_permission("viewer", "ct.power")
         # 只有容器权限的用户不该因此获得虚拟机能力（反之亦然）——

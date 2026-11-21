@@ -296,7 +296,7 @@ async def reset(
 ) -> Dict[str, Any]:
     """按选定方式重置客户机内某个用户的口令。
 
-    口令强度沿用面板自己那一套（``security.password_policy_error``：至少 8 位、
+    口令强度沿用面板自己那一套（``security.password_policy_error``：至少 12 位、
     字母 + 数字）。PVE 对 agent 方式只要求 5 位，但客户机口令是这台机器的最高
     权限凭据，没必要比面板账号更松。
     """

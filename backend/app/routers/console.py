@@ -332,6 +332,30 @@ async def upload_console_file(
             detail=i18n.t("error.permission_denied", permission=needed),
         )
 
+    if node and vmid:
+        # 上传不是「往自己机器里放个文件」那么简单：它会在面板上留一份最长
+        # 24 小时、可被任意能访问面板的客户端拿走的文件（token 即凭据）。
+        # 此前只校验了 console 权限，vmid 可以随便填 —— 999 这种不存在的号
+        # 也照样成功，元数据里的「目标机器」于是变成一句假话（审计项 V-08）。
+        # 归属校验对所有角色都跑；存在性则再问一次 PVE（管理员也没有理由给
+        # 一个不存在的客户机建中转）。
+        guest_kind = ownership.KIND_CT if kind == "lxc" else ownership.KIND_VM
+        await guestguard.require_guest_object(user, node, vmid, guest_kind)
+        client = get_client()
+        try:
+            if kind == "lxc":
+                await client.lxc_status(node, int(vmid))
+            else:
+                await client.qemu_status(node, int(vmid))
+        except ProxmoxError as exc:
+            # PVE 对不存在的客户机回 404；原样转成「资源不存在」，与归属校验
+            # 的拒绝语义保持一致（不区分「没有这台」与「不是你的」）。
+            if exc.status_code == 404:
+                raise HTTPException(
+                    status_code=404, detail=guestguard.NOT_FOUND_DETAIL
+                ) from exc
+            raise
+
     target = f"{node}/{vmid}" if node and vmid else str(file.filename or "")
     try:
         meta = await console_files.save(
@@ -373,11 +397,21 @@ async def upload_console_file(
     }
 
 
-async def _console_file_response(token: str) -> FileResponse:
+async def _console_file_response(token: str, request: Request) -> FileResponse:
     found = await console_files.load(token)
     if found is None:
         raise HTTPException(status_code=404, detail=i18n.t("console.fileMissing"))
     path, meta = found
+    # 这里刻意不要求登录：来拉文件的是客户机，它没有面板凭据，token 就是
+    # capability。能做的不是「再绑一层会话」，而是把使用痕迹留下来 —— 谁在
+    # 什么时候从哪个 IP 取走了哪个 token，出了问题至少查得到（审计项 V-07）。
+    logger.info(
+        "控制台中转文件下载：token=%s size=%s ip=%s ua=%s",
+        token,
+        meta.get("size"),
+        security.client_ip(request) or "-",
+        (request.headers.get("user-agent") or "-")[:120],
+    )
     return FileResponse(
         path,
         media_type="application/octet-stream",
@@ -385,24 +419,32 @@ async def _console_file_response(token: str) -> FileResponse:
         headers={
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
+            # URL 里带 token，任何外链 / 图片引用都不该把它带到第三方站点
+            "Referrer-Policy": "no-referrer",
+            # 即使将来 MIME 判断出错，也不给脚本执行的机会
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            # 响应只属于当前请求，禁止被跨源页面当作资源加载
+            "Cross-Origin-Resource-Policy": "same-origin",
         },
     )
 
 
 @router.get("/console/files/{token}")
-async def download_console_file(token: str) -> FileResponse:
+async def download_console_file(token: str, request: Request) -> FileResponse:
     """客户机拉取中转文件（凭 token，不需要登录）。"""
-    return await _console_file_response(token)
+    return await _console_file_response(token, request)
 
 
 @router.get("/console/files/{token}/{filename:path}")
-async def download_console_file_named(token: str, filename: str = "") -> FileResponse:
+async def download_console_file_named(
+    token: str, request: Request, filename: str = ""
+) -> FileResponse:
     """同一条下载，多带一段文件名。
 
     文件名只是让 URL 与命令行看起来更像回事（``curl -O`` 也能直接用），
     真正的裁决者仍是 token；路径段不参与拼盘上路径。
     """
-    return await _console_file_response(token)
+    return await _console_file_response(token, request)
 
 
 @router.delete("/console/files/{token}")

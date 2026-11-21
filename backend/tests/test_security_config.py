@@ -237,9 +237,10 @@ class TestHttpsEnforcement:
         sent = _call_middleware(_http_scope(scheme="https"))
         assert sent[0]["status"] == 200
         headers = dict(sent[0]["headers"])
-        # includeSubDomains 必须带上：只锁 apex、不锁子域，等于留一条降级旁路
+        # includeSubDomains 必须带上：只锁 apex、不锁子域，等于留一条降级旁路。
+        # preload 是给浏览器预加载列表的声明（审计项 V-05）。
         assert headers[b"strict-transport-security"] == (
-            b"max-age=31536000; includeSubDomains"
+            b"max-age=31536000; includeSubDomains; preload"
         )
 
     def test_loopback_health_check_exempt(self, https_on) -> None:

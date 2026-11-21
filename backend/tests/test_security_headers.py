@@ -20,6 +20,11 @@ def test_security_headers_on_every_response() -> None:
     assert "camera=()" in headers["permissions-policy"]
     assert headers["x-frame-options"] == "DENY"
 
+    # 跨源隔离三件套（V-05）：同源面板不该被跨源窗口引用 / 嵌入 / 当资源加载
+    assert headers["cross-origin-opener-policy"] == "same-origin"
+    assert headers["cross-origin-embedder-policy"] == "require-corp"
+    assert headers["cross-origin-resource-policy"] == "same-origin"
+
     csp = headers["content-security-policy"]
     assert "default-src 'self'" in csp
     # 普通页面的脚本只能是同源 —— 这是 XSS 的纵深防线，别被文档需求带偏

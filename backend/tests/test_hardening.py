@@ -3,7 +3,7 @@
 对应四点修复：
 
 8. access token 从 localStorage 搬进 HttpOnly Cookie，并加 CSRF 双提交校验；
-9. 管理员建号的密码强度与注册 / 自助改密统一（8 位 + 字母数字 + 非常见弱口令）；
+9. 管理员建号的密码强度与注册 / 自助改密统一（12 位 + 字母数字 + 非常见弱口令）；
 10. 敏感数据的**读取**也进审计（连接凭据、邮件配置、审计日志本身）；
 11. 危险操作（删虚拟机、改连接凭据、增删账号）要求二次确认身份。
 """
@@ -174,7 +174,7 @@ class TestPasswordPolicy:
         resp = api.post(
             "/api/users",
             headers=headers,
-            json={"username": "weakling", "password": "password123", "role": "viewer"},
+            json={"username": "weakling", "password": "password1234", "role": "viewer"},
         )
         assert resp.status_code == 400
         assert "常见" in resp.json()["detail"]
@@ -194,6 +194,33 @@ class TestPasswordPolicy:
             json={"username": "newbie", "password": "abc123", "email": "a@b.com"},
         )
         assert resp.status_code == 422
+
+    def test_register_requires_captcha_when_enabled(self, api, monkeypatch) -> None:
+        """注册是匿名写接口：开了人机校验就必须**服务端**强制，不能只看前端。"""
+        from app import captcha
+
+        async def image_mode() -> str:
+            return captcha.MODE_IMAGE
+
+        monkeypatch.setattr(captcha, "get_mode", image_mode)
+        resp = api.post(
+            "/api/auth/register",
+            json={"username": "nocaptcha", "password": STRONG, "email": "a@b.com"},
+        )
+        assert resp.status_code == 400
+        assert "验证码" in resp.json()["detail"]
+
+
+class TestCaptchaRateLimit:
+    def test_captcha_endpoint_is_rate_limited(self, api) -> None:
+        """签发验证码要绘图 / 出题：匿名入口必须限流，否则是一条 CPU 放大链。"""
+        limit = max(1, int(settings.captcha_rate_limit_per_minute))
+        statuses = [api.get("/api/auth/captcha").status_code for _ in range(limit)]
+        assert statuses == [200] * limit
+
+        resp = api.get("/api/auth/captcha")
+        assert resp.status_code == 429
+        assert int(resp.headers["retry-after"]) >= 1
 
 
 # ------------------------------------------------------------ 敏感读取审计

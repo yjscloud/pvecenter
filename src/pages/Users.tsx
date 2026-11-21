@@ -1472,7 +1472,7 @@ function UserEditor({
 
     if (!isEdit || password) {
       if (!password) next.password = t('users.validation.passwordRequired');
-      else if (password.length < 8) next.password = t('users.validation.passwordMin');
+      else if (password.length < 12) next.password = t('users.validation.passwordMin');
       else if (!/[a-zA-Z]/.test(password) || !/\d/.test(password)) {
         next.password = t('users.validation.passwordAlnum');
       }
@@ -2077,7 +2077,7 @@ function ResetPasswordDialog({
   const submit = async () => {
     if (!user || done) return;
     if (mode === 'manual') {
-      if (password.length < 8) {
+      if (password.length < 12) {
         setError(t('users.validation.passwordMin'));
         return;
       }

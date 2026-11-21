@@ -2490,7 +2490,9 @@ function EmailSection() {
   const sendTest = async () => {
     setTesting(true);
     try {
-      const res = await mailApi.test(testTo.trim());
+      // 用户点的是「测试发送」，这里明确表达「要真发」；dry_run 默认是
+      // 演练，防止脚本 / 误调用把测试邮件投到真实收件箱。
+      const res = await mailApi.test(testTo.trim(), false);
       toast.success(t('settings.mailTestSent'), res.detail);
     } catch (err) {
       toast.error(t('settings.mailTestFailed'), errorMessage(err));

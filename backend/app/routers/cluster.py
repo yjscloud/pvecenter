@@ -120,10 +120,15 @@ async def _scope_resources(
 
     * 管理员：不限制；
     * 区域管理员：本区域连接全放行，区域外只留基础设施条目；
-    * 其余角色：客户机条目必须是自己名下的（严格隔离，无归属记录的存量机器不发）；
-    * 基础设施条目（节点 / 存储 / SDN）：不裁剪 —— 它们本来就由各自的权限点管控，
-      一刀切会让「存储页看得到、资源接口看不到」。
-    * 模板（``template=1``）：保留 —— 模板库是共享资源，与 ``/templates`` 一致。
+    * 其余角色：客户机条目（含模板）必须是自己名下的，严格隔离，无归属记录的
+      存量机器不发 —— 与 ``GET /api/vms`` 口径完全一致：同一会话下两个接口的
+      可见集合必须相等，否则「列表看不到、资源接口看得到」就是越权；
+    * 基础设施条目（节点 / 存储 / SDN）：不裁剪 —— 它们本来就由各自的权限点
+      （``node.view`` / ``storage.view``）管控，一刀切会让「存储页看得到、
+      资源接口看不到」。
+
+    模板也在裁剪范围内：需要浏览模板库时用 ``GET /api/templates``（独立的
+    ``template.view`` 权限与用途），不要靠资源清单顺带泄露未授权的模板名。
     """
     scope = security.visible_owner(user)
     if scope is None:
@@ -146,9 +151,6 @@ async def _scope_resources(
             continue
         if kind not in _GUEST_RESOURCE_TYPES:
             continue  # 认不出的类型宁可不发
-        if str(item.get("template") or "0") in ("1", "True", "true"):
-            out.append(item)
-            continue
         ref = ownership.vm_ref(
             connection_id, str(item.get("node") or ""), item.get("vmid")
         )
@@ -513,7 +515,7 @@ async def cluster_fleet_status(
 @router.get("/connections/status")
 async def connections_status(
     request: Request,
-    user: Dict[str, Any] = Depends(security.get_current_user),
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
 ) -> List[Dict[str, Any]]:
     """逐条探测已保存 PVE 的可达性。
 
@@ -522,14 +524,16 @@ async def connections_status(
 
     带一层短 TTL 缓存（见 :data:`CONNECTIONS_STATUS_TTL`）：它逐台真实发请求，
     而首页会定时轮询 —— 多开标签时同一轮探测被重复触发纯属浪费。
+
+    仅管理员：它会拿库里的 API Token 逐台真实发请求，并回报主机地址、端口、
+    可达性与节点数 —— 这既是连接配置（管理信息），也等于给低权限账号一个
+    「用面板去探内网」的开关（审计项 PVE-01，与 ``GET /connections`` 同口径）。
+    普通用户的节点页仍能通过 ``GET /nodes`` 看到自己可用的机器，只是不再看到
+    「哪条连接挂了 / 哪条连接令牌权限不足」这类基础设施状态。
     """
     # 这个接口会拿库里的 API Token 逐台真实发请求 —— 等于「用凭据打了哪些主机」，
     # 事后追溯时属于必看的一条。
     await security.audit_read(request, user, "config.connections_status.read")
-
-    # 这个接口只要求登录，而它会逐台回报「哪台通、哪台不通」—— 地址与端口
-    # 属于连接配置（管理信息），只给管理员，与 /connections 同一口径。
-    can_manage = security.has_user_permission(user, "settings.manage")
 
     async def _build() -> List[Dict[str, Any]]:
         result: List[Dict[str, Any]] = []
@@ -537,11 +541,8 @@ async def connections_status(
             item: Dict[str, Any] = {
                 "id": str(profile.get("id") or ""),
                 "name": connection_label(profile),
-                **(
-                    {"host": profile.get("host"), "port": profile.get("port")}
-                    if can_manage
-                    else {}
-                ),
+                "host": profile.get("host"),
+                "port": profile.get("port"),
                 "ok": False,
                 "error": None,
                 "node_count": 0,

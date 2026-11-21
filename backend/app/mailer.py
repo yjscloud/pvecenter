@@ -727,8 +727,8 @@ def password_reset_mail(username: str, reset_url: str) -> Tuple[str, str, str]:
         ),
         "",
         i18n.pick(
-            "请在 30 分钟内打开下面的链接设置新密码（链接只能用一次）：",
-            "Open the link below within 30 minutes to set a new password (the link can be used once):",
+            "请在 15 分钟内打开下面的链接设置新密码（链接只能用一次）：",
+            "Open the link below within 15 minutes to set a new password (the link can be used once):",
         ),
         reset_url,
         "",
@@ -745,7 +745,7 @@ def password_reset_mail(username: str, reset_url: str) -> Tuple[str, str, str]:
         f"{i18n.pick(f'账号 <b>{username}</b> 收到了一次密码重置请求。', f'A password reset was requested for account <b>{username}</b>.')}"
         "</p>"
         f"<p style='margin:6px 0'>"
-        f"{i18n.pick('请在 30 分钟内点击下面的按钮设置新密码（链接只能用一次）：', 'Click the button below within 30 minutes to set a new password (the link can be used once):')}"
+        f"{i18n.pick('请在 15 分钟内点击下面的按钮设置新密码（链接只能用一次）：', 'Click the button below within 15 minutes to set a new password (the link can be used once):')}"
         "</p>"
         # 纯文字链接在手机上只有十几像素高的点击区，很容易点不中；
         # 改成有底色的块级按钮，高度约 45px，拇指够得着。

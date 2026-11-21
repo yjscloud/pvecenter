@@ -2281,7 +2281,7 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'console.fileCmdHint':
     'This also works when the guest has no internet access but can reach the panel. If the panel uses a self-signed certificate, curl needs -k.',
   /* ---------------------------------------------------- Reset guest password */
-  'guestPw.errMinLength': 'The password must be at least 8 characters',
+  'guestPw.errMinLength': 'The password must be at least 12 characters',
   'guestPw.errAlnum': 'The password must contain both letters and digits',
   'guestPw.errUsernameRequired': 'Please enter the username inside the guest',
   'guestPw.errMismatch': 'The two passwords do not match',
@@ -2300,7 +2300,7 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'guestPw.fieldUsername': 'Username inside the guest',
   'guestPw.usernameHint': 'Containers usually use root; for VMs enter the account that actually exists on the machine',
   'guestPw.fieldPassword': 'New password',
-  'guestPw.passwordPlaceholder': 'At least 8 characters with letters and digits',
+  'guestPw.passwordPlaceholder': 'At least 12 characters with letters and digits',
   'guestPw.passwordHint': 'The same strength rules as panel accounts',
   'guestPw.showPassword': 'Show password',
   'guestPw.hidePassword': 'Hide password',

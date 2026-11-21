@@ -20,12 +20,30 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
+import pytest  # noqa: E402
+
 from app import pbs  # noqa: E402
+from app.config import settings  # noqa: E402
 from app.pve import ProxmoxError  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _allow_probe_targets(monkeypatch):
+    """这些用例只验证能力探测，网络由假客户端代替。
+
+    「测试连通性」现在要求目标已登记或已白名单（见 ``app/ssrfguard.py``）；
+    这里显式放行用例里的主机名，准入逻辑本身由 ``test_ssrfguard.py`` 覆盖。
+    """
+    monkeypatch.setattr(settings, "connection_test_allow_targets", "pbs.lan")
 
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+async def _no_saved_connections() -> List[Dict[str, Any]]:
+    """没有已保存连接：这些用例只验证能力探测，不该去碰数据库。"""
+    return []
 
 
 def _conn(**over: Any) -> Dict[str, Any]:
@@ -622,6 +640,7 @@ def test_config_test_reports_missing_sys_audit(monkeypatch) -> None:
             return None
 
     monkeypatch.setattr(pbs, "PbsClient", lambda conn: _Fake())
+    monkeypatch.setattr(pbs, "load_connections", _no_saved_connections)
     body = PbsConnectionTestIn(
         host="pbs.lan", token_id="root@pam!panel", token_secret="secret"
     )
@@ -664,6 +683,7 @@ def test_config_test_reports_missing_datastore_audit(monkeypatch) -> None:
             return None
 
     monkeypatch.setattr(pbs, "PbsClient", lambda conn: _Fake())
+    monkeypatch.setattr(pbs, "load_connections", _no_saved_connections)
     body = PbsConnectionTestIn(
         host="pbs.lan", token_id="root@pam!panel", token_secret="secret"
     )

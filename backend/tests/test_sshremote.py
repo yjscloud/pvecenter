@@ -140,6 +140,29 @@ class TestConnectCredentials:
         with pytest.raises(ValueError, match="无法解密"):
             sshremote._connect(row)
 
+    def test_private_key_saved_under_password_auth_is_explained(self) -> None:
+        """把「密钥」主机改成「口令」但没换凭据：以前只会得到 Authentication failed。"""
+        row = {
+            "host": "127.0.0.1",
+            "port": 22,
+            "username": "root",
+            "auth_type": "password",
+            "secret": "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----",
+        }
+        with pytest.raises(ValueError, match="保存的内容是私钥"):
+            sshremote._connect(row)
+
+    def test_password_saved_under_key_auth_is_explained(self) -> None:
+        row = {
+            "host": "127.0.0.1",
+            "port": 22,
+            "username": "root",
+            "auth_type": "key",
+            "secret": "p@ssw0rd",
+        }
+        with pytest.raises(ValueError, match="不是私钥"):
+            sshremote._connect(row)
+
 
 class TestCommands:
     @pytest.mark.parametrize(

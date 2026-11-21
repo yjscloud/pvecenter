@@ -311,9 +311,18 @@ class MailConfigIn(BaseModel):
 
 
 class ForgotPasswordIn(BaseModel):
-    """自助重置密码第 1 步：提交用户名，面板给账号邮箱发一次性链接。"""
+    """自助重置密码第 1 步：提交用户名，面板给账号邮箱发一次性链接。
+
+    与登录 / 注册同级的人机校验（审计项 L-01）：这是公开接口，没有验证码时
+    脚本可以按用户名高频触发重置邮件，既骚扰账号主人，也消耗 SMTP 配额。
+    具体用图形码还是滑块由「设置 → 登录验证」决定；关闭时不校验。
+    """
 
     username: str
+    captcha_id: str = ""
+    captcha_code: str = ""
+    captcha_x: Optional[float] = None
+    captcha_path: Optional[List[Dict[str, float]]] = None
 
 
 class ResetTokenIn(BaseModel):
@@ -326,7 +335,7 @@ class ResetPasswordIn(BaseModel):
     """自助重置密码第 2 步：凭链接里的令牌设置新密码。"""
 
     token: str
-    password: str = Field(min_length=8)
+    password: str = Field(min_length=12)
 
 
 class VmQuotaIn(BaseModel):
@@ -383,9 +392,15 @@ class QuotaIn(BaseModel):
 
 
 class MailTestIn(BaseModel):
-    """发送测试邮件。``to`` 留空时发给管理员收件人。"""
+    """发送测试邮件。``to`` 留空时发给管理员收件人。
+
+    ``dry_run`` 默认 **True**：只校验配置与收件人、不真正投递。前端点「测试
+    发送」时会显式传 false —— 但要它先明确表达「我知道这封会真的发出去」。
+    空 body / 脚本误调用因此不会再触发真实投递（审计项 V-14）。
+    """
 
     to: str = ""
+    dry_run: bool = True
 
 
 class PanelUrlIn(BaseModel):
@@ -1602,7 +1617,7 @@ class UserCreate(BaseModel):
     username: str
     # 与注册 / 自助改密同一套强度（security.password_policy_error 还会再校验
     # 字母 + 数字与常见弱口令）；以前这里只要求 6 位，比注册还弱，等于后门。
-    password: str = Field(min_length=8, max_length=128)
+    password: str = Field(min_length=12, max_length=128)
     # 角色 id（内置 admin/operator/viewer 或 admin 自建的角色）
     role: str = "viewer"
     email: str = ""
@@ -1619,7 +1634,7 @@ class UserUpdate(BaseModel):
     email: Optional[str] = None
     enabled: Optional[bool] = None
     # 留空 = 不改密码；给了值就按统一强度校验（见 users.update_user）
-    password: Optional[str] = Field(default=None, min_length=8, max_length=128)
+    password: Optional[str] = Field(default=None, min_length=12, max_length=128)
     permissions: Optional[List[str]] = None
     # 与 permissions 配对：仅当它为 true 时才改动用户级覆盖
     # （用于区分「不改」和「清空覆盖、回到继承角色」）
@@ -1637,8 +1652,8 @@ class RegisterRequest(BaseModel):
     """自助注册。建出来的账号是 pending，管理员审批通过后才能登录。"""
 
     username: str
-    # 与管理员建号 / 改密同一套强度：8 位起，且要字母 + 数字、不是常见弱口令
-    password: str = Field(min_length=8, max_length=128)
+    # 与管理员建号 / 改密同一套强度：12 位起，且要字母 + 数字、不是常见弱口令
+    password: str = Field(min_length=12, max_length=128)
     # 必填：审批结果（通过 / 拒绝）会发到这个邮箱
     email: str
     # 人机校验：与登录**同级**。注册是匿名写接口，没有它，脚本就能把审批队列
@@ -1677,14 +1692,14 @@ class StepUpRequest(BaseModel):
 
 
 class PasswordChange(BaseModel):
-    """自助修改密码：必须提供当前密码，新密码至少 8 位且含字母与数字。
+    """自助修改密码：必须提供当前密码，新密码至少 12 位且含字母与数字。
 
     开了两步验证的账号还要带一次动态码 —— 密码是「改密」这件事的第一重，
     动态码是第二重：只有一枚被盗的 access token 不足以接管账号。
     """
 
     current_password: str
-    new_password: str = Field(min_length=8)
+    new_password: str = Field(min_length=12)
     totp_code: str = ""
 
 

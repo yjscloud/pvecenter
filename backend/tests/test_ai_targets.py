@@ -82,7 +82,11 @@ def clear_cache():
 
 
 def _patch_client(monkeypatch, client) -> None:
-    monkeypatch.setattr(ai_scope.pve, "client_for_connection", lambda conn_id: client)
+    monkeypatch.setattr(
+        ai_scope.pve,
+        "client_for_connection",
+        lambda conn_id, **_kwargs: client,
+    )
 
 
 def test_all_conditions_pass(monkeypatch) -> None:
@@ -200,6 +204,56 @@ def test_fast_mode_reports_excluded_from_cache(monkeypatch) -> None:
     assert pending == 0
 
 
+def test_permission_denied_is_not_a_down_connection() -> None:
+    """401/403 说明 PVE 已经应答，只是令牌权限不够 —— 不能报「连接读不到」。"""
+    class DeniedClient:
+        async def version(self) -> Dict[str, Any]:
+            raise ProxmoxError("Permission check failed", 502, pve_status=403)
+
+    ai_scope.reset_cache()
+    assert (
+        asyncio.run(
+            ai_scope._connection_alive("c1", DeniedClient(), ai_scope.tuning())
+        )
+        is True
+    )
+
+    assert ai_scope._is_connection_failure(ProxmoxError("denied", 502, pve_status=403)) is False
+    assert ai_scope._is_connection_failure(ProxmoxError("boom", 500)) is False
+    assert ai_scope._is_connection_failure(ProxmoxError("unreachable", 502)) is True
+    assert ai_scope._is_connection_failure(asyncio.TimeoutError()) is True
+
+
+def test_missing_connection_falls_back_only_for_internal_aggregation(monkeypatch) -> None:
+    """受管主机行里的旧 conn_id 不该让整条 PVE 被判故障；请求头路径仍严格 404。"""
+    from app import pve
+
+    sentinel = object()
+    monkeypatch.setattr(pve, "_scoped_client", lambda _cid: None)
+    monkeypatch.setattr(pve, "get_client", lambda: sentinel)
+
+    assert pve.client_for_connection("deleted", fallback_to_active=True) is sentinel
+    with pytest.raises(ProxmoxError):
+        pve.client_for_connection("deleted")
+
+
+def test_pve_down_ignores_unrelated_and_stale_connections() -> None:
+    """「1 条读不到」只报本轮候选、且刚刚失败过的连接。
+
+    现场问题：PVE 明明正常，AI 页却长期挂着一条告警 —— 因为进程级 ``_HEALTH``
+    里躺着别的连接（或一分钟前的偶发超时）的失败记录。
+    """
+    import time
+
+    now = time.monotonic()
+    ai_scope._HEALTH["other-conn"] = (now, False)
+    ai_scope._HEALTH["c1"] = (now - 60, False)
+    assert ai_scope._recent_down_connections([HOST]) == 0
+
+    ai_scope._HEALTH["c1"] = (now, False)
+    assert ai_scope._recent_down_connections([HOST]) == 1
+
+
 def test_resolve_host_rejects_ineligible_machine(monkeypatch) -> None:
     """候选清单与发起入口共用规则：绕过页面直接传 host_id 也进不去。"""
     from app import ai
@@ -226,7 +280,7 @@ def test_evaluate_counts_reasons_and_keeps_order(monkeypatch) -> None:
     monkeypatch.setattr(
         ai_scope.pve,
         "client_for_connection",
-        lambda conn_id: clients[conn_id],
+        lambda conn_id, **_kwargs: clients[conn_id],
     )
     hosts = [
         {**HOST, "id": "ok", "conn_id": "ok"},

@@ -37,8 +37,7 @@ environments and the upkeep; not tipping changes nothing about support.
 
 ## Screenshots
 
-> Screenshots live in `docs/screenshots/`, ideally **1600×900** (16:9). Swap the filenames freely; while a
-> file is missing GitHub shows the alt text, and it appears as soon as you add the image.
+
 
 <!--
 Placeholder list (each shows up once the file is in docs/screenshots/):
@@ -360,9 +359,9 @@ in the matching entries under Settings → Security posture.
 14. **No sourcemaps in production**: `build.sourcemap=false` in `vite.config.ts` — `sourcesContent` in a
     `.map` is the complete TypeScript source. nginx answers 404 for `*.map` as a second line of defence
     against stale artefacts. Use `npm run dev` when you need symbols.
-15. **Version and RBAC listings need a session**: `/api/version` and `/api/auth/permissions` now require a
-    signed-in user; only `/api/config/site` (site name, logo, ICP number) stays anonymous so the login and
-    landing pages can render.
+15. **Version and RBAC listings need a session**: `/api/auth/permissions` requires a signed-in user, while
+    `/api/version` is restricted to admins (`settings.manage`); only `/api/config/site` (site name, logo,
+    ICP number) stays anonymous so the login and landing pages can render.
 
 For client certificates (mTLS), add this to the Nginx server block:
 
@@ -868,6 +867,7 @@ plus step-up confirmation. Expired tokens are cleaned up by a background job.
 | `STEP_UP_REQUIRED` / `STEP_UP_WINDOW_MINUTES` | `true` / `5` | Whether dangerous operations ask for confirmation again, and how long that confirmation stays valid |
 | `FRP_ALLOW_LOCAL_CIDRS` / `FRP_BLOCK_PANEL_SUBNET` | empty / `true` | Tunnel target allowlist: ordinary users may only point at their own guest IPs, and networks can be opened here (or single IPs per user on the frp page); pointing at the panel's own subnet is blocked by default |
 | `FRP_REMOTE_PORT_MIN` / `FRP_REMOTE_PORT_MAX` | `40000` / `50000` | Initial / fallback public port range. Administrators can set it on the frp page to whatever frps serves (applied immediately and stored; the page wins). Critical ports such as 22 / 80 / 443 / 7000 / 7001 / 8006 are always refused |
+| `CONNECTION_TEST_ALLOW_TARGETS` | empty | Outbound allowlist for “Test connection” (IP / CIDR / hostname, comma separated). By default only `host:port` pairs already registered in saved connections may be tested, so save a new connection before testing it; list targets here to test before saving. Private and loopback addresses need registration or this allowlist; link-local (including cloud metadata), multicast and reserved addresses are always refused |
 | `PVE_HOST` / `PVE_PORT` | empty / `8006` | Proxmox address (no protocol) and API port |
 | `PVE_TOKEN_ID` / `PVE_TOKEN_SECRET` | empty | The form is `panel@pve!panel` and the token UUID |
 | `PVE_DEFAULT_NODE` | empty | Default node for node-scoped endpoints; a fallback when several nodes exist |
@@ -1027,7 +1027,7 @@ notes under [Docker deployment](#docker-deployment).
 updates fail).** Dependencies are pinned to Python 3.11+, the hardest floor being Pillow 12 (≥3.10) — on 3.9
 `pip install -r backend/requirements.txt` fails to resolve, dependencies stay old and the built-in updater
 stops at the install step. Current `start-prod.sh` / `run.py` refuse an old interpreter outright and print
-the install commands; `/api/version` shows the interpreter actually in use. Install 3.11+, then `rm -rf
+the install commands; the startup log line “运行环境：Python x.y.z” shows the interpreter actually in use. Install 3.11+, then `rm -rf
 .venv` and start again (database and configuration are untouched).
 
 **The host security pages read nothing**: inside a container, `/var/log` and `/proc` belong to the container,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,76 @@ def _raise(exc: ProxmoxError) -> None:
     raise HTTPException(
         status_code=exc.status_code if exc.status_code < 600 else 500,
         detail=exc.message,
+    )
+
+
+#: PVE 对「对象不存在」的典型说法（配置 / 状态接口会返回 500 + 这段正文）
+_MISSING_MARKERS = (
+    "does not exist",
+    "not found",
+    "no such",
+    "unable to find",
+)
+
+
+def _looks_missing(exc: ProxmoxError) -> bool:
+    status = getattr(exc, "pve_status", None) or exc.status_code
+    if status == 404:
+        return True
+    text = str(getattr(exc, "message", "") or "").lower()
+    return status in (500, 502) and any(marker in text for marker in _MISSING_MARKERS)
+
+
+def _same_vmid(value: Any, vmid: int) -> bool:
+    try:
+        return int(value) == int(vmid)
+    except (TypeError, ValueError):
+        return False
+
+
+async def _raise_guest_read_error(
+    client: Any, node: str, vmid: int, kind: str, exc: ProxmoxError
+) -> None:
+    """详情接口的错误出口：语义码 + 固定文案，不把 PVE 原文扔给前端。
+
+    * 对象不存在 → 404；
+    * vmid 属于另一种客户机类型 → 400（「该 vmid 不是容器」）；
+    * 其余失败 → 502 + trace id，原始异常只进服务端日志。
+
+    PVE 的 stat 报错里带宿主机路径（``nodes/pve/qemu-server/114.conf``、
+    ``/var/lib/vz/...``），原样透传就是目录结构泄露。
+    """
+    trace = uuid.uuid4().hex[:12]
+    logger.warning(
+        "读取客户机失败 kind=%s node=%s vmid=%s trace=%s：%s",
+        kind, node, vmid, trace, getattr(exc, "message", exc),
+    )
+
+    if _looks_missing(exc):
+        actual = ""
+        try:
+            resources = await client.cluster_resources("vm") or []
+        except ProxmoxError:
+            resources = []
+        matches = [item for item in resources if _same_vmid(item.get("vmid"), vmid)]
+        if matches:
+            on_node = [
+                item for item in matches if str(item.get("node") or "") == node
+            ]
+            actual = str((on_node or matches)[0].get("type") or "")
+        expected = "qemu" if kind == "qemu" else "lxc"
+        if actual and actual != expected:
+            expected_label = "虚拟机" if expected == "qemu" else "容器"
+            actual_label = "容器" if actual == "lxc" else "虚拟机"
+            raise HTTPException(
+                status_code=400,
+                detail=f"该 vmid 不是{expected_label}（实际为{actual_label}）",
+            )
+        raise HTTPException(status_code=404, detail="资源不存在")
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"读取资源失败，请稍后重试（trace: {trace}）",
     )
 
 
@@ -524,7 +595,7 @@ async def get_vm(
             client.qemu_status(node, vmid),
         )
     except ProxmoxError as exc:
-        _raise(exc)
+        await _raise_guest_read_error(client, node, vmid, "qemu", exc)
 
     config = config or {}
     status = status or {}

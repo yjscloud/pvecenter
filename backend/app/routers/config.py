@@ -28,6 +28,7 @@ from .. import (
     security,
     site,
     specs,
+    ssrfguard,
     store,
     ui,
 )
@@ -205,19 +206,35 @@ def _find_connection(
 @router.get("/connections")
 async def list_connections(
     request: Request,
-    user: Dict[str, Any] = Depends(security.get_current_user),
+    user: Dict[str, Any] = Depends(
+        security.require_any_permission(
+            "node.view",
+            "vm.view",
+            "vm.create",
+            "ct.view",
+            "ct.create",
+            "network.view",
+            "storage.view",
+            "template.view",
+            "pbs.view",
+            "task.view",
+        )
+    ),
 ) -> List[Dict[str, Any]]:
-    """全部已保存的 PVE 连接。
+    """已保存的 PVE 连接（**按权限裁剪**）。
 
-    **按权限裁剪**：完整字段（主机地址 / 端口 / 令牌与控制台凭据的「是否已设置」）
-    只给管理员（``settings.manage``）。连接配置说的是「面板能碰哪些集群、拿什么
-    凭据碰」，属于管理信息 —— 它不该跟着 ``node.view`` 这类权限一起扩散出去，
-    更不该让没有任何节点权限的账号也看得到。
+    完整字段（主机地址 / 端口 / 令牌与控制台凭据的「是否已设置」/ 区域 / 暂停
+    状态 / 是否兜底）只给管理员（``settings.manage``）。连接配置说的是「面板能
+    碰哪些集群、拿什么凭据碰」，属于管理信息。
 
-    普通用户拿到的是精简版（id / 名称 / 区域 / 是否当前 / 是否配好），见
-    ``store.public_connection_brief``：他们确实需要它 —— 节点列表按「区域 →
-    连接 → 节点」分组、创建向导要选目标 PVE、地址池按连接限定适用范围 —— 但
-    这些只需要认得出是哪台。
+    普通用户拿到的是**最小可用视图**，只有 ``id`` 与 ``name``（见
+    ``store.public_connection_brief``）：节点列表与创建向导只需要「认得出是哪
+    台」。此前这里还跟着区域、暂停 / 配好状态与「当前连接」标记 —— 这些既不
+    参与界面必需流程，又拼出了基础设施拓扑（哪台在用、哪台停了、分在哪个机房），
+    审计项 PVE-01 因此要求收口。
+
+    另外加了显式的权限入口：没有任何节点 / 客户机 / 建机 / 网络 / 存储 / 模板等
+    需求的账号（例如只拿到 ``alert.view`` 的自定义角色）不再能读到这份清单。
     """
     await security.audit_read(request, user, "config.connections.read")
     conns = store.get_connections()
@@ -233,12 +250,11 @@ async def list_connections(
     ]
     result: List[Dict[str, Any]] = []
     for c in conns:
-        pub = (
-            store.public_connection_config(c)
-            if can_manage
-            else store.public_connection_brief(c)
-        )
-        pub["active"] = str(c.get("id")) == active_id
+        if can_manage:
+            pub = store.public_connection_config(c)
+            pub["active"] = str(c.get("id")) == active_id
+        else:
+            pub = store.public_connection_brief(c)
         result.append(pub)
     return result
 
@@ -1473,7 +1489,37 @@ async def test_connection(
     「Proxmox 拒绝了该凭据」—— 而凭据其实是好的。连接取自
     ``connection_id``（请求体）或 ``X-PVE-Connection`` 头，两者都没有时才
     回落到兜底连接（旧行为，供单连接部署与脚本使用）。
+
+    两条硬约束（SSRF / 凭据外带的兜底）：
+
+    * **目标必须可信**：只允许已保存连接里登记的 host:port，或运维在
+      ``CONNECTION_TEST_ALLOW_TARGETS`` 里显式放行的地址。面板与 PVE / PBS /
+      跳板机同网段，放任前端指定 host 就等于给了一台内网扫描器；
+    * **复用的密钥不能跟着任意目标走**：留空 secret 时，目标必须就是那条已保存
+      连接本身，否则等于把面板持有的 Token 发到调用方指定的主机上。
     """
+    profiles = store.get_connections()
+    # .env 里的 PVE_HOST 也是「已配置的连接」（见 pve._load_connection 的兜底），
+    # 没有落库连接时同样允许测试它。
+    registered = ssrfguard.registered_targets(profiles, 8006)
+    if settings.pve_host:
+        registered |= ssrfguard.registered_targets(
+            [{"host": settings.pve_host, "port": settings.pve_port}], 8006
+        )
+
+    try:
+        await ssrfguard.assert_target_allowed(
+            payload.host,
+            payload.port,
+            registered=registered,
+        )
+    except ssrfguard.TargetBlocked as exc:
+        await security.audit(
+            request, user, "config.test", target=payload.host,
+            result="blocked", detail={"code": exc.code},
+        )
+        raise HTTPException(status_code=400, detail=exc.message) from exc
+
     secret = payload.token_secret
     if not secret:
         conn_id = (payload.connection_id or "").strip() or requested_connection()
@@ -1481,7 +1527,7 @@ async def test_connection(
             profile: Optional[Dict[str, Any]] = next(
                 (
                     c
-                    for c in store.get_connections()
+                    for c in profiles
                     if str(c.get("id") or "") == conn_id
                 ),
                 None,
@@ -1491,6 +1537,17 @@ async def test_connection(
                 raise HTTPException(status_code=404, detail="连接不存在")
         else:
             profile = store.get_connection_config()
+        if profile and not ssrfguard.same_target(
+            payload.host, payload.port, profile, 8006
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "留空 Token Secret 时，目标必须是该连接已保存的 host:port"
+                    "（避免把已存密钥发送到别的地址）。请重新填写 Secret，"
+                    "或先保存这条连接再测试。"
+                ),
+            )
         secret = str((profile or {}).get("token_secret") or "")
 
     if not secret:
@@ -1510,14 +1567,19 @@ async def test_connection(
         version = await client.version()
         nodes = await client.nodes()
     except ProxmoxError as exc:
+        # 只回归一化后的枚举与固定文案：对端响应正文 / 请求路径一律不外带，
+        # 否则「连不上 / 不是 TLS / 认证失败」的差异本身就能当扫描器用。
+        code, message = ssrfguard.classify_failure(exc)
+        # 诊断细节只进服务端日志（压成单行，避免对端正文里的换行污染日志），
+        # 不回给前端。
+        logger.warning(
+            "连接测试失败（%s）：%s", code, " ".join(str(exc.message).split())[:300]
+        )
         await security.audit(
             request, user, "config.test", target=payload.host,
-            result="failed", detail=exc.message,
+            result="failed", detail={"code": code},
         )
-        raise HTTPException(
-            status_code=400,
-            detail=f"连接失败：{exc.message}",
-        ) from exc
+        raise HTTPException(status_code=400, detail=message) from exc
     finally:
         await client.aclose()
 
@@ -2199,15 +2261,35 @@ async def test_mail_config(
     )
 
     target = (payload.to or "").strip()
-    if target:
+    if payload.dry_run:
+        # 演练：把「能不能发、会发给谁」算清楚，但不碰 SMTP。空 body、脚本
+        # 误触发、批量重放都不会再产生真实投递（审计项 V-14）。
+        cfg = await mailer.load_mail()
+        recipients = (
+            mailer.recipients_of(target)
+            if target
+            else await mailer.admin_recipients()
+        )
+        if not cfg.get("enabled"):
+            ok, detail = False, "邮件通知未启用"
+        elif not cfg.get("host"):
+            ok, detail = False, "未配置 SMTP 服务器"
+        elif not (cfg.get("sender") or cfg.get("username")):
+            ok, detail = False, "需要填写发件人地址（或 SMTP 账号）"
+        elif not recipients:
+            ok, detail = False, "没有可用的管理员收件地址"
+        else:
+            ok, detail = True, "演练模式：将发往 " + ", ".join(recipients) + "，未实际投递"
+    elif target:
         ok, detail = await mailer.send_mail(target, subject, body, html=html)
     else:
         ok, detail = await mailer.send_to_admins(subject, body, html=html)
 
     await security.audit(
         request, user, "config.mail.test", target="mail_settings",
-        result="success" if ok else "failed", detail=detail,
+        result="success" if ok else "failed",
+        detail=("演练：" if payload.dry_run else "") + detail,
     )
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
-    return {"ok": True, "detail": detail}
+    return {"ok": True, "detail": detail, "dry_run": payload.dry_run}

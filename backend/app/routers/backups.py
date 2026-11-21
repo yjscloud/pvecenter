@@ -23,6 +23,7 @@ import logging
 import re
 import shlex
 import time
+import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -1113,7 +1114,7 @@ async def download_backup(
             request, user, "backup.download", target=volid, result="failed",
             detail="归档标识不合法",
         )
-        raise HTTPException(status_code=400, detail=f"归档标识不合法：{volid}")
+        raise HTTPException(status_code=400, detail="归档标识不合法")
 
     host_path = await _dir_storage_path(client, storage)
     if not host_path:
@@ -1132,24 +1133,30 @@ async def download_backup(
         raise HTTPException(
             status_code=409,
             detail=(
-                f"这台 PVE（{client.conn.host}）还没配置 SSH 凭据，读不到宿主机上的归档。"
-                "下载走的是面板已有的 SSH 通道：请到「主机管理」添加该地址的主机"
+                "这台 PVE 还没配置 SSH 凭据，读不到宿主机上的归档。"
+                "下载走的是面板已有的 SSH 通道：请到「主机管理」添加该 PVE 地址的主机"
                 "（地址写法要与 PVE 连接里的一致），再回来点下载。"
             ),
         )
 
-    # 先 stat：归档被清理过时给一句清楚的话，而不是让浏览器收一个空文件
+    # 先 stat：归档被清理过时给一句清楚的话，而不是让浏览器收一个空文件。
+    # stat 的原文带宿主机绝对路径（/var/lib/vz/dump/...），只进服务端日志。
     ok, out = await sshremote.run_command(
         row, f"stat -c %s -- {shlex.quote(remote)}", timeout=20
     )
     if not ok:
+        trace = uuid.uuid4().hex[:12]
+        logger.warning(
+            "读取归档失败 trace=%s node=%s storage=%s remote=%s：%s",
+            trace, node, storage, remote, out.strip()[:300],
+        )
         await security.audit(
             request, user, "backup.download", target=volid, result="failed",
-            detail=f"宿主机上读不到 {remote}",
+            detail=f"归档不可读（trace: {trace}）",
         )
         raise HTTPException(
             status_code=404,
-            detail=f"宿主机上读不到 {remote}：{out.strip()[:200]}",
+            detail=f"归档文件不存在或已被清理（trace: {trace}）",
         )
     try:
         size = int(out.strip().splitlines()[-1])

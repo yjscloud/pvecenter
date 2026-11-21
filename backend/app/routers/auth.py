@@ -5,7 +5,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 
 from .. import (
     captcha,
@@ -51,7 +51,12 @@ _LIMIT_WINDOW = 3600
 
 async def _anon_throttled(kind: str, ip: str, limit: int) -> bool:
     """匿名入口的 IP 限速：窗口内超过 ``limit`` 次即拒。"""
-    allowed, _ = await throttle.allow(f"{kind}:ip:{ip or 'unknown'}", limit, _LIMIT_WINDOW)
+    return await _hit(f"{kind}:ip:{ip or 'unknown'}", limit)
+
+
+async def _hit(key: str, limit: int) -> bool:
+    """通用固定窗口计数：超过 ``limit`` 次即返回 True（已超限）。"""
+    allowed, _ = await throttle.allow(key, limit, _LIMIT_WINDOW)
     return not allowed
 
 
@@ -556,6 +561,19 @@ async def refresh_session(request: Request, response: Response) -> LoginResponse
     )
 
 
+def _registration_received() -> Dict[str, Any]:
+    """注册的对外统一响应。
+
+    首次提交与「用户名已存在」都走这里：body / 状态码完全一致，调用方无法
+    用它判断账号是否存在（审计项 M-02）。
+    """
+    return {
+        "ok": True,
+        "status": store.STATUS_PENDING,
+        "message": "注册申请已收到，请等待管理员审批",
+    }
+
+
 @router.post("/register", status_code=201)
 async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]:
     """自助注册（公开接口，无需登录）。
@@ -640,17 +658,61 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
     if len(email) > 255:
         raise HTTPException(status_code=400, detail="邮箱长度不能超过 255 个字符")
 
-    # 已存在（无论什么状态）都按「被占用」处理，不透露这个账号的状态
+    # 邮箱域名级限速（审计项 M-02）：只按 IP 限 5 次/小时挡不住换 IP 的脚本，
+    # 而同一批灌号往往落在同一个域名（临时邮箱服务 / 同一家企业域）。10 次/小时
+    # 是「同一家公司一天内正常申请几个人」也够用的上限。
+    domain = email.rsplit("@", 1)[-1].strip().lower()
+    if await _hit(f"register:domain:{domain}", 10):
+        await store.add_audit(
+            username=username,
+            action="auth.register",
+            target=username,
+            result="failed",
+            detail=f"邮箱域名 {domain} 注册过于频繁，已被限速",
+            ip=ip,
+        )
+        raise HTTPException(
+            status_code=429, detail="该邮箱域名提交过于频繁，请稍后再试"
+        )
+
+    # 审批队列容量兜底（审计项 M-02）：即使攻击者换 IP、换域名，也不能让
+    # pending 无限堆积把管理员淹没。到上限就自动拒绝并留审计（含来源 IP），
+    # 管理员清理后再放行；阈值可用 REGISTER_PENDING_LIMIT 调整。
+    pending = await store.count_users_with_status(store.STATUS_PENDING)
+    pending_cap = int(settings.register_pending_limit)
+    if pending_cap > 0 and pending >= pending_cap:
+        logger.warning(
+            "注册审批队列已满（%s 条），拒绝来自 %s 的注册请求：%s",
+            pending,
+            ip or "-",
+            username,
+        )
+        await store.add_audit(
+            username=username,
+            action="auth.register",
+            target=username,
+            result="failed",
+            detail=f"待审批队列已满（{pending} 条），自动拒绝",
+            ip=ip,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="注册申请暂时无法受理，请稍后再试",
+        )
+
+    # 已存在（无论什么状态）都**不透露**：响应与首次提交完全一致，否则这个
+    # 公开接口就是一台用户名枚举机（审计项 M-02）。审计里照实记录，供管理员
+    # 发现有人在批量试探。
     if await store.get_user(username):
         await store.add_audit(
             username=username,
             action="auth.register",
             target=username,
             result="failed",
-            detail="用户名已被占用",
+            detail="用户名已被占用（对外统一为已收到）",
             ip=ip,
         )
-        raise HTTPException(status_code=409, detail="该用户名已被占用或正在审批中")
+        return _registration_received()
 
     await store.create_user(
         username,
@@ -677,22 +739,54 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
         },
         ip=ip,
     )
-    return {
-        "ok": True,
-        "status": store.STATUS_PENDING,
-        "message": "注册申请已提交，等待管理员审批",
-    }
+    return _registration_received()
 
 
 # ------------------------------------------------------------ 自助重置密码
+async def _deliver_password_reset(
+    username: str, to_email: str, url: str, ip: str
+) -> None:
+    """真正发重置邮件（后台任务，失败只留日志 / 审计）。
+
+    为什么放到响应之后：SMTP 是网络 I/O，存在与否两条路径的耗时差别会被
+    当成「账号是否存在」的侧信道（审计项 L-01）。对外统一立刻返回通用话术，
+    发信结果只进服务端审计 —— 管理员能看到失败原因，匿名调用者看不到。
+    """
+    try:
+        # 重置邮件按**收件人**的语言渲染，而不是当前请求的语言 —— 两者可能不同：
+        # 用户可能在另一台设备上刚切换过语言，或由管理员代触发。
+        lang = await prefs.get(username, prefs.PREF_LANGUAGE, i18n.DEFAULT_LANG)
+        with i18n.use_language(lang):
+            subject, body, html = mailer.password_reset_mail(username, url)
+        # 收件人是账号邮箱，不是用户名；用户名投给 SMTP 只会 501 Bad address syntax
+        ok, detail = await mailer.send_mail(to_email, subject, body, html=html)
+        await store.add_audit(
+            username=username,
+            action="auth.password_reset.request",
+            target=username,
+            result="success" if ok else "failed",
+            detail=detail,
+            ip=ip,
+        )
+        if not ok:
+            logger.warning(
+                "密码重置邮件发送失败（账号 %s，来源 %s）：%s", username, ip or "-", detail
+            )
+    except Exception:  # noqa: BLE001 - 后台任务不能把异常抛回响应
+        logger.exception("密码重置邮件投递异常（账号 %s）", username)
+
+
 @router.post("/forgot-password")
 async def forgot_password(
-    payload: ForgotPasswordIn, request: Request
+    payload: ForgotPasswordIn,
+    request: Request,
+    background: BackgroundTasks,
 ) -> Dict[str, Any]:
     """自助重置第 1 步：给账号邮箱发一条一次性链接。
 
-    **无论账号是否存在、邮箱填没填，都返回同一句话**。这是公开接口，
-    一旦它对「用户名不存在」给出不同响应，就等于提供了一台账号枚举机。
+    **无论账号是否存在、邮箱填没填、SMTP 配没配好，都返回同一句话**。这是
+    公开接口，任何差异（状态码、文案、甚至「邮件发送失败」）都是一台账号
+    枚举机（审计项 L-01）。
     """
     ip = security.client_ip(request)
     username = (payload.username or "").strip()
@@ -702,18 +796,52 @@ async def forgot_password(
 
     generic = {
         "ok": True,
-        "message": "如果该账号存在且已填写邮箱，重置链接已发送，30 分钟内有效",
+        "message": "如果该账号存在且已填写邮箱，重置链接已发送，15 分钟内有效",
     }
     if not username:
         # 空用户名不值得查库，但同样返回通用话术
         return generic
 
+    # 人机校验（审计项 L-01）：与登录 / 注册同一套配置。放在查库之前，
+    # 未通过时什么都不发、也不消耗该用户名的发送配额。
+    mode = await captcha.get_mode()
+    if mode != captcha.MODE_OFF:
+        if mode == captcha.MODE_SLIDER:
+            state = captcha.check_slider(
+                payload.captcha_id, payload.captcha_x, payload.captcha_path
+            )
+        else:
+            state = captcha.check(payload.captcha_id, payload.captcha_code)
+        if state != captcha.RESULT_OK:
+            await store.add_audit(
+                username=username,
+                action="auth.password_reset.request",
+                target=username,
+                result="failed",
+                detail=f"{captcha.MODE_LABEL.get(mode, mode)}未通过，未发送重置邮件",
+                ip=ip,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="验证码错误或已失效，请刷新后重试",
+            )
+
+    # 单账号的邮件轰炸上限（审计项 L-01）：只按 IP 限速挡不住换 IP 的脚本，
+    # 而受害者收到的邮件条数与攻击者 IP 数成正比。3 次/小时足够正常用户
+    # （忘了自己申请过 / 换邮箱再试），也不至于把 SMTP 配额打空。
+    if await _hit(f"reset:user:{username.lower()}", 3):
+        await store.add_audit(
+            username=username,
+            action="auth.password_reset.request",
+            target=username,
+            result="failed",
+            detail="该账号重置请求过于频繁，已跳过发送",
+            ip=ip,
+        )
+        raise HTTPException(status_code=429, detail="提交过于频繁，请稍后再试")
+
     issued = await password_reset.issue(username)
     if not issued:
-        token = None
-    else:
-        token, to_email = issued
-    if not token:
         await store.add_audit(
             username=username,
             action="auth.password_reset.request",
@@ -724,29 +852,9 @@ async def forgot_password(
         )
         return generic
 
+    token, to_email = issued
     url = f"{await _panel_url(request)}/reset-password?token={token}"
-    # 重置邮件按**收件人**的语言渲染，而不是当前请求的语言 —— 两者可能不同：
-    # 用户可能在另一台设备上刚切换过语言，或由管理员代触发。
-    lang = await prefs.get(username, prefs.PREF_LANGUAGE, i18n.DEFAULT_LANG)
-    with i18n.use_language(lang):
-        subject, body, html = mailer.password_reset_mail(username, url)
-    # 收件人是账号邮箱，不是用户名；用户名投给 SMTP 只会 501 Bad address syntax
-    ok, detail = await mailer.send_mail(to_email, subject, body, html=html)
-
-    await store.add_audit(
-        username=username,
-        action="auth.password_reset.request",
-        target=username,
-        result="success" if ok else "failed",
-        detail=detail,
-        ip=ip,
-    )
-    if not ok:
-        # 邮件发不出去是面板配置问题，与账号是否存在无关，可以直说
-        raise HTTPException(
-            status_code=503,
-            detail=f"邮件发送失败：{detail}。请确认「邮件通知」已配置，或联系管理员重置密码。",
-        )
+    background.add_task(_deliver_password_reset, username, to_email, url, ip)
     return generic
 
 

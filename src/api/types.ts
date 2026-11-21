@@ -137,6 +137,11 @@ export interface RegisterInput {
 /** 自助重置第 1 步：提交用户名，面板给账号邮箱发一次性链接 */
 export interface ForgotPasswordInput {
   username: string;
+  /** 人机校验：与登录 / 注册同级（审计项 L-01），关闭时可不传 */
+  captcha_id?: string;
+  captcha_code?: string;
+  captcha_x?: number;
+  captcha_path?: SliderTracePoint[];
 }
 
 /**
@@ -419,10 +424,12 @@ export interface RoleInfo {
  * ``console_user`` / ``verify_ssl`` / ``node_default`` 描述的是「面板能碰哪些
  * 集群、拿什么凭据碰」，属于管理信息 —— 非管理员请求 ``/api/connections`` 时
  * 后端**不会**返回它们（见后端 ``store.public_connection_brief``）。普通用户
- * 拿到的是精简版：``id`` / ``name`` / ``region`` / ``active`` / ``configured``。
+ * 只拿到最小视图：``id`` / ``name``；区域、暂停 / 配好状态与 ``active`` 标记
+ * 也只属于管理员视角（审计项 PVE-01）。
  *
  * 类型上没把这些标成可选（管理员视角的完整形状更好用），但**读取时一律按
- * 「可能没有」处理** —— 各处取用都写了 ``?? ''`` 兜底。
+ * 「可能没有」处理** —— 各处取用都写了 ``?? ''`` / ``find(c => c.active) ?? first``
+ * 兜底。
  */
 export interface ConnectionConfig {
   host: string;

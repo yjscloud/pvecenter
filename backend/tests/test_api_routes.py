@@ -2177,13 +2177,13 @@ class TestUserLifecycle:
         admin = auth_headers(api)
         api.post(
             "/api/users",
-            json={"username": "resetme", "password": "oldpass123", "role": "viewer"},
+            json={"username": "resetme", "password": "Unit-Test-OldPa55", "role": "viewer"},
             headers=admin,
         )
         assert (
             api.post(
                 "/api/auth/login",
-                json={"username": "resetme", "password": "oldpass123"},
+                json={"username": "resetme", "password": "Unit-Test-OldPa55"},
             ).status_code
             == 200
         )
@@ -2197,7 +2197,7 @@ class TestUserLifecycle:
         assert (
             api.post(
                 "/api/auth/login",
-                json={"username": "resetme", "password": "oldpass123"},
+                json={"username": "resetme", "password": "Unit-Test-OldPa55"},
             ).status_code
             == 401
         )
@@ -2226,7 +2226,7 @@ class TestUserLifecycle:
             "/api/auth/login", json={"username": "opwd", "password": "Unit-Test-Pa55word"}
         )
         operator = {"Authorization": f"Bearer {login.json()['access_token']}"}
-        resp = api.put("/api/users/victim", json={"password": "hacked123"}, headers=operator)
+        resp = api.put("/api/users/victim", json={"password": "Hacked-Pa55word"}, headers=operator)
         assert resp.status_code == 403
 
     def test_duplicate_username_rejected(self, api) -> None:
@@ -2280,7 +2280,7 @@ class TestSelfServicePasswordReset:
     def _make(self, api, username: str, email: str, role: str = "viewer") -> None:
         resp = api.post(
             "/api/users",
-            json={"username": username, "password": "oldpass123", "role": role, "email": email},
+            json={"username": username, "password": "Unit-Test-OldPa55", "role": role, "email": email},
             headers=auth_headers(api),
         )
         assert resp.status_code == 200, resp.text
@@ -2317,7 +2317,7 @@ class TestSelfServicePasswordReset:
         )
         assert (
             api.post(
-                "/api/auth/login", json={"username": "forgot", "password": "oldpass123"}
+                "/api/auth/login", json={"username": "forgot", "password": "Unit-Test-OldPa55"}
             ).status_code
             == 401
         )
@@ -2337,7 +2337,7 @@ class TestSelfServicePasswordReset:
         )
         # 同一条链接第二次就失效了
         again = api.post(
-            "/api/auth/reset-password", json={"token": token, "password": "another789"}
+            "/api/auth/reset-password", json={"token": token, "password": "Unit-Test-NewPa55"}
         )
         assert again.status_code == 400
         assert "无效或已过期" in again.json()["detail"]
@@ -2425,7 +2425,7 @@ class TestSelfServicePasswordReset:
         token = sent[0]["body"].split("/reset-password?token=", 1)[1].split()[0]
 
         resp = api.post(
-            "/api/auth/reset-password", json={"token": token, "password": "nodigits"}
+            "/api/auth/reset-password", json={"token": token, "password": "nodigitsatall"}
         )
         assert resp.status_code == 400
 
@@ -2453,6 +2453,67 @@ class TestSelfServicePasswordReset:
             ).json()["valid"]
             is False
         )
+
+    def test_same_account_mail_bomb_is_capped(self, api, monkeypatch) -> None:
+        """同一账号 3 次/小时后不再发信（L-01）：只按 IP 限挡不住换 IP 的脚本。"""
+        sent = self._mail(api, monkeypatch)
+        self._make(api, "bomb", "bomb@example.com")
+        for _ in range(3):
+            resp = api.post("/api/auth/forgot-password", json={"username": "bomb"})
+            assert resp.status_code == 200, resp.text
+        assert len(sent) == 3
+        blocked = api.post("/api/auth/forgot-password", json={"username": "bomb"})
+        assert blocked.status_code == 429
+        assert len(sent) == 3  # 第 4 次没有再发信
+
+    def test_mail_failure_is_not_visible_to_callers(self, api, monkeypatch) -> None:
+        """SMTP 挂了也必须回通用话术：503 会直接暴露「这个账号存在」（L-01）。"""
+        from app import mailer
+
+        async def broken_mail(*args, **kwargs):
+            return False, "smtp down"
+
+        monkeypatch.setattr(mailer, "send_mail", broken_mail)
+        self._make(api, "broken", "broken@example.com")
+
+        existing = api.post("/api/auth/forgot-password", json={"username": "broken"})
+        missing = api.post("/api/auth/forgot-password", json={"username": "nobody"})
+        assert existing.status_code == missing.status_code == 200
+        assert existing.json() == missing.json()
+
+    def test_forgot_password_requires_captcha_when_enabled(
+        self, api, monkeypatch
+    ) -> None:
+        """与登录 / 注册同级的人机校验（L-01）。"""
+        from app import captcha as captcha_mod
+
+        sent = self._mail(api, monkeypatch)
+        self._make(api, "captchareset", "c@example.com")
+        admin = auth_headers(api)
+        set_captcha_mode(api, "image")
+        try:
+            assert (
+                api.post(
+                    "/api/auth/forgot-password", json={"username": "captchareset"}
+                ).status_code
+                == 400
+            )
+            assert sent == []
+
+            ch = api.get("/api/auth/captcha").json()
+            answer = captcha_mod._pending[ch["id"]][0]
+            ok = api.post(
+                "/api/auth/forgot-password",
+                json={
+                    "username": "captchareset",
+                    "captcha_id": ch["id"],
+                    "captcha_code": answer,
+                },
+            )
+            assert ok.status_code == 200, ok.text
+            assert len(sent) == 1
+        finally:
+            delete_setting_sync("login_captcha_mode")
 
 
 # ---------------------------------------------- 自助注册 + 管理员审批
@@ -2554,16 +2615,35 @@ class TestRegistrationApproval:
         assert row is not None, pending.text
         assert row["status"] == "pending"
 
-    def test_register_rejects_duplicate_and_weak_input(self, api) -> None:
-        assert self._register(api, "dup2").status_code == 201
-        # 重复注册（无论什么状态）都算被占用
-        assert self._register(api, "dup2").status_code == 409
-        # 管理员建的同名账号同样挡住
-        assert self._register(api, "admin").status_code == 409
-        # 密码强度：schema 要求至少 8 位
+    def test_register_does_not_reveal_duplicate_usernames(self, api) -> None:
+        """重复注册与首次提交的响应完全一致，否则就是用户名枚举机（M-02）。"""
+        first = self._register(api, "dup2")
+        assert first.status_code == 201
+        duplicate = self._register(api, "dup2")
+        # 无论「刚建过」「管理员已占用」都回同样的 201 + 同样的 body
+        assert duplicate.status_code == first.status_code == 201
+        assert duplicate.json() == first.json()
+        assert self._register(api, "admin").json() == first.json()
+
+        # 密码强度仍照常拒绝
         assert self._register(api, "short", password="123").status_code == 422
-        # 8 位但纯数字，被 _password_weak_reason 挡下
-        assert self._register(api, "digits", password="12345678").status_code == 400
+        # 12 位但纯数字，被 _password_weak_reason 挡下
+        assert self._register(api, "digits", password="135792468013").status_code == 400
+
+    def test_register_stops_when_pending_queue_is_full(self, api, monkeypatch) -> None:
+        """审批队列到上限就自动拒绝，并留审计（审计项 M-02）。"""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "register_pending_limit", 1)
+        assert self._register(api, "q1", email="q1@example.com").status_code == 201
+        blocked = self._register(api, "q2", email="q2@example.com")
+        assert blocked.status_code == 429, blocked.text
+        assert "暂时无法受理" in blocked.json()["detail"]
+
+        rows = api.get(
+            "/api/audit?action=auth.register&result=failed", headers=auth_headers(api)
+        ).json()
+        assert any("队列已满" in str(r["detail"]) for r in rows["items"])
 
     def test_approve_grants_role_and_permissions(self, api) -> None:
         assert self._register(api, "op1").status_code == 201
@@ -2820,6 +2900,34 @@ class TestMailNotifications:
         )
         assert resp.status_code == 400
         assert "SMTP" in resp.json()["detail"]
+
+    def test_test_send_defaults_to_dry_run(self, api, outbox) -> None:
+        """空 body 只做演练：校验配置与收件人，但不产生真实投递（V-14）。"""
+        admin = auth_headers(api)
+        api.put(
+            "/api/config/mail",
+            json={
+                "enabled": True,
+                "host": "smtp.example.com",
+                "sender": "noreply@example.com",
+                "admin_recipients": "ops@example.com",
+            },
+            headers=admin,
+        )
+        resp = api.post("/api/config/mail/test", json={}, headers=admin)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["dry_run"] is True
+        assert "演练模式" in resp.json()["detail"]
+        assert outbox == []
+
+        # 只有显式 dry_run=false 才会真正投递
+        sent = api.post(
+            "/api/config/mail/test",
+            json={"dry_run": False, "to": "a@b.com"},
+            headers=admin,
+        )
+        assert sent.status_code == 200, sent.text
+        assert len(outbox) == 1
 
     # ---- 注册 / 审批触发 ----
     def test_registration_requires_email(self, api) -> None:
@@ -3151,6 +3259,53 @@ class TestConnectionConfig:
             )
             assert missing.status_code == 404
 
+    def test_connection_test_rejects_unregistered_target(self, api) -> None:
+        """测试连接不能变成内网探测器：未登记、未白名单的地址直接拒绝。"""
+        resp = api.post(
+            "/api/config/connection/test",
+            json={
+                "host": "203.0.113.9",
+                "port": 8006,
+                "token_id": "root@pam!probe",
+                "token_secret": "x" * 32,
+            },
+            headers=auth_headers(api),
+        )
+        assert resp.status_code == 400
+        assert "target_not_allowed" in resp.json()["detail"]
+
+    def test_connection_test_hides_upstream_failure_detail(self, api) -> None:
+        """失败原因只给归一化枚举，不回显对端正文 / 内部路径。"""
+        # 已保存连接（因此通过目标准入），但指向一个没有服务监听的端口：
+        # 回给前端的是 unreachable，而不是底层异常里可能出现的响应正文。
+        api.put(
+            "/api/config/connection",
+            json={
+                "host": "127.0.0.1",
+                "port": 1,
+                "token_id": "root@pam!probe",
+                "token_secret": "x" * 32,
+                "verify_ssl": False,
+            },
+            headers=auth_headers(api),
+        )
+        resp = api.post(
+            "/api/config/connection/test",
+            json={
+                "host": "127.0.0.1",
+                "port": 1,
+                "token_id": "root@pam!probe",
+                "token_secret": "x" * 32,
+                "verify_ssl": False,
+            },
+            headers=auth_headers(api),
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "unreachable" in detail or "not_tls" in detail
+        assert "127.0.0.1" not in detail
+        assert "/api2/json" not in detail
+
     def test_secrets_are_encrypted_in_the_database(self, api) -> None:
         """PVE 密钥落库必须是密文。
 
@@ -3257,7 +3412,6 @@ class TestStartupResilience:
 
             with TestClient(app) as client:
                 # Startup completed and the API is serving.
-                assert client.get("/api/version").status_code == 200
                 assert client.get("/api/health").status_code == 200
         finally:
             pve_module._client = None
@@ -3349,7 +3503,7 @@ class TestMonitoringIsolation:
     SecretKey）各存各的。管理员能看见全部，但不能替别人修改。
     """
 
-    PASSWORD = "bob123456"
+    PASSWORD = "bob123456789"
 
     def _new_user(self, api: TestClient, username: str) -> Dict[str, str]:
         """建一个普通用户并登录，返回它的请求头。"""
@@ -3681,7 +3835,7 @@ class TestSelfServiceProfile:
     提权字段必须被忽略。
     """
 
-    PASSWORD = "bob123456"
+    PASSWORD = "bob123456789"
 
     def _operator(self, api: TestClient, username: str = "bob") -> Dict[str, str]:
         resp = api.post(
@@ -3752,7 +3906,7 @@ class TestSelfServiceProfile:
         bob = self._operator(api)
         resp = api.post(
             "/api/auth/password",
-            json={"current_password": "wrong-one", "new_password": "newpass123"},
+            json={"current_password": "wrong-one", "new_password": "Unit-Test-NewPa55"},
             headers=bob,
         )
         assert resp.status_code == 400
@@ -3772,7 +3926,7 @@ class TestSelfServiceProfile:
 
         weak = api.post(
             "/api/auth/password",
-            json={"current_password": self.PASSWORD, "new_password": "abcdefgh"},
+            json={"current_password": self.PASSWORD, "new_password": "abcdefghijkl"},
             headers=bob,
         )
         assert weak.status_code == 400
@@ -3822,7 +3976,7 @@ class TestSnapshotBackupIsolation:
     备份计划走 comment 标记），无归属记录的存量资源对普通用户不可见。
     """
 
-    PASSWORD = "bob123456"
+    PASSWORD = "bob123456789"
 
     def _new_user(self, api: TestClient, username: str) -> Dict[str, str]:
         resp = api.post(
@@ -4342,3 +4496,79 @@ class TestAlertRuleSaving:
         assert resp.status_code == 200, resp.text
         assert len(resp.json()["rules"]) == 1
         assert len(_read_alert_rules_sync()) == 1
+
+
+def test_cluster_resources_visibility_matches_vm_list(api) -> None:
+    """回归：同一会话下 ``/api/vms`` 与 ``/api/cluster/resources`` 的集合必须一致。
+
+    资源清单此前对**模板**留了例外（当作共享资源），于是普通用户能在
+    ``/api/cluster/resources`` 里看到自己没有的模板机，而 ``/api/vms`` 里看不到 ——
+    两套口径直接冲突。这里把「可见集合」钉成同一个答案。
+    """
+    admin = auth_headers(api)
+    created = api.post(
+        "/api/users",
+        json={
+            "username": "scope-bob",
+            "password": "Unit-Test-Pa55word",
+            "role": "operator",
+        },
+        headers=admin,
+    )
+    assert created.status_code in (200, 201), created.text
+    login = api.post(
+        "/api/auth/login",
+        json={"username": "scope-bob", "password": "Unit-Test-Pa55word"},
+    )
+    assert login.status_code == 200, login.text
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    # 名下只有 100；9000 是未登记的模板（无归属）
+    _seed_owner(ownership.KIND_VM, ownership.vm_ref("", "pve1", 100), "scope-bob")
+
+    vms = api.get("/api/vms", headers=headers).json()
+    own = {int(row["vmid"]) for row in vms}
+    assert own == {100}, vms
+
+    resources = api.get("/api/cluster/resources", headers=headers).json()
+    visible = {
+        int(row["vmid"])
+        for row in resources
+        if str(row.get("type") or "") in ("qemu", "lxc", "vm")
+    }
+    assert visible == own
+
+
+class TestGuestDetailErrors:
+    """不存在的对象 → 404；类型不匹配 → 400；都不带 PVE 原文与宿主机路径。"""
+
+    def test_missing_vm_returns_404_without_pve_text(self, api, monkeypatch) -> None:
+        async def missing(node: str, vmid: int):
+            raise ProxmoxError(
+                "Configuration file 'nodes/pve1/qemu-server/99999.conf' does not exist\n",
+                502,
+                pve_status=500,
+            )
+
+        monkeypatch.setattr(pve_module._client, "qemu_config", missing)
+        resp = api.get("/api/vms/pve1/99999", headers=auth_headers(api))
+        assert resp.status_code == 404
+        detail = resp.json()["detail"]
+        assert detail == "资源不存在"
+        assert "Configuration file" not in detail
+        assert "qemu-server" not in detail
+
+    def test_container_endpoint_rejects_vm_vmid(self, api, monkeypatch) -> None:
+        async def missing(node: str, vmid: int):
+            raise ProxmoxError(
+                "Configuration file 'nodes/pve1/lxc/100.conf' does not exist\n",
+                502,
+                pve_status=500,
+            )
+
+        monkeypatch.setattr(pve_module._client, "lxc_config", missing)
+        resp = api.get("/api/lxc/pve1/100", headers=auth_headers(api))
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "不是容器" in detail
+        assert "Configuration file" not in detail

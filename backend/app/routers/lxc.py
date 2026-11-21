@@ -73,6 +73,7 @@ from .vms import (
     _filter_snapshots,
     _op_connection,
     _raise,
+    _raise_guest_read_error,
     _require_snapshot_access,
     require_ct_access,
 )
@@ -391,7 +392,7 @@ async def get_container(
             client.lxc_status(node, vmid),
         )
     except ProxmoxError as exc:
-        _raise(exc)
+        await _raise_guest_read_error(client, node, vmid, "lxc", exc)
 
     config = config or {}
     status = status or {}

@@ -211,11 +211,15 @@ def _patch(monkeypatch, clients) -> None:
     """clients: 单个客户端，或 {conn_id: client}"""
     if isinstance(clients, dict):
         monkeypatch.setattr(
-            ai_scope.pve, "client_for_connection", lambda conn_id: clients[conn_id]
+            ai_scope.pve,
+            "client_for_connection",
+            lambda conn_id, **_kwargs: clients[conn_id],
         )
     else:
         monkeypatch.setattr(
-            ai_scope.pve, "client_for_connection", lambda conn_id: clients
+            ai_scope.pve,
+            "client_for_connection",
+            lambda conn_id, **_kwargs: clients,
         )
 
 
@@ -314,7 +318,8 @@ def test_batch_failure_marks_whole_connection_down(monkeypatch) -> None:
     """整条 PVE 读不到：一次失败就够了，不必再逐台等超时、也不必再单独探活。"""
     client = BatchClient(
         statuses={101: "running", 102: "running"},
-        resources_error=RuntimeError("connection refused"),
+        # 真实链路里连不上会被包成 status_code=502 的 ProxmoxError
+        resources_error=ProxmoxError("connection refused", 502),
     )
     _patch(monkeypatch, client)
     hosts = [_host(i) for i in range(1, 5)]
@@ -328,10 +333,12 @@ def test_batch_failure_marks_whole_connection_down(monkeypatch) -> None:
     assert ai_scope.last_stats()["pve_down"] == 1
     assert client.calls["status"] == 0
     assert client.calls["version"] == 0
+    # 502 是可重试的瞬时错误，第一次扫描可能打了不止一次 /cluster/resources
+    before = client.calls["resources"]
 
     # 几秒内不再为这条已经躺下的连接花任何往返（下一轮轮询最常见）
     asyncio.run(ai_scope.evaluate_hosts_with_details([_host(9)]))
-    assert client.calls["resources"] == 1
+    assert client.calls["resources"] == before
 
 
 def test_batch_permission_error_falls_back_to_single_status(monkeypatch) -> None:
