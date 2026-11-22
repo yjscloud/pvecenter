@@ -15,14 +15,22 @@
 
    因此这里区分 6 种行状态：下发中 / 成功 / 有警告 / 失败 / 已跳过 / 待确认。
    顶部汇总再按「全部成功 / 部分成功 / 全部失败」三档给出结论。
-   ========================================================================== */
+
+   **「读不到任务」不等于「不知道结果」**：机器建没建成，问机器本身就行。任务记录
+   被 PVE 清理、连接指错、普通用户的归属判定对不上时，这里回到 ``/vms`` / ``/lxc``
+   列表按 vmid 确认一次 —— 在，就是建成（绿色）；确认不在，就是失败（红色）。只有
+   连列表都读不到时才保留「待确认」。这条兜底来自一个真实投诉：普通用户批量建了
+   两台机器，机器都在列表里跑着，结果页却报「待确认」并配了一条红色进度条。
+    ========================================================================== */
 import { useEffect, useState } from 'react';
 import type {
   BadgeVariant,
   BatchCreateItemResult,
   BatchCreateResponse,
+  VmSummary,
 } from '../api/types';
 import { errorMessage } from '../api/client';
+import { lxcApi, vmsApi } from '../api/endpoints';
 import { TaskWaitError, waitForTask } from '../hooks/useTaskRunner';
 import { useT, type MessageKey } from '../i18n';
 import { classifyTaskExit, taskFailureHint } from '../utils/status';
@@ -38,6 +46,9 @@ interface Row extends BatchCreateItemResult {
   note?: string;
 }
 
+   /** 回查客户机是否真的存在：在 / 不在 / 问不到（读列表本身失败） */
+   type Presence = 'present' | 'absent' | 'unknown';
+
 const PHASE_META: Record<Phase, { variant: BadgeVariant; key: MessageKey }> = {
   running: { variant: 'info', key: 'batchCreate.runningOne' },
   done: { variant: 'success', key: 'batchCreate.doneOne' },
@@ -49,11 +60,78 @@ const PHASE_META: Record<Phase, { variant: BadgeVariant; key: MessageKey }> = {
 
 export interface BatchCreateProgressProps {
   response: BatchCreateResponse;
+  /**
+   * 这批任务是在哪条 PVE 连接上发起的。
+   *
+   * 归属记录带连接前缀，轮询时不带就可能落到「当前生效连接」上 —— 多连接部署里
+   * 两者不一致时，普通用户会拿到 404（管理员不受归属限制，所以只有普通用户中招）。
+   */
+  connectionId?: string;
   /** 用户点「完成」：父组件负责关闭向导 / 刷新列表 */
   onClose: () => void;
 }
 
-export function BatchCreateProgress({ response, onClose }: BatchCreateProgressProps) {
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 回查客户机是否真的存在。
+ *
+ * 为什么不能只信任务：``/tasks/{upid}`` 走归属判定，跨节点克隆（任务在源节点、
+ * 归属记在目标节点）与多连接部署都可能回 404，而机器其实已经建好。这里改问
+ * 列表 ——「这台机器在不在」，比「那条任务记录读不读得到」更接近用户关心的问题。
+ *
+ * 返回 ``unknown``（列表本身读不到）与 ``absent`` 必须分开：前者不能判失败。
+ */
+async function confirmPresence(
+  item: BatchCreateItemResult,
+  connectionId: string | undefined,
+): Promise<Presence> {
+  /* 克隆刚结束的那几秒，cluster/resources 可能还没刷新出这台机器，多问两轮 */
+  const ATTEMPTS = 3;
+  for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
+    if (attempt > 0) await sleep(1_500);
+    try {
+      const guests = await loadGuests(item, connectionId);
+      if (guests.some((guest) => Number(guest.vmid) === Number(item.vmid))) {
+        return 'present';
+      }
+    } catch {
+      return 'unknown';
+    }
+  }
+  return 'absent';
+}
+
+/**
+ * 列表请求的短时缓存：一批 20 台全「读不到任务」时不应该打 60 次列表接口。
+ *
+ * TTL 比重试间隔（1.5s）短，所以每一轮重试仍会拿到新数据 —— 这里只想合并
+ * **同一瞬间**的并发查询，不想掩盖「刚建好的机器还没出现在列表里」。
+ */
+const GUESTS_TTL_MS = 1_200;
+const guestsCache = new Map<string, { at: number; promise: Promise<VmSummary[]> }>();
+
+function loadGuests(
+  item: BatchCreateItemResult,
+  connectionId: string | undefined,
+): Promise<VmSummary[]> {
+  const key = `${item.type}|${item.node}|${connectionId ?? ''}`;
+  const now = Date.now();
+  const hit = guestsCache.get(key);
+  if (hit && now - hit.at < GUESTS_TTL_MS) return hit.promise;
+  const promise =
+    item.type === 'lxc'
+      ? lxcApi.list(item.node, { connectionId })
+      : vmsApi.list(item.node, { type: 'qemu', connectionId });
+  guestsCache.set(key, { at: now, promise });
+  return promise;
+}
+
+export function BatchCreateProgress({
+  response,
+  connectionId,
+  onClose,
+}: BatchCreateProgressProps) {
   const t = useT();
   const [rows, setRows] = useState<Row[]>(() =>
     response.results.map((item) => {
@@ -85,6 +163,28 @@ export function BatchCreateProgress({ response, onClose }: BatchCreateProgressPr
       );
     };
 
+    /**
+     * 读不到任务结果时，用「机器在不在」收尾。
+     *
+     * ``fallbackNote`` 是三种都问不到时的说明（任务被清理 / 连接读不到 / 其它异常），
+     * 它必须保留 —— 那时确实只能让人去列表里看。
+     */
+    const settleByPresence = async (
+      item: BatchCreateItemResult,
+      fallbackNote: string,
+    ) => {
+      const presence = await confirmPresence(item, connectionId);
+      if (cancelled) return;
+      if (presence === 'present') {
+        /* 机器在 → 就是建成了。任务记录读不到只是「过程查不到」，不是结果不明 */
+        patch(item.index, { phase: 'done', note: t('batchCreate.verifiedNote') });
+      } else if (presence === 'absent') {
+        patch(item.index, { phase: 'failed', note: t('batchCreate.absentNote') });
+      } else {
+        patch(item.index, { phase: 'unknown', note: fallbackNote });
+      }
+    };
+
     const pending = response.results.filter(
       (item) => item.ok && item.task && !item.skipped,
     );
@@ -94,6 +194,7 @@ export function BatchCreateProgress({ response, onClose }: BatchCreateProgressPr
           const task = await waitForTask(String(item.task), item.node, {
             interval: 2_000,
             timeout: 600_000,
+            connectionId,
           });
           const exit = task.exitstatus ?? '';
           const outcome = classifyTaskExit(task.status, task.exitstatus);
@@ -116,26 +217,30 @@ export function BatchCreateProgress({ response, onClose }: BatchCreateProgressPr
             });
           } else {
             /* 没拿到可判定的终态：任务可能还在跑，不能标失败 */
-            patch(item.index, {
-              phase: 'unknown',
-              note: t('batchCreate.unknownNote'),
-            });
+            await settleByPresence(item, t('batchCreate.unknownNote'));
           }
         } catch (err) {
           if (err instanceof TaskWaitError) {
-            const key =
-              err.kind === 'timeout'
-                ? 'batchCreate.timeoutNote'
-                : err.kind === 'missing'
+            /* 超时说明任务还在跑 —— 这时候「机器已出现」不代表克隆做完了，
+               保持「待确认」，别把中途状态报成成功 */
+            if (err.kind === 'timeout') {
+              patch(item.index, {
+                phase: 'unknown',
+                note: t('batchCreate.timeoutNote'),
+              });
+              return;
+            }
+            await settleByPresence(
+              item,
+              t(
+                err.kind === 'missing'
                   ? 'batchCreate.missingNote'
-                  : 'batchCreate.unreachableNote';
-            patch(item.index, { phase: 'unknown', note: t(key) });
+                  : 'batchCreate.unreachableNote',
+              ),
+            );
           } else {
             /* 认证 / 其它异常同样只代表「读不到终态」，不代表机器没建出来 */
-            patch(item.index, {
-              phase: 'unknown',
-              note: errorMessage(err),
-            });
+            await settleByPresence(item, errorMessage(err));
           }
         }
       })();
@@ -144,7 +249,7 @@ export function BatchCreateProgress({ response, onClose }: BatchCreateProgressPr
     return () => {
       cancelled = true;
     };
-  }, [response, t]);
+  }, [response, connectionId, t]);
 
   const countOf = (phase: Phase) =>
     rows.filter((row) => row.phase === phase).length;
@@ -158,15 +263,29 @@ export function BatchCreateProgress({ response, onClose }: BatchCreateProgressPr
   const success = done + warned;
   const allDone = running === 0;
 
-  /* 只有「全部硬失败」才是 danger。全为「待确认」时任务可能仍在跑，
-     不能直接把整批标成失败。 */
+  /* 结论的色调只看**结果**，不看比例：
+       有失败（含被跳过的）→ 红；只剩「问不到」→ 黄；否则绿。
+     全为「待确认」时任务可能仍在跑，不能反过来标成失败（流程还在继续）。 */
   const tone: 'info' | 'success' | 'warning' | 'danger' = !allDone
     ? 'info'
-    : success === rows.length
-      ? 'success'
-      : success === 0 && failed > 0 && unknown === 0
-        ? 'danger'
-        : 'warning';
+    : failed + skipped > 0
+      ? 'danger'
+      : unknown > 0
+        ? 'warning'
+        : 'success';
+
+  /* 进度条颜色同理：它是「这批下发成不成」的结论条，不是容量计量条。
+     ProgressBar 默认按百分比取色（usageColor），100% 恰好落在红色档 ——
+     一批**全部成功**的机器也会顶着一条红条，正是这里要避免的。
+     所以显式给色，且与上面那张结论卡片同一套语义，两处不打架。 */
+  const barColor: string =
+    tone === 'success'
+      ? 'var(--success)'
+      : tone === 'danger'
+        ? 'var(--danger)'
+        : tone === 'warning'
+          ? 'var(--warning)'
+          : 'var(--accent)';
 
   let title: string;
   if (!allDone) {
@@ -208,7 +327,12 @@ export function BatchCreateProgress({ response, onClose }: BatchCreateProgressPr
         }
       >
         <div className="flex flex-col gap-8">
-          <ProgressBar value={pct} label={t('batchCreate.progress')} showValue />
+          <ProgressBar
+            value={pct}
+            color={barColor}
+            label={t('batchCreate.progress')}
+            showValue
+          />
           {allDone ? (
             <div className="fs-sm text-secondary">
               {t('batchCreate.counts', {

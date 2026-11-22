@@ -98,6 +98,8 @@ export function VmAiLeaseCard({
    */
   const [activeLeases, setActiveLeases] = useState<VmAiLease[]>([]);
   const [busy, setBusy] = useState(false);
+  /** 正在回滚的目标：整机回滚要等 PVE 任务跑完（可能几分钟），按钮必须有反馈 */
+  const [rollingBack, setRollingBack] = useState<'' | 'file' | 'snapshot'>('');
   const [error, setError] = useState('');
   /** 撤销失败的那张票：让错误条旁边有个「重试」可点，而不是只留一句红字 */
   const [failedRevoke, setFailedRevoke] = useState<VmAiLease | null>(null);
@@ -343,19 +345,41 @@ export function VmAiLeaseCard({
 
   const rollback = async (payload: { action_id?: string; mode?: 'file' | 'snapshot' }) => {
     if (!lease) return;
+    const isSnapshot = payload.mode === 'snapshot';
     setBusy(true);
+    setRollingBack(isSnapshot ? 'snapshot' : 'file');
     setError('');
     try {
       const result = await aiApi.vmRollback(lease.id, payload);
-      if (!result.ok) setError(result.output);
-      else {
+      /* 三种结果对应三种提示，绝不能沉默了事：
+         ① ok         —— 后端已等到 PVE 任务终态，确认回滚成功
+         ② pending    —— 任务已提交但等待超时，结果未知（别谎报成功/失败）
+         ③ !ok        —— 失败，output 里带 PVE 任务日志给出的具体原因 */
+      if (result.ok) {
+        toast.success(
+          isSnapshot ? t('ai.lease.rollbackSnapshotOk') : t('ai.lease.rollbackFileOk'),
+          result.output,
+        );
+      } else if (result.pending) {
+        toast.warning(t('ai.lease.rollbackPending'), result.output);
+      } else {
+        toast.error(t('ai.lease.rollbackFailed'), result.output);
+        /* 卡片内保留一份：toast 会消失，失败原因要能回看 */
+        setError(result.output);
+      }
+      try {
         const data = await aiApi.vmLease(lease.id);
         setActions(data.actions);
+      } catch {
+        /* 刷新动作列表失败不影响上面已经拿到的回滚结论 */
       }
     } catch (err) {
-      setError(errorMessage(err));
+      const msg = errorMessage(err);
+      toast.error(t('ai.lease.rollbackFailed'), msg);
+      setError(msg);
     } finally {
       setBusy(false);
+      setRollingBack('');
     }
   };
 
@@ -798,6 +822,7 @@ export function VmAiLeaseCard({
                   size="sm"
                   variant="ghost"
                   disabled={busy}
+                  loading={rollingBack === 'file'}
                   onClick={() => void rollback({ action_id: action.id, mode: 'file' })}
                 >
                   {t('ai.lease.rollbackFile')}
@@ -839,6 +864,8 @@ export function VmAiLeaseCard({
             size="sm"
             variant="ghost"
             disabled={busy}
+            loading={rollingBack === 'snapshot'}
+            title={t('ai.lease.rollbackSnapshotHint')}
             onClick={() => void rollback({ mode: 'snapshot' })}
           >
             {t('ai.lease.rollbackSnapshot')}

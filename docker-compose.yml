@@ -174,8 +174,13 @@ services:
       # 漏洞报告渠道（写进 /.well-known/security.txt）：邮箱或 https 链接，
       # 多个用逗号分隔；留空回落到 mailto:security@<面板域名>。
       SECURITY_CONTACT: ${SECURITY_CONTACT:-}
+      # 自助注册总开关（默认关闭）；false 时注册接口 403、登录页不展示注册入口。
+      REGISTER_ENABLED: ${REGISTER_ENABLED:-false}
       # 待审批注册队列上限；堆满后拒绝新注册（0 = 不限制，不推荐）。
       REGISTER_PENDING_LIMIT: ${REGISTER_PENDING_LIMIT:-100}
+      # 控制台中转文件下载链接的有效期（分钟）与一次性开关。
+      CONSOLE_FILE_TTL_MINUTES: ${CONSOLE_FILE_TTL_MINUTES:-60}
+      CONSOLE_FILE_ONE_SHOT: ${CONSOLE_FILE_ONE_SHOT:-false}
       # --- 内网穿透（frp）目标白名单 ---------------------------------------
       # 普通用户默认只能指向「自己名下」的虚机 / 容器 IP。若还要放行其它内网
       # 地址（例如这些机器没有装 Guest Agent、也拿不到静态 IP），在这里列出来，

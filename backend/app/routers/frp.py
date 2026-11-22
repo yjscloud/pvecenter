@@ -20,7 +20,7 @@ import json
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from .. import frp, frpguard, security, store
 from ..schemas import (
@@ -94,11 +94,15 @@ def _public_host(server: Dict[str, Any]) -> str:
     return str(server.get("public_addr") or server.get("server_addr") or "").strip()
 
 
-def _public_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
+def _public_rule(rule: Dict[str, Any], proxy_name: str = "") -> Dict[str, Any]:
     return {
         "id": rule.get("id"),
         "username": rule.get("username", ""),
         "name": rule.get("name", ""),
+        # 这条规则在 frpc 里的实际名字（「归属用户_规则名」，见 frp.proxy_names）。
+        # 界面用它判断「已生效 / 未应用」：合并后的代理名与规则名不再相等，
+        # 少了这个字段每条规则都会显示成「未应用」。
+        "proxy_name": proxy_name or rule.get("name", ""),
         "type": rule.get("type", "tcp"),
         "local_ip": rule.get("local_ip", "127.0.0.1"),
         "local_port": rule.get("local_port", 80),
@@ -131,7 +135,13 @@ async def _visible_rules(
     也能一眼看出哪些规则因为机器改派而不再生效。
     """
     scoped = _scope_rules(rules, username)
-    return [_public_rule(r) for r in await frp.annotate_rules(scoped)]
+    # 名字按**全部**规则算：只拿自己的那几条算，撞名兜底的序号可能和真正渲染
+    # 出去的不一样（见 frp.proxy_names）
+    names = frp.proxy_names(rules)
+    return [
+        _public_rule(r, names.get(str(r.get("id") or ""), ""))
+        for r in await frp.annotate_rules(scoped)
+    ]
 
 
 def _visible_logs(
@@ -336,6 +346,10 @@ async def list_rules(
 
 @router.get("/policy")
 async def get_policy(
+    with_targets: bool = Query(
+        default=False,
+        description="管理员：附带全平台目标清单（逐连接读 PVE，较慢）",
+    ),
     user: Dict[str, Any] = Depends(security.require_permission(_PERM_VIEW)),
 ) -> Dict[str, Any]:
     """规则策略快照：端口区间 / 关键端口黑名单 / 目标白名单。
@@ -343,9 +357,17 @@ async def get_policy(
     端口区间取管理员在页面上设定的值（见 :func:`set_port_range`），没设置过
     时跟随环境配置，默认 40000–50000。
 
-    前端用它做即时校验与提示（"你能选哪些目标"、"哪些端口已被占"）。普通用户
-    还会拿到「自己名下虚机 / 容器的地址清单」（``targets``，含名字 / VMID）——
-    这正是他们被允许指向的全部目标，创建规则时做成下拉即可，不必对着报错猜。
+    前端用它做即时校验与提示（"你能选哪些目标"、"哪些端口已被占"）。
+
+    ``targets`` 是创建规则时「目标地址」下拉的选项（含名字 / VMID）：
+
+    * 普通用户 —— 自己名下虚机 / 容器的地址，也就是他们**被允许指向的全部**
+      （名下没有归属机器时后端根本不会碰 PVE，所以这份总是照算）；
+    * 管理员 —— 全部虚机 / 容器的地址，只是「手边有哪些地址可以点」的快捷入口，
+      不是权限边界（管理员本来就不受白名单限制，见 frpguard.check_target）。
+      这份要逐条连接读 PVE、再逐台解析 IP，离线连接还会拖到超时，所以**默认不算**，
+      由前端在「新建规则」弹窗打开时带 ``with_targets=1`` 单独取一次 —— 否则每次
+      进页面都要等一遍全平台清单，而管理员多数时候并不在建规则。
 
     目标列表读 PVE 失败时不让整页报错：``own_ips_error`` 说明原因，
     ``targets`` / ``own_ips`` 为空即可（写入时仍然会 fail-closed）。
@@ -359,9 +381,14 @@ async def get_policy(
     data: Dict[str, Any] = await frpguard.policy()
     targets: List[Dict[str, Any]] = []
     own_ips_error = ""
-    if not is_admin:
+    if with_targets or not is_admin:
         try:
-            targets = await frpguard.own_guest_targets(username)
+            # 管理员拿到的是**全部**虚机 / 容器（见 frpguard.all_guest_targets）
+            targets = (
+                await frpguard.all_guest_targets()
+                if is_admin
+                else await frpguard.own_guest_targets(username)
+            )
         except Exception as exc:  # noqa: BLE001 - 只影响提示，不影响写入判定
             own_ips_error = str(exc)
     grants = {} if is_admin else await frp.load_grants()
@@ -513,7 +540,8 @@ async def create_rule(
         },
         username=target_user,
     )
-    # 防重名（不同用户允许同名，相同用户内不允许）
+    # 防重名（不同用户允许同名，相同用户内不允许）—— 跨用户的同名不会互相
+    # 干扰：渲染时每个代理名都带归属前缀（见 frp.proxy_names）
     if any(r.get("username") == rule["username"] and r.get("name") == rule["name"] for r in rules):
         raise HTTPException(
             status_code=400,
@@ -526,7 +554,7 @@ async def create_rule(
         request, user, "frp.rule.create", f"frp/rule/{rule['id']}",
         "success", f"username={rule['username']} name={rule['name']}",
     )
-    return _public_rule(rule)
+    return _public_rule(rule, frp.proxy_names(rules).get(rule["id"], ""))
 
 
 @router.post("/rules/relink")
@@ -625,7 +653,7 @@ async def update_rule(
         request, user, "frp.rule.update", f"frp/rule/{rule_id}",
         "success", f"name={new_rule['name']}",
     )
-    return _public_rule(new_rule)
+    return _public_rule(new_rule, frp.proxy_names(rules).get(rule_id, ""))
 
 
 @router.delete("/rules/{rule_id}")
@@ -761,7 +789,8 @@ async def get_effective(
     username = _visible_username(user)
     # 先标注再合并：失效规则的隧道不该出现在「我现在实际暴露了什么」里
     scoped = await frp.annotate_rules(_scope_rules(rules, username))
-    cfg = frp.effective_config(server, scoped)
+    # 渲染名按全部规则算（见 frp.proxy_names）：与 frpc 里真正生效的名字一致
+    cfg = frp.effective_config(server, scoped, names=frp.proxy_names(rules))
     safe = dict(cfg)
     safe["token"] = ""
     if not _is_admin(user):
@@ -791,7 +820,7 @@ async def get_status(
     server = await _load_server()
     rules = await _load_rules()
     scoped = await frp.annotate_rules(_scope_rules(rules, _visible_username(user)))
-    cfg = frp.effective_config(server, scoped)
+    cfg = frp.effective_config(server, scoped, names=frp.proxy_names(rules))
     return {
         **frp.status(cfg, include_server=_is_admin(user)),
         "auto_restart": await frp.auto_restart_enabled(),
@@ -825,7 +854,7 @@ async def legacy_config(
     rules = await _load_rules()
     username = _visible_username(user)
     scoped = await frp.annotate_rules(_scope_rules(rules, username))
-    cfg = frp.effective_config(server, scoped)
+    cfg = frp.effective_config(server, scoped, names=frp.proxy_names(rules))
     safe = dict(cfg)
     safe["token"] = ""
     is_admin = _is_admin(user)

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -40,12 +42,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "proxies": [],
 }
 
+# frp 代理名只认字母 / 数字 / 下划线 / 短横线（见 _owner_slug）
+_PROXY_NAME_BAD = re.compile(r"[^A-Za-z0-9_-]+")
+
 BIN_DIR = DATA_DIR / "frp"
 CONFIG_PATH = BIN_DIR / "frpc.toml"
 LOG_PATH = BIN_DIR / "frpc.log"
 PID_PATH = BIN_DIR / "frpc.pid"
 
-FRP_VERSION = "0.61.1"
+FRP_VERSION = "0.72.0"
 DOWNLOAD_URL = (
     "https://github.com/fatedier/frp/releases/download/"
     f"v{FRP_VERSION}/frp_{FRP_VERSION}_linux_amd64.tar.gz"
@@ -404,11 +409,6 @@ async def annotate_rules(rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-async def effective_rules() -> List[Dict[str, Any]]:
-    """渲染 frpc 用的规则：已剔除失效项（见 :func:`annotate_rules`）。"""
-    return [r for r in await annotate_rules(await load_rules()) if not r.get("stale")]
-
-
 async def suspend_count_for_guest(ref: str, new_owner: str) -> int:
     """这台机器改派后会有几条规则因此失效（用于审计，不修改任何数据）。"""
     target = normalise_guest_ref(ref)
@@ -507,35 +507,103 @@ async def restart_if_running() -> str:
     return ""
 
 
+def _owner_slug(username: Any) -> str:
+    """用户名 → 能安全拼进 frp 代理名的片段。
+
+    用户名允许中文 / 空格 / 邮箱符号，而 frp 的代理名只认字母、数字、下划线、
+    短横线。整段被过滤空时退回一段**稳定**哈希：同一个账号永远得到同一个片段，
+    代理名不会因为重启或增删规则而漂移。
+    """
+    text = str(username or "").strip()
+    if not text:
+        # 无主规则（改派后归属被收回但还没删除的历史数据）：给一个可读的占位
+        return "shared"
+    slug = _PROXY_NAME_BAD.sub("_", text).strip("_")
+    if not slug:
+        slug = "u" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return slug[:32]
+
+
+def proxy_names(rules: List[Dict[str, Any]]) -> Dict[str, str]:
+    """每条规则在 frpc 配置里的**全局**名字（id → name）。
+
+    为什么必须全局唯一：frpc 只有一个进程、一份 ``frpc.toml``，代理名重复会让它
+    直接拒绝启动（``proxy name [tunnel-1] is duplicated``），**所有人的隧道一起
+    躺下**。而规则名本身只保证「同一个用户内不重名」—— 接口的重名检查按 username
+    过滤，新建弹窗的默认名又人人从 ``tunnel-1`` 开始，多用户面板上撞名是必然的。
+
+    所以渲染名统一带上归属用户：``<用户>_<规则名>``。前缀只是**渲染层**的，
+    存储里的规则名不变，用户在自己的列表里看到的还是 ``tunnel-1``。
+
+    极端情况（两个用户名清洗后相同、或历史数据里同人重名）追加 ``-2``/``-3``
+    兜底；排序保证同一份规则每次算出同样的名字。
+    """
+    names: Dict[str, str] = {}
+    taken: set = set()
+    for rule in sorted(
+        rules,
+        key=lambda r: (
+            str(r.get("username") or ""),
+            str(r.get("name") or ""),
+            str(r.get("id") or ""),
+        ),
+    ):
+        rule_id = str(rule.get("id") or "")
+        if not rule_id or rule_id in names:
+            continue
+        base = f"{_owner_slug(rule.get('username'))}_{str(rule.get('name') or 'proxy')}"
+        name = base
+        index = 2
+        while name in taken:
+            name = f"{base}-{index}"
+            index += 1
+        taken.add(name)
+        names[rule_id] = name
+    return names
+
+
 def effective_config(
-    server: Dict[str, Any], rules: List[Dict[str, Any]]
+    server: Dict[str, Any],
+    rules: List[Dict[str, Any]],
+    *,
+    names: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """合并成 frpc 实际使用的配置（服务端 + 所有人的规则）。
 
     ``stale`` 的规则一律跳过：它们的目标机器已经不属于规则作者了
     （判定见 :func:`annotate_rules`）。调用方即使传的是未过滤的列表也不会漏。
+
+    ``names`` 是 :func:`proxy_names` 的结果（id → 渲染名）。调用方如果只拿得到
+    一份**子集**（普通用户只看自己的规则），要传完整规则集算出来的那份，否则
+    极端撞名时子集算出的名字会与真正渲染出去的不一致。
     """
+    if names is None:
+        names = proxy_names(rules)
+    proxies = [
+        {
+            "name": names.get(str(r.get("id") or "")) or str(r.get("name") or "proxy"),
+            "type": r["type"],
+            "local_ip": r["local_ip"],
+            "local_port": r["local_port"],
+            "remote_port": r["remote_port"],
+        }
+        for r in rules
+        if not r.get("stale")
+    ]
     return {
         "server_addr": server.get("server_addr", ""),
         "server_port": server.get("server_port", 7000),
         "token": server.get("token", ""),
-        "proxies": [
-            {
-                "name": r["name"],
-                "type": r["type"],
-                "local_ip": r["local_ip"],
-                "local_port": r["local_port"],
-                "remote_port": r["remote_port"],
-            }
-            for r in rules
-            if not r.get("stale")
-        ],
+        "proxies": proxies,
     }
 
 
 async def effective() -> Dict[str, Any]:
     await migrate_legacy()
-    return effective_config(await load_server(), await effective_rules())
+    # 刻意带上失效规则一起算名字：名字只跟「归属 + 规则名」有关，不随某条规则
+    # 临时失效而漂移（否则一条规则被暂停，另一条的名字可能从 x-2 变回 x）
+    rules = await annotate_rules(await load_rules())
+    return effective_config(await load_server(), rules)
 
 
 class FrpError(RuntimeError):
@@ -548,6 +616,52 @@ def frpc_binary() -> Optional[str]:
     if local.is_file() and os.access(local, os.X_OK):
         return str(local)
     return shutil.which('frpc')
+
+
+# frpc 版本号缓存。状态接口是轮询的（默认 8 秒一次），每轮拉一个进程只为读
+# 一行版本号没有必要，所以按「二进制路径 + 修改时间 + 大小」缓存：只有重新
+# 安装 / 手动替换了二进制才会重问。
+_version_cache: Dict[str, str] = {"key": "", "version": ""}
+
+_VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+[0-9A-Za-z.+-]*)")
+
+
+def frpc_version() -> str:
+    """frpc 二进制自报的版本号（如 ``0.72.0``）；拿不到时返回空串。
+
+    界面上的「客户端版本」因此显示的是**实际装着的那个二进制**的版本，而不是
+    代码里写死的 ``FRP_VERSION`` —— 后者只代表「点安装会下哪个版本」，机器上
+    装的可能是更早的、或管理员自己放进去的。
+    """
+    binary = frpc_binary()
+    if not binary:
+        return ""
+    try:
+        info = os.stat(binary)
+        key = f"{binary}:{int(info.st_mtime)}:{info.st_size}"
+    except OSError:
+        return ""
+    if _version_cache["key"] == key:
+        return _version_cache["version"]
+    version = ""
+    for flag in ("-v", "--version"):
+        try:
+            proc = subprocess.run(
+                [binary, flag],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        text = f"{proc.stdout or ''} {proc.stderr or ''}".strip()
+        match = _VERSION_RE.search(text)
+        if match:
+            version = match.group(1)
+            break
+    _version_cache["key"] = key
+    _version_cache["version"] = version
+    return version
 
 
 def read_logs(limit: int = 200) -> List[str]:
@@ -713,8 +827,32 @@ def start(cfg: Dict[str, Any]) -> None:
     time.sleep(1.5)
     if proc.poll() is not None:
         PID_PATH.unlink(missing_ok=True)
-        detail = '；'.join(read_logs(4)) or '未知原因'
+        detail = _start_output() or '未知原因'
         raise FrpError('frpc 启动失败：' + detail)
+
+
+def _start_output() -> str:
+    """本次启动里 frpc 自己写的那几行（启动失败的原因）。
+
+    不能直接取「日志最后 N 行」：看护把失败原因写回同一份日志，而那条记录里
+    又含着上一次的整段原因 —— 每失败一次就套娃一层，几轮之后单行文本涨到十几
+    KB，真正的报错（``proxy name [tunnel-1] is duplicated``）反而被埋在中间。
+    所以只取**最后一个**「=== 启动 ... ===」之后、且不是看护自己写的行。
+    """
+    try:
+        text = LOG_PATH.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return ''
+    marker = text.rfind('=== 启动 ')
+    if marker >= 0:
+        text = text[marker:]
+    lines: List[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('===') or '[看护]' in line:
+            continue
+        lines.append(line)
+    return '；'.join(lines[-3:])[:400]
 
 
 def stop() -> None:
@@ -748,10 +886,16 @@ def status(
       这台机器上装了什么、目录怎么摆。前端只需要「装没装」→ ``available``。
     * ``include_server=False`` 时连 ``server_addr`` / ``server_port`` 也不给：
       普通用户只需要知道「在不在跑 / 有几条规则」，frps 地址是管理员那边的事。
+
+    ``version`` 是二进制自报的版本号（见 :func:`frpc_version`）：装没装之外，
+    「装的是哪一版」同样是排障时要看的 —— 出问题的往往是某个旧版本，而
+    界面上只说「已就绪」时没人知道它是不是那一版。拿不到时为空串。
     """
+    available = bool(frpc_binary())
     data: Dict[str, Any] = {
         'running': is_running(),
-        'available': bool(frpc_binary()),
+        'available': available,
+        'version': frpc_version() if available else '',
         'proxy_count': len(cfg.get('proxies', [])),
     }
     if include_server:

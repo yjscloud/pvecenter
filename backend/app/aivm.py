@@ -46,7 +46,7 @@ from contextvars import ContextVar
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from . import ai_approval, aiterm, aitools, database, formatters, i18n, security, store
-from .pve import ProxmoxError, get_client, target_connection_id
+from .pve import ProxmoxError, get_client, target_connection_id, task_exit_ok
 from .vm_scope import bind_node_connection
 
 logger = logging.getLogger(__name__)
@@ -2025,12 +2025,44 @@ async def _ensure_snapshot(lease: Dict[str, Any]) -> str:
 
 # ----------------------------------------------------------------------- 回滚
 
+#: 整机快照回滚的等待上限（秒）。PVE 的回滚是异步任务，几十 GB 的磁盘要跑好
+#: 几分钟；超时不等于失败 —— 任务可能还在执行，回执会如实标成「未确认」。
+SNAPSHOT_ROLLBACK_TIMEOUT = 900.0
+
+
+async def _task_failure_reason(client: Any, upid: str, node: str) -> str:
+    """把 PVE 任务的失败原因压成一句给用户看的话。
+
+    ``exitstatus`` 往往只有 ``command failed`` 这种没有信息量的串，真正原因在
+    任务日志末尾（``TASK ERROR: ...``）。取最后几行非空日志拼起来；日志也读不
+    到时不编造原因，直接说「未给出原因」。
+    """
+    try:
+        raw = await client.task_log(upid, node=node, limit=200)
+    except Exception:  # noqa: BLE001 - 读日志失败不该盖住「回滚失败」这个事实
+        logger.debug("AI VM：读取回滚任务日志失败 %s", upid, exc_info=True)
+        return i18n.pick("PVE 未给出具体原因", "PVE did not provide a reason")
+    lines = [
+        str(item.get("t") or item.get("text") or "").strip()
+        for item in (raw or [])
+        if isinstance(item, dict)
+    ]
+    text = " / ".join([ln for ln in lines if ln][-4:])
+    if not text:
+        return i18n.pick("PVE 未给出具体原因", "PVE did not provide a reason")
+    return text[-300:]
+
+
 async def rollback(
     lease: Dict[str, Any], *, action_id: str = "", mode: str = "file"
 ) -> Dict[str, Any]:
     """回滚一次写操作（file）或整台机器（snapshot）。
 
     回滚本身也是一次动作，同样落审计 —— 否则「用回滚掩盖破坏」就无从追溯。
+
+    返回值是**给用户看的结果回执**，必须与真实状态一一对应：``ok`` 只在确认
+    成功时为 True；``pending`` 表示任务已提交但等待超时、结果未知；失败时
+    ``output`` 里带 PVE 任务日志给出的具体原因。
     """
     seq = await _bump_actions(str(lease.get("id") or ""))
     started = time.time()
@@ -2042,9 +2074,47 @@ async def rollback(
                     i18n.pick("这张租约没有可用的快照", "This lease has no snapshot")
                 )
             client = await _client_for(lease)
-            await client.qemu_snapshot_rollback(
-                str(lease.get("node") or ""), int(lease.get("vmid") or 0), name
-            )
+            node = str(lease.get("node") or "")
+            vmid = int(lease.get("vmid") or 0)
+            task = await client.qemu_snapshot_rollback(node, vmid, name)
+            # PVE 的回滚是**异步任务**：POST 只代表受理。存储不支持快照、快照已被
+            # 删除、VM 卡在磁盘锁上 —— 失败都发生在任务里。不等任务结束就回「已
+            # 回滚」，等于给用户一个假的成功提示，他拿着这句话去用一台没回滚的机器。
+            upid = task if isinstance(task, str) else str((task or {}).get("task") or "")
+            if upid.startswith("UPID:"):
+                try:
+                    status = await client.wait_for_task(
+                        upid, node=node, timeout=SNAPSHOT_ROLLBACK_TIMEOUT
+                    )
+                except ProxmoxError as exc:
+                    if int(getattr(exc, "status_code", 0) or 0) != 504:
+                        raise
+                    # 超时不等于失败：任务可能还在跑（大磁盘回滚很慢）。如实回
+                    # 「未确认」，让用户去任务页核对，而不是替他猜一个结论。
+                    pending_msg = i18n.pick(
+                        f"回滚任务已提交，但等待 {int(SNAPSHOT_ROLLBACK_TIMEOUT)} 秒仍未结束，"
+                        f"结果尚未确认。请稍后到「任务」页查看：{upid}",
+                        f"The rollback task was submitted but did not finish within "
+                        f"{int(SNAPSHOT_ROLLBACK_TIMEOUT)}s; the result is unconfirmed. "
+                        f"Check it in Tasks later: {upid}",
+                    )
+                    await _record(
+                        lease,
+                        seq=seq,
+                        tool="rollback",
+                        target=f"snapshot:{name}",
+                        risk=RISK_CONFIG,
+                        verdict="allow",
+                        ok=False,
+                        output=pending_msg,
+                        elapsed_ms=int((time.time() - started) * 1000),
+                    )
+                    return {"ok": False, "pending": True, "output": pending_msg}
+                if not task_exit_ok(status.get("exitstatus")):
+                    reason = await _task_failure_reason(client, upid, node)
+                    raise ToolDenied(
+                        i18n.pick(f"回滚失败：{reason}", f"Rollback failed: {reason}")
+                    )
             result = {
                 "ok": True,
                 "output": i18n.pick(
@@ -2142,6 +2212,24 @@ async def rollback(
             elapsed_ms=int((time.time() - started) * 1000),
         )
         return {"ok": False, "output": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - PVE / 网络异常也必须变成可读回执
+        # 让异常冒到路由只会变成一句 500「服务器内部错误」，用户既不知道回滚成
+        # 没成功、也不知道下一步该做什么。统一转成失败回执，原因原样带出。
+        logger.warning("AI VM 回滚失败（%s）", mode, exc_info=True)
+        detail = str(exc).strip() or i18n.pick("未知错误", "unknown error")
+        msg = i18n.pick(f"回滚失败：{detail[:300]}", f"Rollback failed: {detail[:300]}")
+        await _record(
+            lease,
+            seq=seq,
+            tool="rollback",
+            target=mode,
+            risk=RISK_CONFIG,
+            verdict="allow",
+            ok=False,
+            output=msg,
+            elapsed_ms=int((time.time() - started) * 1000),
+        )
+        return {"ok": False, "output": msg}
 
 
 # ------------------------------------------------------------------- 工具入口

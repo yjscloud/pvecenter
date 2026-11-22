@@ -23,9 +23,12 @@ from .. import (
     guestip,
     guestnotify,
     guestpasswd,
+    guest_osinfo,
+    i18n,
     ippool,
     ownership,
     panelkey,
+    quarantine_store,
     pvecache,
     prefs,
     quota,
@@ -327,6 +330,14 @@ async def collect_vms(
     # 地址当自己的数据去推池名。
     manual_ips = await manual_ip_index(user) if with_ip else {}
 
+    # 隔离登记：一次取全（表很小），下面逐行打 isolated 标记。PVE 的
+    # /cluster/resources 不带 protection，也不展开 netX，逐台读 config 是 N 次
+    # 请求 —— 这是列表能便宜地显示「隔离」标签的唯一办法。
+    #
+    # 键是「连接 + VMID」而不是「连接 + 节点 + VMID」：机器迁移之后登记行里仍是
+    # 旧节点，按节点匹配会让隔离标签凭空消失（而那台机器其实还 protected）。
+    isolation_index = await quarantine_store.index()
+
     for (profile, client), resources in zip(targets, resources_list):
         if isinstance(resources, BaseException):
             if isinstance(resources, ProxmoxError):
@@ -400,6 +411,9 @@ async def collect_vms(
                 "tags": vm.get("tags") or vm.get("tag") or "",
                 "pool": vm.get("pool"),
                 "lock": vm.get("lock"),
+                # 面板登记过的隔离动作（见 app.quarantine_store）：列表据此打
+                # 「隔离」标签，删除入口也能先提示「请先解除隔离」。
+                "isolated": (cid, int(vm.get("vmid") or 0)) in isolation_index,
                 # 客户机自己的系统类型（`l26` / `win11` / `debian` …，PVE 权威）：
                 # 列表页的 OS 图标优先用它，其次才回落到来源模板名
                 "ostype": ostype_index.get(
@@ -442,10 +456,10 @@ async def collect_vms(
                 # 自动地址解析不到时，退而用手动备注的地址判网络归属 —— 用户手动
                 # 填的那份也想知道它在哪张网里。但 ip_in_pool（池外徽标）仍只描述
                 # 自动识别到的地址，两者别混。
+                # 键不含节点：机器迁移后条目还挂在旧节点下（见 manual_ip_index）
                 manual_ip = manual_ips.get(
                     (
                         str(item.get("connection_id") or ""),
-                        str(item.get("node") or ""),
                         int(item.get("vmid") or 0),
                     ),
                     "",
@@ -2107,6 +2121,17 @@ async def vm_power(
     await security.audit(
         request, user, f"vm.{action}", target=f"{node}/{vmid}"
     )
+    # 开机 / 重启后再确认一次系统信息：清空 / 重装之后系统的真实状态要看 config，
+    # 采集失败只保留上一次快照，绝不把已有信息当成「已清除」（见 app.guest_osinfo）
+    if action in ("start", "reboot", "resume"):
+        await guest_osinfo.capture(
+            node,
+            vmid,
+            conn_id=_op_connection(),
+            reason=f"power.{action}",
+            actor=str(user.get("username") or ""),
+            restore_os=True,
+        )
     return {"task": task}
 
 
@@ -2156,6 +2181,15 @@ async def delete_vm(
 ) -> Dict[str, Any]:
     client = get_client()
 
+    # 隔离中的虚拟机不能删：那台机器就是证据（取证快照 + 断网状态）。PVE 侧
+    # protection=1 也会拒，但抛出来的是一句英文原文，用户不知道下一步该做什么 ——
+    # 这里直接告诉他「先去应急响应页解除隔离」。
+    if await quarantine_store.get(_op_connection(), node, vmid):
+        raise HTTPException(
+            status_code=409,
+            detail=i18n.t("isolation.deleteBlocked", vmid=vmid),
+        )
+
     # Refuse to destroy a running VM — PVE would error anyway, but a clear
     # message is friendlier than the raw failure.
     try:
@@ -2193,6 +2227,10 @@ async def delete_vm(
     )
     # IP 缓存同样要清：VMID 回收后，旧地址会贴着同号的新机器显示一分钟
     await _best_effort("IP 缓存", guestip.forget(conn_id, node, vmid, "qemu"))
+    # 隔离登记也要清：VMID 会被回收，同号的新机器不该一出生就带「隔离」标签
+    # （正常情况下隔离中的机器走不到这里，见上面的 409 —— 这行是给「先解除隔离
+    # 再删除」以及历史残留兜底的）
+    await _best_effort("隔离记录", quarantine_store.drop(conn_id, node, vmid))
     # 从地址池分配出去的地址也一并释放：配置已经没了，登记行若还留着会白占
     # 一个地址（扫描结果接管后本来就该由删除来回收，这里只是立刻生效）
     await _best_effort("地址池登记", ippool.release_guest(conn_id, node, vmid))

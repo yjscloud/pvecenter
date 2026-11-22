@@ -300,6 +300,9 @@ export const zhMonitor = {
   'frp.statClient': '客户端程序',
   'frp.installed': '已安装',
   'frp.notInstalled': '未安装',
+  /* 版本号取自 frpc 二进制自身（frpc -v），不是代码里写死的目标版本 */
+  'frp.installedWithVersion': '已安装 · v{version}',
+  'frp.versionUnknown': '版本未知',
   'frp.statServer': 'frps 服务端',
   'frp.notConfigured': '未配置',
   /* 服务端地址只下发给管理员（V2-04），普通用户看到这句说明 */
@@ -310,19 +313,44 @@ export const zhMonitor = {
   'frp.serverSubtitleAdmin': '仅管理员可改 —— 服务端地址 / token 属于基础设施',
   'frp.serverSubtitleUser': '只读 —— 服务端配置仅管理员可改',
   'frp.saveChanges': '保存修改',
+  /* 手动保存才有「未保存」这个中间态（词条与规则表共用 'frp.unsaved'）：
+     没有它，改过两个字符和从没动过长得一样 */
+  'frp.discard': '撤销',
+  'frp.saveDisabledHint': '没有改动需要保存',
+  /* 三个分区：前两组决定「连不连得上 / 会不会被拒」，第三组多数部署用不到 */
+  'frp.sectionBasic': '基础参数',
+  'frp.sectionBasicHint': 'frpc 连接 frps 的入口，对应 frps.ini 的 bind_addr / bindPort',
+  'frp.sectionAuth': '连接参数',
+  'frp.sectionAuthHint': '鉴权信息须与服务端一致，否则 frpc 会被拒绝连接',
+  'frp.sectionAdvanced': '高级选项',
+  'frp.sectionAdvancedHint':
+    '多数部署用不到：只在 frps 位于 NAT 后面、或用户通过独立域名访问穿透服务时才需要设置。',
+  'frp.advancedUnset': '未配置',
   'frp.fieldServerAddr': '服务端地址',
+  'frp.serverAddrHint':
+    '例：frps.example.com 或 42.194.184.49。只填域名或 IP，不要带 http:// 与端口。',
   'frp.serverAddrPlaceholder': 'frps.example.com 或公网 IP',
-  'frp.fieldPublicAddr': '对外访问地址（选填）',
-  'frp.publicAddrPlaceholder': 'frp.example.com 或公网 IP',
-  'frp.publicAddrHint':
-    '用户连穿透服务时用的地址：frps 在 NAT 后面或走域名时填这里，留空则沿用服务端地址。只填域名 / IP，不要带 http:// 与路径。',
-  'frp.fieldServerPort': '服务端端口（frps bindPort）',
-  'frp.fieldToken': 'Token（与服务端 auth.token 一致）',
+  'frp.fieldServerPort': '服务端端口',
+  'frp.serverPortHint': '例：7000。填 frps.ini 里的 bindPort，不是 frpc 的本地端口。',
+  'frp.fieldToken': 'Token',
+  'frp.tokenSet': '已设置',
+  'frp.tokenUnset': '未设置',
   'frp.tokenHintSet': '已加密保存，前端不回显明文；输入新值可替换，留空则保持原值。',
   'frp.tokenHintUnset': '服务端未设置则留空。保存后以 **** 显示，不会回显明文。',
   'frp.tokenPlaceholder': '****（已设置）',
+  'frp.tokenPlaceholderNew': '与服务端 auth.token 相同',
   'frp.clear': '清空',
+  'frp.fieldPublicAddr': '对外访问地址',
+  'frp.publicAddrPlaceholder': 'frp.example.com 或公网 IP',
+  'frp.publicAddrHint':
+    '用户连穿透服务时用的地址：frps 在 NAT 后面或走域名时填这里，留空则沿用服务端地址。只填域名 / IP，不要带 http:// 与路径。',
   'frp.restartNote': '修改服务端配置后，若 frpc 正在运行会自动重启使新配置生效。',
+  /* 校验：只在碰过字段或点过保存之后才显示 */
+  'frp.errAddrRequired': '请填写服务端地址',
+  'frp.errAddrShape': '只填域名或 IP，不要带 http:// 、端口或路径',
+  'frp.errPortRequired': '请填写端口',
+  'frp.errPortRange': '端口需为 1–65535 之间的整数',
+  'frp.fixErrorsFirst': '请先修正标红的字段',
   'frp.savedTitle': '已保存',
   'frp.savedRestartFailedDetail': '但自动重启 frpc 失败：{error}',
   'frp.savedRestarted': '服务端配置已保存，frpc 已重启并立即生效',
@@ -332,7 +360,6 @@ export const zhMonitor = {
   'frp.clearFailed': '清空失败',
   'frp.clientTitle': 'frpc 客户端',
   'frp.clientVersion': '客户端版本',
-  'frp.ready': '已就绪',
   'frp.missing': '缺失',
   'frp.notInstalledTitle': '尚未安装 frpc',
   'frp.notInstalledBody': '面板自带目录与系统 PATH 中都没有 frpc 二进制。',
@@ -355,7 +382,8 @@ export const zhMonitor = {
   'frp.currentUser': '当前用户',
   'frp.newRule': '新建规则',
   'frp.dupTitle': '存在重名规则',
-  'frp.dupBody': '以下规则名重复：{names}。frpc 启动会因此失败，请改名。',
+  'frp.dupBody':
+    '以下规则名重复：{names}。合并渲染时会自动加序号（如 tunnel-1-2）才能启动，建议改成不重复的名字。',
   'frp.noRules': '还没有规则，点击右上角「新建规则」开始。',
   'frp.colOwner': '归属',
   'frp.colName': '名称',
@@ -384,15 +412,26 @@ export const zhMonitor = {
   /* 普通用户的目标下拉（选项由后端按归属 + PVE 实况算出） */
   'frp.kindQemu': '虚拟机',
   'frp.kindLxc': '容器',
-  'frp.targetOption': '{name}（{kind} {vmid}）· {ip}',
-  'frp.targetOptionUnnamed': '{kind} {vmid} · {ip}',
-  'frp.targetSelectPlaceholder': '请选择目标地址',
+  /* 可搜索的目标选择器（见 ui/TargetSelect.tsx 与 utils/targetSearch.ts）：
+     主机名 / IP / VMID 三个维度都能搜，匹配与排序规则写在那两个文件的注释里 */
+  'frp.targetSearchPlaceholder': '搜索主机名 / IP / VMID',
+  'frp.targetSearchListAria': '可选的目标地址',
+  'frp.targetSearchNoMatch': '没有匹配「{query}」的目标',
+  'frp.targetSearchManual': '改为手动填写',
+  'frp.targetSearchMore': '还有 {n} 个未显示，继续输入以缩小范围',
+  'frp.targetGrantedName': '管理员授权',
   'frp.targetSelectEmpty': '暂无可指向的虚拟机 / LXC 容器',
-  'frp.targetSelectHint': '只能选择你名下虚拟机 / LXC 容器的 IP（共 {n} 个）',
+  'frp.targetSelectHint': '可按主机名 / IP / VMID 搜索；只能选择你名下虚拟机 / LXC 容器的 IP（共 {n} 个）',
   'frp.targetSelectHintManual':
-    '只能选择你名下虚拟机 / LXC 容器的 IP；其它地址仅限管理员放行的网段：{cidrs}',
+    '可按主机名 / IP / VMID 搜索；其它地址仅限管理员放行的网段：{cidrs}',
   'frp.targetManualOption': '其它地址（管理员已放行的网段）',
-  'frp.targetGrantedOption': '管理员授权 · {ip}',
+  'frp.targetManualOptionAdmin': '自定义 IP（手动填写）',
+  'frp.targetSelectHintAdmin':
+    '可按主机名 / IP / VMID 搜索；共 {n} 个已知地址，列表外的地址选「自定义 IP」',
+  'frp.targetSelectLoading': '正在读取可选地址…',
+  'frp.targetSelectAdminNoPreset':
+    '暂时没读到可选的地址（PVE 连接可能不可用），请切到「自定义 IP」手动填写',
+  'frp.fieldLocalIpManualAdmin': '目标 IP（自定义）',
   'frp.fieldLocalIpManual': '目标 IP（须在放行网段内）',
   'frp.localIpPlaceholder': '例如 10.0.0.25',
   'frp.localIpRequired': '请填写目标 IP',

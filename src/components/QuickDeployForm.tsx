@@ -60,16 +60,19 @@ import {
   ctTemplatePickItems,
   elsewhereTemplatesHint,
   vmTemplatePickItems,
+  type TemplatePickItem,
 } from '../utils/templatePick';
 import { isPathDisabled, SSH_SECURITY_NAV_PATH } from './Sidebar';
 import { IconCloud, IconPlus, IconTrash } from './Icons';
+import { OsLogo } from './OsLogo';
+import { osFamilyLabel, templateFamily } from '../utils/osFamily';
 import { useNodeBridges } from '../hooks/useNodeBridges';
 import { useToast } from '../hooks/useToast';
 import { useUiPrefs } from '../hooks/useUiPrefs';
 import { useAuth } from '../hooks/useAuth';
 import { useNodeStorages } from '../hooks/useNodeStorages';
 import { useT, type MessageKey } from '../i18n';
-import { formatBytes } from '../utils/format';
+import { formatBytes, normalizeSizeText } from '../utils/format';
 import { parseVlan, vlanInvalid } from '../utils/vlan';
 import { BatchCreateProgress } from './BatchCreateProgress';
 import { NicSegmentFields, type IpMode } from './NicSegmentFields';
@@ -238,9 +241,6 @@ export function QuickDeployForm({
 
   /** 用户自己点过 IP 获取方式：之后不再被「有没有可用网段」的自动判断覆盖 */
 
-  /** 用户自己挑过模板：之后不再被「默认选中第一张」覆盖（与自定义部署同一规则） */
-  const templateTouchedRef = useRef(false);
-
   /** 已经按面板默认值预选过克隆方式：每次打开只填一次，不覆盖用户的选择 */
   const cloneDefaultRef = useRef(false);
 
@@ -281,7 +281,6 @@ export function QuickDeployForm({
        上一次开了完整克隆就悄悄沿用下去，等于替用户改了磁盘语义 */
     setFullClone(false);
     cloneDefaultRef.current = false;
-    templateTouchedRef.current = false;
     /* targetConn 不清：保留上次选的主机（多台 PVE 时省一次选择），下面那个
        effect 只在它为空时兜底选当前连接 */
   }, [open]);
@@ -412,14 +411,13 @@ export function QuickDeployForm({
     if (target) setTargetConn(target.id);
   }, [open, targetConn, connectionsQuery.data]);
 
-  /* 换主机：节点、存储、模板都不通用，全部清掉重选。
-     一并放开「用户挑过模板」的锁：清空之后要按新主机的模板重新落一次默认值。 */
+  /* 换主机：节点、存储、模板都不通用，全部清掉重选。模板本来就要求用户自己确认，
+     清掉之后停在「可选模板列表」上，正好是他该做的那一步。 */
   useEffect(() => {
     setNode('');
     setStorage('');
     setTemplateRef('');
     setOsTemplate('');
-    templateTouchedRef.current = false;
   }, [targetConn]);
 
   /* 换节点：节点名不通用，存储与模板也跟着变。模板列表现在按节点收窄了（见
@@ -429,7 +427,6 @@ export function QuickDeployForm({
     setStorage('');
     setOsTemplate('');
     setTemplateRef('');
-    templateTouchedRef.current = false;
   }, [node]);
 
   /* 网桥默认取节点上的第一个（通常是 vmbr0），所有还没选网桥的网卡一起填上。
@@ -712,14 +709,18 @@ export function QuickDeployForm({
     [osTemplatesQuery.data],
   );
 
-  /* 默认选中第一张模板 —— 与自定义部署（见 VmCreateWizard 的 autoPickedRef）
-     同一条规则：模板是创建的前提，列表到了就先落一个默认值，用户要换再换。
-     用户自己点过之后不再覆盖；换主机后引用已失效，锁会在上面那个效果里放开。 */
-  useEffect(() => {
-    if (!open || !isVm || templateTouchedRef.current || templateRef) return;
-    const first = vmPickItems[0];
-    if (first) setTemplateRef(first.value);
-  }, [open, isVm, templateRef, vmPickItems]);
+  /* 当前选中的模板（还没选时 undefined）：提交摘要里那块「模板信息」用它。
+     直接取选择器的候选 —— 摘要显示的名称 / 内存 / 磁盘必须与选择器逐字一致，
+     再回原接口记录里拼一份，迟早会长出两种写法（见 utils/templatePick 文件头）。 */
+  const selectedTemplate = useMemo(() => {
+    const value = isVm ? templateRef : osTemplate;
+    if (!value) return undefined;
+    return (isVm ? vmPickItems : ctPickItems).find((item) => item.value === value);
+  }, [isVm, templateRef, osTemplate, vmPickItems, ctPickItems]);
+
+  /* 模板**不预选**：装哪套系统是要用户自己确认的决定，替他选第一张等于把
+     「随机的默认值」当成答案 —— 选错了要到开机才发现。所以打开时模板为空，
+     选择器直接铺出可选列表（见 SystemTemplatePicker：没选中值时列表常驻）。 */
 
   const storageOptions = useMemo(() => {
     const want = isVm ? 'images' : 'rootdir';
@@ -1045,15 +1046,27 @@ export function QuickDeployForm({
     }
   };
 
-  /* 磁盘现在两种类型都会按规格生效（VM 走克隆后扩容系统盘），所以摘要里
-     直接写实际大小 —— 不再有「虚拟机沿用模板磁盘」这个例外。 */
-  const summary = spec
-    ? t('quickDeploy.summary', {
-        cores: spec.cores,
-        mem: gb(spec.memory),
-        disk: t('quickDeploy.summaryDisk', { n: spec.disk }),
-      })
-    : '';
+  /* ---- 提交摘要：额度（还能建几台）× 规格（每台多大） ----
+     这两件事原来被塞在按钮右边同一行灰字里，用「·」连着，还夹着一个空数字
+     （quota 为 null = 这一层没设台数上限时，会把 null 直接插成「已用 3 / ，还剩 台」）。
+     现在拆成两行两列：左侧固定标签、右侧数值，规格与额度不再混成一句话。 */
+  const unit = isVm ? t('quota.unitGuest') : t('quota.unitItem');
+
+  /* 台数不够：表单已经据此禁用提交，这里把话说满（还差多少） */
+  const quotaShort = Boolean(
+    quota?.limited &&
+      quota.remaining !== null &&
+      quantity > quota.remaining,
+  );
+
+  /* 额度占用比例：只用来画进度条，不参与任何判定 —— 能不能建仍由后端额度
+     与 quotaShort 决定。80% 起转琥珀、放不下时转红，与额度徽标的配色一致。 */
+  const quotaPct = useMemo(() => {
+    const cap = quota?.quota ?? 0;
+    if (!quota?.limited || cap <= 0) return 0;
+    return Math.min(100, Math.round((quota.used / cap) * 100));
+  }, [quota]);
+  const quotaTone = quotaShort ? 'is-danger' : quotaPct >= 80 ? 'is-warn' : '';
 
   /* 批量提交后不再显示表单：保留结果页，让每台的 PVE 任务在这里跑完 */
   if (batchResult) {
@@ -1061,6 +1074,9 @@ export function QuickDeployForm({
     return (
       <BatchCreateProgress
         response={batchResult}
+        /* 这批任务是在哪条连接上发起的：轮询任务与回查列表都要带上，
+           否则多连接部署里普通用户会被当成「这不是你的任务」 */
+        connectionId={targetConn}
         onClose={() => {
           setBatchResult(null);
           onCreated?.(firstVmid);
@@ -1186,34 +1202,7 @@ export function QuickDeployForm({
           ) : null}
         </Card>
 
-        {/* ---- 2. 资源规格 ---- */}
-        <Card>
-          <CardHeader
-            title={t('quickDeploy.sectionSpec')}
-            subtitle={t('quickDeploy.specSubtitle')}
-          />
-          {specsQuery.isLoading ? (
-            <Spinner />
-          ) : specs.length === 0 ? (
-            /* 空态已在上面用 Notice 说明；这里不重复占位 */
-            null
-          ) : (
-            /* 与「系统镜像」同一套列表：一行一档、字段成列，档位分组带色。
-               规格多了才有搜索 / 档位 chip / 分组，见 SpecPicker。 */
-            <SpecPicker
-              specs={specs}
-              value={specId}
-              onChange={setSpecId}
-              recommendedId={recommendedSpecId}
-              blockedIds={blockedSpecIds}
-              /* 装不下模板系统盘的档位：禁用 + 行内写明差多少 */
-              unfitReasons={diskUnfitReasons}
-              disabled={!canCreate}
-            />
-          )}
-        </Card>
-
-        {/* ---- 3. 部署位置 ---- */}
+        {/* ---- 2. 部署位置 ---- */}
         <Card>
           <CardHeader
             title={t('quickDeploy.sectionLocation')}
@@ -1249,6 +1238,36 @@ export function QuickDeployForm({
           </div>
         </Card>
 
+        {/* ---- 3. 资源规格 ----
+            排在部署位置之后：档位能不能用是按「所选节点上的存储」判的（装不下模板
+            系统盘的会被禁用），先定落点再挑档位，才不会点了一个禁用项才发现换台
+            节点就能用。 */}
+        <Card>
+          <CardHeader
+            title={t('quickDeploy.sectionSpec')}
+            subtitle={t('quickDeploy.specSubtitle')}
+          />
+          {specsQuery.isLoading ? (
+            <Spinner />
+          ) : specs.length === 0 ? (
+            /* 空态已在上面用 Notice 说明；这里不重复占位 */
+            null
+          ) : (
+            /* 与「系统镜像」同一套列表：一行一档、字段成列，档位分组带色。
+               规格多了才有搜索 / 档位 chip / 分组，见 SpecPicker。 */
+            <SpecPicker
+              specs={specs}
+              value={specId}
+              onChange={setSpecId}
+              recommendedId={recommendedSpecId}
+              blockedIds={blockedSpecIds}
+              /* 装不下模板系统盘的档位：禁用 + 行内写明差多少 */
+              unfitReasons={diskUnfitReasons}
+              disabled={!canCreate}
+            />
+          )}
+        </Card>
+
         {/* ---- 4. 系统镜像 ---- */}
         <Card>
           <CardHeader
@@ -1260,9 +1279,10 @@ export function QuickDeployForm({
             }
           />
           {/* 系统模板用与「创建虚拟机 / 创建容器」向导同一套选择器（见
-              SystemTemplatePicker）：一两张时直接平铺成行，几十张时先给一张
-              摘要卡再展开搜索/分类。原来的原生下拉把发行版、版本、容量全塞进
-              一行，模板一多就只能靠运气翻。 */}
+              SystemTemplatePicker）：一两张时直接平铺成行，几十张时给一张可滚动
+              列表（搜索 / 分类 / 分组），选定后再收成摘要卡。原来的原生下拉把发行版、
+              版本、容量全塞进一行，模板一多就只能靠运气翻。
+              **这里不预选**：装哪套系统由用户自己确认，见上面那段说明。 */}
           <Field
             label={isVm ? t('templatePicker.vmLabel') : t('templatePicker.ctLabel')}
             required
@@ -1289,13 +1309,8 @@ export function QuickDeployForm({
               items={isVm ? vmPickItems : ctPickItems}
               value={isVm ? templateRef : osTemplate}
               onChange={(next) => {
-                if (isVm) {
-                  /* 用户自己挑过：之后的自动默认值不再覆盖他 */
-                  templateTouchedRef.current = true;
-                  setTemplateRef(next);
-                } else {
-                  setOsTemplate(next);
-                }
+                if (isVm) setTemplateRef(next);
+                else setOsTemplate(next);
               }}
             />
           </Field>
@@ -1564,10 +1579,186 @@ export function QuickDeployForm({
         </Card>
 
         {/* ---- 提交 ---- */}
-        <div>
+        <div className="deploy-submit">
           {/* 用中性提示而不是红色报错：这是「还差什么」的引导，不是用户填错了 */}
           {error ? <div className="field-message">{error}</div> : null}
-          <div className="mt-12 flex items-center gap-12 flex-wrap">
+
+          {/* 提交摘要：额度与规格各占一行，左侧标签成立一列，数值在右列对齐。
+              原来挤在按钮右边那一行里，「已用 3 / 」后面直接断掉、紧接「1C · 1G · 20G」，
+              既看不出还够不够建，也读不出单位。 */}
+          <dl className="deploy-summary">
+            <div className="deploy-summary-row">
+              <dt className="deploy-summary-key">
+                {/* 口径写在标签上：普通用户看到的是自己名下（并点明是虚拟机还是容器），
+                    能管设置的人看到的是全平台 —— 同一个数字两种含义，不能都写「额度」 */}
+                {quota?.scope === 'global'
+                  ? t('quota.platformLabel')
+                  : t('quickDeploy.quotaKindLabel', {
+                      label: quota?.label ?? t('quickDeploy.quotaFallback'),
+                    })}
+              </dt>
+              <dd className="deploy-summary-value deploy-summary-quota">
+                {/* 一行两段：左 = 额度读数（还能建几台），右 = 模板信息（按哪张
+                    模板建）。额度读数右边原来空着半行，把模板放在那儿，正好
+                    补上那块空白；窄屏时模板整块折到下一行、贴右边缘，不与额度
+                    数字挤在同一截里。 */}
+                <span className="deploy-quota-main">
+                  {!quota ? (
+                    <span className="deploy-summary-loading">
+                      <Spinner size={12} /> {t('quickDeploy.loadingQuota')}
+                    </span>
+                  ) : !quota.limited ? (
+                    /* 两层都没设限：只报已用，别把「不限制」写成「已用 x / 」 */
+                    t('quickDeploy.quotaUnlimitedUsed', {
+                      used: quota.used,
+                      unit,
+                    })
+                  ) : quota.quota === null ? (
+                    /* 只限了规格、没限台数（或个人池在限、全局护栏没设）：
+                       台数这一维本来就是无限，说「台数不限」比留一个空数字诚实 */
+                    t('quickDeploy.quotaNoCapUsed', {
+                      used: quota.used,
+                      unit,
+                    })
+                  ) : (
+                    <>
+                      {/* 已用 / 上限 + 占用条：一眼看出「还剩多少空间」，
+                          不必先在脑里做一次除法 */}
+                      <span className="deploy-quota-text">
+                        {t('quickDeploy.quotaUsedOf', {
+                          used: quota.used,
+                          quota: quota.quota,
+                          unit,
+                        })}
+                      </span>
+                      {/* 纯视觉辅助：同一信息已由左边那句「已用 15 / 30 台」表达，
+                          进度条不再重复朗读 */}
+                      <span
+                        className={`deploy-quota-bar ${quotaTone}`}
+                        aria-hidden="true"
+                      >
+                        <span
+                          className="deploy-quota-fill"
+                          style={{ width: `${quotaPct}%` }}
+                        />
+                      </span>
+                      {quantity > 1 ? (
+                        <span className="deploy-chip">
+                          {t('quickDeploy.quotaThisBatch', {
+                            qty: quantity,
+                            unit,
+                          })}
+                        </span>
+                      ) : null}
+                      <span className="deploy-summary-divider" aria-hidden="true" />
+                      {quotaShort ? (
+                        /* 拆成两段：前半（含数字与单位）不许断行，后半才折行 ——
+                           否则窄屏会把「2 台」拆成「2 / 台」 */
+                        <span className="deploy-quota-short">
+                          <span className="deploy-summary-em is-warn">
+                            {t('quickDeploy.quotaShortLeft', {
+                              n: quota.remaining,
+                              unit,
+                            })}
+                          </span>
+                          <span className="deploy-summary-warn">
+                            {t('quickDeploy.quotaShortNeed', {
+                              qty: quantity,
+                              unit,
+                            })}
+                          </span>
+                        </span>
+                      ) : (
+                        <span className="deploy-summary-em">
+                          {t('quickDeploy.quotaAfter', {
+                            n: (quota.remaining ?? 0) - quantity,
+                            unit,
+                          })}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </span>
+                <TemplateBrief
+                  item={selectedTemplate}
+                  kind={kind}
+                  fullClone={fullClone}
+                  storage={storage}
+                />
+              </dd>
+            </div>
+            <div className="deploy-summary-row">
+              <dt className="deploy-summary-key">
+                {t('quickDeploy.summarySpecKey')}
+              </dt>
+              {/* 规格不再拼成一整句「单台 2 核 · …，共 3 台（合计 …）」：括号里再套
+                  一遍同样的三项，读的时候得先拆句再对数。改成三段 —— 单台三个
+                  胶囊、乘数、合计 —— 每台与整批各自成组，眼睛扫一眼就能对上
+                  「2 核 ×3 = 6 核」。
+                  磁盘两种类型都按规格生效（VM 是克隆后扩容系统盘），所以这里直接
+                  写实际大小，不再有「虚拟机沿用模板磁盘」那个例外。 */}
+              <dd className="deploy-summary-value deploy-summary-spec">
+                {spec ? (
+                  <span className="deploy-spec">
+                    <span className="deploy-spec-label">
+                      {t('quickDeploy.specPerGuest')}
+                    </span>
+                    <span className="deploy-spec-chips">
+                      <span className="deploy-spec-chip">
+                        {t('quickDeploy.specCores', { n: spec.cores })}
+                      </span>
+                      <span className="deploy-spec-chip">
+                        {t('quickDeploy.specMem', { n: gb(spec.memory) })}
+                      </span>
+                      <span className="deploy-spec-chip">
+                        {t('quickDeploy.summaryDisk', { n: spec.disk })}
+                      </span>
+                    </span>
+                    {quantity > 1 ? (
+                      <>
+                        {/* 乘数：中文「× 3 台」，英文的台数单位是空串，模板里
+                            只写数量 —— 两语各自读得通，不是漏了单位 */}
+                        <span className="deploy-spec-times">
+                          {t('quickDeploy.specTimes', {
+                            qty: quantity,
+                            unit,
+                          })}
+                        </span>
+                        {/* 虚点引导线：把「单台」与「合计」之间那截空白变成一条
+                            视线路径 —— 两组数字被读成一道乘法，而不是各占一头、
+                            互不相干的两条读数。只有批量（有乘数）时才需要。 */}
+                        <span className="deploy-spec-leader" aria-hidden="true" />
+                        <span className="deploy-spec-total">
+                          <span className="deploy-spec-label">
+                            {t('quickDeploy.specTotalLabel')}
+                          </span>
+                          <span className="deploy-spec-chip is-total">
+                            {t('quickDeploy.specCores', {
+                              n: spec.cores * quantity,
+                            })}
+                          </span>
+                          <span className="deploy-spec-chip is-total">
+                            {t('quickDeploy.specMem', {
+                              n: gb(spec.memory * quantity),
+                            })}
+                          </span>
+                          <span className="deploy-spec-chip is-total">
+                            {t('quickDeploy.summaryDisk', {
+                              n: spec.disk * quantity,
+                            })}
+                          </span>
+                        </span>
+                      </>
+                    ) : null}
+                  </span>
+                ) : (
+                  '—'
+                )}
+              </dd>
+            </div>
+          </dl>
+
+          <div className="deploy-actions">
             <Button
               variant="primary"
               icon={<IconCloud size={15} />}
@@ -1580,26 +1771,126 @@ export function QuickDeployForm({
             <Button variant="secondary" onClick={onClose} disabled={busy}>
               {t('common.cancel')}
             </Button>
-            {quota ? (
-              <span className="fs-sm text-muted">
-                {quota.limited
-                  ? t('quickDeploy.quotaLimited', {
-                      label: quota.label,
-                      used: quota.used,
-                      quota: quota.quota,
-                      remaining: quota.remaining,
-                    })
-                  : t('quickDeploy.quotaUnlimited', { label: quota.label })}
-                {summary ? t('quickDeploy.willCreate', { summary }) : ''}
-              </span>
-            ) : (
-              <span className="flex items-center gap-6 fs-sm text-muted">
-                <Spinner size={12} /> {t('quickDeploy.loadingQuota')}
-              </span>
-            )}
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * 提交摘要里的「模板信息」卡（额度读数右边那块）。
+ *
+ * 为什么放在摘要里而不是再开一张卡：下单前用户只确认两件事 —— 「还能建几台」
+ * 和「按哪张模板建」。前者是额度行，后者原来只在上面「系统镜像」卡里，滚到底
+ * 部按按钮时已经看不见了；额度行右侧本来空着半行，正好把模板的名字、规格与
+ * 关键配置摆在那里，一屏之内两件事都读得到。
+ *
+ * 显示规则：
+ * · 名称 / 系统与选择器里的写法逐字一致（都来自 TemplatePickItem），不另拼一份；
+ * · 「规格」是模板自带的核数 / 内存 / 磁盘，与下一行「单台」的计划规格是两回事，
+ *   所以两者都标了来源（这块写「模板」，那行写「单台」）；
+ * · 「关键配置」只放模板自身的身份与落点：VMID、克隆方式、存储、节点。网络、
+ *   登录这些字段属于这台机器，不在这里重复。
+ */
+function TemplateBrief({
+  item,
+  kind,
+  fullClone,
+  storage,
+}: {
+  item: TemplatePickItem | undefined;
+  kind: QuickDeployKind;
+  fullClone: boolean;
+  storage: string;
+}) {
+  const t = useT();
+  const isVm = kind === 'qemu';
+
+  /* 模板还没选：留一个占位而不是整块消失 —— 否则用户看到的是额度行右边一片
+     空白，不知道这里本该有什么。 */
+  if (!item) {
+    return (
+      <span className="deploy-tpl-brief is-empty">
+        <span className="deploy-tpl-kicker">
+          {t('quickDeploy.templateTitle')}
+        </span>
+        <span className="deploy-tpl-empty">
+          {t('quickDeploy.templateEmpty')}
+        </span>
+      </span>
+    );
+  }
+
+  const family = templateFamily(item);
+
+  const specs: string[] = [];
+  if (isVm) {
+    if (item.cores) specs.push(t('quickDeploy.specCores', { n: item.cores }));
+    const mem = normalizeSizeText(item.sizeText);
+    const disk = normalizeSizeText(item.metaText);
+    if (mem !== '—') specs.push(t('quickDeploy.templateMem', { size: mem }));
+    if (disk !== '—') specs.push(t('quickDeploy.templateDisk', { size: disk }));
+  } else {
+    /* 容器模板只报压缩包大小：rootfs 多大由规格决定，模板本身没有「磁盘」 */
+    const size = normalizeSizeText(item.sizeText);
+    if (size !== '—') specs.push(t('quickDeploy.templateSize', { size }));
+  }
+
+  const config: string[] = [];
+  if (item.vmid) config.push(t('quickDeploy.templateVmid', { vmid: item.vmid }));
+  if (isVm) {
+    config.push(fullClone ? t('vmCreate.cloneFull') : t('vmCreate.cloneLinked'));
+    /* 链接克隆不写存储（磁盘留在模板那块盘上），只有完整克隆才有落点 */
+    if (fullClone && storage) {
+      config.push(t('quickDeploy.templateStorage', { storage }));
+    }
+  } else if (item.metaText) {
+    config.push(t('quickDeploy.templateStorage', { storage: item.metaText }));
+  }
+  if (item.node) config.push(t('quickDeploy.templateNode', { node: item.node }));
+
+  return (
+    <span className="deploy-tpl-brief" data-os={family.key}>
+      <span className="deploy-tpl-mark" aria-hidden="true">
+        <OsLogo family={family} size="chip" />
+      </span>
+      <span className="deploy-tpl-body">
+        <span className="deploy-tpl-head">
+          <span className="deploy-tpl-kicker">
+            {t('quickDeploy.templateTitle')}
+          </span>
+          <strong className="deploy-tpl-name" title={item.name}>
+            {item.name}
+          </strong>
+          <span className="deploy-tpl-os">{osFamilyLabel(family, t)}</span>
+        </span>
+        {/* 一项一个 span：整句拼起来只能整段折行，窄屏上会溢出卡片；拆开后
+            每个「4 GB 内存」自己不许断，「·」由 CSS 补在同一组相邻两项之间，
+            折行时不会出现以「·」起头的一行。 */}
+        <span className="deploy-tpl-meta">
+          {specs.map((text, index) => (
+            <span
+              className={`deploy-tpl-specs${
+                index < specs.length - 1 ? ' has-sep' : ''
+              }`}
+              key={`spec-${text}`}
+            >
+              {text}
+            </span>
+          ))}
+          {config.map((text, index) => (
+            <span
+              className={`deploy-tpl-config${
+                index === 0 && specs.length > 0 ? ' is-first' : ''
+              }${index < config.length - 1 ? ' has-sep' : ''}`}
+              key={`config-${text}`}
+            >
+              {text}
+            </span>
+          ))}
+        </span>
+      </span>
+    </span>
   );
 }

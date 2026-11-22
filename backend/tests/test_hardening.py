@@ -188,7 +188,11 @@ class TestPasswordPolicy:
         )
         assert resp.status_code == 200, resp.text
 
-    def test_register_rejects_short_password(self, api) -> None:
+    def test_register_rejects_short_password(self, api, monkeypatch) -> None:
+        from app.config import settings
+
+        # 注册默认关闭；这里测的是开放时的口令强度校验，先打开开关
+        monkeypatch.setattr(settings, "register_enabled", True)
         resp = api.post(
             "/api/auth/register",
             json={"username": "newbie", "password": "abc123", "email": "a@b.com"},
@@ -198,10 +202,12 @@ class TestPasswordPolicy:
     def test_register_requires_captcha_when_enabled(self, api, monkeypatch) -> None:
         """注册是匿名写接口：开了人机校验就必须**服务端**强制，不能只看前端。"""
         from app import captcha
+        from app.config import settings
 
         async def image_mode() -> str:
             return captcha.MODE_IMAGE
 
+        monkeypatch.setattr(settings, "register_enabled", True)
         monkeypatch.setattr(captcha, "get_mode", image_mode)
         resp = api.post(
             "/api/auth/register",

@@ -38,6 +38,9 @@ from app.config import settings  # noqa: E402
 
 # 用例直接 POST 登录，不逐张解验证码（验证码自身的用例会临时打开）
 settings.login_captcha = False
+# 自助注册的邮箱验证码同理：默认关掉，否则每个注册用例都要先收一封邮件。
+# 这层机制本身由 tests/test_register_email_code.py 显式打开后专门覆盖。
+settings.register_email_code = False
 
 # 各模块的建表语句覆盖的表
 #
@@ -100,6 +103,9 @@ TABLES = (
     # 一键接入注册码：不清的话上一条用例签发的码会出现在下一条用例的列表里，
     # 「签一张就能用一次」这类断言会被旧行干扰。
     "connection_register_codes",
+    # 注册邮箱验证码：不清的话上一条用例的码还留在库里，会顶掉下一条用例新发的
+    # 那条（同一邮箱只保留最新一条），校验结果全乱。
+    "email_verification_codes",
 )
 
 

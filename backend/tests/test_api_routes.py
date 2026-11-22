@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 import httpx
@@ -21,8 +22,10 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
+from app import main  # noqa: E402
 from app import ownership  # noqa: E402
 from app import pve as pve_module  # noqa: E402
+from app import routeguard  # noqa: E402
 from app import store  # noqa: E402
 from app.pve import PveConnection, ProxmoxError  # noqa: E402
 
@@ -172,11 +175,14 @@ class TestAuthFlow:
         """
         resp = api.get("/api/health")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "ok"}
+        # authenticated=false 是关键：页面靠它区分「诊断字段可信」与「只是活着」，
+        # 否则一份匿名载荷和「已配置但连不上」在字段上完全一样（误报的根因）。
+        assert resp.json() == {"status": "ok", "authenticated": False}
 
         # 登录后字段与从前一致：mock 报告了 PVE 版本，说明连接可用。
         body = api.get("/api/health", headers=auth_headers(api)).json()
         assert body["status"] == "ok"
+        assert body["authenticated"] is True
         assert body["pve_connected"] is True
         assert body["pve_version"] == "8.2.4"
         # 配置状态与连通状态分开上报：前端据此区分「去添加」和「去排查」
@@ -2056,6 +2062,41 @@ class TestRbac:
             parts = upid.split(":")
             assert len(parts) >= 7 and parts[5].startswith(("qm", "vz")), upid
 
+    def test_operator_can_poll_his_own_batch_create_task(self, api) -> None:
+        """批量下发后，普通用户必须能读到自己那台机器的任务。
+
+        改版前这类请求会 404（"任务记录已不存在"），前端把结果页报成「待确认」
+        并配一条红条 —— 而机器其实已经建好、就躺在他的列表里。桌面截图里的
+        投诉正是这一条。管理员不受归属限制，所以只有普通用户中招。
+
+        这里覆盖「节点一致」这一路；跨节点克隆（任务在源节点、归属记在目标节点）
+        在 ``test_task_scope.py::test_clone_task_on_source_node_is_visible`` 里。
+        """
+        ops = self._make_user(api, "o-poll", "operator")
+        base = {
+            "node": "pve1",
+            "memory": 1024,
+            "cores": 1,
+            "disks": [{"storage": "local-lvm", "size": 20, "interface": "scsi0"}],
+            "networks": [{"bridge": "vmbr0", "model": "virtio"}],
+        }
+        resp = api.post(
+            "/api/vms/batch",
+            json={"items": [{**base, "name": "poll-1"}]},
+            headers=ops,
+        )
+        assert resp.status_code == 200, resp.text
+        item = resp.json()["results"][0]
+        assert item["ok"] and item["task"], item
+
+        detail = api.get(f"/api/tasks/{item['task']}", headers=ops)
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["upid"] == item["task"]
+
+        # 别人名下的机器仍然读不到（隔离不能被这次放宽带松）
+        foreign = f"UPID:pve1:0000FFFF:0:1700000000:qmcreate:{int(item['vmid']) + 700}:root@pam:"
+        assert api.get(f"/api/tasks/{foreign}", headers=ops).status_code == 404
+
     def test_operator_cannot_manage_users(self, api) -> None:
         ops = self._make_user(api, "o2", "operator")
         resp = api.post(
@@ -2091,6 +2132,94 @@ class TestRbac:
             assert "token_secret_set" not in item
             assert "console_user" not in item
             assert "ca_cert" not in item
+
+    def test_operator_gets_403_across_the_whole_config_group(self, api) -> None:
+        """审计项：``/api/config/*`` 路由级鉴权遗漏。
+
+        复测口径就是审计报告写的那一条：**以 operator 遍历整组子路径，除匿名
+        白名单外应统一 403**。此前是逐端点手写 ``Depends``，于是
+        ``/config/mail``（SMTP 主机 / 发件账号 / 管理员收件人）、
+        ``/config/session``（会话窗口）、``/config/vm-quota`` / ``lxc-quota``
+        （配额策略）、``/config/login-captcha``、``/config/panel-url`` 这些
+        只要登录就是 200 —— 而同组的 connection / diagnostics /
+        security-posture 却正确返回 403。
+
+        现在整组由路由级守卫统一收在 ``settings.manage``（``app/routeguard.py``），
+        所以这条用例应该覆盖**所有** GET，而不只是审计报告里点名的几个。
+        """
+        ops = self._make_user(api, "o-cfg", "operator")
+
+        # 读数清单**从真实路由表推**，不写死：以后往 /api/config 下新增端点，
+        # 这条用例自动把它纳入复测（漏加守卫会在这里变成「200 ≠ 403」）。
+        reads = [
+            route.path
+            for route in main.app.routes
+            if isinstance(route, APIRoute)
+            and route.path.startswith("/api/config")
+            and "GET" in (route.methods or set())
+            and "{" not in route.path  # 带路径参数的端点需要真实 id，另算
+            and not routeguard.is_public("GET", route.path)
+        ]
+        # 先证明清单没退化成空集（路由表遍历失效时下面的断言会假绿）
+        for expected in (
+            "/api/config/mail",
+            "/api/config/session",
+            "/api/config/vm-quota",
+            "/api/config/lxc-quota",
+            "/api/config/panel-url",
+        ):
+            assert expected in reads, (expected, reads)
+        for path in reads:
+            assert api.get(path, headers=ops).status_code == 403, path
+
+        # 写入口：同样 403（守卫在端点自己的 Depends 之前就拦下）
+        writes = [
+            ("put", "/api/config/mail", {"host": "smtp.evil.example"}),
+            ("put", "/api/config/session", {"access_minutes": 60, "refresh_days": 1}),
+            ("put", "/api/config/vm-quota", {"quota": 1000}),
+            ("put", "/api/config/lxc-quota", {"quota": 1000}),
+            ("put", "/api/config/panel-url", {"url": "https://evil.example"}),
+            ("put", "/api/config/vm-defaults", {"dns": "10.0.0.1", "full_clone": False}),
+            ("put", "/api/config/specs", []),
+            ("put", "/api/config/ui", {"nav_disabled": []}),
+            ("put", "/api/config/login-captcha", {"mode": "off"}),
+            ("post", "/api/config/mail/test", {}),
+        ]
+        for method, path, body in writes:
+            resp = getattr(api, method)(path, json=body, headers=ops)
+            assert resp.status_code == 403, f"{method.upper()} {path} → {resp.status_code}"
+
+        # 分家后的运行时读视图仍对 operator 开放：创建向导与下单页要用它们，
+        # 把整组 /api/config 收成一档权限不能顺手把下单流程一起关死。
+        for path in (
+            "/api/runtime/ui",
+            "/api/runtime/specs",
+            "/api/runtime/specs/presets",
+            "/api/runtime/vm-defaults",
+        ):
+            assert api.get(path, headers=ops).status_code == 200, path
+
+    def test_config_group_anonymous_whitelist_is_minimal(self, api) -> None:
+        """匿名白名单只有「登录页 / 官网渲染素材」，其余一律 401。
+
+        白名单是 ``(方法, 完整路径)`` 精确匹配（见 ``routeguard.PUBLIC_ROUTES``）：
+        往这个前缀下新增端点时**不会**被一起放出去，这是它不用通配的原因。
+        """
+        # 公开：品牌信息与 FAQ（未登录的登录页 / 官网就要渲染）
+        assert api.get("/api/config/site").status_code == 200
+        assert api.get("/api/config/faq").status_code == 200
+
+        # 其余任何一条都不是匿名可读的
+        for path in (
+            "/api/config/mail",
+            "/api/config/session",
+            "/api/config/vm-quota",
+            "/api/config/lxc-quota",
+            "/api/config/login-captcha",
+            "/api/config/panel-url",
+            "/api/config/connection",
+        ):
+            assert api.get(path).status_code == 401, path
 
     def test_viewer_cannot_open_console(self, api) -> None:
         viewer = self._make_user(api, "v4", "viewer")
@@ -2429,6 +2558,79 @@ class TestSelfServicePasswordReset:
         )
         assert resp.status_code == 400
 
+    def test_reset_password_requires_captcha_when_enabled(
+        self, api, monkeypatch
+    ) -> None:
+        """第 2 步（设置新密码）也要人机校验，与登录 / 注册 / 忘记密码同级。
+
+        守的是一个真实缺口：滑块模式下重置页压根不渲染验证码、后端也不校验，
+        拿到链接（或猜中）就能直接改口令并踢掉原主人的会话。
+        """
+        from app import captcha as captcha_mod
+
+        sent = self._mail(api, monkeypatch)
+        self._make(api, "captchareset2", "c2@example.com")
+        # 先拿到链接（此时验证码仍是关的），再切到滑块 —— 否则 forgot 那步也要过滑块
+        api.post("/api/auth/forgot-password", json={"username": "captchareset2"})
+        token = sent[0]["body"].split("/reset-password?token=", 1)[1].split()[0]
+
+        set_captcha_mode(api, "slider")
+        try:
+            # 1) 不带验证码 → 拒，而且**不能**把一次性令牌烧掉
+            denied = api.post(
+                "/api/auth/reset-password",
+                json={"token": token, "password": "Unit-Test-NewPa55"},
+            )
+            assert denied.status_code == 400, denied.text
+            assert (
+                api.post(
+                    "/api/auth/reset-password/check", json={"token": token}
+                ).json()["valid"]
+                is True
+            )
+
+            # 2) 位置对但没有轨迹（H-1 的脚本路径）→ 仍然拒
+            ch = api.get("/api/auth/captcha").json()
+            target = captcha_mod._sliders[ch["id"]][0]
+            scripted = api.post(
+                "/api/auth/reset-password",
+                json={
+                    "token": token,
+                    "password": "Unit-Test-NewPa55",
+                    "captcha_id": ch["id"],
+                    "captcha_x": target,
+                },
+            )
+            assert scripted.status_code == 400
+            assert "滑块" in scripted.json()["detail"]
+
+            # 3) 位置 + 像人拖出来的轨迹 → 通过
+            fresh = api.get("/api/auth/captcha").json()
+            answer = captcha_mod._sliders[fresh["id"]][0]
+            ok = api.post(
+                "/api/auth/reset-password",
+                json={
+                    "token": token,
+                    "password": "Unit-Test-NewPa55",
+                    "captcha_id": fresh["id"],
+                    "captcha_x": answer,
+                    "captcha_path": drag_trace(answer),
+                },
+            )
+            assert ok.status_code == 200, ok.text
+        finally:
+            # 复位在线配置：只关 settings.login_captcha 不够，KV 优先级更高
+            delete_setting_sync("login_captcha_mode")
+
+        # 新口令确实生效（此时验证码已关，登录不需要滑块）
+        assert (
+            api.post(
+                "/api/auth/login",
+                json={"username": "captchareset2", "password": "Unit-Test-NewPa55"},
+            ).status_code
+            == 200
+        )
+
     def test_reset_purges_other_tokens_for_the_same_user(self, api, monkeypatch) -> None:
         """改完密码，邮箱里可能还有几条旧链接，必须一起作废。"""
         sent = self._mail(api, monkeypatch)
@@ -2523,6 +2725,14 @@ class TestRegistrationApproval:
     注册是公开接口，建出来的账号状态必须是 pending，审批通过前一律登不进来。
     """
 
+    @pytest.fixture(autouse=True)
+    def _registration_open(self, monkeypatch):
+        """注册默认关闭（REGISTER_ENABLED=false）。这组用例测的是「开放时」的
+        行为，统一在这里打开；测关闭行为的用例自己再 monkeypatch 关闭。"""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "register_enabled", True)
+
     @staticmethod
     def _register(
         api, username: str, password: str = "Unit-Test-Pa55word", email: str = "user@example.com"
@@ -2548,6 +2758,24 @@ class TestRegistrationApproval:
         login = self._login(api, "newbie")
         assert login.status_code == 403
         assert "审批" in login.json()["detail"]
+
+    def test_register_rejects_when_disabled(self, api, monkeypatch) -> None:
+        """注册总开关（REGISTER_ENABLED）：**默认关闭**，关闭时可用性接口如实
+        报告，注册接口直接 403，且拒绝发生在建号之前。"""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "register_enabled", False)
+        # 默认值本身就是关闭（admin 不开就没有匿名注册入口）
+        assert type(settings).model_fields["register_enabled"].default is False
+
+        avail = api.get("/api/auth/register-availability")
+        assert avail.status_code == 200
+        assert avail.json()["enabled"] is False
+        assert avail.json()["message"]
+
+        resp = self._register(api, "closedreg", email="closed@example.com")
+        assert resp.status_code == 403, resp.text
+        assert "自助注册" in resp.json()["detail"]
 
     def test_register_requires_captcha_when_enabled(self, api) -> None:
         """注册与登录同级的人机校验（审计项 FD-06）：没有验证码不许建号。"""
@@ -2703,8 +2931,11 @@ class TestRegistrationApproval:
         assert login.status_code == 403
         assert "未通过" in login.json()["detail"]
 
-        # 用户名仍被占住，不能被别人重新注册
-        assert self._register(api, "spammer").status_code == 409
+        # 用户名仍被占住，不能被别人重新注册。对外响应与首投完全一致（201 +
+        # pending），否则这个公开接口就成了用户名枚举机（审计项 M-02）。
+        again = self._register(api, "spammer")
+        assert again.status_code == 201
+        assert again.json()["status"] == "pending"
 
     def test_pending_user_cannot_be_approved_twice(self, api) -> None:
         assert self._register(api, "twice").status_code == 201
@@ -2790,12 +3021,334 @@ class TestRegistrationApproval:
 
 
 # ------------------------------------------------------- 邮件通知（SMTP）
+def set_registration_mode(api, mode: str) -> None:
+    """切换注册方式（设置页那一档，需要 settings.manage + step-up）。"""
+    resp = api.put(
+        "/api/config/registration/mode",
+        json={"mode": mode},
+        headers=auth_headers(api),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["mode"] == mode
+
+
+def issue_registration_code(api, kind: str, **extra):
+    resp = api.post(
+        "/api/config/registration/codes",
+        json={"kind": kind, **extra},
+        headers=auth_headers(api),
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def issue_invite_link(api, **extra):
+    """邀请制唯一的凭证形态：邀请链接（见 app/invites.py）。"""
+    resp = api.post(
+        "/api/config/invites",
+        json={"role": "viewer", **extra},
+        headers=auth_headers(api),
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+class TestRegistrationModes:
+    """四种注册方式互斥、切换即生效、凭证一次性。
+
+    覆盖报告的诉求：设置页可切「关闭 / 邀请制 / 注册码制 / 自助」，切换后公开
+    接口与校验逻辑立刻跟着变；邀请码与注册码各自只在对应模式下有效。
+    """
+
+    @staticmethod
+    def _register(api, username: str, invite_code: str = "", invite_token: str = ""):
+        payload = {
+            "username": username,
+            "password": "Unit-Test-Pa55word",
+            "email": f"{username}@example.com",
+        }
+        if invite_code:
+            payload["invite_code"] = invite_code
+        if invite_token:
+            payload["invite_token"] = invite_token
+        return api.post("/api/auth/register", json=payload)
+
+    def test_default_mode_follows_register_enabled(self, api, monkeypatch) -> None:
+        """设置页没配过时，行为与升级前一致（跟着 REGISTER_ENABLED 走）。"""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "register_enabled", False)
+        closed = api.get("/api/auth/registration-mode").json()
+        assert closed["mode"] == "off"
+        assert closed["enabled"] is False
+        assert closed["message"]
+
+        monkeypatch.setattr(settings, "register_enabled", True)
+        opened = api.get("/api/auth/registration-mode").json()
+        assert opened["mode"] == "open"
+        assert opened["requires"] == ""
+        assert opened["enabled"] is True
+
+    def test_invite_mode_end_to_end(self, api) -> None:
+        """邀请制只认邀请链接：无链接拒绝、一次性用尽、审计可回查。"""
+        set_registration_mode(api, "invite")
+
+        info = api.get("/api/auth/registration-mode").json()
+        assert info["mode"] == "invite"
+        # 邀请制不再要求文本凭证（链接本身就是凭证）
+        assert info["requires"] == ""
+        assert "邀请链接" in info["message"]
+
+        # 没有链接：连凭证都没有，直接拒
+        missing = self._register(api, "inv-missing")
+        assert missing.status_code == 400
+        assert "邀请链接" in missing.json()["detail"]
+
+        # 邀请码已不再签发
+        legacy = api.post(
+            "/api/config/registration/codes",
+            json={"kind": "invite"},
+            headers=auth_headers(api),
+        )
+        assert legacy.status_code == 400
+
+        link = issue_invite_link(
+            api,
+            note="qa",
+            max_uses=1,
+            role="viewer",
+            # 链接可以预先给新账号分配额度（注册时写进 user_quota）
+            quota={"vm": {"cores": 2, "memory_mb": 1024}},
+        )
+        assert link["token"]
+        assert link["path"] == f"/register?invite={link['token']}"
+        assert link["quota"]["vm"]["cores"] == 2
+
+        # 公开预览：可用、带角色与审批策略、剩余次数
+        preview = api.get(f"/api/auth/invite/{link['token']}").json()
+        assert preview["valid"] is True
+        assert preview["role"] == "viewer"
+        assert preview["requires_approval"] is True
+        assert preview["remaining"] == 1
+
+        ok = self._register(api, "inv-ok", invite_token=link["token"])
+        assert ok.status_code == 201
+        # 仍需管理员审批：链接只解决「怎么进来」，不跳过审批
+        assert ok.json()["status"] == "pending"
+
+        # 额度在注册那一刻就写进用户级配置（审批只负责放行）
+        report = api.get("/api/users/inv-ok/quota", headers=auth_headers(api)).json()
+        assert report["quota"]["vm"]["cores"] == 2
+        assert report["quota"]["vm"]["memory_mb"] == 1024
+
+        # 一次性：同一链接再用被拒
+        assert self._register(api, "inv-reuse", invite_token=link["token"]).status_code == 400
+
+        rows = api.get("/api/config/invites", headers=auth_headers(api)).json()["invites"]
+        used = next(row for row in rows if row["id"] == link["id"])
+        assert used["used_count"] == 1
+        assert used["status"] == "exhausted"
+
+        # 审计里能回查到是哪条链接放进来的
+        audit = api.get(
+            "/api/audit",
+            params={"action": "auth.register", "result": "success"},
+            headers=auth_headers(api),
+        ).json()
+        assert any(link["id"] in str(row["detail"]) for row in audit["items"])
+
+    def test_invite_mode_approval_toggle(self, api) -> None:
+        """邀请链接也能关掉审批：建号即 active，不需要再等管理员放行。"""
+        set_registration_mode(api, "invite")
+
+        link = issue_invite_link(api, requires_approval=False)
+        assert link["requires_approval"] is False
+
+        created = self._register(api, "inv-active", invite_token=link["token"])
+        assert created.status_code == 201
+        assert created.json()["status"] == "active"
+        assert created.json()["message"] == "注册成功，现在可以直接登录"
+
+        login = api.post(
+            "/api/auth/login",
+            json={"username": "inv-active", "password": "Unit-Test-Pa55word"},
+        )
+        assert login.status_code == 200, login.text
+
+    def test_auto_approved_duplicate_username_is_not_pending(self, api) -> None:
+        """免审批凭证重复提交已存在用户名时，不能再伪装成「等待审批」。"""
+        admin = auth_headers(api)
+
+        set_registration_mode(api, "invite")
+        pending_link = issue_invite_link(api)
+        first = self._register(api, "dup-invite", invite_token=pending_link["token"])
+        assert first.status_code == 201
+        assert first.json()["status"] == "pending"
+
+        active_link = issue_invite_link(api, requires_approval=False)
+        duplicate = self._register(api, "dup-invite", invite_token=active_link["token"])
+        assert duplicate.status_code == 409
+        assert "用户名已被占用" in duplicate.json()["detail"]
+        invites = api.get("/api/config/invites", headers=admin).json()["invites"]
+        assert next(row for row in invites if row["id"] == active_link["id"])["used_count"] == 0
+
+        set_registration_mode(api, "code")
+        pending_code = issue_registration_code(api, "code")
+        first_code = self._register(api, "dup-code", pending_code["code"])
+        assert first_code.status_code == 201
+        assert first_code.json()["status"] == "pending"
+
+        active_code = issue_registration_code(api, "code", requires_approval=False)
+        duplicate_code = self._register(api, "dup-code", active_code["code"])
+        assert duplicate_code.status_code == 409
+        assert "用户名已被占用" in duplicate_code.json()["detail"]
+        codes = api.get("/api/config/registration", headers=admin).json()["codes"]
+        assert next(row for row in codes if row["id"] == active_code["id"])["used_count"] == 0
+
+    def test_switch_isolates_credential_kinds(self, api) -> None:
+        """切到注册码制后，之前发出的邀请链接立即失效（反之亦然）。"""
+        set_registration_mode(api, "code")
+        regcode = issue_registration_code(api, "code")["code"]
+        assert regcode.startswith("zpreg_")
+
+        set_registration_mode(api, "invite")
+        # 邀请制不认注册码，也不认「什么都没有」——必须带链接
+        assert self._register(api, "cross-code", regcode).status_code == 400
+        assert self._register(api, "cross-none").status_code == 400
+
+        link = issue_invite_link(api)
+        assert self._register(api, "cross-link-ok", invite_token=link["token"]).status_code == 201
+
+        set_registration_mode(api, "code")
+        crossed = self._register(api, "cross-invite", invite_token=link["token"])
+        assert crossed.status_code == 400
+        assert "注册码" in crossed.json()["detail"]
+
+    def test_code_mode_assigns_role_and_quota(self, api) -> None:
+        """注册码制也能提前指定角色与额度：注册写入，审批沿用角色。"""
+        set_registration_mode(api, "code")
+        admin = auth_headers(api)
+        created = api.post(
+            "/api/roles",
+            json={"id": "reg-ops", "name": "注册运维", "permissions": []},
+            headers=admin,
+        )
+        assert created.status_code == 200, created.text
+
+        issued = issue_registration_code(
+            api,
+            "code",
+            role="reg-ops",
+            quota={"vm": {"cores": 4, "memory_mb": 2048, "disk_gb": 40}},
+        )
+        assert issued["role"] == "reg-ops"
+        assert issued["role_name"] == "注册运维"
+        assert issued["quota"]["vm"]["cores"] == 4
+
+        assert self._register(api, "code-quota", issued["code"]).status_code == 201
+        report = api.get("/api/users/code-quota/quota", headers=admin).json()
+        assert report["quota"]["vm"]["cores"] == 4
+        assert report["quota"]["vm"]["memory_mb"] == 2048
+
+        # 审批不传 role：沿用注册时写入的角色，而不是打回 viewer
+        approve = api.post("/api/users/code-quota/approve", json={}, headers=admin)
+        assert approve.status_code == 200
+        assert approve.json()["role"] == "reg-ops"
+
+    def test_code_mode_approval_toggle(self, api) -> None:
+        """注册码自带审批开关：关掉建号即 active，默认仍进审批队列。"""
+        set_registration_mode(api, "code")
+        admin = auth_headers(api)
+
+        active_code = issue_registration_code(api, "code", requires_approval=False)
+        assert active_code["requires_approval"] is False
+        created = self._register(api, "code-active", active_code["code"])
+        assert created.status_code == 201
+        assert created.json()["status"] == "active"
+        assert created.json()["message"] == "注册成功，现在可以直接登录"
+        # active 账号确实能直接登录，不需要先过审批
+        login = api.post(
+            "/api/auth/login",
+            json={"username": "code-active", "password": "Unit-Test-Pa55word"},
+        )
+        assert login.status_code == 200
+
+        pending_code = issue_registration_code(api, "code")
+        assert pending_code["requires_approval"] is True
+        applied = self._register(api, "code-pending", pending_code["code"])
+        assert applied.status_code == 201
+        assert applied.json()["status"] == "pending"
+        assert api.post(
+            "/api/users/code-pending/approve", json={}, headers=admin
+        ).status_code == 200
+
+        # 设置页清单要能看出每张码的审批策略
+        rows = api.get("/api/config/registration", headers=admin).json()["codes"]
+        by_id = {row["id"]: row for row in rows}
+        assert by_id[active_code["id"]]["requires_approval"] is False
+        assert by_id[pending_code["id"]]["requires_approval"] is True
+
+    def test_auto_approved_code_bypasses_full_pending_queue(self, api, monkeypatch) -> None:
+        """免审批码不占审批队列，队列满了也照样能注册。"""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "register_pending_limit", 1)
+        set_registration_mode(api, "code")
+
+        normal = issue_registration_code(api, "code")
+        assert self._register(api, "queue-pending", normal["code"]).json()["status"] == "pending"
+        # 队列已满：普通注册码被拦
+        normal2 = issue_registration_code(api, "code")
+        blocked = self._register(api, "queue-blocked", normal2["code"])
+        assert blocked.status_code == 429
+
+        auto = issue_registration_code(api, "code", requires_approval=False)
+        allowed = self._register(api, "queue-auto", auto["code"])
+        assert allowed.status_code == 201
+        assert allowed.json()["status"] == "active"
+
+    def test_open_mode_needs_no_credential(self, api) -> None:
+        set_registration_mode(api, "open")
+        assert self._register(api, "open-user").status_code == 201
+
+    def test_off_mode_blocks_registration(self, api) -> None:
+        set_registration_mode(api, "off")
+        assert api.get("/api/auth/registration-mode").json()["enabled"] is False
+        assert self._register(api, "off-user").status_code == 403
+
+    def test_switch_requires_admin_and_is_audited(self, api) -> None:
+        viewer = user_with_permissions(api, ["vm.view"], "reg-viewer")
+        denied = api.put(
+            "/api/config/registration/mode",
+            json={"mode": "open"},
+            headers=viewer,
+        )
+        assert denied.status_code == 403
+        # 管理员读得到凭证列表；普通用户连读都不行
+        assert api.get("/api/config/registration", headers=viewer).status_code == 403
+
+        set_registration_mode(api, "invite")
+        audit = api.get(
+            "/api/audit",
+            params={"action": "config.registration_mode"},
+            headers=auth_headers(api),
+        ).json()
+        assert any(row["action"] == "config.registration_mode" for row in audit["items"])
+
+
 class TestMailNotifications:
     """邮件配置接口 + 注册/审批触发的发信。
 
     发信本身不碰真实 SMTP：把 ``mailer._deliver`` 换掉，直接检查构造出来的
     邮件报文，这样既验证了「真的发了」，也不依赖任何外部服务。
     """
+
+    @pytest.fixture(autouse=True)
+    def _registration_open(self, monkeypatch):
+        """注册默认关闭；这里的注册发信用例需要开放注册才能走到发信环节。"""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "register_enabled", True)
 
     @pytest.fixture()
     def outbox(self, monkeypatch):
@@ -2825,8 +3378,10 @@ class TestMailNotifications:
         ).json()["access_token"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        # 读只要登录；写要 settings.manage
-        assert api.get("/api/config/mail", headers=headers).status_code == 200
+        # 读与写同一档（审计项：/api/config/* 路由级鉴权遗漏）。
+        # 此前「读只要登录」—— SMTP 主机 / 端口 / 发件账号 / 管理员收件人
+        # 对所有登录用户可见，等于给钓鱼与 SMTP 侧探测发了一份情报。
+        assert api.get("/api/config/mail", headers=headers).status_code == 403
         assert api.put("/api/config/mail", json={"host": "x"}, headers=headers).status_code == 403
         assert api.post("/api/config/mail/test", json={}, headers=headers).status_code == 403
 
@@ -3358,9 +3913,12 @@ class TestConnectionConfig:
         _clear_connection_config()
         pve_module._client = pve_module.ProxmoxClient(PveConnection())
 
-        resp = api.get("/api/health")
+        # 诊断字段只在登录后下发（匿名只有 {"status","authenticated"}），
+        # 所以这里必须带上管理员凭据，不能依赖同一客户端上残留的 cookie。
+        resp = api.get("/api/health", headers=auth_headers(api))
         assert resp.status_code == 200
         body = resp.json()
+        assert body["authenticated"] is True
         assert body["pve_connected"] is False
         # 未配置时 pve_configured 必须是 false，前端才会显示「去添加连接」的引导，
         # 而不是把它当成「连不上」的故障去报错
@@ -4572,3 +5130,41 @@ class TestGuestDetailErrors:
         detail = resp.json()["detail"]
         assert "不是容器" in detail
         assert "Configuration file" not in detail
+
+
+class TestConsoleFileTransfer:
+    """控制台中转文件：签名 token、归属校验、客户机匿名取件。
+
+    下载必须对客户机开放（它没有面板 Cookie），所以安全边界落在 token 本身：
+    签名绑定「谁的、发给谁、什么时候失效」，带会话访问时再校验归属。
+    """
+
+    def test_token_is_signed_and_bound_to_uploader(self, api) -> None:
+        alice = user_with_permissions(api, ["vm.console"], "cf-alice")
+        bob = user_with_permissions(api, ["vm.console"], "cf-bob")
+
+        up = api.post(
+            "/api/console/files",
+            headers=alice,
+            files={"file": ("a.txt", b"hello", "text/plain")},
+            data={"guest_type": "qemu"},
+        )
+        assert up.status_code == 200, up.text
+        token = up.json()["token"]
+        # 对外 token 形如 <id>.<sig>：裸 id 无法被拼出来冒用
+        assert "." in token
+
+        api.cookies.clear()  # 模拟客户机 curl：没有任何面板凭据
+        anon = api.get(f"/api/console/files/{token}")
+        assert anon.status_code == 200
+        assert anon.content == b"hello"
+
+        # 别人的会话拿到链接也打不开（不区分「不存在」与「不是你的」）
+        assert api.get(f"/api/console/files/{token}", headers=bob).status_code == 404
+        # 上传者自己的会话可以下载
+        assert api.get(f"/api/console/files/{token}", headers=alice).status_code == 200
+
+        # 改签名：拒绝，且不会因此删掉盘上文件
+        tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
+        assert api.get(f"/api/console/files/{tampered}").status_code == 404
+        assert api.get(f"/api/console/files/{token}").status_code == 200

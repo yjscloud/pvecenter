@@ -26,10 +26,12 @@ from fastapi import HTTPException, Request
 
 from . import (
     frp,
+    i18n,
     ippool,
     ownership,
     prefs,
     pvecache,
+    quarantine_store,
     quota,
     security,
     storagecaps,
@@ -309,6 +311,12 @@ async def _run_one(
             )
 
         elif action == "delete":
+            # 隔离中的机器就是证据：与单机删除同一口径，先拦下来并告诉他去哪儿
+            # 解除（批量里逐台给结果，这一台报错不会影响其它机器）
+            if await quarantine_store.get(conn_id, node, vmid):
+                raise ProxmoxError(
+                    i18n.t("isolation.deleteBlocked", vmid=vmid), 409
+                )
             status_getter = client.qemu_status if gtype == "qemu" else client.lxc_status
             try:
                 status = await status_getter(node, vmid)
@@ -346,6 +354,8 @@ async def _run_one(
             # 这里不吞异常 —— 批量操作本来就要逐台给出结果，清理失败同样该让
             # 这一台报出来，而不是默默留着一条会错伤别人的记录。
             await ownership.forget_guest(conn_id, node, vmid)
+            # 隔离登记随机器一起清（VMID 会被回收，别让同号新机器带上隔离标签）
+            await quarantine_store.drop(conn_id, node, vmid)
             # 从地址池分配出去的地址同样立即释放（与单机删除同一口径）
             await ippool.release_guest(conn_id, node, vmid)
             # 置顶 / 收藏同样按 vmid 记账：回收时清掉，同号的新机器才不会

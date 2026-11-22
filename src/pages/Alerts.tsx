@@ -1094,8 +1094,13 @@ export function Alerts() {
       {/* 停推是最危险的静默失败：出事了却没人收到通知。所以在页面顶端持续提醒，
           而不是只让开关自己显示成灰色 —— 那张卡可能在屏幕外。
           措辞要说全「也不记录」：否则用户会以为历史里还能翻到，实际上这些告警
-          连库都不会进（见 alerting.record），事后是真的查不到。 */}
-      {mutedSources.length > 0 ? (
+          连库都不会进（见 alerting.record），事后是真的查不到。
+
+          **只给管理员看**（is_admin ⇔ 那几个开关可点，后端 PUT /notify-sources
+          同样要求 settings.manage）：提示的落点是「到下方『告警推送开关』可恢复」，
+          而普通用户改不了那些开关，告诉他们平台级推送被关掉了哪几项，只是给一条
+          看得见、动不了、只能去问管理员的横幅，占着首屏最贵的位置。 */}
+      {isAdmin && mutedSources.length > 0 ? (
         <Notice tone="warning" title={t("alerts.partialMuted")}>
           {t("alerts.mutedNotice", {
             sources: mutedSources.map((item) => item.label).join("、"),

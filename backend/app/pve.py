@@ -1767,16 +1767,20 @@ def get_client() -> ProxmoxClient:
         except Exception:  # noqa: BLE001 - 判定失败不阻断正常读取
             paused = False
         if paused:
+            # 连接 id 与「去连接配置里恢复」这类运维指引只写日志：对外文案里
+            # 带上它等于把面板内部的连接编号交给调用方（审计项 L-3）。
+            logger.info("目标连接已暂停接入：id=%s", target_id)
             raise ProxmoxError(
-                f"连接已暂停接入（id={target_id}）：在「连接配置」里恢复后才会继续采集",
+                "目标 Proxmox 连接当前已暂停接入，请稍后重试",
                 status_code=503,
                 endpoint="get_client",
             )
     if scoped and scoped != _active_connection_id():
         scoped_client = _scoped_client(scoped)
         if scoped_client is None:
+            logger.info("目标连接不存在或已被删除：id=%s", scoped)
             raise ProxmoxError(
-                f"目标 PVE 连接不存在或已被删除（id={scoped}）",
+                "目标 Proxmox 连接不可用",
                 status_code=404,
                 endpoint="get_client",
             )

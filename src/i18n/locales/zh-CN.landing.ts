@@ -90,7 +90,7 @@ export const zhLanding = {
   'landing.architecture.entriesLabel': '访问入口',
   'landing.architecture.coreName': '面板服务',
   'landing.architecture.corePill': '同源托管',
-  'landing.architecture.coreSub': 'FastAPI :8080 · MySQL 8 · 单进程对外',
+  'landing.architecture.coreSub': 'FastAPI :8080 · MySQL · 单进程对外',
   'landing.architecture.linkOut': 'PVE API · 出站',
   'landing.architecture.clustersLabel': 'Proxmox 连接',
   'landing.architecture.clusterMeta': '{nodes} · 节点 / 存储 / 虚拟机与 LXC 容器',

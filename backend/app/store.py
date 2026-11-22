@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS users (
     -- 区域管理员可管理的区域名（JSON 数组，来自连接的 region 标签）。
     -- NULL / 空 = 不按区域限制；对 admin 无意义（admin 本来就是全平台视角）。
     regions       TEXT,
+    -- 最近一次成功登录的时间（Unix 秒）。0 = 建号后从未登录过。
+    -- 只是给人看的统计，不参与任何鉴权判断，见 touch_last_login。
+    last_login    DOUBLE       NOT NULL DEFAULT 0,
     PRIMARY KEY (id),
     UNIQUE KEY uk_users_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -238,6 +241,12 @@ async def init_db() -> None:
                 # 区域管理员可管理的区域（JSON 数组）。NULL = 不按区域限制，存量账号
                 # 无需迁移；这一列只对 role='region_admin' 的账号有实际作用。
                 ("regions", "ALTER TABLE users ADD COLUMN regions TEXT"),
+                # 最近登录时间（Unix 秒）。DEFAULT 0 让存量账号显示成「从未登录」，
+                # 而不是「1970 年」——是否为 0 就是前端判断「没登录过」的依据。
+                (
+                    "last_login",
+                    "ALTER TABLE users ADD COLUMN last_login DOUBLE NOT NULL DEFAULT 0",
+                ),
             ),
         )
         await db.commit()
@@ -415,6 +424,12 @@ def _row_to_user(row: database.Row) -> Dict[str, Any]:
     except (KeyError, IndexError, TypeError, ValueError):
         expiry_frozen = 0.0
 
+    # 最近登录时间是后补的列：缺失按 0（从未登录）兜底，和存量账号语义一致。
+    try:
+        last_login = float(row["last_login"] or 0)
+    except (KeyError, IndexError, TypeError, ValueError):
+        last_login = 0.0
+
     # 可管理区域（区域管理员用）：后补的列，缺失 / 非法 JSON 一律按「不限」兜底。
     try:
         raw_regions = row["regions"]
@@ -444,6 +459,7 @@ def _row_to_user(row: database.Row) -> Dict[str, Any]:
         "expiry_notice": expiry_notice,
         "expiry_frozen": expiry_frozen,
         "regions": regions,
+        "last_login": last_login,
     }
 
 
@@ -712,6 +728,23 @@ async def update_user(
         await db.execute(f"UPDATE users SET {', '.join(fields)} WHERE username = ?", values)
         await db.commit()
     return await get_user(username)
+
+
+async def touch_last_login(username: str, at: Optional[float] = None) -> None:
+    """记录一次**成功**登录的时间，只写 ``users.last_login`` 一列。
+
+    刻意不复用 :func:`update_user`：那条路径要按角色 / 状态做校验、会把
+    「改了有效期就重置提醒档位」之类的联动一起带上，登录不该碰这些。
+
+    这里不做异常兜底 —— 时间戳只是管理页上的统计信息，写失败不该把已经成功
+    的登录变成 500，由调用方（``app.routers.auth``）吞掉异常并记 warning。
+    """
+    async with database.connect() as db:
+        await db.execute(
+            "UPDATE users SET last_login = ? WHERE username = ?",
+            (time.time() if at is None else float(at), username),
+        )
+        await db.commit()
 
 
 async def remember_login_ip(username: str, ip: str) -> bool:

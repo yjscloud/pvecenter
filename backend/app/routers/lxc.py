@@ -32,6 +32,7 @@ from .. import (
     guestostype,
     guestip,
     guestnotify,
+    guest_osinfo,
     guestpasswd,
     ippool,
     ownership,
@@ -245,8 +246,7 @@ async def list_containers(
                 # GET /ip-pools —— 那个接口按用户裁剪池，普通用户会漏显）。
                 # 自动地址解析不到时退而用手动备注地址判网络归属。
                 manual_ip = manual_ips.get(
-                    (str(cid), str(item.get("node") or ""), int(item.get("vmid") or 0)),
-                    "",
+                    (str(cid), int(item.get("vmid") or 0)), ""
                 )
                 item["ip_pool_name"] = ippool.pool_name_for_ip(pools, value or manual_ip)
 
@@ -793,6 +793,17 @@ async def container_power(
 
     task = result if isinstance(result, str) else (result or {}).get("task", "")
     await security.audit(request, user, f"ct.{action}", target=f"{node}/{vmid}")
+    # 开机 / 重启后再确认一次系统信息（同 vms.vm_power：失败只保留上一次快照）
+    if action in ("start", "reboot", "resume"):
+        await guest_osinfo.capture(
+            node,
+            vmid,
+            kind="lxc",
+            conn_id=_op_connection(),
+            reason=f"power.{action}",
+            actor=str(user.get("username") or ""),
+            restore_os=True,
+        )
     return {"task": task}
 
 

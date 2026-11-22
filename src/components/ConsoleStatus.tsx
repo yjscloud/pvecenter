@@ -58,19 +58,27 @@ export function ConsoleStatus() {
 
   const totals = fleet?.totals;
   const backendUp = !health.isError;
-  const connected = health.data?.pve_connected ?? false;
+  /* 只有这次探测带了诊断字段，`pve_connected` 才有意义。匿名载荷（access
+     cookie 过期、面板刚重启）里它是缺省的，按 `?? false` 渲染会把「还不知道」
+     说成「未连接」—— 与顶部那条误报是同一个根因。 */
+  const probeKnown =
+    health.data?.authenticated !== false &&
+    typeof health.data?.pve_configured === 'boolean';
+  const connected = probeKnown ? Boolean(health.data?.pve_connected) : false;
   const offline = totals ? totals.connections - totals.online : 0;
   const tone: OverallTone = !backendUp
     ? 'danger'
-    : totals
-      ? (totals.no_quorum ?? 0) > 0 || totals.online === 0
-        ? 'danger'
-        : offline > 0
-          ? 'warning'
-          : 'success'
-      : connected
-        ? 'success'
-        : 'warning';
+    : !probeKnown
+      ? 'warning'
+      : totals
+        ? (totals.no_quorum ?? 0) > 0 || totals.online === 0
+          ? 'danger'
+          : offline > 0
+            ? 'warning'
+            : 'success'
+        : connected
+          ? 'success'
+          : 'warning';
 
   /* 点外部 / Esc 关闭：与命令面板、用户菜单一致 */
   useEffect(() => {
@@ -105,15 +113,17 @@ export function ConsoleStatus() {
 
   const summary = !backendUp
     ? t('status.console.summaryBackendDown')
-    : totals
-      ? t('status.console.summaryFleet', {
-          online: totals.online,
-          total: totals.connections,
-          nodes: totals.nodes,
-        })
-      : connected
-        ? t('status.console.summaryConnected')
-        : t('status.console.summaryDisconnected');
+    : !probeKnown
+      ? t('status.console.summaryUnknown')
+      : totals
+        ? t('status.console.summaryFleet', {
+            online: totals.online,
+            total: totals.connections,
+            nodes: totals.nodes,
+          })
+        : connected
+          ? t('status.console.summaryConnected')
+          : t('status.console.summaryDisconnected');
 
   /* 普通用户看不到「控制台状态」：它汇总的是后端 / PVE 机队健康，属于运维视角。
      管理员照常。放在所有 hook 之后返回，避免破坏 hook 调用顺序。 */
@@ -163,7 +173,11 @@ export function ConsoleStatus() {
             <div className="cs-row">
               <span className="cs-row-key">Proxmox VE</span>
               <span className="cs-row-val">
-                {totals ? (
+                {!probeKnown ? (
+                  <Badge variant="warning" dot pulse size="sm">
+                    {t('status.console.unknown')}
+                  </Badge>
+                ) : totals ? (
                   <Badge
                     variant={totals.online === totals.connections ? 'success' : 'warning'}
                     dot

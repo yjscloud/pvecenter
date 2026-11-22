@@ -17,7 +17,8 @@ import { Card, CardHeader } from "../components/ui/Card";
 import { Badge } from "../components/ui/Badge";
 import { Button, IconButton } from "../components/ui/Button";
 import { Notice } from "../components/ui/EmptyState";
-import { Input, Select, Switch } from "../components/ui/Input";
+import { Field, Input, Select, Switch } from "../components/ui/Input";
+import { TargetSelect, type TargetChoice } from "../components/ui/TargetSelect";
 import { Modal } from "../components/ui/Modal";
 import {
   IconNetwork,
@@ -34,6 +35,8 @@ import {
   IconCopy,
   IconCheck,
   IconSettings,
+  IconSave,
+  IconChevronDown,
 } from "../components/Icons";
 import type {
   FrpGrant,
@@ -41,13 +44,12 @@ import type {
   FrpRule,
   FrpRuleInput,
   FrpRulePatch,
-  FrpTarget,
 } from "../api/types";
 import { useAuth } from "../hooks/useAuth";
 import { PagerBar, usePaged } from "../hooks/usePaged";
 import { useRefreshInterval } from "../hooks/useRefreshInterval";
 import { useToast } from "../hooks/useToast";
-import { useT, type TFunc } from "../i18n";
+import { useT } from "../i18n";
 
 export function Frp() {
   const t = useT();
@@ -159,6 +161,8 @@ function StatusRow() {
 
   const running = statusQuery.data?.running ?? false;
   const available = statusQuery.data?.available ?? false;
+  /* 装的是哪一版，取自二进制本身（后端跑一次 frpc -v 并缓存） */
+  const version = (statusQuery.data?.version ?? "").trim();
   const ruleCount = rulesQuery.data?.rules.length ?? 0;
   /* 服务端地址只有管理员能拿到（见 /api/frp/server）：普通用户看到的是
      「由管理员配置」，而不是一个看起来像「还没配」的空地址。 */
@@ -178,7 +182,11 @@ function StatusRow() {
         </Stat>
         <Stat label={t('frp.statClient')}>
           <Badge variant={available ? "success" : "warning"} size="sm">
-            {available ? t('frp.installed') : t('frp.notInstalled')}
+            {available
+              ? version
+                ? t('frp.installedWithVersion', { version })
+                : t('frp.installed')
+              : t('frp.notInstalled')}
           </Badge>
         </Stat>
         <Stat label={t('frp.statServer')}>
@@ -222,6 +230,24 @@ const EMPTY_SERVER = {
   token: "",
 };
 
+type ServerDraft = typeof EMPTY_SERVER;
+type ServerField = keyof ServerDraft;
+
+/**
+ * 地址类字段只接受「主机」形态：域名、IPv4 或 IPv6 字面量。
+ *
+ * 服务端在这里填的是 frps 的主机名 / IP，不是 URL —— 带着 ``http://``、端口或
+ * 路径粘进来是最常见的错（从浏览器地址栏直接复制），后端会把它当成主机名去解析，
+ * 失败时只报「连不上」。所以这里先拦一道，并在提示里说清该填什么。
+ * 允许 ``:`` 与 ``[]`` 是为了 IPv6（``fe80::1`` / ``[::1]``）。
+ */
+const HOST_LIKE = /^[A-Za-z0-9._:[\]-]+$/;
+
+function isHostLike(value: string): boolean {
+  const v = value.trim();
+  return v.length > 0 && HOST_LIKE.test(v) && !v.includes("//");
+}
+
 function ServerCard() {
   const t = useT();
   const { hasPermission } = useAuth();
@@ -236,18 +262,26 @@ function ServerCard() {
     refetchInterval: refresh,
   });
 
-  const [draft, setDraft] = useState<typeof EMPTY_SERVER | null>(null);
+  const [draft, setDraft] = useState<ServerDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [tokenDraft, setTokenDraft] = useState("");
+  /* 高级选项默认收起；已经配过对外地址的展开着 —— 折叠不该藏住已生效的配置。 */
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  /* 校验只在「碰过这个字段」或「点过一次保存」之后才显示：
+     一进页面就满屏红字，骂的是用户还没做的事。 */
+  const [touched, setTouched] = useState<Partial<Record<ServerField, boolean>>>({});
+  const [attempted, setAttempted] = useState(false);
 
   useEffect(() => {
     if (serverQuery.data && draft === null) {
-      setDraft({
+      const initial: ServerDraft = {
         server_addr: serverQuery.data.server_addr,
         server_port: serverQuery.data.server_port,
         public_addr: serverQuery.data.public_addr ?? "",
         token: "",
-      });
+      };
+      setDraft(initial);
+      setAdvancedOpen(Boolean(initial.public_addr.trim()));
     }
   }, [serverQuery.data, draft]);
 
@@ -259,8 +293,66 @@ function ServerCard() {
       draft.public_addr.trim() !== (serverQuery.data.public_addr ?? "") ||
       Boolean(tokenDraft));
 
+  const errors = useMemo(() => {
+    const out: Partial<Record<ServerField, string>> = {};
+    if (!draft) return out;
+    const addr = draft.server_addr.trim();
+    if (!addr) {
+      out.server_addr = t('frp.errAddrRequired');
+    } else if (!isHostLike(addr)) {
+      out.server_addr = t('frp.errAddrShape');
+    }
+    /* 0 = 输入框被清空（Number("") 的结果），与「超出范围」分开提示：
+       用户删光一个数字和填了 70000 想改的东西并不一样 */
+    if (!draft.server_port) {
+      out.server_port = t('frp.errPortRequired');
+    } else if (
+      !Number.isInteger(draft.server_port) ||
+      draft.server_port < 1 ||
+      draft.server_port > 65535
+    ) {
+      out.server_port = t('frp.errPortRange');
+    }
+    const pub = draft.public_addr.trim();
+    if (pub && !isHostLike(pub)) {
+      out.public_addr = t('frp.errAddrShape');
+    }
+    return out;
+    /* t 参与依赖：切语言时错误文案要跟着换 */
+  }, [draft, t]);
+
+  const errorFor = (field: ServerField): string | undefined =>
+    attempted || touched[field] ? errors[field] : undefined;
+
+  const touch = (field: ServerField) =>
+    setTouched((prev) => (prev[field] ? prev : { ...prev, [field]: true }));
+
+  /** 放弃改动：回到服务端当前值（含 token 草稿与校验状态）。 */
+  function discard() {
+    if (!serverQuery.data) return;
+    setDraft({
+      server_addr: serverQuery.data.server_addr,
+      server_port: serverQuery.data.server_port,
+      public_addr: serverQuery.data.public_addr ?? "",
+      token: "",
+    });
+    setTokenDraft("");
+    setTouched({});
+    setAttempted(false);
+  }
+
   async function save() {
     if (!draft) return;
+    /* 地址 / 端口错了就不该发出去：后端拒的是「连不上」，用户拿到的是
+       一句笼统的失败，还得回来猜是哪个字段的问题。 */
+    const firstError = Object.keys(errors)[0] as ServerField | undefined;
+    if (firstError) {
+      setAttempted(true);
+      /* 错误在折叠区里时先把那一段展开，否则提示红字在页面上根本找不到 */
+      if (errors.public_addr) setAdvancedOpen(true);
+      toast.error(t('frp.fixErrorsFirst'), errors[firstError]);
+      return;
+    }
     setBusy(true);
     try {
       const payload: {
@@ -270,7 +362,7 @@ function ServerCard() {
         token?: string;
         token_clear?: boolean;
       } = {
-        server_addr: draft.server_addr,
+        server_addr: draft.server_addr.trim(),
         server_port: draft.server_port,
         public_addr: draft.public_addr.trim(),
       };
@@ -290,7 +382,17 @@ function ServerCard() {
       } else {
         toast.success(t('frp.saved'));
       }
+      /* 用「真正发出去的值」回填草稿：后端会 trim，若草稿里还留着那个空格，
+         重新拉回来的数据就与草稿不相等，「未保存」徽章会永远亮着。 */
+      setDraft({
+        server_addr: payload.server_addr,
+        server_port: payload.server_port,
+        public_addr: payload.public_addr,
+        token: "",
+      });
       setTokenDraft("");
+      setAttempted(false);
+      setTouched({});
       void qc.invalidateQueries({ queryKey: ["frp"] });
     } catch (err) {
       toast.error(t('frp.saveFailed'), errorMessage(err));
@@ -320,7 +422,7 @@ function ServerCard() {
   }
 
   return (
-    <Card collapsible={false}>
+    <Card collapsible={false} className="frp-server-card">
       <CardHeader
         title={t('frp.serverTitle')}
         icon={<IconServer size={16} />}
@@ -329,15 +431,38 @@ function ServerCard() {
         }
         actions={
           canManage ? (
-            <Button
-              variant="primary"
-              size="sm"
-              loading={busy}
-              disabled={!dirty}
-              onClick={() => void save()}
-            >
-              {t('frp.saveChanges')}
-            </Button>
+            <>
+              {/* 改动是否落盘必须一眼可见：地址栏改了两个字符和「根本没动过」
+                  长得一样，而这张卡的保存是手动的，没有这个标记就只能靠记忆。 */}
+              {dirty ? (
+                <Badge variant="warning" size="sm" dot>
+                  {t('frp.unsaved')}
+                </Badge>
+              ) : null}
+              {dirty ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy}
+                  onClick={discard}
+                >
+                  {t('frp.discard')}
+                </Button>
+              ) : null}
+              <Button
+                variant="primary"
+                size="sm"
+                icon={<IconSave size={14} />}
+                loading={busy}
+                disabled={!dirty}
+                /* 置灰时说明为什么点不动：没有改动 vs 有错要改，
+                   两种原因给的提示不一样，否则用户只会以为按钮坏了 */
+                title={dirty ? undefined : t('frp.saveDisabledHint')}
+                onClick={() => void save()}
+              >
+                {t('frp.saveChanges')}
+              </Button>
+            </>
           ) : null
         }
       />
@@ -346,98 +471,179 @@ function ServerCard() {
            普通用户看到一句说明，而不是几个禁用状态的空输入框。 */
         <p className="fs-sm text-secondary">{t('frp.serverManagedByAdmin')}</p>
       ) : draft ? (
-        <div className="flex flex-col gap-12">
-          <Field label={t('frp.fieldServerAddr')}>
-            <input
-              className="input"
-              value={draft.server_addr}
-              placeholder={t('frp.serverAddrPlaceholder')}
-              disabled={!canManage}
-              onChange={(e) => setDraft({ ...draft, server_addr: e.target.value })}
-            />
-          </Field>
-          <Field label={t('frp.fieldServerPort')}>
-            <input
-              className="input"
-              type="number"
-              value={draft.server_port}
-              disabled={!canManage}
-              onChange={(e) =>
-                setDraft({ ...draft, server_port: Number(e.target.value) })
-              }
-            />
-          </Field>
-          <Field
-            label={t('frp.fieldPublicAddr')}
-            hint={t('frp.publicAddrHint')}
-          >
-            <input
-              className="input mono"
-              value={draft.public_addr}
-              placeholder={t('frp.publicAddrPlaceholder')}
-              disabled={!canManage}
-              onChange={(e) =>
-                setDraft({ ...draft, public_addr: e.target.value })
-              }
-            />
-          </Field>
-          <Field
-            label={t('frp.fieldToken')}
-            hint={
-              serverQuery.data?.token_set
-                ? t('frp.tokenHintSet')
-                : t('frp.tokenHintUnset')
-            }
-          >
-            <div className="flex gap-8">
-              <input
-                className="input"
-                type="password"
-                value={tokenDraft}
-                placeholder={serverQuery.data?.token_set ? t('frp.tokenPlaceholder') : ""}
-                disabled={!canManage}
-                onChange={(e) => setTokenDraft(e.target.value)}
-              />
-              {canManage && serverQuery.data?.token_set ? (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  loading={busy}
-                  onClick={() => void clearToken()}
-                >
-                  {t('frp.clear')}
-                </Button>
-              ) : null}
+        <div className="frp-form">
+          {/* 基础参数：决定「连不连得上」，两项都必填 */}
+          <section className="frp-form-section">
+            <div className="frp-form-legend">
+              <h4 className="frp-form-legend-title">{t('frp.sectionBasic')}</h4>
+              <span className="frp-form-legend-hint">
+                {t('frp.sectionBasicHint')}
+              </span>
             </div>
-          </Field>
+            {/* .form-grid 是 auto-fit：这张卡在桌面上常常只占半栏（约 490px），
+                写死两列会把两条说明挤成三行；宽的时候它自己并排，窄的时候自己叠。 */}
+            <div className="form-grid">
+              <Field
+                label={t('frp.fieldServerAddr')}
+                required
+                htmlFor="frp-server-addr"
+                error={errorFor('server_addr')}
+                hint={t('frp.serverAddrHint')}
+              >
+                <Input
+                  id="frp-server-addr"
+                  mono
+                  value={draft.server_addr}
+                  placeholder={t('frp.serverAddrPlaceholder')}
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-invalid={errorFor('server_addr') ? true : undefined}
+                  disabled={!canManage}
+                  onChange={(e) =>
+                    setDraft({ ...draft, server_addr: e.target.value })
+                  }
+                  onBlur={() => touch('server_addr')}
+                />
+              </Field>
+              <Field
+                label={t('frp.fieldServerPort')}
+                required
+                htmlFor="frp-server-port"
+                error={errorFor('server_port')}
+                hint={t('frp.serverPortHint')}
+              >
+                <Input
+                  id="frp-server-port"
+                  mono
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  max={65535}
+                  value={draft.server_port || ""}
+                  placeholder="7000"
+                  aria-invalid={errorFor('server_port') ? true : undefined}
+                  disabled={!canManage}
+                  onChange={(e) =>
+                    setDraft({
+                      ...draft,
+                      server_port: Number(e.target.value) || 0,
+                    })
+                  }
+                  onBlur={() => touch('server_port')}
+                />
+              </Field>
+            </div>
+          </section>
+
+          {/* 连接参数：决定「不被服务端拒绝」，token 只认服务端那一份 */}
+          <section className="frp-form-section">
+            <div className="frp-form-legend">
+              <h4 className="frp-form-legend-title">{t('frp.sectionAuth')}</h4>
+              <span className="frp-form-legend-hint">
+                {t('frp.sectionAuthHint')}
+              </span>
+            </div>
+            <Field
+              /* 状态徽章跟着标签走，不甩到行尾：这是一条「读一眼就知道」的状态，
+                 隔着半张卡的距离去找它，反而不如紧挨着标签 */
+              label={
+                <span className="frp-field-label-state">
+                  {t('frp.fieldToken')}
+                  <Badge
+                    variant={serverQuery.data?.token_set ? 'success' : 'neutral'}
+                    size="sm"
+                  >
+                    {serverQuery.data?.token_set
+                      ? t('frp.tokenSet')
+                      : t('frp.tokenUnset')}
+                  </Badge>
+                </span>
+              }
+              htmlFor="frp-token"
+              hint={
+                serverQuery.data?.token_set
+                  ? t('frp.tokenHintSet')
+                  : t('frp.tokenHintUnset')
+              }
+            >
+              <div className="frp-token-row">
+                <Input
+                  id="frp-token"
+                  type="password"
+                  value={tokenDraft}
+                  placeholder={
+                    serverQuery.data?.token_set
+                      ? t('frp.tokenPlaceholder')
+                      : t('frp.tokenPlaceholderNew')
+                  }
+                  autoComplete="new-password"
+                  disabled={!canManage}
+                  onChange={(e) => setTokenDraft(e.target.value)}
+                />
+                {canManage && serverQuery.data?.token_set ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    loading={busy}
+                    onClick={() => void clearToken()}
+                  >
+                    {t('frp.clear')}
+                  </Button>
+                ) : null}
+              </div>
+            </Field>
+          </section>
+
+          {/* 高级选项：多数部署用不到，默认收起；已经配过的展开着，
+              免得「配了但看不见」 */}
+          <details
+            className="frp-advanced"
+            open={advancedOpen}
+            onToggle={(e) => setAdvancedOpen(e.currentTarget.open)}
+          >
+            <summary>
+              <span className="frp-advanced-chevron" aria-hidden="true">
+                <IconChevronDown size={14} />
+              </span>
+              {t('frp.sectionAdvanced')}
+              <span className="frp-advanced-state">
+                {draft.public_addr.trim() || t('frp.advancedUnset')}
+              </span>
+            </summary>
+            <div className="frp-advanced-body">
+              <p className="fs-xs text-muted">{t('frp.sectionAdvancedHint')}</p>
+              <Field
+                label={t('frp.fieldPublicAddr')}
+                htmlFor="frp-public-addr"
+                error={errorFor('public_addr')}
+                hint={t('frp.publicAddrHint')}
+              >
+                <Input
+                  id="frp-public-addr"
+                  mono
+                  value={draft.public_addr}
+                  placeholder={t('frp.publicAddrPlaceholder')}
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-invalid={errorFor('public_addr') ? true : undefined}
+                  disabled={!canManage}
+                  onChange={(e) =>
+                    setDraft({ ...draft, public_addr: e.target.value })
+                  }
+                  onBlur={() => touch('public_addr')}
+                />
+              </Field>
+            </div>
+          </details>
+
           {canManage ? (
-            <p className="fs-xs text-muted">
-              {t('frp.restartNote')}
-            </p>
+            <p className="frp-form-footnote">{t('frp.restartNote')}</p>
           ) : null}
         </div>
       ) : (
         <div className="skeleton skeleton-text" />
       )}
     </Card>
-  );
-}
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="field">
-      <label className="field-label">{label}</label>
-      {children}
-      {hint ? <span className="field-message">{hint}</span> : null}
-    </div>
   );
 }
 
@@ -458,6 +664,7 @@ function ProcessCard() {
     refetchInterval: refresh,
   });
   const available = statusQuery.data?.available ?? false;
+  const version = (statusQuery.data?.version ?? "").trim();
 
   const [busy, setBusy] = useState(false);
 
@@ -469,7 +676,15 @@ function ProcessCard() {
             对探测者却是一条「这台机器上装了什么、目录怎么摆」的情报（V2-04）。 */}
         <div className="flex items-center justify-between">
           <span className="fs-sm text-secondary">{t('frp.clientVersion')}</span>
-          <span className="mono fs-sm">{available ? t('frp.ready') : t('frp.missing')}</span>
+          {/* 显示二进制自己报的版本号（后端 frpc -v），而不是「已就绪」这种
+              等于没说的状态：排障时要知道装的到底是哪一版。 */}
+          <span className="mono fs-sm">
+            {available
+              ? version
+                ? `v${version}`
+                : t('frp.versionUnknown')
+              : t('frp.missing')}
+          </span>
         </div>
         {!available ? (
           <Notice tone="warning" title={t('frp.notInstalledTitle')}>
@@ -559,28 +774,12 @@ const EMPTY_RULE: FrpRuleInput = {
   remote_port: 40000,
 };
 
-/** 手动输入模式的哨兵值（只在管理员放行了网段时出现）。 */
-const MANUAL_TARGET = "__manual__";
-
 /** 拼「公网地址:端口」。IPv6 必须加方括号，否则 host:port 会被当成别的东西。 */
 function endpoint(host: string, port: number): string {
   const text = (host || "").trim();
   if (!text) return "";
   const hostPart = text.startsWith("[") || !text.includes(":") ? text : `[${text}]`;
   return `${hostPart}:${port}`;
-}
-
-/** 目标下拉的选项文案：「web-01（虚拟机 105）· 10.0.0.25」。 */
-function targetLabel(t: TFunc, target: FrpTarget): string {
-  const kind = target.type === 'lxc' ? t('frp.kindLxc') : t('frp.kindQemu');
-  return target.name
-    ? t('frp.targetOption', {
-        name: target.name,
-        kind,
-        vmid: target.vmid,
-        ip: target.ip,
-      })
-    : t('frp.targetOptionUnnamed', { kind, vmid: target.vmid, ip: target.ip });
 }
 
 function RulesCard() {
@@ -614,7 +813,7 @@ function RulesCard() {
      （invalidateQueries）重新取一次，足够跟上「新建虚机 / 别人占了端口」。 */
   const policyQuery = useQuery({
     queryKey: ["frp", "policy"],
-    queryFn: frpApi.policy,
+    queryFn: () => frpApi.policy(),
     staleTime: 60_000,
   });
   const policy = policyQuery.data;
@@ -626,13 +825,18 @@ function RulesCard() {
   const isAdmin = listQuery.data?.is_admin ?? false;
   const ownUsername = listQuery.data?.own_username ?? "";
 
-  /* 当前生效（合并后）规则名集合 —— 用于标记「已生效 / 未生效」 */
+  /* 当前生效（合并后）的代理名集合 —— 用于标记「已生效 / 未应用」。
+     比的是**渲染名**（proxy_name，带归属前缀），不是规则名：合并后的 frpc
+     配置里每条代理都叫 `<用户>_<规则名>`，用规则名永远对不上。 */
   const effectiveNames = useMemo(() => {
     const set = new Set<string>();
     for (const r of effectiveQuery.data?.config.proxies ?? []) set.add(r.name);
     return set;
   }, [effectiveQuery.data]);
 
+  /* 同一个人名下的重名规则。跨用户同名不算问题：渲染时名字带归属前缀
+     （alice_tunnel-1 / bob_tunnel-1），所以这里按「用户名 + 规则名」成对去重；
+     同人重名则会被自动加序号，提示用户改名是为了让隧道名字可预期。 */
   const dupNames = useMemo(() => {
     const seen = new Set<string>();
     const dups = new Set<string>();
@@ -858,7 +1062,7 @@ function RulesCard() {
                     portMin={policy?.remote_port_min}
                     portMax={policy?.remote_port_max}
                     canManageRow={canManage && (isAdmin || r.username === ownUsername)}
-                    isEffective={effectiveNames.has(r.name)}
+                    isEffective={effectiveNames.has(r.proxy_name ?? r.name)}
                     onUpdate={async (patch) => {
                       try {
                         await update(r.id, patch);
@@ -1167,18 +1371,43 @@ function RuleDialog({
      判定 —— 界面上根本没有「填一个别人的 IP 试试」这条路。只有放行过网段时，
      才多给一个手动输入的入口（输入后仍然按网段校验）。 */
   const restricted = policy?.restricted ?? false;
-  const targets = policy?.targets ?? [];
+  /* 管理员的可选目标要逐条连接读 PVE（离线连接会一直等到超时），所以不跟页面
+     一起拉：只在弹窗打开时单独请求一次。普通用户那份随 policy 一起到 —— 他们
+     名下没有归属机器时后端根本不会碰 PVE，很便宜。 */
+  const targetsQuery = useQuery({
+    queryKey: ["frp", "policy", "targets"],
+    queryFn: () => frpApi.policy({ withTargets: true }),
+    enabled: open && !restricted,
+    staleTime: 60_000,
+  });
+  const targets = restricted
+    ? policy?.targets ?? []
+    : targetsQuery.data?.targets ?? [];
+  /* 读 PVE 失败（连接不通等）：下拉里只剩「自定义」，得说清为什么 */
+  const targetsError = restricted ? "" : targetsQuery.data?.own_ips_error ?? "";
+  const targetsLoading = !restricted && targetsQuery.isLoading;
   const granted = policy?.granted ?? [];
   const grantedIps = granted.filter((item) => !item.includes('/'));
   const grantedCidrs = granted.filter((item) => item.includes('/'));
   const manualCidrs = [...(policy?.allow_cidrs ?? []), ...grantedCidrs];
   const allowManual = restricted && manualCidrs.length > 0;
-  const grantedOptions = grantedIps
-    .filter((ip) => !targets.some((item) => item.ip === ip))
-    .map((ip) => ({ value: ip, label: t('frp.targetGrantedOption', { ip }) }));
-  const choices = targets.length + grantedOptions.length;
+  /* 下拉的候选：虚机 / 容器（带主机名、VMID）+ 管理员单独放行的 IP（没有主机名，
+     只标一句「管理员授权」）。两种都支持按主机名 / IP / VMID 搜索。 */
+  const choices = useMemo<TargetChoice[]>(() => {
+    const guests: TargetChoice[] = targets.map((item) => ({
+      ip: item.ip,
+      name: item.name,
+      vmid: item.vmid,
+      node: item.node,
+      type: item.type,
+    }));
+    const grantedOnly: TargetChoice[] = grantedIps
+      .filter((ip) => !targets.some((item) => item.ip === ip))
+      .map((ip) => ({ ip, note: t('frp.targetGrantedName') }));
+    return [...guests, ...grantedOnly];
+  }, [targets, grantedIps, t]);
   const [manual, setManual] = useState(false);
-  const noTarget = restricted && choices === 0 && !allowManual;
+  const noTarget = restricted && choices.length === 0 && !allowManual;
 
   /* 策略与默认名每秒都在轮询 / 重算，如果它们进了依赖，弹窗开着的时候也会
      把用户正在填的内容冲掉。只在「打开」这一刻取一次初值。 */
@@ -1197,8 +1426,10 @@ function RuleDialog({
     setForm({
       ...EMPTY_RULE,
       name: initialNameRef.current,
-      /* 有候选就直接选中第一个（下拉里换一下即可），不必让人从空白开始猜。 */
-      local_ip: candidates[0]?.ip ?? firstGranted ?? "",
+      /* 普通用户只有「自己名下」这一小组地址，直接选中第一个省一次点击；
+         管理员面对的是全平台清单（见 /api/frp/policy 的 targets），预选第一个
+         等于替他把公网端口指向一台随机的机器 —— 留空让他自己选。 */
+      local_ip: current?.restricted ? candidates[0]?.ip ?? firstGranted ?? "" : "",
       remote_port: current?.default_remote_port ?? EMPTY_RULE.remote_port,
     });
     setManual(false);
@@ -1305,18 +1536,34 @@ function RuleDialog({
         <>
           {/* 普通用户：目标只能从自己名下虚机 / 容器的地址里选。选项由后端按
               归属 + PVE 实况算出（/api/frp/policy 的 targets），不是前端自己
-              拼的列表 —— 列表和判定永远一致。 */}
-          <Select
+              拼的列表 —— 列表和判定永远一致。机器多了就在框里搜（主机名 / IP /
+              VMID），规则见 utils/targetSearch.ts。 */}
+          <TargetSelect
             label={t('frp.fieldLocalIp')}
             required
-            value={manual ? MANUAL_TARGET : form.local_ip}
-            error={manual ? undefined : errors.local_ip}
+            choices={choices}
+            value={manual ? '' : form.local_ip}
+            manual={manual}
+            manualLabel={t('frp.targetManualOption')}
+            onSelect={(choice) => {
+              setManual(false);
+              patch('local_ip', choice.ip);
+            }}
+            onManual={
+              allowManual
+                ? (text) => {
+                    setManual(true);
+                    patch('local_ip', text);
+                  }
+                : undefined
+            }
             disabled={noTarget}
             placeholder={
               noTarget
                 ? t('frp.targetSelectEmpty')
-                : t('frp.targetSelectPlaceholder')
+                : t('frp.targetSearchPlaceholder')
             }
+            error={manual ? undefined : errors.local_ip}
             hint={
               noTarget
                 ? undefined
@@ -1324,34 +1571,15 @@ function RuleDialog({
                   ? t('frp.targetSelectHintManual', {
                       cidrs: manualCidrs.join('、'),
                     })
-                  : t('frp.targetSelectHint', { n: choices })
+                  : t('frp.targetSelectHint', { n: choices.length })
             }
-            options={[
-              ...targets.map((item) => ({
-                value: item.ip,
-                label: targetLabel(t, item),
-              })),
-              ...grantedOptions,
-              ...(allowManual
-                ? [{ value: MANUAL_TARGET, label: t('frp.targetManualOption') }]
-                : []),
-            ]}
-            onChange={(e) => {
-              const value = e.target.value;
-              if (value === MANUAL_TARGET) {
-                setManual(true);
-                patch('local_ip', '');
-                return;
-              }
-              setManual(false);
-              patch('local_ip', value);
-            }}
           />
           {manual ? (
             <Input
               label={t('frp.fieldLocalIpManual')}
               className="mono"
               required
+              autoFocus
               placeholder={t('frp.localIpPlaceholder')}
               value={form.local_ip}
               error={manual ? errors.local_ip : undefined}
@@ -1366,16 +1594,56 @@ function RuleDialog({
           ) : null}
         </>
       ) : (
-        <Input
-          label={t('frp.fieldLocalIp')}
-          className="mono"
-          required
-          placeholder={t('frp.localIpPlaceholder')}
-          value={form.local_ip}
-          error={errors.local_ip}
-          hint={t('frp.localIpHint')}
-          onChange={(e) => patch("local_ip", e.target.value)}
-        />
+        <>
+          {/* 管理员不受目标白名单限制，所以这个选择器只是「预设地址」的快捷入口 ——
+              候选是 /api/frp/policy 的 targets（全部虚机 / 容器的地址，与普通用户
+              那份同一套生成逻辑），列表末尾单独一行切到「自定义 IP」手动填写。
+              默认不预选：这份清单是全平台的，预选第一个等于替他把公网端口指向
+              一台随机的机器，让他自己选（或切到自定义）。 */}
+          <TargetSelect
+            label={t('frp.fieldLocalIp')}
+            required
+            choices={choices}
+            value={manual ? '' : form.local_ip}
+            manual={manual}
+            manualLabel={t('frp.targetManualOptionAdmin')}
+            onSelect={(choice) => {
+              setManual(false);
+              patch('local_ip', choice.ip);
+            }}
+            onManual={(text) => {
+              setManual(true);
+              patch('local_ip', text);
+            }}
+            loading={targetsLoading}
+            placeholder={t('frp.targetSearchPlaceholder')}
+            error={manual ? undefined : errors.local_ip}
+            hint={
+              manual
+                ? undefined
+                : targetsLoading
+                  ? t('frp.targetSelectLoading')
+                  : targetsError
+                    ? t('frp.policyTargetLookupFailed', { error: targetsError })
+                    : choices.length > 0
+                      ? t('frp.targetSelectHintAdmin', { n: choices.length })
+                      : t('frp.targetSelectAdminNoPreset')
+            }
+          />
+          {manual ? (
+            <Input
+              label={t('frp.fieldLocalIpManualAdmin')}
+              className="mono"
+              required
+              autoFocus
+              placeholder={t('frp.localIpPlaceholder')}
+              value={form.local_ip}
+              error={manual ? errors.local_ip : undefined}
+              hint={t('frp.localIpHint')}
+              onChange={(e) => patch('local_ip', e.target.value)}
+            />
+          ) : null}
+        </>
       )}
       <div className="form-grid-2">
         <Input

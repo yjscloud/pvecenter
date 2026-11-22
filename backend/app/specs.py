@@ -236,8 +236,9 @@ def presets() -> List[Dict[str, Any]]:
     """内置的一组常用规格（:data:`DEFAULT_SPECS` 的副本）。
 
     设置页的「添加常用规格」用它：已经在用的部署早把规格存进 KV 了，读
-    ``/config/specs`` 拿不到这份内置表，所以单独给一个只读入口。返回副本，
-    调用方拿去做 UI 时不可能改到模块级常量。
+    ``/api/runtime/specs`` 拿不到这份内置表，所以单独给一个只读入口
+    （``/api/runtime/specs/presets``）。返回副本，调用方拿去做 UI 时不可能
+    改到模块级常量。
     """
     return [dict(item) for item in DEFAULT_SPECS]
 

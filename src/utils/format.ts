@@ -316,3 +316,18 @@ export function truncate(text: string, max = 40): string {
   if (text.length <= max) return text;
   return `${text.slice(0, max - 1)}…`;
 }
+
+/**
+ * 容量文本统一成 `20 GB` 这种写法。
+ *
+ * 模板容量来自两三处，写法并不统一：虚拟机模板的系统盘是 `${rootfs_gb}G`，
+ * 其余走 `formatBytes` 出 `4 GB`。同一张卡片里混着 `20G` 与 `4 GB`，右对齐
+ * 之后就对不齐了，读起来也像两个单位。认不出的原样返回，空值给 `—`。
+ */
+export function normalizeSizeText(text?: string | null): string {
+  const raw = String(text ?? '').trim();
+  if (!raw) return '—';
+  const hit = /^([\d.]+)\s*([KMGT])(?:B)?$/i.exec(raw);
+  if (!hit) return raw;
+  return `${hit[1]} ${hit[2].toUpperCase()}B`;
+}

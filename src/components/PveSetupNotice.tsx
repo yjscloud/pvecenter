@@ -15,12 +15,13 @@
    ========================================================================== */
 
 import { useLocation, useNavigate } from 'react-router';
+import { useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../hooks/useAuth';
 import { usePveStatus } from '../hooks/usePveStatus';
 import { useT } from '../i18n';
 import { Notice } from './ui/EmptyState';
 import { Button } from './ui/Button';
-import { IconAlert, IconPlug } from './Icons';
+import { IconAlert, IconPlug, IconRefresh } from './Icons';
 
 /* 「添加节点」跳转的目标：连接管理页，并让它自动摊开新增表单 */
 const SETUP_PATH = '/nodes/connections';
@@ -29,8 +30,11 @@ export function PveSetupNotice() {
   const t = useT();
   const navigate = useNavigate();
   const location = useLocation();
+  const queryClient = useQueryClient();
   const { isAdmin } = useAuth();
-  const { configured, loading, reachable, paused, hasData } = usePveStatus();
+  /* anyReachable：面板的数据类接口遍历的是**全部**未暂停连接，兜底那台掉线
+     但其它集群正常时，「面板读不到 PVE 数据」并不成立，不该报警。 */
+  const { configured, loading, anyReachable, paused, hasData } = usePveStatus();
 
   if (loading || location.pathname.startsWith(SETUP_PATH)) {
     return null;
@@ -44,22 +48,34 @@ export function PveSetupNotice() {
      算到 PVE 头上（同 usePveStatus 里的说明）。 */
   if (configured) {
     /* 暂停接入不是「连不上」：那是管理员主动停用，提示排查只会把人带偏 */
-    if (!hasData || reachable || paused) return null;
+    if (!hasData || anyReachable || paused) return null;
     return (
       <Notice
         tone="warning"
         icon={<IconAlert size={16} />}
         title={t('pve.unreachableTitle')}
         action={
-          isAdmin ? (
+          <div className="flex items-center gap-8">
+            {/* 真故障才给「重试」；它顺手把各页面已经失败的查询一起重取，
+                用户不用自己刷新页面（选了「不自动刷新」时尤其需要）。 */}
             <Button
               size="sm"
               variant="secondary"
-              onClick={() => navigate(SETUP_PATH)}
+              icon={<IconRefresh size={14} />}
+              onClick={() => void queryClient.invalidateQueries()}
             >
-              {t('setup.pveManage')}
+              {t('common.retry')}
             </Button>
-          ) : undefined
+            {isAdmin ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => navigate(SETUP_PATH)}
+              >
+                {t('setup.pveManage')}
+              </Button>
+            ) : null}
+          </div>
         }
       >
         {t('pve.unreachableDesc')}

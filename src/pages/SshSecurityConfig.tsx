@@ -903,7 +903,7 @@ export function SshSecurityConfig() {
                 <Input
                   value={String(hostDraft.host ?? '')}
                   onChange={(e) => setHostDraft({ ...hostDraft, host: e.target.value })}
-                  placeholder="172.16.149.3"
+                  placeholder="10.0.0.10"
                   mono
                 />
               </Field>

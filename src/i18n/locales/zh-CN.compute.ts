@@ -1179,12 +1179,10 @@ export const zhCompute = {
   'backups.notImplMessage': '后端 /backups 返回未实现。前端已完成对接，待后端提供数据后自动生效。',
   'backups.kpiFiles': '备份文件',
   'backups.kpiSpace': '占用空间',
-  'backups.kpiSpaceHintPbs': 'PBS 仓库实际已用（已去重压缩）',
   'backups.kpiSpaceHintDir': '归档文件实际大小',
-  'backups.kpiSpaceHintFallback': '部分存储读不到实际占用，按归档大小估算',
   'backups.colDataSize': '数据量',
   'backups.colDataSizeHint':
-    'PBS 归档这里是去重前的数据量，不等于盘上占用；盘上真实占用看「占用空间」卡片',
+    'PBS 归档这里是这份快照记录的数据量，不等于盘上占用（同一批数据块在多份归档间共享）；上方「占用空间」取存储侧的实际已用，不是这一列的合计',
   'backups.kpiVms': '覆盖虚拟机',
   'backups.kpiSuccess': '近期成功率',
   'backups.kpiRecent': '近 {days} 天 {ok} 成功 / {failed} 失败',
@@ -1519,13 +1517,8 @@ export const zhCompute = {
   'lxcDetail.deleteSnapMessage': '删除后无法恢复。',
   'guestList.snap.quotaRemaining': '你名下的快照额度还剩 {n} 张',
   'guestList.snap.quotaUsedUp': '快照额度已用尽（上限 {limit} 张），请先删掉一些快照再建。',
-  /* 维度名，**不带单位**：额度过限提示点名「超的是哪一项」、剩余额度摘要
-     （remainingSummary）都用它 —— 单位由摘要自己拼，传带单位的字段名会拼出
-     「内存 (GB) 8 GB」 */
-  'quota.fieldLabel.count': '数量',
-  'quota.fieldLabel.cores': 'CPU 核数',
-  'quota.fieldLabel.memory': '内存',
-  'quota.fieldLabel.disk': '磁盘',
+  /* 维度名（'quota.fieldLabel.*'）放在 core：用户管理页的「谁快满了」也用它，
+     而那一页不加载本词典。 */
   /* 额度用尽时对普通用户说的话：只给出路。上限 / 已用与「去哪儿改」是管理员的事，
      普通用户既改不了也不必知道他所在平台的总盘子有多大 */
   'quota.askAdmin': '请联系管理员调整下发额度。',
@@ -1687,7 +1680,11 @@ export const zhCompute = {
   'batchCreate.warnNote': '任务已完成但有警告，请到列表确认实际结果',
   'batchCreate.timeoutNote': '轮询超时，任务可能仍在 PVE 上执行，请到「任务队列」确认',
   'batchCreate.unreachableNote': '暂时读不到任务状态，任务可能仍在执行，请到「任务队列」确认',
+  /* 读不到任务 → 按列表核对：机器在就是成功，明确不在才算失败。
+     下面三条是「核对」的三种结论；只有在列表也读不到时才退回 missingNote。 */
   'batchCreate.missingNote': '任务记录已不存在，请到列表确认客户机是否创建成功',
+  'batchCreate.verifiedNote': '任务记录已不可读，已按列表确认客户机存在',
+  'batchCreate.absentNote': '未在集群中找到该客户机，创建未完成，请查看 PVE 任务日志',
   'batchCreate.unknownNote': '无法确认任务结果，请到列表或「任务队列」确认',
   'batchCreate.close': '完成',
   'batchCreate.quantity': '数量',
@@ -1706,8 +1703,44 @@ export const zhCompute = {
   'quickDeploy.createdLxcHint': 'CT {vmid}，可在任务队列查看进度',
   'quickDeploy.createdDiskMismatch': '已创建，但系统盘未达规格容量',
   'quickDeploy.createFailed': '创建失败',
-  'quickDeploy.summaryDisk': '{n}G 磁盘',
-  'quickDeploy.summary': '{cores}C · {mem}G 内存 · {disk}',
+  /* 单位写全：原先的 1C / 1G / 20G 里「C」不是通用写法，「G」也分不清是内存
+     还是带宽。规格卡片与提交摘要共用这两条，改一次两处一致。 */
+  'quickDeploy.summaryDisk': '{n} GB 磁盘',
+  'quickDeploy.summary': '{cores} 核 · {mem} GB 内存 · {disk}',
+  /* ---- 提交摘要（额度 / 规格 两行） ----
+     额度只报「台数」这一维：规格维度的余额由上面那条资源额度提示负责，
+     两处都报会变成两个口径的数字。数字留空是刻意的 —— quota 为 null 时
+     上层换用 quotaNoCapUsed / quotaUnlimitedUsed，绝不输出「已用 3 / 」。 */
+  'quickDeploy.summarySpecKey': '规格',
+  'quickDeploy.quotaKindLabel': '{label}额度',
+  'quickDeploy.quotaUsedOf': '已用 {used} / {quota} {unit}',
+  'quickDeploy.quotaThisBatch': '本次 {qty} {unit}',
+  'quickDeploy.quotaAfter': '创建后剩 {n} {unit}',
+  /* 拆两段是为了断行位置可控：前半「仅剩 2 台，」整体不折，后半才折 */
+  'quickDeploy.quotaShortLeft': '仅剩 {n} {unit}，',
+  'quickDeploy.quotaShortNeed': '不足以创建 {qty} {unit}',
+  'quickDeploy.quotaUnlimitedUsed': '不限制（已用 {used} {unit}）',
+  'quickDeploy.quotaNoCapUsed': '台数不限（已用 {used} {unit}）',
+  /* ---- 额度行右侧的模板信息 ---- */
+  /* 这块回答的是「按哪张模板建」：名称、系统家族、模板自带规格、关键配置。
+     「模板」两个字必须留着 —— 下一行「单台」说的是本次要建的规格，两个数字
+     不标来源就会被读成同一件事。 */
+  'quickDeploy.templateTitle': '模板',
+  'quickDeploy.templateEmpty': '尚未选择模板',
+  'quickDeploy.templateMem': '{size} 内存',
+  'quickDeploy.templateDisk': '{size} 磁盘',
+  'quickDeploy.templateSize': '大小 {size}',
+  'quickDeploy.templateVmid': 'VMID {vmid}',
+  'quickDeploy.templateStorage': '存储 {storage}',
+  'quickDeploy.templateNode': '节点 {node}',
+  /* 规格行拆成可对齐的三段：「单台」标签 + 三个胶囊、乘数胶囊、合计一组。
+     原先是一整句话，括号里又把同样三项重复一遍，读的时候得先拆句再对数；
+     拆开后「2 核 ×3 = 6 核」是并排放着给人看的。 */
+  'quickDeploy.specPerGuest': '单台',
+  'quickDeploy.specCores': '{n} 核',
+  'quickDeploy.specMem': '{n} GB 内存',
+  'quickDeploy.specTimes': '× {qty} {unit}',
+  'quickDeploy.specTotalLabel': '合计',
   'quickDeploy.noPermTitle': '没有下发权限',
   'quickDeploy.noPermBody': '需要 vm.create 权限。',
   'quickDeploy.quotaBlockedTitle': '{label}下发额度已用尽',
@@ -1807,9 +1840,9 @@ export const zhCompute = {
   'quickDeploy.segmentHint':
     '选中后网桥与 VLAN 会按该网段对齐：DHCP 请求从这条二层网络发出，地址由该网段的 DHCP 服务器分配（面板不预留）。',
   'quickDeploy.labelIp': 'IP 地址',
-  'quickDeploy.ipPlaceholder': '如 172.16.149.50',
+  'quickDeploy.ipPlaceholder': '如 10.0.0.50',
   'quickDeploy.labelGateway': '网关',
-  'quickDeploy.gatewayPlaceholder': '如 172.16.149.1',
+  'quickDeploy.gatewayPlaceholder': '如 10.0.0.1',
   'quickDeploy.sectionLogin': '登录信息',
   'quickDeploy.loginSubtitleVm': '经 cloud-init 写入（模板需带 cloud-init）',
   'quickDeploy.loginSubtitleLxc': '创建时写入 root 密码',
@@ -1819,9 +1852,6 @@ export const zhCompute = {
   'quickDeploy.passwordPlaceholder': '留空则不设置',
   'quickDeploy.createVm': '创建虚拟机',
   'quickDeploy.createLxc': '创建容器',
-  'quickDeploy.quotaLimited': '{label}额度：已用 {used} / {quota}，还剩 {remaining} 台',
-  'quickDeploy.quotaUnlimited': '{label}额度：不限制',
-  'quickDeploy.willCreate': ' · 将创建：{summary}',
   'quickDeploy.loadingQuota': '读取额度…',
   /* ---------------------------------------------------------------- 控制台 */
   'console.mode': '控制台类型',
@@ -1925,7 +1955,7 @@ export const zhCompute = {
   'console.fileHint':
     '文件先上传到面板，再生成一条下载命令；客户机需要能访问面板地址。命令里已经带好文件名。',
   'console.chooseFile': '选择文件或拖到这里',
-  'console.chooseFileHint': '最大 1 GB，链接 24 小时后失效',
+  'console.chooseFileHint': '最大 1 GB，链接有效期较短（默认 60 分钟），请尽快取走',
   'console.uploading': '正在上传',
   'console.uploadFile': '上传到面板',
   'console.fileUploaded': '文件已上传',
@@ -2143,6 +2173,14 @@ export const zhCompute = {
   'guestList.empty': '暂无{noun}',
   'guestList.deleteTitle': '删除{noun}',
   'guestList.deleteSoon': '即将删除{noun}',
+  /* 隔离状态：列表标签 + 删除前的引导（见「应急响应」页的隔离处置） */
+  'guestList.isolated': '隔离',
+  'guestList.isolatedTitle': '处于隔离状态：网络已切断，删除前请先在「应急响应」页解除隔离',
+  'guestList.deleteIsolatedTitle': '该{noun}处于隔离状态',
+  'guestList.deleteIsolatedSoon': '无法直接删除：',
+  'guestList.deleteIsolatedTail':
+    '仍处于隔离状态（断网 + 取证快照），删除它就等于销毁证据。请先在「应急响应」页解除隔离，再回来删除。',
+  'guestList.deleteIsolatedGo': '前往解除隔离',
   'guestList.bulkDeleteTitle': '批量删除{noun}',
   'guestList.bulkDeleteConfirm': '删除 {count} {unit}',
   'guestList.bulkDeleteSoon': '即将删除选中的',
@@ -2271,6 +2309,9 @@ export const zhCompute = {
   'guestList.osFromMeta': '手动标注',
   'guestList.osFromTemplate': '来源模板 {name}',
   'guestList.osFromLinkedTemplate': '手工关联的模板 {name}',
+  'guestList.osFromSnapshot': '系统信息快照（{time}）',
+  'guestList.osSnapshot': '系统信息快照：{detail}（采集于 {time}）。隔离 / 解除隔离 / 开机时自动更新，读取失败不会清空已有信息。',
+  'guestList.osSnapshotEmpty': '已记录采集时间',
   'guestList.templateLabel': '来源模板',
   'guestList.templateNone': '不关联（按克隆记录推断）',
   'guestList.templateHint':
@@ -2424,6 +2465,20 @@ export const zhCompute = {
   'incident.step.power': '电源动作',
   'incident.isoSection': '虚拟机隔离处置',
   'incident.isoSectionHint': '先取证、再断网、最后关机 —— 顺序反了现场就没了',
+  /* 隔离清单：面板登记过的隔离动作，刷新页面后仍然看得到 */
+  'incident.isoListSection': '隔离清单',
+  'incident.isoListSectionHint': '面板登记过的隔离记录，刷新后仍在（真实状态仍以 PVE 为准）',
+  'incident.isoListTitle': '隔离中的虚拟机（{n}）',
+  'incident.isoListSubtitle': '可直接在这里解除隔离；清单只是索引，单台状态以 PVE 实时读到的为准',
+  'incident.isoListEmptyTitle': '当前没有登记在案的隔离',
+  'incident.isoListEmptyDesc': '在上方选中一台虚拟机执行「立即隔离」后，记录会出现在这里。',
+  'incident.isoListCaption': '隔离清单',
+  'incident.isoListLoadFailed': '读取隔离清单失败',
+  'incident.isoColGuest': '虚拟机',
+  'incident.isoColAt': '隔离时间',
+  'incident.isoColNics': '已断网卡',
+  'incident.isoColSnapshot': '取证快照',
+  'incident.isoStatePartial': '部分失败',
   'incident.targetTitle': '处置目标与动作',
   'incident.targetSubtitle': '隔离是不可逆的现场保全动作，先看状态，再动手',
   'incident.needPermTitle': '需要「应急隔离」权限',
@@ -2489,7 +2544,13 @@ export const zhCompute = {
   'incident.verifyNow': '立即核对',
   'incident.fieldStorage': '存储',
   'incident.colVolid': '备份卷',
-  'incident.volidHint': '可在「备份」页的归档列表里复制',
+  'incident.volidSelectPlaceholder': '请选择备份卷',
+  'incident.volidSelectHint': '只列该存储下的备份归档；选定后显示大小与创建时间',
+  'incident.volidDetail': '{size} · 创建于 {time}',
+  'incident.noVolids': '该存储下没有备份归档',
+  'incident.noNodes': '没有可用节点',
+  'incident.pickNodeFirst': '请先选择节点',
+  'incident.pickStorageFirst': '请先选择存储',
   'incident.notePlaceholder': '例如：上线前基线备份，保留 30 天',
   'incident.protectBtn': '登记为受保护',
   'incident.listLoadFailed': '读取受保护清单失败',
@@ -2510,7 +2571,7 @@ export const zhCompute = {
   'incident.quarantineFailed': '隔离失败',
   'incident.released': '已解除隔离',
   'incident.releaseFailed': '解除隔离失败',
-  'incident.fillFields': '请填写节点、存储与备份卷 ID',
+  'incident.fillFields': '请选择节点、存储与备份卷',
   'incident.protectDone': '已登记为受保护备份',
   'incident.protectFailed': '登记失败',
   'incident.verifyProblem': '核对发现异常',

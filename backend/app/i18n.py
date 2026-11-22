@@ -231,8 +231,8 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "en": "Forensic snapshot {name} created (crash-consistent, no memory image)",
     },
     "isolation.detail.snapshotFail": {
-        "zh-CN": "取证快照失败（不影响后续隔离）：{error}",
-        "en": "Forensic snapshot failed (isolation continues): {error}",
+        "zh-CN": "取证快照未完成（后续处置仍会尝试）：{error}",
+        "en": "Forensic snapshot did not complete (the remaining steps are still attempted): {error}",
     },
     "isolation.detail.noNics": {
         "zh-CN": "这台虚拟机没有虚拟网卡（net*），未做断网",
@@ -292,6 +292,22 @@ MESSAGES: Dict[str, Dict[str, str]] = {
     "isolation.detail.readConfigFail": {
         "zh-CN": "读取虚拟机配置失败：{error}",
         "en": "Could not read the VM configuration: {error}",
+    },
+    "isolation.detail.locked": {
+        "zh-CN": "虚拟机有其它任务正在执行（{error}），请等它结束后重试",
+        "en": "The VM is busy with another task ({error}); wait for it to finish and try again",
+    },
+    "isolation.detail.timedOut": {
+        "zh-CN": "等待虚拟机任务超时（{error}），请稍后在页面上确认结果",
+        "en": "Timed out waiting for the VM task ({error}); check the result on this page shortly",
+    },
+    "isolation.detail.noSpace": {
+        "zh-CN": "存储空间不足（{error}），请先清理后再试",
+        "en": "Not enough storage space ({error}); free some space and try again",
+    },
+    "isolation.deleteBlocked": {
+        "zh-CN": "虚拟机 {vmid} 处于隔离状态，请先在「应急响应」页解除隔离后再删除",
+        "en": "VM {vmid} is isolated. Release the isolation on the Incident Response page before deleting it",
     },
     # ---- SSH 安全：日志来源与 fail2ban 提示 ----
     "ssh.logUnreadable": {
@@ -353,9 +369,13 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "Download it inside the guest, or upload it to a PVE storage instead.",
     },
     "console.fileMissing": {
-        "zh-CN": "文件不存在或下载链接已过期（默认 24 小时有效），请回到面板重新上传。",
-        "en": "The file does not exist or the download link has expired "
-        "(valid for 24 hours by default). Upload it again from the panel.",
+        "zh-CN": "文件不存在或下载链接已过期，请回到面板重新上传。",
+        "en": "The file does not exist or the download link has expired. "
+        "Upload it again from the panel.",
+    },
+    "console.fileTooMany": {
+        "zh-CN": "下载请求过于频繁，请稍后再试。",
+        "en": "Too many download requests. Please try again later.",
     },
     "console.fileUploadFailed": {
         "zh-CN": "保存上传文件失败：{error}",
@@ -618,8 +638,16 @@ MESSAGES: Dict[str, Dict[str, str]] = {
 }
 
 
-def t(key: str, **variables: Any) -> str:
-    """按当前语言取消息并替换 ``{placeholder}``。"""
+def t(key: str, /, **variables: Any) -> str:
+    """按当前语言取消息并替换 ``{placeholder}``。
+
+    ``key`` 是**位置参数专用**（``/``）：模板变量名可能与形参重名。应急响应那边
+    的失败项模板就是 ``"{key}（{error}）"``（key = 网卡名），调用写成
+    ``t("isolation.failed_item", key=..., error=...)`` 时，Python 会先把这个
+    ``key`` 绑到形参上，于是报 ``TypeError: t() got multiple values for
+    argument 'key'`` —— 一句本该可读的「net0（VM is locked）」变成了 500。
+    形参只能按位置传之后，同名的模板变量就只是普通的 ``**variables`` 了。
+    """
     entry = MESSAGES.get(key)
     if entry is None:
         logger.warning("i18n 缺少消息：%s", key)

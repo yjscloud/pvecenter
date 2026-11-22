@@ -138,9 +138,18 @@ _cache: Dict[str, Tuple[float, Optional[int]]] = {}
 # 就记住进程内不再重复查）。回填的日期一旦落库，后续轮询直接命中表。
 _backfilled: set = set()
 
-# 节点名是不是全局唯一（回填的前提）：(检查时刻, 节点名 -> 出现在几条连接上)
-_node_name_counts: Tuple[float, Dict[str, int]] = (0.0, {})
+# 节点名是不是全局唯一（回填的前提）+ 每条连接自己的节点集合：
+# (检查时刻, 节点名 -> 出现在几条连接上, 连接 id -> 节点名集合)
+_node_map_cache: Tuple[float, Dict[str, int], Dict[str, Set[str]]] = (0.0, {}, {})
 _NODE_NAME_TTL = 300.0
+
+# 列表刷新顺带清理陈旧记录时的宽限窗口（秒）。
+#
+# 「这一轮列表里没看到」不等于「机器已经被删了」：迁移时机器会先在旧节点上锁、
+# 再从新节点出现（中间可能哪一张清单里都没有），隔离要关机、快照要冻结 —— 正是
+# 这些操作让记录被误清。真正的删除有显式钩子（删除端点 / 批量删除），这里只善后
+# VMID 回收留下的历史行，所以给足宽限。
+SWEEP_GRACE_SECONDS = 900.0
 
 # 每条连接上的模板集合：(检查时刻, {连接 id: {(节点, VMID)}})
 # 节点名在多台 PVE 上重名时，审计里的 `节点/VMID` 分不清是哪一台 —— 但克隆记录里
@@ -256,6 +265,19 @@ async def record(
 
     try:
         async with database.connect() as db:
+            # 先清掉这台机器在**其它节点**下的旧行：VMID 在一条连接内唯一，同号
+            # 只可能是它自己迁移走了。留着旧行，列表会在两个节点上都看到同一台
+            # 机器的时间，迁移自愈时也分不清哪行才是当前节点。
+            await db.execute(
+                "DELETE FROM guest_created_record "
+                "WHERE conn_id = ? AND vmid = ? AND guest_type = ? AND node <> ?",
+                (
+                    str(conn_id or ""),
+                    int(vmid),
+                    str(guest_type or "qemu"),
+                    str(node),
+                ),
+            )
             await db.execute(
                 "REPLACE INTO guest_created_record "
                 "(conn_id, node, vmid, guest_type, created, source, username, recorded_at) "
@@ -278,18 +300,60 @@ async def record(
 
 
 async def drop_record(conn_id: Any, node: Any, vmid: Any, guest_type: Any) -> None:
-    """删掉面板记录（机器被删除时调）。"""
+    """删掉面板记录（机器被删除时调）。
+
+    按 ``连接 + VMID + 类型`` 删，不按节点：机器迁移过之后行还挂在旧节点下，
+    只按当前节点删会留下孤儿行，VMID 一被回收就贴到新机器上。
+    """
     forget(conn_id, node, vmid, guest_type)
     try:
         async with database.connect() as db:
             await db.execute(
                 "DELETE FROM guest_created_record "
-                "WHERE conn_id = ? AND node = ? AND vmid = ? AND guest_type = ?",
-                (str(conn_id or ""), str(node), int(vmid), str(guest_type or "qemu")),
+                "WHERE conn_id = ? AND vmid = ? AND guest_type = ?",
+                (str(conn_id or ""), int(vmid), str(guest_type or "qemu")),
             )
             await db.commit()
     except Exception:  # noqa: BLE001
         logger.debug("删除创建时间记录失败（%s/%s）", node, vmid, exc_info=True)
+
+
+async def _move_record(
+    conn_id: str, old_node: str, new_node: str, vmid: int, guest_type: str
+) -> None:
+    """把记录行从旧节点挪到新节点（迁移自愈）。
+
+    「同一连接 + 同一 VMID + 同一类型、节点不同」= 同一台机器换了位置。VMID 在
+    一条连接内唯一，所以这个推断不会指向另一台机器。
+    """
+    try:
+        async with database.connect() as db:
+            await db.execute(
+                "UPDATE guest_created_record SET node = ? "
+                "WHERE conn_id = ? AND node = ? AND vmid = ? AND guest_type = ?",
+                (
+                    str(new_node),
+                    str(conn_id or ""),
+                    str(old_node),
+                    int(vmid),
+                    str(guest_type or "qemu"),
+                ),
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001 - 自愈失败只是「这一轮没认领」，不改显示
+        logger.debug("迁移创建时间记录失败（%s→%s）", old_node, new_node, exc_info=True)
+
+
+def _identity_of(key: str) -> Optional[str]:
+    """缓存键 → 「连接|VMID|类型」：机器换节点时不变的那部分。
+
+    VMID 在一条连接（= 一个 PVE 集群）内唯一，所以这三段就是这台机器的身份，
+    节点只是它当前所在的位置。
+    """
+    parts = key.split("|")
+    if len(parts) != 4:
+        return None
+    return f"{parts[0]}|{parts[2]}|{parts[3]}"
 
 
 async def _records_for(conn_id: str) -> Dict[str, int]:
@@ -312,11 +376,23 @@ async def _records_for(conn_id: str) -> Dict[str, int]:
     }
 
 
-async def _drop_stale_records(conn_id: str, node: str, guest_type: str, vmids: List[int]) -> None:
+async def _drop_stale_records(
+    conn_id: str,
+    node: str,
+    guest_type: str,
+    vmids: List[int],
+    *,
+    older_than: float,
+) -> None:
     """清掉「本轮列表里已经不存在的机器」的记录。
 
     VMID 会被回收：机器在面板之外删掉又建一台同号的，旧记录会把上一台的时间
     贴到新机器上。只在本轮实际出现过、且 vmids 非空的 ``连接|节点|类型`` 范围内清。
+
+    ``older_than`` 是安全阀：只清**写入时间早于**这个时刻的行。列表刷新看到的
+    「这一轮没有」不等于「已被删除」—— 迁移时机器会先在旧节点上锁、再从新节点
+    出现，隔离要关机、快照要冻结，这些瞬间都可能让一台还活着的机器缺席一轮。
+    真正删除机器的地方有显式钩子（单机删除 / 批量删除都会 ``drop_record``）。
     """
     if not node or not guest_type or not vmids:
         return
@@ -325,8 +401,15 @@ async def _drop_stale_records(conn_id: str, node: str, guest_type: str, vmids: L
         async with database.connect() as db:
             await db.execute(
                 "DELETE FROM guest_created_record WHERE conn_id = ? AND node = ? "
-                f"AND guest_type = ? AND vmid NOT IN ({placeholders})",
-                (str(conn_id or ""), str(node), str(guest_type), *[int(v) for v in vmids]),
+                f"AND guest_type = ? AND vmid NOT IN ({placeholders}) "
+                "AND recorded_at < ?",
+                (
+                    str(conn_id or ""),
+                    str(node),
+                    str(guest_type),
+                    *[int(v) for v in vmids],
+                    float(older_than),
+                ),
             )
             await db.commit()
     except Exception:  # noqa: BLE001
@@ -334,35 +417,70 @@ async def _drop_stale_records(conn_id: str, node: str, guest_type: str, vmids: L
 
 
 # ------------------------------------------------------------------ 审计日志回填
-async def _node_names_are_unique() -> Dict[str, int]:
-    """节点名 → 出现在几条连接上（5 分钟缓存）。
+async def _node_map() -> Tuple[Dict[str, int], Dict[str, Set[str]]]:
+    """``(节点名 → 出现在几条连接上, 连接 id → 该连接的节点名集合)``（5 分钟缓存）。
 
-    回填审计记录的前提：审计表的 ``target`` 是 ``节点/VMID``，**不含连接**，
+    第一个映射是回填的前提：审计表的 ``target`` 是 ``节点/VMID``，**不含连接**，
     多台 PVE 上有同名节点时无法判断那条记录属于哪一台 —— 那时宁可不填。
-    """
-    global _node_name_counts
-    checked_at, counts = _node_name_counts
-    if counts and time.time() - checked_at < _NODE_NAME_TTL:
-        return counts
 
-    result: Dict[str, int] = {}
+    第二个映射是「机器换了节点」的兜底依据：VMID 在一条连接（= 一个 PVE 集群）
+    内唯一，所以「同一连接、同一 VMID、不同节点」只可能是同一台机器被迁移走了。
+    审计里的克隆记录仍然写在**旧**节点名下，只有知道这条连接有哪些节点才找得回来。
+    """
+    global _node_map_cache
+    checked_at, counts, nodes_of = _node_map_cache
+    if counts and time.time() - checked_at < _NODE_NAME_TTL:
+        return counts, nodes_of
+
+    counts = {}
+    nodes_of = {}
     # 用 collection_targets：单连接 / 尚未保存连接的部署走的是兜底客户端，
     # 只看 all_connection_clients 会得到空集合，来源模板整列都填不出来。
     try:
         targets = collection_targets()
     except Exception:  # noqa: BLE001 - 探测不到就当作不可判定
-        return {}
-    for _profile, client in targets:
+        return {}, {}
+    for profile, client in targets:
         try:
             nodes = await client.nodes() or []
         except Exception:  # noqa: BLE001 - 探测不到就当作不可判定
-            return {}
+            return {}, {}
+        conn = str((profile or {}).get("id") or "")
+        bucket = nodes_of.setdefault(conn, set())
         for item in nodes:
             name = str(item.get("node") or "")
             if name:
-                result[name] = result.get(name, 0) + 1
-    _node_name_counts = (time.time(), result)
-    return result
+                counts[name] = counts.get(name, 0) + 1
+                bucket.add(name)
+    _node_map_cache = (time.time(), counts, nodes_of)
+    return counts, nodes_of
+
+
+async def _node_names_are_unique() -> Dict[str, int]:
+    """节点名 → 出现在几条连接上（保留旧接口，内部走 :func:`_node_map`）。"""
+    counts, _nodes_of = await _node_map()
+    return counts
+
+
+def _candidate_refs(
+    conn_id: Any, node: Any, vmid: Any, nodes_of: Dict[str, Set[str]]
+) -> List[str]:
+    """这台机器在审计里可能出现过的所有 ``节点/VMID``。
+
+    第一项是当前节点，后面是**同一条连接**的其它节点 —— 机器迁移过去之后，当年
+    那条克隆 / 建机记录仍留在旧节点名下。跨连接不碰：同名节点上可能有同号机器，
+    那是别人的记录，宁可空着也不能贴过来。
+    """
+    try:
+        number = int(vmid)
+    except (TypeError, ValueError):
+        return []
+    current = str(node or "")
+    refs = [f"{current}/{number}"]
+    for name in sorted(nodes_of.get(str(conn_id or ""), set())):
+        if name and name != current:
+            refs.append(f"{name}/{number}")
+    return refs
 
 
 async def _template_keys_by_connection() -> Dict[str, Set[Tuple[str, int]]]:
@@ -558,14 +676,18 @@ async def source_of(
     """
     if not node or vmid is None:
         return {}
-    counts = await _node_names_are_unique()
+    counts, nodes_of = await _node_map()
     if counts.get(str(node), 0) != 1:
         return {}
 
     actions = ", ".join("?" for _ in _SOURCE_ACTIONS)
-    ref = f"{node}/{vmid}"
-    # 这台机器上一次被删除之前的克隆记录不属于它（VMID 回收）
-    cutoff = (await _delete_cutoffs([ref])).get(ref, (0.0, 0))
+    # 迁移过的机器：克隆记录还写在旧节点名下，所以把这条连接的所有节点都算上
+    refs = _candidate_refs(conn_id, node, vmid, nodes_of)
+    if not refs:
+        return {}
+    marks = ", ".join("?" for _ in refs)
+    # 这台机器上一次被删除之前的克隆记录不属于它（VMID 回收），逐 ref 判定
+    cutoffs = await _delete_cutoffs(refs)
     try:
         async with database.connect() as db:
             # 只看成功 / 部分成功的：失败的那次重装没动过系统盘，来源仍然是上一个
@@ -574,30 +696,34 @@ async def source_of(
             # 用 target_guest（审计表上的虚拟列 + 索引）而不是前置通配的 LIKE：
             # 后者每台机器一次全表扫描，而它跑在详情 / 列表首屏路径上。
             cursor = await db.execute(
-                f"SELECT target, timestamp, id FROM audit_log "
+                f"SELECT target_guest, target, timestamp, id FROM audit_log "
                 f"WHERE action IN ({actions}) "
-                "AND result IN ('success', 'partial') AND target_guest = ? "
-                "AND (timestamp > ? OR (timestamp = ? AND id > ?)) "
-                "ORDER BY timestamp DESC, id DESC LIMIT 1",
-                (*_SOURCE_ACTIONS, ref, cutoff[0], cutoff[0], cutoff[1]),
+                f"AND result IN ('success', 'partial') "
+                f"AND target_guest IN ({marks}) "
+                "ORDER BY timestamp DESC, id DESC",
+                (*_SOURCE_ACTIONS, *refs),
             )
-            row = await cursor.fetchone()
+            rows = await cursor.fetchall()
     except Exception:  # noqa: BLE001 - 查不到就当「没有来源」，不影响详情页
         logger.debug("查询克隆来源失败（%s/%s）", node, vmid, exc_info=True)
         return {}
 
-    if not row or not row[0]:
-        return {}
-    origin = str(row[0]).split("->", 1)[0].strip()
-    src_node, _, src_vmid = origin.rpartition("/")
-    if not src_vmid.isdigit():
-        return {}
-    origin_node = src_node or str(node)
-    # 旧格式的克隆记录只写了目标机器（`… -> 104`），解析出来就是它自己。
-    # 宁可不填，也不能让列表显示「来源：自己」。
-    if int(src_vmid) == int(vmid) and origin_node == str(node):
-        return {}
-    return {"node": origin_node, "vmid": int(src_vmid)}
+    for row in rows or []:
+        ref = str(row["target_guest"] or "")
+        cutoff = cutoffs.get(ref)
+        if cutoff and (float(row["timestamp"] or 0), int(row["id"] or 0)) <= cutoff:
+            continue
+        origin = str(row["target"] or "").split("->", 1)[0].strip()
+        src_node, _, src_vmid = origin.rpartition("/")
+        if not src_vmid.isdigit():
+            continue
+        origin_node = src_node or str(node)
+        # 旧格式的克隆记录只写了目标机器（`… -> 104`），解析出来就是它自己。
+        # 宁可不填，也不能让列表显示「来源：自己」。
+        if int(src_vmid) == int(vmid) and origin_node == str(node):
+            continue
+        return {"node": origin_node, "vmid": int(src_vmid)}
+    return {}
 
 
 async def sources_for(
@@ -625,6 +751,8 @@ async def sources_for(
     留空 —— 比起把别的连接上同名节点的记录贴过来，空着更安全（模板一旦被删，
     「来源」本身也已经不可用）。
     """
+    counts, nodes_of = await _node_map()
+    # 第一遍只查「当前节点」：没迁移过的部署与改动前完全一样，不多打一次库。
     wanted: Dict[str, List[Tuple[str, str, int]]] = {}
     for item in items:
         node = str(item.get("node") or "")
@@ -632,72 +760,98 @@ async def sources_for(
         if not node or vmid is None:
             continue
         key = (str(item.get("connection_id") or ""), node, int(vmid))
-        bucket = wanted.setdefault(f"{node}/{vmid}", [])
+        bucket = wanted.setdefault(f"{node}/{int(vmid)}", [])
         if key not in bucket:
             bucket.append(key)
     if not wanted:
         return {}
 
-    counts = await _node_names_are_unique()
-    # 节点名出现在多条连接上的那些 ref：需要靠「来源模板是否在这条连接上」消歧
-    ambiguous = {
-        ref for ref, keys in wanted.items() if counts.get(keys[0][1], 0) > 1
-    }
-    # 连节点名是否唯一都探测不到的（客户端不可达 / 存储异常）：照旧不填。
-    # counts 为空时若当成「唯一」，等于把别的连接的记录贴上来的老问题原样放回来。
-    refs = [
-        ref for ref, keys in wanted.items() if counts.get(keys[0][1], 0) > 0
-    ]
-    templates = await _template_keys_by_connection() if ambiguous else {}
-
     out: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     actions = ", ".join("?" for _ in _SOURCE_ACTIONS)
-    # 一页最多几百台，400 一批留出余量；MySQL 的占位符上限远高于此
-    for start in range(0, len(refs), 400):
-        chunk = refs[start : start + 400]
-        marks = ", ".join("?" for _ in chunk)
-        # 同号机器被删过又重新建出来时，删除之前的克隆记录不属于现在这台
-        cutoffs = await _delete_cutoffs(list(chunk))
-        try:
-            async with database.connect() as db:
-                cursor = await db.execute(
-                    f"SELECT target_guest, target, timestamp, id FROM audit_log "
-                    f"WHERE action IN ({actions}) "
-                    "AND result IN ('success', 'partial') "
-                    f"AND target_guest IN ({marks}) "
-                    "ORDER BY timestamp DESC, id DESC",
-                    (*_SOURCE_ACTIONS, *chunk),
-                )
-                rows = await cursor.fetchall()
-        except Exception:  # noqa: BLE001 - 取不到来源不该让列表失败
-            logger.debug("批量查询克隆来源失败", exc_info=True)
-            continue
-        for row in rows:
-            ref = str(row["target_guest"] or "")
-            # 同一个 `节点/VMID` 可能对应多条连接的机器（同名节点），逐条判定
-            keys = [k for k in wanted.get(ref, []) if k not in out]
-            if not keys:
-                # ORDER BY timestamp DESC：每个目标只认最近一条能对上的记录
+
+    async def _assign(ref_map: Dict[str, List[Tuple[str, str, int]]]) -> None:
+        """把 ``ref -> 目标机器`` 的审计记录解析进 ``out``（400 个 ref 一批）。
+
+        节点名出现在多条连接上时（``counts > 1``）需要靠「来源模板是否在这条
+        连接上」消歧；连唯一性都探测不到的（客户端不可达 / 连接表读不出来）
+        一律跳过 —— 那种情况下没有任何可用于判断归属的依据。
+        """
+        # 一页最多几百台，400 一批留出余量；MySQL 的占位符上限远高于此
+        refs = [ref for ref in ref_map if counts.get(ref.split("/")[0], 0) > 0]
+        for start in range(0, len(refs), 400):
+            chunk = refs[start : start + 400]
+            marks = ", ".join("?" for _ in chunk)
+            # 同名节点的那些 ref：拉一次模板清单做存在性校验（进程内缓存）
+            templates = (
+                await _template_keys_by_connection()
+                if any(counts.get(ref.split("/")[0], 0) > 1 for ref in chunk)
+                else {}
+            )
+            # 同号机器被删过又重新建出来时，删除之前的克隆记录不属于现在这台
+            cutoffs = await _delete_cutoffs(list(chunk))
+            try:
+                async with database.connect() as db:
+                    cursor = await db.execute(
+                        f"SELECT target_guest, target, timestamp, id FROM audit_log "
+                        f"WHERE action IN ({actions}) "
+                        "AND result IN ('success', 'partial') "
+                        f"AND target_guest IN ({marks}) "
+                        "ORDER BY timestamp DESC, id DESC",
+                        (*_SOURCE_ACTIONS, *chunk),
+                    )
+                    rows = await cursor.fetchall()
+            except Exception:  # noqa: BLE001 - 取不到来源不该让列表失败
+                logger.debug("批量查询克隆来源失败", exc_info=True)
                 continue
-            cutoff = cutoffs.get(ref)
-            if cutoff and (float(row["timestamp"] or 0), int(row["id"] or 0)) <= cutoff:
-                continue
-            origin = str(row["target"] or "").split("->", 1)[0].strip()
-            src_node, _, src_vmid = origin.rpartition("/")
-            if not src_vmid.isdigit():
-                continue
-            origin_node = src_node or keys[0][1]
-            src_id = int(src_vmid)
-            for key in keys:
-                # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
-                if src_id == key[2] and origin_node == key[1]:
+            for row in rows:
+                ref = str(row["target_guest"] or "")
+                # 同一个 `节点/VMID` 可能对应多条连接的机器（同名节点），逐条判定
+                keys = [k for k in ref_map.get(ref, []) if k not in out]
+                if not keys:
+                    # ORDER BY timestamp DESC：每个目标只认最近一条能对上的记录
                     continue
-                if ref in ambiguous:
-                    # 同名节点：来源模板只可能存在于它自己那条连接上，
-                    # 不在就是别人的记录，接着看更早的那条
-                    if (origin_node, src_id) not in templates.get(key[0], set()):
+                cutoff = cutoffs.get(ref)
+                if cutoff and (
+                    float(row["timestamp"] or 0), int(row["id"] or 0)
+                ) <= cutoff:
+                    continue
+                origin = str(row["target"] or "").split("->", 1)[0].strip()
+                src_node, _, src_vmid = origin.rpartition("/")
+                if not src_vmid.isdigit():
+                    continue
+                origin_node = src_node or keys[0][1]
+                src_id = int(src_vmid)
+                for key in keys:
+                    # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
+                    if src_id == key[2] and origin_node == key[1]:
                         continue
-                out[key] = {"node": origin_node, "vmid": src_id}
+                    if counts.get(ref.split("/")[0], 0) > 1:
+                        # 同名节点：来源模板只可能存在于它自己那条连接上，
+                        # 不在就是别人的记录，接着看更早的那条
+                        if (origin_node, src_id) not in templates.get(key[0], set()):
+                            continue
+                    out[key] = {"node": origin_node, "vmid": src_id}
+
+    await _assign(wanted)
+
+    # 第二遍：还没解析出来的，去**同一条连接**的其它节点找。迁移动的是节点、
+    # 不动 VMID —— 当年那条克隆 / 重装记录仍留在旧节点名下，只按当前节点查会
+    # 让「操作系统」列突然变「—」。只有真漏了才多打这一轮库。
+    leftovers = {
+        ref: [k for k in keys if k not in out]
+        for ref, keys in wanted.items()
+        if any(k not in out for k in keys)
+    }
+    if leftovers and nodes_of:
+        moved: Dict[str, List[Tuple[str, str, int]]] = {}
+        for ref, keys in leftovers.items():
+            for key in keys:
+                for other in _candidate_refs(key[0], ref.split("/")[0], key[2], nodes_of)[1:]:
+                    bucket = moved.setdefault(other, [])
+                    if key not in bucket:
+                        bucket.append(key)
+        if moved:
+            await _assign(moved)
     return out
 
 
@@ -756,6 +910,8 @@ async def lxc_sources_for(
     **文件**，审计里既没有连接信息也没有可校验的落点，所以这类记录在重名节点上
     只能留空 —— 宁可空着，也不能把别的连接上同号容器的来源贴过来。
     """
+    counts, nodes_of = await _node_map()
+    # 第一遍只查当前节点；迁移过（记录留在旧节点）的机器放到第二遍
     wanted: Dict[str, List[Tuple[str, str, int]]] = {}
     for item in items:
         node = str(item.get("node") or "")
@@ -763,79 +919,99 @@ async def lxc_sources_for(
         if not node or vmid is None:
             continue
         key = (str(item.get("connection_id") or ""), node, int(vmid))
-        bucket = wanted.setdefault(f"{node}/{vmid}", [])
+        bucket = wanted.setdefault(f"{node}/{int(vmid)}", [])
         if key not in bucket:
             bucket.append(key)
     if not wanted:
         return {}
 
-    counts = await _node_names_are_unique()
-    # 节点名出现在多条连接上的那些 ref：靠来源模板做存在性校验来消歧
-    ambiguous = {
-        ref for ref, keys in wanted.items() if counts.get(keys[0][1], 0) > 1
-    }
-    # 探测不到节点名是否唯一的，照旧不填（理由见 sources_for）
-    refs = [ref for ref, keys in wanted.items() if counts.get(keys[0][1], 0) > 0]
-    if not refs:
-        return {}
-    templates = await _template_keys_by_connection() if ambiguous else {}
-
     out: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     actions = ", ".join("?" for _ in _CLONE_ACTIONS)
-    # 一页最多几百台，400 一批留出余量（与 sources_for 同一个理由）
-    for start in range(0, len(refs), 400):
-        chunk = refs[start : start + 400]
-        marks = ", ".join("?" for _ in chunk)
-        # 同号容器被删过又重新建出来时，删除之前的建机 / 克隆记录不属于现在这台
-        cutoffs = await _delete_cutoffs(list(chunk))
-        try:
-            async with database.connect() as db:
-                cursor = await db.execute(
-                    f"SELECT target_guest, target, action, detail, timestamp, id "
-                    f"FROM audit_log "
-                    f"WHERE action IN ({actions}) AND result = 'success' "
-                    f"AND target_guest IN ({marks}) "
-                    "ORDER BY timestamp DESC, id DESC",
-                    (*_CLONE_ACTIONS, *chunk),
-                )
-                rows = await cursor.fetchall()
-        except Exception:  # noqa: BLE001 - 取不到来源不该让列表失败
-            logger.debug("批量查询容器来源失败", exc_info=True)
-            continue
-        for row in rows:
-            ref = str(row["target_guest"] or "")
-            # 同一个 `节点/VMID` 可能对应多条连接的容器（同名节点），逐条判定
-            keys = [k for k in wanted.get(ref, []) if k not in out]
-            if not keys:
-                # ORDER BY timestamp DESC：每个目标只认最近一条能对上的记录
+
+    async def _assign(ref_map: Dict[str, List[Tuple[str, str, int]]]) -> None:
+        """把 ``ref -> 目标容器`` 的建机 / 克隆记录解析进 ``out``。"""
+        # 探测不到节点名是否唯一的，照旧不填（理由见 sources_for）
+        refs = [ref for ref in ref_map if counts.get(ref.split("/")[0], 0) > 0]
+        for start in range(0, len(refs), 400):
+            chunk = refs[start : start + 400]
+            marks = ", ".join("?" for _ in chunk)
+            ambiguous = {
+                ref for ref in chunk if counts.get(ref.split("/")[0], 0) > 1
+            }
+            # 重名节点上靠「来源模板是否在这条连接上」消歧
+            templates = await _template_keys_by_connection() if ambiguous else {}
+            # 同号容器被删过又重新建出来时，删除之前的建机 / 克隆记录不属于现在这台
+            cutoffs = await _delete_cutoffs(list(chunk))
+            try:
+                async with database.connect() as db:
+                    cursor = await db.execute(
+                        f"SELECT target_guest, target, action, detail, timestamp, id "
+                        f"FROM audit_log "
+                        f"WHERE action IN ({actions}) AND result = 'success' "
+                        f"AND target_guest IN ({marks}) "
+                        "ORDER BY timestamp DESC, id DESC",
+                        (*_CLONE_ACTIONS, *chunk),
+                    )
+                    rows = await cursor.fetchall()
+            except Exception:  # noqa: BLE001 - 取不到来源不该让列表失败
+                logger.debug("批量查询容器来源失败", exc_info=True)
                 continue
-            cutoff = cutoffs.get(ref)
-            if cutoff and (float(row["timestamp"] or 0), int(row["id"] or 0)) <= cutoff:
-                continue
-            if str(row["action"] or "") == _CREATE_ACTION:
-                name = template_file_name(_ostemplate_of(row["detail"]))
-                if not name or ref in ambiguous:
-                    # 重名节点上分不清这条建机记录是哪条连接的，见函数说明
+            for row in rows:
+                ref = str(row["target_guest"] or "")
+                # 同一个 `节点/VMID` 可能对应多条连接的容器（同名节点），逐条判定
+                keys = [k for k in ref_map.get(ref, []) if k not in out]
+                if not keys:
+                    # ORDER BY timestamp DESC：每个目标只认最近一条能对上的记录
                     continue
+                cutoff = cutoffs.get(ref)
+                if cutoff and (
+                    float(row["timestamp"] or 0), int(row["id"] or 0)
+                ) <= cutoff:
+                    continue
+                if str(row["action"] or "") == _CREATE_ACTION:
+                    name = template_file_name(_ostemplate_of(row["detail"]))
+                    if not name or ref in ambiguous:
+                        # 重名节点上分不清这条建机记录是哪条连接的，见函数说明
+                        continue
+                    for key in keys:
+                        out[key] = {"file": name}
+                    continue
+                origin = str(row["target"] or "").split("->", 1)[0].strip()
+                src_node, _, src_vmid = origin.rpartition("/")
+                if not src_vmid.isdigit():
+                    continue
+                origin_node = src_node or keys[0][1]
+                src_id = int(src_vmid)
                 for key in keys:
-                    out[key] = {"file": name}
-                continue
-            origin = str(row["target"] or "").split("->", 1)[0].strip()
-            src_node, _, src_vmid = origin.rpartition("/")
-            if not src_vmid.isdigit():
-                continue
-            origin_node = src_node or keys[0][1]
-            src_id = int(src_vmid)
+                    # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
+                    if src_id == key[2] and origin_node == key[1]:
+                        continue
+                    if ref in ambiguous and (
+                        (origin_node, src_id) not in templates.get(key[0], set())
+                    ):
+                        # 来源模板不在这条连接上：这条记录是别人的
+                        continue
+                    out[key] = {"node": origin_node, "vmid": src_id}
+
+    await _assign(wanted)
+
+    # 第二遍：容器迁移后审计记录仍留在旧节点名下（同一条连接才找，跨连接可能
+    # 是同号容器，不能算）
+    leftovers = {
+        ref: [k for k in keys if k not in out]
+        for ref, keys in wanted.items()
+        if any(k not in out for k in keys)
+    }
+    if leftovers and nodes_of:
+        moved: Dict[str, List[Tuple[str, str, int]]] = {}
+        for ref, keys in leftovers.items():
             for key in keys:
-                # 旧格式只写了目标机器：解析出来是它自己，跳过继续看更早的记录
-                if src_id == key[2] and origin_node == key[1]:
-                    continue
-                if ref in ambiguous and (
-                    (origin_node, src_id) not in templates.get(key[0], set())
-                ):
-                    # 来源模板不在这条连接上：这条记录是别人的
-                    continue
-                out[key] = {"node": origin_node, "vmid": src_id}
+                for other in _candidate_refs(key[0], ref.split("/")[0], key[2], nodes_of)[1:]:
+                    bucket = moved.setdefault(other, [])
+                    if key not in bucket:
+                        bucket.append(key)
+        if moved:
+            await _assign(moved)
     return out
 
 
@@ -861,6 +1037,23 @@ async def resolve(
     if value:
         _cache[key] = (time.time() + HIT_TTL_SECONDS, value)
         return value
+
+    # 迁移过的机器：行还挂在旧节点下。按「连接 + VMID + 类型」认领并挪到当前节点，
+    # 否则详情页会退回 PVE 的 meta —— 克隆出来的机器那就是模板的时间。
+    mine = _identity_of(key)
+    if mine:
+        for other_key, other_value in records.items():
+            if other_key == key or _identity_of(other_key) != mine:
+                continue
+            await _move_record(
+                str(conn_id or ""),
+                other_key.split("|")[1],
+                str(node),
+                int(vmid),
+                str(guest_type or "qemu"),
+            )
+            _cache[key] = (time.time() + HIT_TTL_SECONDS, other_value)
+            return other_value
 
     meta = parse_created(config)
     # 与列表口径一致：克隆出来的机器，meta 是模板带过来的，用审计记录纠正
@@ -942,6 +1135,34 @@ async def fill(
         seen_conns.add(conn)
         records.update(await _records_for(conn))
 
+    # 迁移过的机器：记录还挂在旧节点下，新节点这一侧查不到 —— 列表看上去就是
+    # 「创建时间丢了」。VMID 在一条连接内唯一，所以「同连接 + 同 VMID + 同类型、
+    # 节点不同」就是同一台机器换了位置：就地认领，并把行挪到新节点（自愈）。
+    identity: Dict[str, Tuple[str, int]] = {}
+    for key, value in records.items():
+        parts = key.split("|")
+        if len(parts) != 4:
+            continue
+        identity.setdefault(f"{parts[0]}|{parts[2]}|{parts[3]}", (parts[1], value))
+    moved: List[Tuple[str, str, str, int, str]] = []
+    for key in list(groups):
+        if key in records:
+            continue
+        parts = key.split("|")
+        if len(parts) != 4:
+            continue
+        found = identity.get(f"{parts[0]}|{parts[2]}|{parts[3]}")
+        if not found:
+            continue
+        old_node, value = found
+        if not old_node or old_node == parts[1]:
+            continue
+        records[key] = value
+        moved.append((parts[0], old_node, parts[1], int(parts[2] or 0), parts[3]))
+    # 先落库再清理：否则下面按节点清陈旧行时，会把还没挪走的旧行当成「已删除」
+    for conn, old_node, new_node, vmid, guest_type in moved:
+        await _move_record(conn, old_node, new_node, vmid, guest_type)
+
     pending: List[Tuple[str, List[Dict[str, Any]]]] = []
     without_record: List[Tuple[str, List[Dict[str, Any]]]] = []
     for key, group in groups.items():
@@ -992,8 +1213,11 @@ async def fill(
                 for item in group:
                     item["created"] = value
 
+    # 只清「消失得够久」的行：刚写入的记录可能只是这一轮没被列出来（迁移 / 隔离
+    # 关机 / 快照冻结都会出现这种瞬间），不该当成已删除。
+    cut_off = time.time() - SWEEP_GRACE_SECONDS
     for conn, node, guest_type, alive in _sweep(groups, records):
-        await _drop_stale_records(conn, node, guest_type, alive)
+        await _drop_stale_records(conn, node, guest_type, alive, older_than=cut_off)
 
 
 def _scope_of(key: str) -> Optional[Tuple[str, str, str]]:

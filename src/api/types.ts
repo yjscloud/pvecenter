@@ -73,6 +73,8 @@ export interface UserOut {
   expires_at?: number;
   /** 已到期冻结的时间（Unix 秒）；非 0 = 名下机器已关机、账号已锁定 */
   expiry_frozen?: number;
+  /** 最近一次成功登录（Unix 秒）；0 / undefined = 建号后还没登录过 */
+  last_login?: number;
   /** 区域管理员可管理的区域名；空 = 不按区域限制 */
   regions?: string[];
 }
@@ -117,6 +119,176 @@ export interface NodeScopeEntry {
   allowed: boolean;
 }
 
+/** 自助注册是否开放（后端公开接口）：关闭时登录页不展示注册入口 */
+export interface RegisterAvailability {
+  enabled: boolean;
+  /** 关闭时的提示文案，enabled=true 时为空串 */
+  message: string;
+}
+
+/** 注册方式：四种互斥，同一时间只有一种生效 */
+export type RegisterMode = 'off' | 'invite' | 'code' | 'open';
+
+/** 当前注册方式（公开接口）：驱动登录页入口与注册页表单 */
+export interface RegistrationModeInfo {
+  mode: RegisterMode;
+  /** 需要哪种凭证：空串 = 不需要；invite / code = 要填对应输入框 */
+  requires: '' | 'invite' | 'code';
+  enabled: boolean;
+  /** 关闭时的提示，或「请填写邀请码 / 注册码」 */
+  message: string;
+  /**
+   * 自助注册的邮箱验证码策略（后端配置，前端只读）。
+   * ``required`` 为 false 时注册页不渲染验证码输入框与「发送」按钮 ——
+   * 判断依据只能是这个字段，不能按模式自己推：管理员可以用环境变量关掉。
+   */
+  email_code: {
+    required: boolean;
+    /** 有效期（秒）：用于提示「N 分钟内有效」 */
+    ttl_seconds: number;
+    /** 一条码最多能填错几次：用于提示文案 */
+    max_attempts: number;
+    /** 两次发送的最小间隔（秒）：发送按钮倒计时 */
+    resend_after: number;
+  };
+}
+
+/** 自助注册第 1 步：给填写的邮箱发一次性验证码 */
+export interface RegisterEmailCodeInput {
+  email: string;
+  /** 人机校验：发信是对外投递，没有它就成了免费的邮件轰炸接口 */
+  captcha_id?: string;
+  captcha_code?: string;
+  captcha_x?: number;
+  captcha_path?: SliderTracePoint[];
+}
+
+/** 发码成功：message 由后端按语言给好，前端不自己拼 */
+export interface RegisterEmailCodeResult {
+  ok: boolean;
+  message: string;
+  ttl_seconds: number;
+  max_attempts: number;
+  resend_after: number;
+}
+
+/** 一枚邀请凭证 / 注册码（列表视图，**不含明文**） */
+export interface RegistrationCode {
+  id: string;
+  kind: 'invite' | 'code';
+  note: string;
+  /** 注册时写进新账号的角色（注册码也能预先指定） */
+  role: string;
+  /** 注册时写进新账号的资源额度；null = 不额外限制（继承角色默认） */
+  quota: QuotaLimits | null;
+  /** 注册后是否需要管理员审批：false = 建好即可登录 */
+  requires_approval: boolean;
+  created_by: string;
+  created: number;
+  expires: number;
+  max_uses: number;
+  used_count: number;
+  /** 剩余次数；0 = 不限时返回 null */
+  remaining: number | null;
+  used: number;
+  used_by: string;
+  status: 'active' | 'used' | 'exhausted' | 'expired' | 'revoked';
+}
+
+/** 签发凭证：kind 决定是邀请码还是注册码 */
+export interface RegistrationCodeInput {
+  kind: 'invite' | 'code';
+  note?: string;
+  ttl_minutes?: number;
+  /** 0 = 不限次，默认一次性 */
+  max_uses?: number;
+  /** 新账号角色：注册那一刻写进账号 */
+  role?: string;
+  /** 新账号资源额度；不传 = 不额外限制（继承角色默认） */
+  quota?: QuotaLimits;
+  /** 注册后是否需要管理员审批；默认 true */
+  requires_approval?: boolean;
+}
+
+/** 设置页的注册方式总览 */
+export interface RegistrationOverview {
+  mode: RegisterMode;
+  requires: '' | 'invite' | 'code';
+  /** null = 还没在设置页选过，仍跟着 REGISTER_ENABLED 走 */
+  configured: RegisterMode | null;
+  modes: RegisterMode[];
+  /** 自助注册是否要求邮箱验证码（设置页的开关，只对 open 模式生效） */
+  email_code_enabled: boolean;
+  codes: RegistrationCode[];
+  limits: {
+    default_ttl_minutes: Record<string, number>;
+    default_max_uses: number;
+    max_ttl_minutes: number;
+    max_uses: number;
+  };
+}
+
+/** 一条邀请链接（列表视图，**含 token**：链接要能被再次复制） */
+export interface InviteLink {
+  id: string;
+  token: string;
+  /** 相对路径：``/register?invite=<token>``，前端拼 origin 得到完整 URL */
+  path: string;
+  note: string;
+  role: string;
+  role_name: string;
+  requires_approval: boolean;
+  /** 注册时写进新账号的资源额度；null = 不额外限制（继承角色默认） */
+  quota: QuotaLimits | null;
+  max_uses: number;
+  used_count: number;
+  /** 剩余次数；0 = 不限时返回 null */
+  remaining: number | null;
+  expires: number;
+  created: number;
+  created_by: string;
+  revoked: boolean;
+  last_used: number;
+  last_used_by: string;
+  status: 'active' | 'exhausted' | 'expired' | 'revoked';
+}
+
+/** 新建邀请链接 */
+export interface InviteLinkInput {
+  note?: string;
+  role?: string;
+  requires_approval?: boolean;
+  /** 0 = 不限 */
+  max_uses?: number;
+  /** 0 = 永久 */
+  ttl_days?: number;
+  /** 新账号资源额度；不传 = 不额外限制（继承角色默认） */
+  quota?: QuotaLimits;
+}
+
+/** 设置页的邀请链接总览 */
+export interface InviteOverview {
+  invites: InviteLink[];
+  limits: {
+    max_uses: number;
+    max_ttl_days: number;
+    default_ttl_days: number;
+  };
+}
+
+/** 邀请链接的公开预览：注册页据此展示角色 / 审批要求 / 剩余次数 */
+export interface InvitePreview {
+  valid: boolean;
+  /** 不可用时的原因（已失效 / 过期 / 次数用尽） */
+  reason?: string;
+  role?: string;
+  role_name?: string;
+  requires_approval?: boolean;
+  remaining?: number | null;
+  expires?: number;
+  note?: string;
+}
+
 /** 自助注册：提交后进入待审批队列 */
 export interface RegisterInput {
   username: string;
@@ -132,6 +304,15 @@ export interface RegisterInput {
   captcha_x?: number;
   /** 拖动轨迹采样点，语义同 LoginRequest.captcha_path */
   captcha_path?: SliderTracePoint[];
+  /** 注册凭证：邀请制填邀请码、注册码制填注册码（自助注册忽略） */
+  invite_code?: string;
+  /** 邀请链接 token（从 ``?invite=`` 取）：带它时角色与审批策略由链接决定 */
+  invite_token?: string;
+  /**
+   * 邮箱验证码（自助注册必填，见 `authApi.sendRegisterEmailCode`）。
+   * 邀请制 / 注册码制不需要：那两种的凭证本身就是管理员线下分发的。
+   */
+  email_code?: string;
 }
 
 /** 自助重置第 1 步：提交用户名，面板给账号邮箱发一次性链接 */
@@ -153,6 +334,24 @@ export interface ForgotPasswordInput {
 export interface ForgotPasswordResult {
   ok: boolean;
   message: string;
+}
+
+/**
+ * 自助重置第 2 步：凭令牌设置新密码。
+ *
+ * 与登录 / 注册 / 忘记密码同级的人机校验：这一步会改掉账号口令并踢掉全部
+ * 会话，属于匿名入口里破坏力最大的一个。验证方式同样由「设置 → 登录验证」
+ * 决定，关闭时这些字段可以省略。
+ */
+export interface ResetPasswordInput {
+  token: string;
+  password: string;
+  captcha_id?: string;
+  captcha_code?: string;
+  /** 滑块验证码：拖动结束时手柄的水平位置（展示坐标 px） */
+  captcha_x?: number;
+  /** 拖动轨迹采样点，语义同 LoginRequest.captcha_path */
+  captcha_path?: SliderTracePoint[];
 }
 
 /** 校验重置链接是否还有效（不消耗令牌） */
@@ -1017,12 +1216,22 @@ export interface SearchResult {
 export interface HealthStatus {
   status: string;
   /**
+   * 这份载荷是否来自**已登录**的探测。
+   *
+   * `false`（或旧后端的 `undefined` + 缺 `pve_configured`）表示只有 liveness，
+   * 下面的诊断字段不可信：**不能**把缺省当成 `pve_connected: false` 去弹
+   * 「PVE 连不上」。access cookie 过期、代理缓存、面板刚启动都可能拿到这一档。
+   *
+   * 匿名访问 `/api/health` 只得到 `{"status": "ok", "authenticated": false}`：
+   * PVE 版本、节点数与连接状态属于内网指纹（版本可对公开漏洞库做匹配），
+   * 不该给未登录访客（审计项 FD-04）。
+   */
+  authenticated?: boolean;
+  /**
    * 只有**已登录**才返回下面这些诊断字段。
    *
-   * 匿名访问 `/api/health` 只得到 `{"status": "ok"}`：PVE 版本、节点数与
-   * 连接状态属于内网指纹（版本可对公开漏洞库做匹配），不该给未登录访客
-   * （审计项 FD-04）。所以凡是从 health 读这些字段的界面，都必须按「可能
-   * 不存在」处理，别用 `?? false` 之外的假值去渲染告警。
+   * 凡是从 health 读这些字段的界面，都必须按「可能不存在」处理：先看
+   * `authenticated`，再看 `pve_configured` 是否存在。
    */
   pve_connected?: boolean;
   /**
@@ -1728,6 +1937,13 @@ export interface VmSummary {
   pool?: string;
   /** 操作锁（如 backup、migrate、clone），非空时表示有任务进行中 */
   lock?: string;
+  /**
+   * 是否处于隔离状态（面板登记过的隔离动作，见 ``app/quarantine_store``）。
+   *
+   * 列表页据此打「隔离」标签，并在删除前拦一道「请先解除隔离」。真实状态仍以
+   * 详情页的 ``isolationApi.status`` 为准 —— 在面板之外做的隔离不会出现在这里。
+   */
+  isolated?: boolean;
   netin?: number;
   netout?: number;
   diskread?: number;
@@ -2681,10 +2897,48 @@ export interface VmMetaEntry {
    * `name` 只是关联当时的存档，模板被改名 / 删除后仍然显示「当初关联的是哪张」。
    */
   template?: { node: string; vmid: number; name: string };
+  /**
+   * 系统信息快照：隔离 / 解除隔离 / 开机时由后端主动采集（见 app/guest_osinfo）。
+   *
+   * 它解决的是「读不到的瞬间」：隔离把机器关掉、取证快照上锁、迁移期间 config
+   * 短暂不可读时，面板侧至少还有一份上次确认过的系统信息 —— 列表的「操作系统」
+   * 列据此兜底，不至于退化成「—」，解除隔离时也能用它把缺失的标注补回来。
+   * 采集失败**不会**清空任何字段。
+   */
+  snapshot?: VmOsSnapshot;
+  /** 快照采集时间（秒） */
+  snapshot_at?: number;
+  /** true = 面板自动采集（非人工填写），用于区分「系统补的」与「人改的」 */
+  auto?: boolean;
   /** 填写人；普通用户只拿得到自己填的条目 */
   by?: string;
   /** 填写时间（秒） */
   at?: number;
+}
+
+/** 一次系统信息采集的结果（PVE config 里「这台机器是什么系统」的那一部分）。 */
+export interface VmOsSnapshot {
+  /** PVE 的 ostype（qemu: l26 / win11；lxc: debian / ubuntu …） */
+  ostype?: string;
+  /** 由 ostype 推出的面板家族 key（windows / linux / debian …） */
+  family?: string;
+  /** 机器名（qemu 的 name / lxc 的 hostname） */
+  name?: string;
+  /** lxc 的主机名 */
+  hostname?: string;
+  /** 容器模板卷（lxc 独有） */
+  ostemplate?: string;
+  /** 架构 */
+  arch?: string;
+  cores?: string;
+  sockets?: string;
+  /** 内存（MB，PVE 原样字符串） */
+  memory?: string;
+  kind?: 'qemu' | 'lxc' | string;
+  /** 采集原因：quarantine / release / power.start … */
+  reason?: string;
+  /** 采集时刻（秒） */
+  taken_at?: number;
 }
 
 export interface VmMetaListResult {
@@ -3592,6 +3846,14 @@ export interface FrpRule {
   id: string;
   username: string;
   name: string;
+  /**
+   * 这条规则在 frpc 里的**实际代理名**（`<归属用户>_<规则名>`）。
+   *
+   * frpc 只有一份配置，代理名必须全局唯一，而规则名只在同一个人内不重名 ——
+   * 所以渲染时统一加了归属前缀（见后端 frp.proxy_names）。判断「已生效 / 未应用」
+   * 必须比对这个名字，用 `name` 会永远对不上。
+   */
+  proxy_name?: string;
   type: string;
   local_ip: string;
   local_port: number;
@@ -3725,6 +3987,11 @@ export interface FrpEffective {
 export interface FrpStatus {
   running: boolean;
   available: boolean;
+  /**
+   * frpc 二进制自报的版本号（如 ``0.72.0``），空串 = 取不到。
+   * 界面直接显示它而不是写死的目标版本：机器上装的可能是更早的版本。
+   */
+  version?: string;
   /**
    * 实际连接的服务端 —— **仅管理员可见**。普通用户的响应里没有这两个字段：
    * frps 地址对他们没有用处，却能用来测绘「面板把哪台机器穿透到了公网」。
@@ -5430,6 +5697,8 @@ export interface QuarantineStep {
 export interface QuarantineResult {
   node: string;
   vmid: number;
+  /** 机器名（来自 VM config；老后端不返回时前端按 VMID 兜底） */
+  name?: string;
   ok: boolean;
   steps: QuarantineStep[];
   summary: string;
@@ -5462,6 +5731,30 @@ export interface QuarantineStatus {
   networks: QuarantineNet[];
   protected: boolean;
   evidence_snapshots: QuarantineEvidence[];
+}
+
+/**
+ * 面板登记过的一次隔离动作（``GET /api/isolation``）。
+ *
+ * 它只是**索引**：真实的隔离状态仍以 PVE 读到的为准（见 ``QuarantineStatus``），
+ * 但列表页要标「隔离」标签、应急响应页要列出「现在哪些机器被隔离」，都只能靠它
+ * （PVE 的 /cluster/resources 不带 protection）。
+ */
+export interface QuarantineRecord {
+  conn_id: string;
+  node: string;
+  vmid: number;
+  name: string;
+  snapshot: string;
+  interfaces: string[];
+  power_action: string;
+  note: string;
+  summary: string;
+  /** ok = 全部步骤成功；partial = 部分失败（仍然是半隔离状态） */
+  state: 'ok' | 'partial' | string;
+  started_at: number;
+  recorded_at: number;
+  recorded_by: string;
 }
 
 /* ---------------------------------------------------------------------------

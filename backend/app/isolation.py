@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -35,6 +36,16 @@ logger = logging.getLogger(__name__)
 EVIDENCE_PREFIX = "quarantine-"
 NET_KEY_RE = re.compile(r"^net(\d+)$")
 POWER_ACTIONS = ("none", "shutdown", "stop")
+
+#: 建快照是 **异步任务**，任务期间 PVE 给 VM 上 ``snapshot`` 锁：此时改 ``netX``
+#: 会被拒（``VM is locked (snapshot)``）。所以必须等任务结束再往下走。上限 120 秒
+#: 是「等得起」与「别把一次点击挂成十分钟」的折中；超时不算失败，只是如实回报。
+SNAPSHOT_WAIT_TIMEOUT = 120.0
+
+#: 配置类操作遇到锁时的重试节奏：锁是秒级的（快照收尾 / 备份 / 迁移），
+#: 等一会儿再试比直接判定失败更接近人的处理方式。总等待约 10 秒。
+LOCK_RETRY_ATTEMPTS = 8
+LOCK_RETRY_DELAY = 1.5
 
 
 def set_link_down(raw: str, down: bool) -> str:
@@ -72,10 +83,53 @@ def _step(name: str, ok: bool, detail: str, **extra: Any) -> Dict[str, Any]:
     return {"step": name, "ok": ok, "detail": detail, **extra}
 
 
-async def _set_link_down(node: str, vmid: int, key: str, raw: str, down: bool) -> Dict[str, Any]:
+def friendly_error(exc: BaseException) -> str:
+    """把上游 / 内部异常翻成用户能照着做的一句话。
+
+    上游原文（``VM is locked (snapshot)``、``500 ...``）既不告诉用户该等还是该
+    找人，英文原文夹在中文提示里也不好读。这里只处理**最常见的几种**，其余原样
+    透出 —— 宁可给出原始错误，也不要编一个猜的原因。
+    """
+    text = str(exc).strip() or exc.__class__.__name__
+    low = text.lower()
+    if "locked" in low:
+        return i18n.t("isolation.detail.locked", error=text)
+    if "timeout" in low or "timed out" in low:
+        return i18n.t("isolation.detail.timedOut", error=text)
+    if "no space" in low or "disk full" in low:
+        return i18n.t("isolation.detail.noSpace", error=text)
+    return text
+
+
+async def _config_with_lock_retry(
+    node: str, vmid: int, changes: Dict[str, Any]
+) -> Any:
+    """改配置，遇到「VM is locked」时等一会儿重试。
+
+    锁在隔离流程里是**必然**会撞上的：取证快照本身就会给 VM 上锁（``snapshot``），
+    备份 / 迁移 / 回收站操作也会。把一次几秒后会自己消失的锁直接判成「隔离失败」，
+    等于让用户在正确操作的路径上反复失败。
+    """
     client = get_client()
-    await client.qemu_set_config(node, vmid, {key: set_link_down(raw, down)})
-    return {"interface": key, "value": set_link_down(raw, down)}
+    last: Optional[ProxmoxError] = None
+    for attempt in range(LOCK_RETRY_ATTEMPTS):
+        try:
+            return await client.qemu_set_config(node, vmid, changes)
+        except ProxmoxError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            last = exc
+            if attempt == LOCK_RETRY_ATTEMPTS - 1:
+                break
+            await asyncio.sleep(LOCK_RETRY_DELAY)
+    assert last is not None
+    raise last
+
+
+async def _set_link_down(node: str, vmid: int, key: str, raw: str, down: bool) -> Dict[str, Any]:
+    value = set_link_down(raw, down)
+    await _config_with_lock_retry(node, vmid, {key: value})
+    return {"interface": key, "value": value}
 
 
 async def quarantine(
@@ -104,7 +158,9 @@ async def quarantine(
     try:
         config = await client.qemu_config(node, vmid) or {}
     except ProxmoxError as exc:
-        raise RuntimeError(i18n.t("isolation.detail.readConfigFail", error=exc)) from exc
+        raise RuntimeError(
+            i18n.t("isolation.detail.readConfigFail", error=friendly_error(exc))
+        ) from exc
 
     # ---- 1. 取证快照（务必在处置之前）----
     snapshot_name = ""
@@ -117,7 +173,20 @@ async def quarantine(
             + " · 由面板在隔离前自动创建"
         )
         try:
-            await client.qemu_snapshot_create(node, vmid, snapshot_name, description)
+            upid = await client.qemu_snapshot_create(node, vmid, snapshot_name, description)
+            # 建快照是异步任务，任务期间 VM 带 ``snapshot`` 锁。不等它结束就直接
+            # 改 ``netX``，PVE 会回 ``VM is locked (snapshot)`` —— 而「先取证快照」
+            # 是默认勾选的，这条路本来会让每一次隔离都失败。
+            if isinstance(upid, str) and upid:
+                status = await client.wait_for_task(
+                    upid, node, timeout=SNAPSHOT_WAIT_TIMEOUT
+                )
+                exit_status = str(status.get("exitstatus") or "").strip()
+                # PVE 的 exitstatus 除了 "OK" 还可能是 "WARNINGS: 1" 之类（任务
+                # 跑完了、但有告警）：那不算失败，只有其它值才是真失败。
+                if exit_status and not exit_status.startswith(("OK", "WARNING")):
+                    # 任务失败也要回报：锁此时已经释放，后续断网可以继续
+                    raise ProxmoxError(exit_status, 500)
             steps.append(
                 _step(
                     "snapshot",
@@ -131,7 +200,9 @@ async def quarantine(
                 _step(
                     "snapshot",
                     False,
-                    i18n.t("isolation.detail.snapshotFail", error=exc),
+                    i18n.t(
+                        "isolation.detail.snapshotFail", error=friendly_error(exc)
+                    ),
                 )
             )
 
@@ -149,7 +220,9 @@ async def quarantine(
                 await _set_link_down(node, vmid, key, raw, True)
                 cut.append(key)
             except ProxmoxError as exc:
-                failures.append(i18n.t("isolation.failed_item", key=key, error=exc))
+                failures.append(
+                    i18n.t("isolation.failed_item", key=key, error=friendly_error(exc))
+                )
         if not keys:
             steps.append(
                 _step("network", False, i18n.t("isolation.detail.noNics"))
@@ -202,7 +275,7 @@ async def quarantine(
                 _step(
                     "power",
                     False,
-                    i18n.t("isolation.detail.powerFail", error=exc),
+                    i18n.t("isolation.detail.powerFail", error=friendly_error(exc)),
                     action=action,
                 )
             )
@@ -210,7 +283,7 @@ async def quarantine(
     # ---- 4. 顺手保护：防止慌乱中把证据 VM 删掉 ----
     if protect:
         try:
-            await client.qemu_set_config(node, vmid, {"protection": 1})
+            await _config_with_lock_retry(node, vmid, {"protection": 1})
             steps.append(
                 _step("protect", True, i18n.t("isolation.detail.protectOk"))
             )
@@ -219,7 +292,7 @@ async def quarantine(
                 _step(
                     "protect",
                     False,
-                    i18n.t("isolation.detail.protectFail", error=exc),
+                    i18n.t("isolation.detail.protectFail", error=friendly_error(exc)),
                 )
             )
 
@@ -227,6 +300,9 @@ async def quarantine(
     return {
         "node": node,
         "vmid": vmid,
+        # 机器名来自刚读过的 config：隔离记录与清单里要显示「是哪台机器」，
+        # 只有 VMID 的清单在应急现场没法用
+        "name": str(config.get("name") or ""),
         "ok": ok,
         "steps": steps,
         "snapshot": snapshot_name,
@@ -255,7 +331,9 @@ async def release(
     try:
         config = await client.qemu_config(node, vmid) or {}
     except ProxmoxError as exc:
-        raise RuntimeError(i18n.t("isolation.detail.readConfigFail", error=exc)) from exc
+        raise RuntimeError(
+            i18n.t("isolation.detail.readConfigFail", error=friendly_error(exc))
+        ) from exc
 
     restored: List[str] = []
     if restore_network:
@@ -268,7 +346,9 @@ async def release(
                 await _set_link_down(node, vmid, key, raw, False)
                 restored.append(key)
             except ProxmoxError as exc:
-                failures.append(i18n.t("isolation.failed_item", key=key, error=exc))
+                failures.append(
+                    i18n.t("isolation.failed_item", key=key, error=friendly_error(exc))
+                )
         if failures:
             steps.append(
                 _step(
@@ -302,7 +382,7 @@ async def release(
 
     if unprotect:
         try:
-            await client.qemu_set_config(node, vmid, {"protection": 0})
+            await _config_with_lock_retry(node, vmid, {"protection": 0})
             steps.append(
                 _step("protect", True, i18n.t("isolation.detail.unprotectOk"))
             )
@@ -311,7 +391,7 @@ async def release(
                 _step(
                     "protect",
                     False,
-                    i18n.t("isolation.detail.unprotectFail", error=exc),
+                    i18n.t("isolation.detail.unprotectFail", error=friendly_error(exc)),
                 )
             )
 
@@ -321,7 +401,11 @@ async def release(
             steps.append(_step("power", True, i18n.t("isolation.detail.startOk")))
         except ProxmoxError as exc:
             steps.append(
-                _step("power", False, i18n.t("isolation.detail.startFail", error=exc))
+                _step(
+                    "power",
+                    False,
+                    i18n.t("isolation.detail.startFail", error=friendly_error(exc)),
+                )
             )
 
     return {

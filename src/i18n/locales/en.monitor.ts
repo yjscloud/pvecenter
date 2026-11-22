@@ -289,6 +289,9 @@ export const enMonitor: Partial<Record<MessageKey, string>> = {
   'frp.statClient': 'Client binary',
   'frp.installed': 'Installed',
   'frp.notInstalled': 'Not installed',
+  /* The version comes from the binary itself (frpc -v), not the bundled target */
+  'frp.installedWithVersion': 'Installed · v{version}',
+  'frp.versionUnknown': 'Version unknown',
   'frp.statServer': 'frps server',
   'frp.notConfigured': 'Not configured',
   /* The server address is only sent to administrators (V2-04) */
@@ -300,22 +303,45 @@ export const enMonitor: Partial<Record<MessageKey, string>> = {
     'Administrators only — the server address and token are infrastructure',
   'frp.serverSubtitleUser': 'Read-only — only administrators can change the server settings',
   'frp.saveChanges': 'Save changes',
+  'frp.discard': 'Discard',
+  'frp.saveDisabledHint': 'Nothing to save',
+  'frp.sectionBasic': 'Basics',
+  'frp.sectionBasicHint': 'How frpc reaches frps — bind_addr / bindPort in frps.ini',
+  'frp.sectionAuth': 'Authentication',
+  'frp.sectionAuthHint':
+    'Must match the server, otherwise frpc connections are rejected',
+  'frp.sectionAdvanced': 'Advanced',
+  'frp.sectionAdvancedHint':
+    'Rarely needed: only when frps sits behind NAT, or when users reach your tunnels through a separate domain.',
+  'frp.advancedUnset': 'Not configured',
   'frp.fieldServerAddr': 'Server address',
+  'frp.serverAddrHint':
+    'e.g. frps.example.com or 42.194.184.49 — host or IP only, no http:// and no port.',
   'frp.serverAddrPlaceholder': 'frps.example.com or a public IP',
-  'frp.fieldPublicAddr': 'Public address (optional)',
-  'frp.publicAddrPlaceholder': 'frp.example.com or a public IP',
-  'frp.publicAddrHint':
-    'The address users connect to in order to reach your tunnels. Set it when frps sits behind NAT or is reached by domain; leave it empty to reuse the server address. Domain / IP only — no http:// and no path.',
-  'frp.fieldServerPort': 'Server port (frps bindPort)',
-  'frp.fieldToken': 'Token (must match the server\u2019s auth.token)',
+  'frp.fieldServerPort': 'Server port',
+  'frp.serverPortHint':
+    'e.g. 7000 — bindPort from frps.ini, not a local port on frpc.',
+  'frp.fieldToken': 'Token',
+  'frp.tokenSet': 'Set',
+  'frp.tokenUnset': 'Not set',
   'frp.tokenHintSet':
     'Stored encrypted and never echoed to the UI; enter a new value to replace it, or leave it empty to keep the current one.',
   'frp.tokenHintUnset':
     'Leave empty if the server has none. Once saved it is shown as **** and the plain text is never returned.',
   'frp.tokenPlaceholder': '**** (already set)',
+  'frp.tokenPlaceholderNew': 'Same as the server\u2019s auth.token',
   'frp.clear': 'Clear',
+  'frp.fieldPublicAddr': 'Public address',
+  'frp.publicAddrPlaceholder': 'frp.example.com or a public IP',
+  'frp.publicAddrHint':
+    'The address users connect to in order to reach your tunnels. Set it when frps sits behind NAT or is reached by domain; leave it empty to reuse the server address. Domain / IP only — no http:// and no path.',
   'frp.restartNote':
     'After changing the server settings, frpc is restarted automatically if it is running, so the new configuration takes effect.',
+  'frp.errAddrRequired': 'Enter the server address',
+  'frp.errAddrShape': 'Host or IP only — no http://, port or path',
+  'frp.errPortRequired': 'Enter the port',
+  'frp.errPortRange': 'Port must be an integer between 1 and 65535',
+  'frp.fixErrorsFirst': 'Fix the highlighted fields first',
   'frp.savedTitle': 'Saved',
   'frp.savedRestartFailedDetail': 'but restarting frpc automatically failed: {error}',
   'frp.savedRestarted': 'Server settings saved; frpc restarted and is in effect',
@@ -325,7 +351,6 @@ export const enMonitor: Partial<Record<MessageKey, string>> = {
   'frp.clearFailed': 'Could not clear',
   'frp.clientTitle': 'frpc client',
   'frp.clientVersion': 'Client version',
-  'frp.ready': 'Ready',
   'frp.missing': 'Missing',
   'frp.notInstalledTitle': 'frpc is not installed yet',
   'frp.notInstalledBody':
@@ -352,7 +377,7 @@ export const enMonitor: Partial<Record<MessageKey, string>> = {
   'frp.newRule': 'New rule',
   'frp.dupTitle': 'Duplicate rule names',
   'frp.dupBody':
-    'These rule names are duplicated: {names}. frpc will fail to start; rename them.',
+    'These rule names are duplicated: {names}. They get a numeric suffix (e.g. tunnel-1-2) when merged so frpc can start; renaming them is recommended.',
   'frp.noRules': 'No rules yet — click "New rule" in the top right to start.',
   'frp.colOwner': 'Owner',
   'frp.colName': 'Name',
@@ -385,16 +410,27 @@ export const enMonitor: Partial<Record<MessageKey, string>> = {
   /* Target dropdown for ordinary users (options come from ownership + live PVE data) */
   'frp.kindQemu': 'VM',
   'frp.kindLxc': 'Container',
-  'frp.targetOption': '{name} ({kind} {vmid}) · {ip}',
-  'frp.targetOptionUnnamed': '{kind} {vmid} · {ip}',
-  'frp.targetSelectPlaceholder': 'Choose a target address',
+  /* Searchable target picker (see ui/TargetSelect.tsx and utils/targetSearch.ts):
+     hostname / IP / VMID, with the matching and ordering rules documented there */
+  'frp.targetSearchPlaceholder': 'Search hostname / IP / VMID',
+  'frp.targetSearchListAria': 'Selectable target addresses',
+  'frp.targetSearchNoMatch': 'No target matches "{query}"',
+  'frp.targetSearchManual': 'Enter it manually',
+  'frp.targetSearchMore': '{n} more not shown — keep typing to narrow it down',
+  'frp.targetGrantedName': 'Granted by admin',
   'frp.targetSelectEmpty': 'No virtual machine / container available',
   'frp.targetSelectHint':
-    'Only IPs of virtual machines / containers you own ({n} available)',
+    'Search by hostname / IP / VMID; only IPs of virtual machines / containers you own ({n} available)',
   'frp.targetSelectHintManual':
-    'Only IPs of virtual machines / containers you own; other addresses must fall inside an administrator-approved network: {cidrs}',
+    'Search by hostname / IP / VMID; other addresses must fall inside an administrator-approved network: {cidrs}',
   'frp.targetManualOption': 'Other address (inside an administrator-approved network)',
-  'frp.targetGrantedOption': 'Granted by admin · {ip}',
+  'frp.targetManualOptionAdmin': 'Custom IP (enter manually)',
+  'frp.targetSelectHintAdmin':
+    'Search by hostname / IP / VMID; {n} known addresses, pick "Custom IP" for anything else',
+  'frp.targetSelectLoading': 'Loading available addresses…',
+  'frp.targetSelectAdminNoPreset':
+    'No preset addresses are available right now (the PVE connection may be down) — switch to "Custom IP" and enter one',
+  'frp.fieldLocalIpManualAdmin': 'Target IP (custom)',
   'frp.fieldLocalIpManual': 'Target IP (must be inside an approved network)',
   'frp.localIpPlaceholder': 'e.g. 10.0.0.25',
   'frp.localIpRequired': 'Enter the target IP',

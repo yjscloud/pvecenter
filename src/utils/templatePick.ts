@@ -41,6 +41,10 @@ export interface TemplatePickItem {
   node?: string;
   /** 家族判定的兜底依据（PVE 的 ostype，可能为空） */
   ostype?: string | null;
+  /** 模板自带的核数（只有虚拟机模板有；提交摘要的「模板信息」会用到） */
+  cores?: number;
+  /** 虚拟机模板的 VMID（只有虚拟机模板有，用来点明选的是哪一张） */
+  vmid?: number;
   /** 第一列：内存 / 模板大小 */
   sizeText?: string;
   /** 第二列：磁盘 / 存储 */
@@ -169,6 +173,8 @@ export function vmTemplatePickItems(
       node: tpl.node,
       // ostype 优先：同名模板可能一个是 Windows、一个是 Linux
       ostype: tpl.ostype || tpl.type,
+      cores: tpl.maxcpu,
+      vmid: tpl.vmid,
       sizeText: tpl.maxmem ? formatBytes(tpl.maxmem, 0) : '—',
       // 系统盘优先用后端解析出的整数 GB：`maxdisk` 是字节、还可能把数据盘算进去。
       metaText: tpl.rootfs_gb

@@ -515,8 +515,6 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
   const [form, setForm] = useState<FormState>(initialState);
   const [errors, setErrors] = useState<Errors>({});
   const [submitting, setSubmitting] = useState(false);
-  /* 仅在本轮打开时自动选一次模板，避免用户手动清空后被回填 */
-  const autoPickedRef = useRef(false);
   /* 目标 PVE 主机：空串 = 面板当前连接；否则用指定连接创建（多台 PVE 场景） */
   const [targetConn, setTargetConn] = useState('');
 
@@ -696,7 +694,6 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
     setForm(initialState);
     setErrors({});
     setTargetConn('');
-    autoPickedRef.current = false;
     setMode('quick');
     modeTouchedRef.current = false;
   }, [open]);
@@ -749,10 +746,10 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
 
   /* 切换目标 PVE 主机后：VMID / 节点名 / 模板都不通用，清空后由下方效果按新主机重新填充。
      VMID 必须一起清掉：每台 PVE 的 VMID 空间各自独立，A 主机取到的号在 B 主机上
-     很可能已被占用（就是「config file already exists」的来源）。 */
+     很可能已被占用（就是「config file already exists」的来源）。
+     模板清空后就停在可选列表上 —— 换主机等于换了一整套镜像，本来也该重新挑。 */
   useEffect(() => {
     setForm((f) => ({ ...f, vmid: '', node: '', cloneFrom: '' }));
-    autoPickedRef.current = false;
   }, [targetConn]);
 
   /* 自动填充 VMID 与默认节点 */
@@ -951,28 +948,17 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
      第 2 步的 clone-method 卡片），不改写用户已选的值 */
   const panelDefaultFull = Boolean(vmDefaultsQuery.data?.full_clone);
 
-  /* 默认选中第一个模板，省去手动选择。
-     取的是**过滤后**的 cloneSources：直接用接口返回的第一条，可能是一张容器
-     模板或别的主机的模板，写进 cloneFrom 后选择器找不到对应项，摘要卡会整个
-     消失 —— 看着像「没选」。 */
-  useEffect(() => {
-    if (!open || autoPickedRef.current) return;
-    if (form.mode !== 'clone' || form.cloneFrom) return;
-    const first = clonePickItems[0];
-    if (first) {
-      autoPickedRef.current = true;
-      setForm((f) => (f.cloneFrom ? f : { ...f, cloneFrom: first.value }));
-    }
-  }, [open, form.mode, form.cloneFrom, clonePickItems]);
+  /* 模板**不预选**：装哪套系统必须由用户自己确认（与快速部署、容器向导同一规则）。
+     列表一到就铺出可选模板，不再替他把第一张填进 cloneFrom —— 列表顺序取决于
+     接口返回顺序，等于随机替他挑了一台机器的系统。 */
 
-  /* 目标节点一换，候选就换了一份：原来选中的模板若已不在列表里就清掉，交给上面
-     那段「默认选中第一个」按新节点重挑。不清的话界面上一个都没选中，提交时却还
-     带着上一台节点的 `clone_from.node` —— 源节点与目标节点是两回事，后端不会替
-     你纠正，克隆会直接打到模板不在的那台机器上。 */
+  /* 目标节点一换，候选就换了一份：原来选中的模板若已不在列表里就清掉（清掉之后
+     选择器回到可选列表，让用户按新节点重挑）。不清的话界面上一个都没选中，提交时
+     却还带着上一台节点的 `clone_from.node` —— 源节点与目标节点是两回事，后端不会
+     替你纠正，克隆会直接打到模板不在的那台机器上。 */
   useEffect(() => {
     if (!open || !form.cloneFrom) return;
     if (clonePickItems.some((item) => item.value === form.cloneFrom)) return;
-    autoPickedRef.current = false;
     setForm((f) => (f.cloneFrom === form.cloneFrom ? { ...f, cloneFrom: '' } : f));
   }, [open, form.cloneFrom, clonePickItems]);
 
@@ -1767,9 +1753,9 @@ export function VmCreateWizard({ open, onClose, onCreated }: VmCreateWizardProps
                   <span className="choice-panel-hint">{t('vmCreate.cloneParamsHint')}</span>
                 </div>
 
-                {/* 克隆源：模板少时直接平铺，多时先给一张「将使用此模板」摘要卡，
-                    其余收进「更换模板」—— 与重装选模板同一套交互（见
-                    SystemTemplatePicker）。 */}
+                {/* 克隆源：模板少时直接平铺，多时给出可滚动列表（搜索 / 分类 / 分组），
+                    选定后可收成一张「将使用此模板」摘要卡 —— 与重装选模板同一套交互
+                    （见 SystemTemplatePicker）。默认不预选，由用户自己挑。 */}
                 <Field
                   label={t('templatePicker.vmLabel')}
                   required

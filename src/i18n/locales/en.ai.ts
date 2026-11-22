@@ -410,6 +410,12 @@ export const enAi: Partial<Record<MessageKey, string>> = {
   'ai.lease.denied': 'Denied',
   'ai.lease.rollbackFile': 'Roll back this file',
   'ai.lease.rollbackSnapshot': 'Roll back to snapshot',
+  'ai.lease.rollbackSnapshotHint':
+    'Roll back to this snapshot: disk changes made since then will be lost',
+  'ai.lease.rollbackSnapshotOk': 'Snapshot rollback succeeded',
+  'ai.lease.rollbackFileOk': 'File restored',
+  'ai.lease.rollbackFailed': 'Rollback failed',
+  'ai.lease.rollbackPending': 'Rollback result unconfirmed',
   'ai.lease.revoke': 'Revoke access',
   'ai.lease.revokeRetry': 'Retry revoke',
   'ai.lease.revoked': 'Access revoked',

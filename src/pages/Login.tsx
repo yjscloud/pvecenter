@@ -60,10 +60,11 @@ export function Login() {
   const refresh = useRefreshInterval();
 
   /* 后端连接状态。
-     key 带 'public' 前缀：这里是**匿名**请求，后端只回 {"status":"ok"}（不含
-     pve_configured，见 routers/config.health 的两档设计）。若与登录后的
-     usePveStatus 共用 ['health']，登录瞬间会命中这份匿名缓存（全局 staleTime
-     30 秒），把「还没配连接」误判成「已配置」—— 引导条与初始化跳转一起消失。 */
+     key 带 'public' 前缀：这里是**匿名**请求，后端只回
+     {"status":"ok","authenticated":false}（不含 pve_configured，见
+     routers/config.health 的两档设计）。若与登录后的 usePveStatus 共用
+     ['health']，登录瞬间会命中这份匿名缓存（全局 staleTime 30 秒），把
+     「还没配连接」误判成「已配置」—— 引导条与初始化跳转一起消失。 */
   const health = useQuery({
     queryKey: ['health', 'public'],
     queryFn: healthApi.check,
@@ -89,6 +90,18 @@ export function Login() {
   /* 老后端不返回 mode，只有 required —— 按图形验证码处理，行为与改造前一致 */
   const captchaMode = captchaQ.data?.mode ?? (captchaQ.data?.required ? 'image' : 'off');
   const captchaRequired = captchaMode !== 'off';
+
+  /* 当前注册方式（设置页可切：关闭 / 邀请制 / 注册码制 / 自助）。关闭时不展示
+     「去注册」入口 —— 点进去只会拿到 403。接口失败时按「开放」处理（老后端
+     没有这个接口），行为与改造前一致。queryKey 与注册页共用，切换后一起失效。 */
+  const registerModeQ = useQuery({
+    queryKey: ['registration-mode'],
+    queryFn: authApi.registrationMode,
+    refetchOnWindowFocus: false,
+    retry: 0,
+    staleTime: 5 * 60_000,
+  });
+  const registerOpen = registerModeQ.data?.enabled !== false;
 
   /*
     滑块位置用 ref 承接：拖动过程中每移动 1px 都会回调一次，走 state 会把整个
@@ -466,19 +479,22 @@ export function Login() {
             <IconChevronLeft size={14} />
             {t('auth.mfa.back')}
           </button>
-        ) : (
+        ) : registerOpen ? (
           <div className="login-register-hint">
             {t('auth.login.noAccount')}
             <Link to="/register">{t('auth.login.registerLink')}</Link>
             {t('auth.login.registerSuffix')}
           </div>
+        ) : (
+          /* 注册关闭时不摆链接，只留一句去路：给管理员开通 */
+          <div className="login-register-hint">{t('auth.login.registerClosed')}</div>
         )}
       </form>
 
       {/* ---- 后端状态 ----
-          匿名访问时 /api/health 只回 {"status":"ok"}：PVE 连接状态、版本、
-          节点数属于内网指纹，未登录不该看到（见后端 routers/config.py）。
-          所以这里只保留「面板服务是否可达」这一条。 */}
+          匿名访问时 /api/health 只回 {"status":"ok","authenticated":false}：
+          PVE 连接状态、版本、节点数属于内网指纹，未登录不该看到（见后端
+          routers/config.py）。所以这里只保留「面板服务是否可达」这一条。 */}
       <div className="login-health">
         <div className="login-health-row">
           <span className="login-health-label">{t('auth.health.backend')}</span>

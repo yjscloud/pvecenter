@@ -160,6 +160,8 @@ async def get_user(
         # 账号有效期：0 = 永不过期；expiry_frozen 非 0 = 已到期冻结（已关机）
         "expires_at": found.get("expires_at", 0),
         "expiry_frozen": found.get("expiry_frozen", 0),
+        # 最近一次成功登录（Unix 秒）；0 = 建号后还没登录过
+        "last_login": found.get("last_login", 0),
         # 区域管理员可管理的区域（空 = 不按区域限制）
         "regions": found.get("regions") or [],
     }
@@ -525,7 +527,9 @@ async def approve_user(
 ) -> Dict[str, Any]:
     """审批通过一条注册申请，并当场把角色与权限定下来。
 
-    角色/权限一起在这里给定，省掉「先通过、再编辑」两次操作。
+    角色/权限一起在这里给定，省掉「先通过、再编辑」两次操作。请求里没带角色时
+    **沿用账号当前角色** —— 邀请链接在注册那一刻就把角色写进去了，审批只负责
+    放行，不该因为管理员没重新选一次就把人打回 viewer。
     """
     existing = await store.get_user(username)
     if not existing:
@@ -533,7 +537,7 @@ async def approve_user(
     if existing.get("status", store.STATUS_ACTIVE) == store.STATUS_ACTIVE:
         raise HTTPException(status_code=409, detail=f"用户 {username} 已是正常状态")
 
-    role_id = (payload.role or "viewer").strip()
+    role_id = (payload.role or existing.get("role") or "viewer").strip()
     if not await store.get_role(role_id):
         raise HTTPException(status_code=400, detail=f"角色 {role_id} 不存在")
     # 授予链边界：不能建 / 批准一个权限高于自己的账号（含 admin 角色本身）

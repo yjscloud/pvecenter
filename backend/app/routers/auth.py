@@ -3,20 +3,24 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 
 from .. import (
     captcha,
     crypto,
+    emailcodes,
     i18n,
+    invites,
     loginalert,
     mailer,
     maintenance,
     panel_url,
     password_reset,
     prefs,
+    quota,
+    regcodes,
     security,
     store,
     throttle,
@@ -31,6 +35,7 @@ from ..schemas import (
     LoginResponse,
     PasswordChange,
     ProfileUpdate,
+    RegisterEmailCodeIn,
     RegisterRequest,
     ResetPasswordIn,
     ResetTokenIn,
@@ -58,6 +63,44 @@ async def _hit(key: str, limit: int) -> bool:
     """通用固定窗口计数：超过 ``limit`` 次即返回 True（已超限）。"""
     allowed, _ = await throttle.allow(key, limit, _LIMIT_WINDOW)
     return not allowed
+
+
+async def _check_captcha(
+    *,
+    captcha_id: str,
+    captcha_code: str,
+    captcha_x: Optional[float],
+    captcha_path: Optional[List[Dict[str, float]]],
+) -> Tuple[bool, str, str]:
+    """统一的人机校验入口：返回 ``(是否通过, 失败提示, 审计短句)``。
+
+    登录 / 注册 / 忘记密码 / 重置密码四个匿名入口共用同一套「设置 → 登录验证」
+    配置。抽成一个函数不只是去重：这四个入口**必须**口径一致，曾经就是漏了
+    重置密码这一步（滑块模式下那个页面根本没有验证码），只补一处实现迟早
+    还会在第五个入口重演。
+
+    通过时后两项为空串；未通过时提示面向用户（区分「答错」与「已失效」），
+    短句面向审计日志（写成人话，如「拖动滑块未通过」）。
+    """
+    mode = await captcha.get_mode()
+    if mode == captcha.MODE_OFF:
+        return True, "", ""
+    if mode == captcha.MODE_SLIDER:
+        # 轨迹一并校验：只交坐标、不交轨迹的脚本在这一步就会被拒（H-1）
+        state = captcha.check_slider(captcha_id, captcha_x, captcha_path)
+    else:
+        state = captcha.check(captcha_id, captcha_code)
+    if state == captcha.RESULT_OK:
+        return True, "", ""
+
+    # 两种失败分开说：答错 → 换一张重试；已失效（过期 / 同一 id 二次提交）
+    # → 明确告知「请重新获取」。既不作废前又不含糊其辞（审计项 PT-09）。
+    label = captcha.MODE_LABEL.get(mode, mode)
+    if state == captcha.RESULT_GONE:
+        return False, "验证码已失效，请重新获取", f"{label}已失效（过期或重放）"
+    if mode == captcha.MODE_SLIDER:
+        return False, "验证失败，请重新拖动滑块", f"{label}未通过"
+    return False, "验证码错误，请点击图片更换", f"{label}未通过"
 
 
 async def _login_guard(username: str, ip: str) -> None:
@@ -146,6 +189,21 @@ async def _issue_session(
     )
     security.set_session_cookies(response, access, refresh)
     return access
+
+
+async def _mark_login(user: Dict[str, Any]) -> None:
+    """在管理页留下「最近登录时间」。
+
+    只写一列统计信息：登录本身已经成功，这一步失败（锁等待、连接抖动）不该
+    把用户挡在门外，所以异常在这里吞掉、只记一条 warning。
+    两步验证的账号在第二步（``/login/2fa``）才算真正登录，那一处同样会调它。
+    """
+    try:
+        await store.touch_last_login(str(user["username"]))
+    except Exception:  # noqa: BLE001 - 统计字段写失败不能影响登录
+        logger.warning(
+            "记录账号 %s 的登录时间失败", user.get("username"), exc_info=True
+        )
 
 
 def _requires_totp_setup(user: Dict[str, Any]) -> bool:
@@ -264,38 +322,23 @@ async def login(
     #
     # 验证码没过**不**计入失败次数：否则拿一张错图（或一个错误位置）反复提交
     # 就能把任意账号锁死（拿别人的用户名做拒绝服务）。计数只认「口令不对」。
-    mode = await captcha.get_mode()
-    if mode != captcha.MODE_OFF:
-        if mode == captcha.MODE_SLIDER:
-            # 轨迹一并校验：只交坐标、不交轨迹的脚本在这一步就会被拒（H-1）
-            state = captcha.check_slider(
-                payload.captcha_id, payload.captcha_x, payload.captcha_path
-            )
-        else:
-            state = captcha.check(payload.captcha_id, payload.captcha_code)
-        if state != captcha.RESULT_OK:
-            # 两种失败分开说：答错 → 换一张重试；已失效（过期 / 同一 id 二次提交）
-            # → 明确告知「请重新获取」。这样既不作废前又不含糊其辞
-            # （审计项 PT-09 就是把后者误判成「id 未作废」）。
-            if state == captcha.RESULT_GONE:
-                detail = "验证码已失效，请重新获取"
-                audit_note = f"{captcha.MODE_LABEL.get(mode, mode)}已失效（过期或重放）"
-            elif mode == captcha.MODE_SLIDER:
-                detail = "验证失败，请重新拖动滑块"
-                audit_note = f"{captcha.MODE_LABEL.get(mode, mode)}未通过"
-            else:
-                detail = "验证码错误，请点击图片更换"
-                audit_note = f"{captcha.MODE_LABEL.get(mode, mode)}未通过"
-            await store.add_audit(
-                username=payload.username,
-                action="auth.login",
-                result="failed",
-                # 写成人话（「图形验证码未通过」/「拖动滑块未通过」）：
-                # 审计日志是给人看的，写 image/slider 还得回头翻代码。
-                detail=audit_note,
-                ip=ip,
-            )
-            raise HTTPException(status_code=400, detail=detail)
+    passed, detail, audit_note = await _check_captcha(
+        captcha_id=payload.captcha_id,
+        captcha_code=payload.captcha_code,
+        captcha_x=payload.captcha_x,
+        captcha_path=payload.captcha_path,
+    )
+    if not passed:
+        await store.add_audit(
+            username=payload.username,
+            action="auth.login",
+            result="failed",
+            # 写成人话（「图形验证码未通过」/「拖动滑块未通过」）：
+            # 审计日志是给人看的，写 image/slider 还得回头翻代码。
+            detail=audit_note,
+            ip=ip,
+        )
+        raise HTTPException(status_code=400, detail=detail)
 
     user = await store.get_user(payload.username)
 
@@ -400,6 +443,7 @@ async def login(
     # 登录成功：清掉失败计数（账号与 IP 两个维度），再签发会话
     await throttle.clear_login_failures(payload.username, ip)
     access = await _issue_session(response, user, request)
+    await _mark_login(user)
 
     await store.add_audit(
         username=user["username"],
@@ -471,6 +515,7 @@ async def login_mfa(
 
     await throttle.clear_login_failures(username, ip)
     access = await _issue_session(response, user, request)
+    await _mark_login(user)
 
     # 勾了「信任设备」：登记一台信任设备并下发 cookie。之后 7 天内，这台浏览器
     # 只要口令对就能直接登录（第二因子被跳过），到期或换密码 / 开关 2FA 即失效。
@@ -561,16 +606,302 @@ async def refresh_session(request: Request, response: Response) -> LoginResponse
     )
 
 
-def _registration_received() -> Dict[str, Any]:
+def _register_closed_message() -> str:
+    """注册关闭时的统一文案：接口拒绝与前端关闭提示共用一套口径。"""
+    return i18n.pick(
+        "自助注册已关闭，请联系管理员开通账号",
+        "Self-registration is disabled. Please contact an administrator for an account.",
+    )
+
+
+def _credential_missing_message(kind: str) -> str:
+    """邀请制 / 注册码制下没填凭证。"""
+    if kind == regcodes.KIND_INVITE:
+        return i18n.pick("请填写邀请码", "Please enter your invitation code")
+    return i18n.pick("请填写注册码", "Please enter your registration code")
+
+
+def _credential_invalid_message(kind: str) -> str:
+    """凭证不可用：不存在 / 已过期 / 已用完 / 已撤销 / 类型不匹。
+
+    刻意**不区分**这几种情况：注册是匿名接口，区分了就等于给枚举者一个
+    「这枚码存在但过期了」的确认信号。
+    """
+    if kind == regcodes.KIND_INVITE:
+        return i18n.pick(
+            "邀请码无效、已过期或已用完，请联系管理员重新获取",
+            "The invitation code is invalid, expired or used up. Ask an administrator for a new one.",
+        )
+    return i18n.pick(
+        "注册码无效、已过期或已用完，请联系管理员重新获取",
+        "The registration code is invalid, expired or used up. Ask an administrator for a new one.",
+    )
+
+
+async def _register_email_code_required(mode: str) -> bool:
+    """自助注册是否要邮箱验证码。
+
+    只对 ``open`` 生效：邀请制 / 注册码制的凭证本身就是管理员线下分发的，
+    拿到凭证已经等于「管理员认得这个人」，再要一道邮箱码就是过两道门。
+    自助注册才是完全匿名的入口 —— 那里唯一能证明「这个邮箱是你的」的东西
+    就是这封邮件。
+
+    开关本身由设置页控制（见 :func:`app.emailcodes.enabled`），环境变量只是
+    没配过时的默认值。
+    """
+    return mode == regcodes.MODE_OPEN and await emailcodes.enabled()
+
+
+def _email_code_send_message(status: str, meta: Dict[str, Any]) -> Tuple[int, str]:
+    """把签发结果翻成 ``(HTTP 状态码, 面向用户的说明)``。"""
+    ttl_min = max(1, int(meta.get("ttl_seconds", 600)) // 60)
+    if status == emailcodes.SEND_COOLDOWN:
+        return 429, i18n.pick(
+            f"发送过于频繁，请 {max(1, int(meta.get('retry_after', 60)))} 秒后再试",
+            f"Too many requests. Try again in {max(1, int(meta.get('retry_after', 60)))} second(s).",
+        )
+    if status == emailcodes.SEND_RATE_LIMITED:
+        return 429, i18n.pick(
+            "该邮箱或来源 IP 获取验证码的次数过多，请稍后再试",
+            "Too many verification codes requested for this email or IP. Try again later.",
+        )
+    if status == emailcodes.SEND_MAIL_FAILED:
+        return 503, i18n.pick(
+            "验证码邮件发送失败，请稍后再试；如果一直失败请联系管理员检查邮件配置",
+            "The verification email could not be sent. Try again later, or ask an "
+            "administrator to check the mail settings.",
+        )
+    return 200, i18n.pick(
+        f"验证码已发送到 {meta.get('email', '')}，{ttl_min} 分钟内有效",
+        f"A verification code was sent to {meta.get('email', '')}; it is valid for {ttl_min} minute(s).",
+    )
+
+
+def _email_code_reject_message(result: str, meta: Dict[str, Any]) -> str:
+    """校验失败时的四种说法。
+
+    刻意区分「填错还几次」「已过期」「次数用尽」「压根没发」：它们是四种不同的
+    下一步动作（继续填 / 重新获取 / 联系管理员 / 先点发送），统一成一句
+    「验证码无效」只会让用户反复试同一个码。
+    """
+    if result == emailcodes.RESULT_EXPIRED:
+        return i18n.pick(
+            "邮箱验证码已过期，请重新获取",
+            "The email verification code has expired. Request a new one.",
+        )
+    if result == emailcodes.RESULT_TOO_MANY:
+        return i18n.pick(
+            "邮箱验证码错误次数过多，已作废，请重新获取",
+            "Too many wrong attempts. The code is no longer valid; request a new one.",
+        )
+    if result == emailcodes.RESULT_INVALID:
+        left = int(meta.get("remaining_attempts", 0))
+        return i18n.pick(
+            f"邮箱验证码不正确，还可尝试 {left} 次",
+            f"The email verification code is incorrect. {left} attempt(s) left.",
+        )
+    return i18n.pick(
+        "请先获取邮箱验证码，并填写收到的 6 位数字",
+        "Request an email verification code first, then enter the 6-digit code you received.",
+    )
+
+
+@router.get("/registration-mode")
+async def registration_mode() -> Dict[str, Any]:
+    """当前注册方式（公开接口，无需登录）。
+
+    登录页据此决定是否展示「注册申请」入口，注册页据此决定渲染哪个凭证输入框。
+    模式存在 settings KV（管理员在「设置 → 注册方式」里切换），读取没有副作用，
+    所以不需要限流 —— 但它必须**每次都查库**，否则「切换后立即生效」就成了空话。
+    """
+    mode = await regcodes.current_mode()
+    kind = regcodes.MODE_KIND.get(mode) or ""
+    if mode == regcodes.MODE_OFF:
+        message = _register_closed_message()
+    elif mode == regcodes.MODE_INVITE:
+        # 邀请制没有「缺失凭证」这回事：入口是链接，注册页据 mode 直接提示
+        message = "邀请制仅支持通过邀请链接注册，请向管理员索取邀请链接"
+    elif kind:
+        message = _credential_missing_message(kind)
+    else:
+        message = ""
+    return {
+        "mode": mode,
+        "requires": kind,
+        "enabled": mode != regcodes.MODE_OFF,
+        "message": message,
+        # 自助注册的邮箱验证码：注册页据此决定是否渲染验证码输入框与「发送」按钮，
+        # 并直接拿这里的秒数做倒计时与提示（不在前端重复一份配置）。
+        "email_code": {
+            "required": await _register_email_code_required(mode),
+            "ttl_seconds": emailcodes.ttl_seconds(),
+            "max_attempts": emailcodes.max_attempts(),
+            "resend_after": emailcodes.resend_after(),
+        },
+    }
+
+
+@router.get("/register-availability")
+async def register_availability() -> Dict[str, Any]:
+    """注册是否开放（公开接口）—— ``/registration-mode`` 的兼容视图。
+
+    老前端只认 ``enabled``；保留这条是为了升级过程中「前端还是旧包、后端已
+    更新」的那段时间不出现入口消失/报错。
+    """
+    mode = await regcodes.current_mode()
+    enabled = mode != regcodes.MODE_OFF
+    return {
+        "enabled": enabled,
+        "message": "" if enabled else _register_closed_message(),
+    }
+
+
+@router.get("/invite/{token}")
+async def invite_preview(token: str, request: Request) -> Dict[str, Any]:
+    """邀请链接的公开预览（注册页打开 ``?invite=`` 时先问一句）。
+
+    返回「还能不能用、进来是什么角色、要不要审批、还剩几次」。链接无效时也回
+    200 + ``valid: false`` 而不用 404：注册页要能稳稳地渲染一句「这个链接不能
+    用了」，用状态码区分会让前端多一层错误分支，也容易把提示写丢。
+
+    token 是 43 字符的高熵串，猜不出来；仍然按 IP 限流，避免有人拿它当免费
+    的哈希查询接口刷着玩。
+    """
+    ip = security.client_ip(request) or "unknown"
+    if await _anon_throttled("invite-preview", ip, 30):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+    # 链接归属邀请制：其它注册方式下链接本来就不生效，预览直接说不能用，
+    # 省得注册页显示「可以加入」却在提交时被拒。
+    mode = await regcodes.current_mode()
+    if mode != regcodes.MODE_INVITE:
+        return {
+            "valid": False,
+            "reason": "当前注册方式不是邀请制，邀请链接不可用",
+        }
+    row = await invites.peek(token)
+    if row is None:
+        return {
+            "valid": False,
+            "reason": "邀请链接无效、已失效或使用次数已用完",
+        }
+    role = await store.get_role(row["role"])
+    if not role:
+        # 链接指向的角色被删了：注册必然失败，预览就先说不能用，
+        # 别让人填完一屏才在提交时撞到「角色不存在」
+        return {
+            "valid": False,
+            "reason": "该邀请链接指定的角色已不存在，请联系管理员",
+        }
+    return {
+        "valid": True,
+        "role": row["role"],
+        "role_name": str(role.get("name") or row["role"]),
+        "requires_approval": bool(row["requires_approval"]),
+        "remaining": row["remaining"],
+        "expires": row["expires"],
+        "note": row["note"],
+    }
+
+
+def _registration_received(
+    status: str = store.STATUS_PENDING,
+    message: str = "注册申请已收到，请等待管理员审批",
+) -> Dict[str, Any]:
     """注册的对外统一响应。
 
-    首次提交与「用户名已存在」都走这里：body / 状态码完全一致，调用方无法
-    用它判断账号是否存在（审计项 M-02）。
+    需要审批的通道里，首次提交与「用户名已存在」都走这里：body / 状态码完全
+    一致，调用方无法用它判断账号是否存在（审计项 M-02）。免审批凭证不走这条
+    伪装逻辑：用户名已存在时明确返回 409，否则用户会把重复提交误认为「等待
+    审批」，永远等不到一个不存在的审批。
     """
     return {
         "ok": True,
-        "status": store.STATUS_PENDING,
-        "message": "注册申请已收到，请等待管理员审批",
+        "status": status,
+        "message": message,
+    }
+
+
+@router.post("/register/email-code")
+async def send_register_email_code(
+    payload: RegisterEmailCodeIn, request: Request
+) -> Dict[str, Any]:
+    """自助注册第 1 步：把一次性验证码发到用户填写的邮箱。
+
+    与第 2 步（``/register``）分开是刻意的：邮箱是**匿名接口里唯一能证明归属的
+    东西**，而「发信」本身是个对外投递动作，必须单独限频、单独要求人机校验，
+    不能和提交绑在一起 —— 否则脚本一次请求就能既发信又建号。
+
+    人机校验在这里（而不是提交时）生效：提交端已经有验证码作为「你是不是这个
+    邮箱的主人」的证明，再要一道图形码只会让人过两次题。
+    """
+    ip = security.client_ip(request)
+    mode = await regcodes.current_mode()
+    if mode == regcodes.MODE_OFF:
+        raise HTTPException(status_code=403, detail=_register_closed_message())
+    if not await _register_email_code_required(mode):
+        raise HTTPException(
+            status_code=400,
+            detail=i18n.pick(
+                "当前注册方式不需要邮箱验证码",
+                "The current registration mode does not use email verification codes.",
+            ),
+        )
+
+    state = await maintenance.state()
+    if state["enabled"]:
+        raise maintenance.error(state)
+
+    # 发信接口按 IP 再限一层：单邮箱上限挡不住「换着邮箱群发」。
+    if await _anon_throttled("register-code", ip or "unknown", 10):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
+    passed, detail, audit_note = await _check_captcha(
+        captcha_id=payload.captcha_id,
+        captcha_code=payload.captcha_code,
+        captcha_x=payload.captcha_x,
+        captcha_path=payload.captcha_path,
+    )
+    if not passed:
+        await store.add_audit(
+            username="",
+            action="auth.register.email_code",
+            target="",
+            result="failed",
+            detail=audit_note,
+            ip=ip,
+        )
+        raise HTTPException(status_code=400, detail=detail)
+
+    email = (payload.email or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="请填写正确的邮箱")
+    if len(email) > 255:
+        raise HTTPException(status_code=400, detail="邮箱长度不能超过 255 个字符")
+
+    status, meta = await emailcodes.issue(email, ip or "")
+    http_status, message = _email_code_send_message(status, meta)
+    await store.add_audit(
+        username="",
+        action="auth.register.email_code",
+        target=email,
+        result="success" if http_status == 200 else "failed",
+        detail=message if http_status != 200 else "",
+        ip=ip,
+    )
+    if http_status != 200:
+        headers = (
+            {"Retry-After": str(max(1, int(meta.get("retry_after") or 1)))}
+            if http_status == 429
+            else None
+        )
+        raise HTTPException(status_code=http_status, detail=message, headers=headers)
+
+    return {
+        "ok": True,
+        "message": message,
+        "ttl_seconds": meta["ttl_seconds"],
+        "max_attempts": meta["max_attempts"],
+        "resend_after": meta["resend_after"],
     }
 
 
@@ -578,18 +909,69 @@ def _registration_received() -> Dict[str, Any]:
 async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]:
     """自助注册（公开接口，无需登录）。
 
-    建出来的账号状态恒为 ``pending``：能登录的前提是管理员审批通过。
-    角色先给 viewer，真正的角色与权限由管理员在审批时决定。
+    建出来的账号默认是 ``pending``：能登录的前提是管理员审批通过。例外是
+    「免审批」的凭证（邀请链接 / 注册码都可以在签发时关掉审批）—— 那条路径
+    建好即 ``active``，角色当场生效。角色默认 viewer；带凭证时用凭证上配置的。
 
-    校验顺序是「限流 → 人机校验 → 口令强度 → 邮箱 → 用户名唯一 → 建号」，
-    任何一步失败都**不写用户表**，也不给管理员发信：这样「先插入待审批记录、
-    再校验重复」那类问题不会出现（首投成功 = 201 且队列里一条pending；同名重投
-    = 409 且队列不受影响）。
+    校验顺序是「注册方式 → 维护模式 → 限流 → 人机校验（自助注册换成邮箱验证码）
+    → 口令强度 → 邮箱 → 凭证（邀请制 / 注册码制）→ 域名限速 → 队列容量 →
+    用户名唯一 → 邮箱验证码 → 占用凭证 → 建号」，任何一步失败都**不写用户表**，
+    也不给管理员发信：这样「先插入待审批记录、再校验重复」那类问题不会出现
+    （首投成功 = 201 且队列里一条 pending；同名重投同样是 201 +「已收到」，
+    队列不受影响）。
 
-    注意这里**不返回任何账号信息**，也不在响应里区分「已存在」的具体状态，
-    只说用户名被占用 —— 与登录接口的防枚举口径保持一致。
+    邮箱验证码排得靠后是有意的：前面几种拒绝（口令太弱、重名、队列满）都是
+    「改一下就能重试」的，不该把用户手上那枚码烧掉；而码一旦通过就作废，
+    所以它必须在最后一道可能失败的门之前。
+
+    凭证只在「前面的字段都合法」之后才真正占用额度（``consume``）：填错一次
+    口令就废掉一枚邀请码，用户还得回去找管理员要新的。建号失败会把额度退回。
+
+    注意这里**不返回任何账号信息**，也不在响应里区分「已存在」的具体状态 ——
+    与登录接口的防枚举口径保持一致。
     """
     ip = security.client_ip(request)
+    # 注册方式（设置页可切，切换后立即生效）：关闭时直接 403 —— 不消耗限流
+    # 配额，也不落审计（匿名可无限触发，记了只会把审计表刷爆）。放在维护模式
+    # 之前：关闭是配置级的，维护是临时的，语义更硬的那条先答。
+    mode = await regcodes.current_mode()
+    if mode == regcodes.MODE_OFF:
+        raise HTTPException(status_code=403, detail=_register_closed_message())
+
+    # 邀请链接属于「邀请制」：链接自带角色与审批策略，它本身就是邀请凭证，
+    # 所以邀请制下带了链接就不再要求邀请码 —— 再要一枚等于让用户过两道门。
+    # 其它方式一律不认链接（它曾经是一种独立入口，现在归属邀请制）。
+    invite_token = (payload.invite_token or "").strip()
+    if invite_token and mode != regcodes.MODE_INVITE:
+        if mode == regcodes.MODE_CODE:
+            raise HTTPException(
+                status_code=400,
+                detail="当前为注册码制，邀请链接不适用，请填写管理员分发的注册码",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="当前为自助注册，无需邀请链接，直接提交即可",
+        )
+    # 邀请制已只保留邀请链接：没有链接就没有凭证，直接拒绝（不再回落到邀请码）
+    if mode == regcodes.MODE_INVITE and not invite_token:
+        raise HTTPException(
+            status_code=400,
+            detail="邀请制仅支持通过邀请链接注册，请向管理员索取邀请链接",
+        )
+    invite = await invites.peek(invite_token) if invite_token else None
+    if invite_token and invite is None:
+        raise HTTPException(
+            status_code=400,
+            detail="邀请链接无效、已失效或使用次数已用完，请向管理员索取新的链接",
+        )
+    # 角色可能在链接签发之后被删掉：提前拦住，否则要到 create_user 才炸成 500
+    if invite is not None and not await store.get_role(invite["role"]):
+        raise HTTPException(
+            status_code=400, detail="该邀请链接指定的角色已不存在，请联系管理员"
+        )
+
+    # 需要凭证的模式 → 认哪一种凭证（邀请制认邀请码，注册码制认注册码）
+    need_kind = "" if invite is not None else (regcodes.MODE_KIND.get(mode) or "")
     # 维护模式：自助注册也属于「对外服务」，一并停掉。放在限流之前 —— 维护期间
     # 没有理由再为注册消耗一次限流配额。
     state = await maintenance.state()
@@ -608,30 +990,29 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
             status_code=429, detail="提交过于频繁，请稍后再试"
         )
 
+    username = payload.username.strip()
+    email = (payload.email or "").strip()
+
+    # 自助注册改由邮箱验证码把门（见 app/emailcodes.py）：它同时承担了「人机」
+    # 与「邮箱真实且属于你」两件事，比图形码强；再要一道图形码等于让用户过两次
+    # 题（发码那一步的图形码已经被消耗掉了）。邀请制 / 注册码制没有人机校验的
+    # 替代品，仍然走原来的图灵校验。
+    code_required = await _register_email_code_required(mode)
+
     # 人机校验与登录同级（审计项 FD-06）：注册成功会往审批队列里塞一条记录，
     # 也会给管理员发一封信 —— 没有验证码，匿名脚本可以用随机用户名把队列刷满，
     # 顺带把管理员邮箱打爆。放在建号之前：未通过就什么都不写。
     #
     # 验证码没过**不**计入任何失败计数，理由同登录：否则拿错图反复提交就能把
     # 正常用户挡在门外（限流仍按来源 IP 独立生效）。
-    mode = await captcha.get_mode()
-    if mode != captcha.MODE_OFF:
-        if mode == captcha.MODE_SLIDER:
-            state = captcha.check_slider(
-                payload.captcha_id, payload.captcha_x, payload.captcha_path
-            )
-        else:
-            state = captcha.check(payload.captcha_id, payload.captcha_code)
-        if state != captcha.RESULT_OK:
-            if state == captcha.RESULT_GONE:
-                detail = "验证码已失效，请重新获取"
-                audit_note = f"{captcha.MODE_LABEL.get(mode, mode)}已失效（过期或重放）"
-            elif mode == captcha.MODE_SLIDER:
-                detail = "验证失败，请重新拖动滑块"
-                audit_note = f"{captcha.MODE_LABEL.get(mode, mode)}未通过"
-            else:
-                detail = "验证码错误，请点击图片更换"
-                audit_note = f"{captcha.MODE_LABEL.get(mode, mode)}未通过"
+    if not code_required:
+        passed, detail, audit_note = await _check_captcha(
+            captcha_id=payload.captcha_id,
+            captcha_code=payload.captcha_code,
+            captcha_x=payload.captcha_x,
+            captcha_path=payload.captcha_path,
+        )
+        if not passed:
             await store.add_audit(
                 username=payload.username,
                 action="auth.register",
@@ -641,9 +1022,6 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
                 ip=ip,
             )
             raise HTTPException(status_code=400, detail=detail)
-
-    username = payload.username.strip()
-    email = (payload.email or "").strip()
 
     weak = _password_weak_reason(payload.password)
     if weak:
@@ -657,6 +1035,38 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
         raise HTTPException(status_code=400, detail="邮箱格式不正确")
     if len(email) > 255:
         raise HTTPException(status_code=400, detail="邮箱长度不能超过 255 个字符")
+
+    # 邀请制 / 注册码制：先**判活**（不消费）。放在域名限速与队列容量之前 ——
+    # 一枚假码不该消耗域名配额，也不该占掉一个待审批名额。
+    credential = (payload.invite_code or "").strip()
+    credential_label = "邀请码" if need_kind == regcodes.KIND_INVITE else "注册码"
+    peeked_code: Optional[Dict[str, Any]] = None
+    if need_kind:
+        if not credential:
+            await store.add_audit(
+                username=username,
+                action="auth.register",
+                target=username,
+                result="failed",
+                detail=f"未填写{credential_label}（当前注册方式：{mode}）",
+                ip=ip,
+            )
+            raise HTTPException(
+                status_code=400, detail=_credential_missing_message(need_kind)
+            )
+        peeked_code = await regcodes.check(credential, need_kind)
+        if peeked_code is None:
+            await store.add_audit(
+                username=username,
+                action="auth.register",
+                target=username,
+                result="failed",
+                detail=f"{credential_label}无效 / 过期 / 已用完（当前注册方式：{mode}）",
+                ip=ip,
+            )
+            raise HTTPException(
+                status_code=400, detail=_credential_invalid_message(need_kind)
+            )
 
     # 邮箱域名级限速（审计项 M-02）：只按 IP 限 5 次/小时挡不住换 IP 的脚本，
     # 而同一批灌号往往落在同一个域名（临时邮箱服务 / 同一家企业域）。10 次/小时
@@ -680,7 +1090,13 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
     # 管理员清理后再放行；阈值可用 REGISTER_PENDING_LIMIT 调整。
     pending = await store.count_users_with_status(store.STATUS_PENDING)
     pending_cap = int(settings.register_pending_limit)
-    if pending_cap > 0 and pending >= pending_cap:
+    # 免审批凭证不会往队列里加人：队列满时它们不该被一并挡掉。这里用前面
+    # 判活的凭证预览（仍需在后面真正 consume），不额外暴露任何信息。
+    auto_approved = (
+        (invite is not None and not invite.get("requires_approval", True))
+        or (peeked_code is not None and not peeked_code.get("requires_approval", True))
+    )
+    if pending_cap > 0 and pending >= pending_cap and not auto_approved:
         logger.warning(
             "注册审批队列已满（%s 条），拒绝来自 %s 的注册请求：%s",
             pending,
@@ -700,10 +1116,26 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
             detail="注册申请暂时无法受理，请稍后再试",
         )
 
-    # 已存在（无论什么状态）都**不透露**：响应与首次提交完全一致，否则这个
-    # 公开接口就是一台用户名枚举机（审计项 M-02）。审计里照实记录，供管理员
-    # 发现有人在批量试探。
+    # 已存在（无论什么状态）都**不透露**：需要审批的通道继续返回与首次提交
+    # 完全一致的 pending 响应，否则这个公开接口就是一台用户名枚举机（审计项
+    # M-02）。但免审批凭证例外：它不会产生审批，若继续伪装成 pending，用户会
+    # 永远等一个不存在的审批。持有效免审批凭证的人本来就能创建账号，这里明确
+    # 告知用户名冲突不会额外泄露可利用的信息。
     if await store.get_user(username):
+        if auto_approved:
+            await store.add_audit(
+                username=username,
+                action="auth.register",
+                target=username,
+                result="failed",
+                detail="用户名已被占用（免审批凭证，明确拒绝）",
+                ip=ip,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="用户名已被占用，请更换用户名；如果你已经注册过，请直接登录或联系管理员处理原账号",
+            )
+
         await store.add_audit(
             username=username,
             action="auth.register",
@@ -714,16 +1146,114 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
         )
         return _registration_received()
 
-    await store.create_user(
-        username,
-        payload.password,
-        role="viewer",
-        email=email,
-        status=store.STATUS_PENDING,
-    )
+    # 自助注册：邮箱验证码校验放在这里 —— 前面几种拒绝（密码太弱、重名、队列满）
+    # 都是「用户改一下就能重试」的，不该把码烧掉；而码一旦通过就作废，所以它必须
+    # 排在最后一道可能失败的门之前。校验失败按原因分档提示（见 _email_code_reject_message）。
+    if code_required:
+        result, code_meta = await emailcodes.verify(email, payload.email_code)
+        if result != emailcodes.RESULT_OK:
+            await store.add_audit(
+                username=username,
+                action="auth.register",
+                target=username,
+                result="failed",
+                detail=f"邮箱验证码未通过（{result}）",
+                ip=ip,
+            )
+            raise HTTPException(
+                status_code=400, detail=_email_code_reject_message(result, code_meta)
+            )
+
+    # 到此为止字段全部合法，才真正占用一次凭证额度（条件 UPDATE，并发不超发）。
+    # 建号失败会把额度退回去，不让用户白丢一枚邀请码。
+    consumed: Optional[Dict[str, Any]] = None
+    if need_kind:
+        consumed = await regcodes.consume(
+            credential, need_kind, used_by=f"{username} <{email}>"
+        )
+        if consumed is None:
+            await store.add_audit(
+                username=username,
+                action="auth.register",
+                target=username,
+                result="failed",
+                detail=f"{credential_label}在提交过程中失效（并发用尽 / 被撤销）",
+                ip=ip,
+            )
+            raise HTTPException(
+                status_code=400, detail=_credential_invalid_message(need_kind)
+            )
+
+    # 链接同样只在字段全部合法之后才扣次数
+    consumed_invite: Optional[Dict[str, Any]] = None
+    if invite is not None:
+        consumed_invite = await invites.consume(
+            invite_token, used_by=f"{username} <{email}>"
+        )
+        if consumed_invite is None:
+            await store.add_audit(
+                username=username,
+                action="auth.register",
+                target=username,
+                result="failed",
+                detail="邀请链接在提交过程中失效（次数用尽 / 被失效）",
+                ip=ip,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="邀请链接在提交过程中失效，请向管理员索取新的链接",
+            )
+
+    # 角色、额度与审批策略都由凭证决定（注册码与邀请链接都能预先指定）：
+    # 免审批凭证建好即可登录（active），其余一律 pending；自助注册没有凭证，
+    # 保持原来的「必须审批」。
+    invite_role = str((consumed_invite or {}).get("role") or "")
+    code_role = str((consumed or {}).get("role") or "")
+    assigned_role = invite_role or code_role or "viewer"
+    if code_role and not await store.get_role(code_role):
+        # 码签发后角色被删：同样提前拦住，别让 create_user 抛成 500
+        if consumed is not None:
+            await regcodes.release(str(consumed.get("id") or ""))
+        raise HTTPException(
+            status_code=400, detail="该注册码指定的角色已不存在，请联系管理员"
+        )
+    limits = (consumed_invite or {}).get("quota") or (consumed or {}).get("quota")
+    used_credential = consumed_invite or consumed or {}
+    needs_approval = bool(used_credential.get("requires_approval", True))
+    status = store.STATUS_PENDING if needs_approval else store.STATUS_ACTIVE
+
+    try:
+        await store.create_user(
+            username,
+            payload.password,
+            role=assigned_role,
+            email=email,
+            status=status,
+        )
+    except Exception:
+        if consumed is not None:
+            await regcodes.release(str(consumed.get("id") or ""))
+        if consumed_invite is not None:
+            await invites.release(str(consumed_invite.get("id") or ""))
+        raise
+
+    # 额度写进用户级（覆盖角色默认）。失败不影响注册结果：账号已经建好，
+    # 额度只是附加项，记日志让管理员能补设。
+    if limits:
+        try:
+            await quota.set_user_limits(
+                username, limits, actor=f"registration:{mode}"
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("注册时写入用户额度失败：%s", username, exc_info=True)
 
     # 通知管理员。发信失败只记进审计，不影响注册结果。
-    mail_note = await _notify_admins_registration(username, email, ip, request)
+    # 免审批凭证不发：那封模板的标题就是「[待审批]」，发出去只会让人误会。
+    mail_note = (
+        await _notify_admins_registration(username, email, ip, request)
+        if needs_approval
+        else "免审批凭证，未发送审批通知"
+    )
 
     # 注册是匿名行为，actor 与 target 都是这个新账号本身；
     # 审批队列靠这条记录回溯「谁在什么时候申请过」。
@@ -734,12 +1264,23 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
         result="success",
         detail={
             "email": email,
-            "status": store.STATUS_PENDING,
+            "status": status,
             "mail": mail_note,
+            # 用哪种方式注册的、哪枚凭证 / 哪条链接：出问题时能回查是哪一批放进来的人
+            "mode": mode,
+            "code_id": str((consumed or {}).get("id") or ""),
+            "invite_id": str((consumed_invite or {}).get("id") or ""),
+            "role": assigned_role,
+            "quota": bool(limits),
         },
         ip=ip,
     )
-    return _registration_received()
+    return _registration_received(
+        status,
+        "注册成功，现在可以直接登录"
+        if not needs_approval
+        else "注册申请已收到，请等待管理员审批",
+    )
 
 
 # ------------------------------------------------------------ 自助重置密码
@@ -804,27 +1345,22 @@ async def forgot_password(
 
     # 人机校验（审计项 L-01）：与登录 / 注册同一套配置。放在查库之前，
     # 未通过时什么都不发、也不消耗该用户名的发送配额。
-    mode = await captcha.get_mode()
-    if mode != captcha.MODE_OFF:
-        if mode == captcha.MODE_SLIDER:
-            state = captcha.check_slider(
-                payload.captcha_id, payload.captcha_x, payload.captcha_path
-            )
-        else:
-            state = captcha.check(payload.captcha_id, payload.captcha_code)
-        if state != captcha.RESULT_OK:
-            await store.add_audit(
-                username=username,
-                action="auth.password_reset.request",
-                target=username,
-                result="failed",
-                detail=f"{captcha.MODE_LABEL.get(mode, mode)}未通过，未发送重置邮件",
-                ip=ip,
-            )
-            raise HTTPException(
-                status_code=400,
-                detail="验证码错误或已失效，请刷新后重试",
-            )
+    passed, detail, audit_note = await _check_captcha(
+        captcha_id=payload.captcha_id,
+        captcha_code=payload.captcha_code,
+        captcha_x=payload.captcha_x,
+        captcha_path=payload.captcha_path,
+    )
+    if not passed:
+        await store.add_audit(
+            username=username,
+            action="auth.password_reset.request",
+            target=username,
+            result="failed",
+            detail=f"{audit_note}，未发送重置邮件",
+            ip=ip,
+        )
+        raise HTTPException(status_code=400, detail=detail)
 
     # 单账号的邮件轰炸上限（审计项 L-01）：只按 IP 限速挡不住换 IP 的脚本，
     # 而受害者收到的邮件条数与攻击者 IP 数成正比。3 次/小时足够正常用户
@@ -869,12 +1405,40 @@ async def check_reset_token(payload: ResetTokenIn) -> Dict[str, Any]:
 async def reset_password(
     payload: ResetPasswordIn, request: Request
 ) -> Dict[str, Any]:
-    """自助重置第 2 步：凭令牌设置新密码。令牌一次性，用完即废。"""
+    """自助重置第 2 步：凭令牌设置新密码。令牌一次性，用完即废。
+
+    与登录 / 注册 / 忘记密码同级的人机校验：这一步会改掉账号口令并吊销该
+    账号全部会话，是四个匿名入口里破坏力最大的一个。曾经漏掉了它（滑块
+    模式下这个页面干脆没有验证码），补上时顺手把校验抽成 ``_check_captcha``
+    共用，避免下一次再漏。
+
+    顺序：口令强度 → 人机校验 → 兑换令牌。人机校验必须在 ``redeem`` **之前**
+    —— 令牌是一次性的，验证码没过就把链接烧掉，用户得重新申请一封邮件。
+    口令强度放最前是因为它只看输入本身，先拒掉能省一次验证码消耗。
+    """
     ip = security.client_ip(request)
 
     weak = _password_weak_reason(payload.password)
     if weak:
         raise HTTPException(status_code=400, detail=weak)
+
+    passed, detail, audit_note = await _check_captcha(
+        captcha_id=payload.captcha_id,
+        captcha_code=payload.captcha_code,
+        captcha_x=payload.captcha_x,
+        captcha_path=payload.captcha_path,
+    )
+    if not passed:
+        # 还没兑换令牌，拿不到用户名；这条审计只能记来源 IP。
+        await store.add_audit(
+            username="",
+            action="auth.password_reset",
+            target="",
+            result="failed",
+            detail=f"{audit_note}，未重置密码",
+            ip=ip,
+        )
+        raise HTTPException(status_code=400, detail=detail)
 
     username = await password_reset.redeem(payload.token or "")
     if not username:

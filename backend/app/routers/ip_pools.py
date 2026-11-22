@@ -78,7 +78,13 @@ async def get_ip_pools(
         }
         item.pop("owner", None)
         out.append(item)
-    return {"pools": out, "used": sorted(used.keys())}
+    # ``used`` 是「整个网段里哪些 IP 已被占用」的全量清单：属于内网地址规划，
+    # 只有管理员（``scope is None``）需要拿它做分配核对。普通用户建机只用各池
+    # 的 ``free``，前端也不消费 ``used``（见 IpPoolPanel），不必随响应下发。
+    return {
+        "pools": out,
+        "used": sorted(used.keys()) if scope is None else [],
+    }
 
 
 @router.put("/ip-pools")

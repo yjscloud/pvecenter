@@ -316,6 +316,7 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'auth.login.noAccount': 'No account yet?',
   'auth.login.registerLink': 'Request access',
   'auth.login.registerSuffix': ' and an administrator will approve it',
+  'auth.login.registerClosed': 'Self-registration is disabled — ask an administrator for an account',
 
   'auth.mfa.title': 'Two-factor verification',
   'auth.mfa.subtitle': 'Enter the code from your authenticator app',
@@ -365,6 +366,7 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'table.empty': 'No data',
   'table.resizeColumnAria': 'Drag to resize this column; double-click to restore',
   'table.resizeColumnTitle': 'Drag to resize (double-click to restore)',
+  'table.reorderColumnTitle': 'Drag onto another header to reorder columns',
   'table.paginationAria': 'Pagination',
   'table.pageSizePrefix': 'Rows per page',
   'table.pageSizeUnit': '{size}',
@@ -378,6 +380,39 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   /* ------------------------------------------------------ Registration */
   'register.title': 'Create an account',
   'register.titleDone': 'Request submitted',
+  'register.inviteCode': 'Invitation code',
+  'register.inviteCodePlaceholder': 'zpinv_...',
+  'register.inviteCodeHint':
+    'Ask an administrator for an invitation code; each code registers one account',
+  'register.regCode': 'Registration code',
+  'register.regCodePlaceholder': 'zpreg_...',
+  'register.regCodeHint': 'Enter the registration code distributed by an administrator',
+  'register.inviteLinkTitle': 'Invitation-only registration',
+  'register.inviteLinkBody':
+    'You are joining through an invite link shared by an administrator, as “{role}”; {approval}',
+  'register.inviteLinkModeTitle': 'Registration is not invitation-only',
+  'register.inviteLinkModeBody':
+    'This link only works while the registration mode is invitation-only. Ask an administrator, or register with the current mode.',
+  'register.inviteNeedsLinkTitle': 'Invitation-only mode requires an invite link',
+  'register.inviteNeedsLinkBody':
+    'Ask an administrator for an invite link and open it to register; visiting this page directly will not work.',
+  'register.inviteLinkApproval': 'an administrator must approve it',
+  'register.inviteLinkNoApproval': 'you can sign in right after registering',
+  'register.inviteLinkInvalidTitle': 'This invite link is no longer usable',
+  'register.inviteLinkInvalidBody':
+    'It may be revoked, expired or out of uses. Ask an administrator for a new link.',
+  'register.inviteLinkChecking': 'Checking the invite link…',
+  'register.inviteLinkRemaining': '{n} uses left',
+  'register.inviteLinkUnlimited': 'Unlimited uses',
+  'register.successActiveTitle': 'Registration complete',
+  'register.successActiveBody': ' — your account is active; you can sign in now.',
+  'register.subtitleActive': 'This invite link skips approval — you can sign in right away',
+  'register.subtitleActiveDone': 'Your account is active — sign in now',
+  'register.err.inviteRequired': 'Please enter your invitation code',
+  'register.err.codeRequired': 'Please enter your registration code',
+  'register.closedTitle': 'Self-registration is disabled',
+  'register.closedBody':
+    'This panel does not offer self-registration. Please contact an administrator for an account.',
   'register.subtitle': 'An administrator must approve it before you can sign in',
   'register.subtitleDone': 'Waiting for an administrator to approve',
   'register.successTitle': 'Registered — awaiting approval',
@@ -394,6 +429,18 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'register.passwordPlaceholder': 'At least 12 characters, letters and digits',
   'register.confirmPassword': 'Confirm password',
   'register.confirmPlaceholder': 'Type the password again',
+  'register.humanCheck': 'Human check',
+  'register.humanCheckDone': 'Human check passed',
+  'register.humanCheckReset': 'Verify again',
+  'register.emailCode': 'Email code',
+  'register.emailCodePlaceholder': 'Enter the 6-digit code from the email',
+  'register.emailCodeHint':
+    'The code is valid for {minutes} minute(s); you may enter it wrongly up to {attempts} time(s)',
+  'register.emailCodeSend': 'Send code',
+  'register.emailCodeSending': 'Sending…',
+  'register.emailCodeResend': 'Resend',
+  'register.emailCodeResendIn': 'Resend in {seconds}s',
+  'register.emailCodeSent': 'A code was sent to {email}. Check your inbox (and spam folder).',
   'register.submit': 'Submit request',
   'register.submitting': 'Submitting…',
   'register.haveAccount': 'Already have an account?',
@@ -406,6 +453,9 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'register.err.passwordWeak': 'Password must contain both letters and digits',
   'register.err.confirmRequired': 'Please type the password again',
   'register.err.confirmMismatch': 'The two passwords do not match',
+  'register.err.emailCodeRequired':
+    'Click "Send code" first, then enter the 6-digit code you received',
+  'register.err.emailCodeInvalid': 'The code is 6 digits',
 
   /* ------------------------------------------------------ Password reset */
   'forgot.title': 'Reset password',
@@ -496,6 +546,7 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'status.console.connectionsOnline': '{online}/{total} connections online',
   'status.console.connected': 'Connected',
   'status.console.disconnected': 'Not connected',
+  'status.console.unknown': 'Unknown',
   'status.console.pveVersion': 'PVE version',
   'status.console.nodesAll': 'PVE nodes (all connections)',
   'status.console.nodesCluster': 'Cluster nodes',
@@ -506,6 +557,7 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'status.console.summaryFleet': 'Backend is up, {online}/{total} PVE connections online, {nodes} nodes in total',
   'status.console.summaryConnected': 'Backend is up and connected to Proxmox VE',
   'status.console.summaryDisconnected': 'Backend is up but not connected to Proxmox VE',
+  'status.console.summaryUnknown': 'Backend is up; still confirming the Proxmox VE connection',
   'notif.ariaUnread': 'Notifications, {count} unread',
   'notif.ariaNone': 'Notifications, nothing unread',
   'notif.title': 'Notifications',
@@ -821,4 +873,12 @@ export const enCore: Partial<Record<MessageKey, string>> = {
 
   /* ---------------------------------------------------------- AI assistant */
   'nav.aiAssistant': 'AI assistant',
+
+  /* ------------------------------------------------------ Quota dimensions
+     Lives in core (not compute): the users page's "running out" table reads
+     these too, and that page never loads the compute dictionary. */
+  'quota.fieldLabel.count': 'count',
+  'quota.fieldLabel.cores': 'CPU cores',
+  'quota.fieldLabel.memory': 'memory',
+  'quota.fieldLabel.disk': 'disk',
 };

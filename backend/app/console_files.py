@@ -17,17 +17,27 @@ VNC 协议本身也只同步剪贴板文本，不传文件。
 
 存储与生命周期
 --------------
-文件落在 ``DATA_DIR/console-files``，盘上形如 ``<token>.bin`` + ``<token>.json``。
-token 是 32 位十六进制（128 bit 随机），下载接口不要求登录 —— 它本来就要被
-客户机（没有面板凭据）拉取，token 就是「能力凭据」。因此：
+文件落在 ``DATA_DIR/console-files``，盘上形如 ``<id>.bin`` + ``<id>.json``。
+下载接口不要求登录 —— 它本来就要被客户机（没有面板凭据）拉取，token 就是
+「能力凭据」。既然不能绑会话，就把 token 本身做扎实：
 
-  * 有有效期（默认 24 小时），过期即删；
-  * 下载地址不可枚举（128 bit 随机），也拿不到上传者之外的任何信息；
-  * 每次上传都会顺带清理一遍过期文件，不需要额外的定时任务。
+  * 对外 token = ``<id>.<sig>``，``sig`` 是对 ``id + 上传者 + 目标 + 文件名 +
+    过期时间`` 的 HMAC-SHA256 截断。改任何一个字段签名都不再匹配，因此
+    「把 meta 里的过期时间改长」「换个 uploader」这类篡改无效，也无法凭空
+    拼出一个有效 token；
+  * 有效期默认 60 分钟（``CONSOLE_FILE_TTL_MINUTES``），过期即删；
+  * 可选一次性（``CONSOLE_FILE_ONE_SHOT``）：文件流发送完毕后立刻删除；
+  * 每次上传都会顺带清理一遍过期文件，不需要额外的后台任务。
+
+注意：token 仍是 bearer 凭据 —— 拿到完整链接的人（含客户机）能下载，这是
+「客户机没有面板 Cookie」这个前提决定的。所以额外加了**下载审计**与按 IP
+限流，并且带会话访问时会校验 token 归属（别人的链接在自己会话里打不开）。
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import re
 import secrets
@@ -37,21 +47,32 @@ from typing import Any, Dict, Optional, Tuple
 
 from fastapi import UploadFile
 
-from .config import DATA_DIR
+from .config import DATA_DIR, settings
 
 #: 中转文件目录。与数据库同盘，但单独一个子目录，方便运维整体清理。
 STORE_DIR = DATA_DIR / "console-files"
 
-#: token 只接受我们自己生成的形态。下载接口拿它直接拼盘上路径，必须严格校验
+#: 盘上 id：32 位十六进制（128 bit 随机）。下载接口拿它拼盘上路径，必须严格校验
 #: （否则 ``..`` 之类会变成路径穿越）。
 TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+
+#: 对外 token：``<id>.<sig>``；也接受裸 id（盘上文件名 / 老调用方）。
+_TOKEN_RE = re.compile(r"^([0-9a-f]{32})(?:\.([0-9a-f]{32}))?$")
 
 #: 单个文件上限。中转是为了「把脚本 / 配置 / 补丁带进去」这类场景，
 #: 不是网盘；太大既占面板磁盘，也常被反代的 client_max_body_size 挡掉。
 MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
-#: 下载链接有效期（秒）。太短来不及在客户机里操作，太长等于在面板上留文件。
-TTL_SECONDS = 24 * 3600
+
+def ttl_seconds() -> int:
+    """下载链接有效期（秒）。
+
+    太短来不及在客户机里粘命令，太长等于在面板上长期留一份可能含凭据的文件。
+    默认 60 分钟，可用 ``CONSOLE_FILE_TTL_MINUTES`` 调整；下限 1 分钟。
+    """
+    minutes = int(getattr(settings, "console_file_ttl_minutes", 60) or 60)
+    return max(60, minutes * 60)
+
 
 _CHUNK = 1024 * 1024
 _NAME_MAX = 120
@@ -88,12 +109,46 @@ def _dir() -> Path:
     return STORE_DIR
 
 
+def _file_id(token: str) -> str:
+    """从「对外 token」或「盘上 id」取出盘上 id；形态不对返回空串。"""
+    match = _TOKEN_RE.match(str(token or ""))
+    return match.group(1) if match else ""
+
+
+def _sign(meta: Dict[str, Any]) -> str:
+    """对元数据里决定「谁的文件、发给谁、什么时候失效」的字段签名。
+
+    ``id / uploader / target / name / expires_at`` 任一被改，签名都不再匹配；
+    签名密钥就是 ``SECRET_KEY``（与 JWT 同源，但用途独立，不需要额外配置）。
+    """
+    payload = "\x1f".join(
+        [
+            str(meta.get("id") or ""),
+            str(meta.get("uploader") or ""),
+            str(meta.get("target") or ""),
+            str(meta.get("name") or ""),
+            str(int(float(meta.get("expires_at") or 0))),
+        ]
+    )
+    digest = hmac.new(
+        str(settings.secret_key or "").encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest[:32]
+
+
+def public_token(meta: Dict[str, Any]) -> str:
+    """对外发放的 token：``<id>.<签名>``。"""
+    return f"{meta.get('id') or ''}.{_sign(meta)}"
+
+
 def _meta_path(token: str) -> Path:
-    return _dir() / f"{token}.json"
+    return _dir() / f"{_file_id(token)}.json"
 
 
 def file_path(token: str) -> Path:
-    return _dir() / f"{token}.bin"
+    return _dir() / f"{_file_id(token)}.bin"
 
 
 def _write_meta(meta: Dict[str, Any]) -> None:
@@ -163,8 +218,8 @@ async def save(
     出事时不必翻审计日志。参数名不能叫 ``target`` —— 下面盘上路径的局部变量就是
     这个名字，会把它覆盖掉。
     """
-    token = secrets.token_hex(16)
-    target = file_path(token)
+    file_id = secrets.token_hex(16)
+    target = file_path(file_id)
     part = target.with_suffix(".part")
     name = clean_filename(upload.filename)
     size = 0
@@ -190,14 +245,16 @@ async def save(
 
     now = time.time()
     meta: Dict[str, Any] = {
-        "token": token,
+        "id": file_id,
         "name": name,
         "size": size,
         "created_at": now,
-        "expires_at": now + TTL_SECONDS,
+        "expires_at": now + ttl_seconds(),
         "uploader": username or "",
         "target": str(guest or ""),
     }
+    # 对外 token 带签名：调用方拿它下载 / 撤销；盘上仍按 id 落文件。
+    meta["token"] = public_token(meta)
     await asyncio.to_thread(_write_meta, meta)
     # 上传是最自然的清理时机：没有额外的后台任务，也不会拖慢下载
     await asyncio.to_thread(purge_expired)
@@ -205,22 +262,39 @@ async def save(
 
 
 async def load(token: str) -> Optional[Tuple[Path, Dict[str, Any]]]:
-    """按 token 取文件；不存在 / 已过期 / token 非法一律返回 ``None``。"""
-    if not TOKEN_RE.match(token or ""):
+    """按 token 取文件；不存在 / 已过期 / 签名不符 / token 非法一律返回 ``None``。
+
+    签名不符时**不删盘上文件**：任何人都能随手构造一个坏 token，删文件就成了
+    一条免费的 DoS。只有真正过期的记录才会被清掉。
+    """
+    match = _TOKEN_RE.match(str(token or ""))
+    if not match:
         return None
-    path = file_path(token)
+    file_id = match.group(1)
+    sig = match.group(2) or ""
+    path = file_path(file_id)
     try:
-        meta = json.loads(_meta_path(token).read_text(encoding="utf-8"))
+        meta = json.loads(_meta_path(file_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return None
+    # 升级前落盘的 meta 里 ``token`` 就是裸 id：这类存量链接允许在剩余有效期
+    # 内继续下载（不认会让升级瞬间的所有链接 404）。新记录一律验签。
+    legacy = str(meta.get("token") or "") == file_id
+    if not legacy and not hmac.compare_digest(sig, _sign(meta)):
         return None
     try:
         expires = float(meta.get("expires_at") or 0)
     except (TypeError, ValueError):
         expires = 0
     if expires <= time.time() or not await asyncio.to_thread(path.exists):
-        await asyncio.to_thread(_drop, token)
+        await asyncio.to_thread(_drop, file_id)
         return None
     return path, meta
+
+
+async def drop(file_id: str) -> None:
+    """删除一条中转文件（下载完成后的一次性清理走这里）。"""
+    await asyncio.to_thread(_drop, file_id)
 
 
 async def revoke(token: str, username: Optional[str] = None) -> bool:
@@ -233,7 +307,8 @@ async def revoke(token: str, username: Optional[str] = None) -> bool:
     早期落盘的 meta 可能没有 ``uploader``：这类「无主」记录只允许管理员回收，
     与「无归属记录的存量资源对普通用户不可见」同一套严格口径。
     """
-    if not TOKEN_RE.match(token or ""):
+    file_id = _file_id(token)
+    if not file_id:
         return False
     found = await load(token)
     if found is None:

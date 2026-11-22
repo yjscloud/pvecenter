@@ -91,18 +91,38 @@ def test_invalid_token_is_rejected(store: Path) -> None:
 
 
 def test_expired_file_is_removed(store: Path) -> None:
+    """过期清理仍然生效 —— 走 purge_expired（load 只在**签名有效**时才删）。"""
+
     async def run() -> None:
         meta = await console_files.save(_upload(b"x", "old.txt"), "alice")
         token = meta["token"]
-        # 直接把过期时间改到过去，模拟 24 小时之后
+        # 把到期时间往后推两小时的「现在」交给清理器，等价于自然过期
+        assert console_files.purge_expired(time.time() + 7200) == 1
+        meta_path = console_files._meta_path(token)
+        assert not meta_path.exists()
+        assert not console_files.file_path(token).exists()
+        assert await console_files.load(token) is None
+
+    asyncio.run(run())
+
+
+def test_tampered_meta_is_rejected_without_deleting(store: Path) -> None:
+    """meta 被改过（签名失配）时拒绝下载，但**不删盘上文件**。
+
+    否则任何人都能构造一个坏 token 反复打这个匿名接口，把别人的中转文件删光。
+    """
+
+    async def run() -> None:
+        meta = await console_files.save(_upload(b"x", "a.txt"), "alice")
+        token = meta["token"]
         meta_path = console_files._meta_path(token)
         data = json.loads(meta_path.read_text(encoding="utf-8"))
-        data["expires_at"] = 0
+        data["expires_at"] = time.time() + 99999  # 想把有效期改长
         meta_path.write_text(json.dumps(data), encoding="utf-8")
 
         assert await console_files.load(token) is None
-        assert not meta_path.exists()
-        assert not console_files.file_path(token).exists()
+        assert meta_path.exists()
+        assert console_files.file_path(token).exists()
 
     asyncio.run(run())
 

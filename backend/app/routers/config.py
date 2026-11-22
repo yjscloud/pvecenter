@@ -7,7 +7,7 @@ import secrets
 import ssl as ssl_module
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -19,12 +19,17 @@ from .. import (
     captcha,
     connregister,
     defaults,
+    # 自助注册的邮箱验证码：开关存 settings KV（见 app/emailcodes.py）
+    emailcodes,
     faq,
     fleetstatus,
+    invites,
     mailer,
     onboard,
     panel_url,
     quota,
+    regcodes,
+    routeguard,
     security,
     site,
     specs,
@@ -50,10 +55,14 @@ from ..schemas import (
     ConnectionRegisterIn,
     ConnectionTestIn,
     FaqIn,
+    InviteLinkIn,
     LoginCaptchaIn,
     MailConfigIn,
     MailTestIn,
     PanelUrlIn,
+    RegistrationCodeIn,
+    RegistrationEmailCodeIn,
+    RegistrationModeIn,
     SessionPolicyIn,
     SiteInfoIn,
     UiPrefsIn,
@@ -63,7 +72,20 @@ from ..schemas import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api", tags=["config"])
+# 权限是**前缀级**统一的，不在这里逐个端点手写：``/api/config/*`` 整组收在
+# ``settings.manage`` 一档（审计项：路由级鉴权遗漏 —— 此前 mail / session /
+# specs / quota / ui 只要登录就能读，同组的 connection / diagnostics 却要
+# settings.manage，于是漏出了 SMTP 拓扑与会话策略）。规则与白名单见
+# ``app/routeguard.py``，由 ``tests/test_route_permissions.py`` 静态核对。
+#
+# 注意这条 dependencies 挂在**整个 router** 上：``/api/health``、``/api/connections``、
+# ``/api/quota/*`` 也会经过它，但守卫只对命中受控前缀的路径生效（先做一次字符串
+# 前缀短路，不额外查库），所以这些热点接口没有额外开销。
+router = APIRouter(
+    prefix="/api",
+    tags=["config"],
+    dependencies=[Depends(routeguard.enforce_route_permission)],
+)
 
 
 @router.get("/health")
@@ -78,16 +100,27 @@ async def health(
     信息没有任何用处。
 
     所以现在分两档：
-      * 匿名：只回 ``{"status": "ok"}``，且**不探测 PVE** —— 顺带堵掉「匿名
-        请求即可让面板反复向上游发请求」这条放大路径；
-      * 已登录（前端登录后的各处都在轮询它）：字段与以前完全一致。
+      * 匿名：回 ``{"status": "ok", "authenticated": false}``，且**不探测 PVE**
+        —— 顺带堵掉「匿名请求即可让面板反复向上游发请求」这条放大路径；
+      * 已登录（前端登录后的各处都在轮询它）：``authenticated: true``，字段与
+        以前完全一致。
+    两档用 ``authenticated`` 显式区分：少了这一位，匿名载荷与「已配置但连不上」
+    在字段上无从分辨（诊断字段都缺省），前端只能误报成 PVE 故障。
     需要深度诊断用的是 ``/api/config/diagnostics``（要求 settings.manage）。
     """
     if user is None:
-        return {"status": "ok"}
+        # ``authenticated`` 是给前端判别用的：没有它时，一份「只有 status」的
+        # 匿名载荷和「连上了但读不到 PVE」在字段上完全一样（pve_configured /
+        # pve_connected 都缺省），前端只能把两者都渲染成「PVE 连不上」。
+        # 匿名分支显式带上 false，登录分支带 true，前端才不会把探测结果未知
+        # 当成故障（曾经的误报：access cookie 过期后 /health 静默降级成匿名，
+        # 面板顶部一直挂着「无法连接到 Proxmox 主机」）。
+        return {"status": "ok", "authenticated": False}
 
     result: Dict[str, Any] = {
         "status": "ok",
+        # 已登录：下面的诊断字段才可信。见匿名分支的说明。
+        "authenticated": True,
         "pve_connected": False,
         # 与 pve_connected 分两个字段是有意的：前者是「连通」，这个是「填没填过」。
         # 未配置和配了但连不上，用户要做的事完全不同（去添加 vs 去排查），
@@ -1599,18 +1632,9 @@ async def test_connection(
         ],
     }
 
-@router.get("/config/vm-defaults")
-async def get_vm_defaults(
-    user: Dict[str, Any] = Depends(security.get_current_user),
-) -> Dict[str, Any]:
-    """面板级创建默认值：默认 DNS 与默认克隆方式。
 
-    创建向导向所有可创建虚拟机的用户预填这两个值（DNS 写进 cloud-init，克隆方式
-    预选链接 / 完整），因此读取只要求登录。
-    """
-    return await defaults.get_vm_defaults()
-
-
+# 读取在 ``GET /api/runtime/vm-defaults``（创建向导向所有用户预填，不能要求
+# 管理权限）；这里只剩写入口，整个 ``/api/config`` 前缀统一 ``settings.manage``。
 @router.put("/config/vm-defaults")
 async def put_vm_defaults(
     payload: VmDefaultsIn,
@@ -1639,29 +1663,9 @@ async def put_vm_defaults(
 
 # ==================================================== 资源规格（管理员定义）
 # 用户下单时挑「几核几 G 多大盘」，规格由管理员在设置页维护。
-# 读取只要求登录（下单页要用它渲染规格卡片，且它不含敏感信息）；
-# 写入要求 settings.manage —— 与 IP 池、创建默认值同一档。
-@router.get("/config/specs")
-async def get_specs(
-    user: Dict[str, Any] = Depends(security.get_current_user),
-) -> Dict[str, Any]:
-    """全量资源规格。从未保存过时返回内置那几档（见 :data:`app.specs.DEFAULT_SPECS`）。"""
-    return {"specs": await specs.list_specs()}
-
-
-@router.get("/config/specs/presets")
-async def get_spec_presets(
-    user: Dict[str, Any] = Depends(security.get_current_user),
-) -> Dict[str, Any]:
-    """内置的常用规格（只读）。
-
-    和 ``GET /config/specs`` 的区别：那份是**当前生效的配置**，老部署里早就存了
-    自己的一套，内置表读不到了。设置页的「添加常用规格」要把内置表并进草稿，
-    所以单开这条 —— 纯静态数据，不碰库，也不含任何敏感信息，读权限与上面一致。
-    """
-    return {"specs": specs.presets()}
-
-
+#
+# 读在 ``GET /api/runtime/specs``（还有 ``/specs/presets``）：下单的人得能挑，
+# 所以那条只要求登录；写留在这里 —— ``/api/config/*`` 整组 ``settings.manage``。
 @router.put("/config/specs")
 async def put_specs(
     payload: List[Dict[str, Any]],
@@ -1688,10 +1692,11 @@ async def put_specs(
 # 三档：关闭 / 图形验证码 / 拖动滑块。存在 settings KV 表，改完立即生效，
 # 不需要重启（登录接口每次现读，见 captcha.get_mode）。
 #
-# 读取只要求登录：设置页要显示当前值，而它不含任何敏感信息（就是个枚举）。
-# 写入要求 settings.manage，并且**要过二次确认** —— 把验证码关掉等于降低
-# 整个面板的登录门槛，和改连接凭据属于同一类操作，不该只凭一个在线的会话
-# 就能完成。
+# 读与写都在 ``settings.manage`` 这一档（路由级守卫，见 app/routeguard.py）：
+# 它不是凭据，但「登录门槛现在关掉了」本身就是攻击者最想确认的一条情报 ——
+# 只有打算登录的人才需要读它，而这个人应该是管理员。
+# 写入还要**过二次确认** —— 把验证码关掉等于降低整个面板的登录门槛，和改连接
+# 凭据属于同一类操作，不该只凭一个在线的会话就能完成。
 
 
 @router.get("/config/login-captcha")
@@ -1723,15 +1728,331 @@ async def put_login_captcha(
     return {"mode": mode}
 
 
+# ============================================================ 注册方式
+# 四种模式互斥（关闭 / 邀请制 / 注册码制 / 自助），存 settings KV，改完下一
+# 次注册请求就生效，不用重启。整组读写都在 ``/api/config`` 前缀下，路由守卫
+# 已经统一收进 ``settings.manage``；写操作再加 step-up，并落审计 —— 换注册
+# 方式等于放开一个匿名写入口，必须留痕。
+
+
+@router.get("/config/registration")
+async def get_registration(
+    _user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+) -> Dict[str, Any]:
+    """注册方式 + 凭证列表（不含明文，库里也没有）。"""
+    mode = await regcodes.current_mode()
+    configured = await regcodes.configured_mode()
+    return {
+        "mode": mode,
+        "requires": regcodes.MODE_KIND.get(mode) or "",
+        # 是否在设置页显式选过；null 表示仍跟着 REGISTER_ENABLED 走
+        "configured": configured,
+        "modes": list(regcodes.MODES),
+        # 自助注册的邮箱验证码开关：只对 open 模式生效，但设置页要能提前看到它
+        "email_code_enabled": await emailcodes.enabled(),
+        "codes": await regcodes.list_codes(),
+        "limits": {
+            "default_ttl_minutes": regcodes.DEFAULT_TTL_MINUTES,
+            "default_max_uses": regcodes.DEFAULT_MAX_USES,
+            "max_ttl_minutes": regcodes.MAX_TTL_MINUTES,
+            "max_uses": regcodes.MAX_USES_LIMIT,
+        },
+    }
+
+
+@router.put("/config/registration/mode")
+async def put_registration_mode(
+    payload: RegistrationModeIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    mode = regcodes.normalize_mode(payload.mode)
+    if mode is None:
+        raise HTTPException(status_code=400, detail="未知的注册方式")
+    previous = await regcodes.current_mode()
+    await regcodes.set_mode(mode)
+    if previous != mode:
+        logger.info("注册方式已切换：%s → %s（%s）", previous, mode, user.get("username"))
+    await security.audit(
+        request,
+        user,
+        "config.registration_mode",
+        target="registration",
+        detail={"from": previous, "to": mode},
+    )
+    return {"mode": mode, "requires": regcodes.MODE_KIND.get(mode) or ""}
+
+
+@router.put("/config/registration/email-code")
+async def put_registration_email_code(
+    payload: RegistrationEmailCodeIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    """自助注册的邮箱验证码开关。
+
+    单独一个接口、只改这一个字段：整份「保存配置」会覆盖所有字段，两个管理员
+    同时编辑时，后保存的那份会把对方刚改的开关带回旧值。
+
+    关掉之后自助注册退回「只要人机校验」的老行为 —— 邮件服务没配好、或者不想
+    让注册依赖 SMTP 的部署可以走这条路，但代价是邮箱不再被验证（批量注册与
+    「用别人的邮箱注册」重新变得没有成本），确认弹窗里已经把这句话讲明白。
+    """
+    previous = await emailcodes.enabled()
+    enabled = await emailcodes.set_enabled(bool(payload.enabled))
+    if previous != enabled:
+        logger.info(
+            "注册邮箱验证码：%s → %s（%s）", previous, enabled, user.get("username")
+        )
+    await security.audit(
+        request,
+        user,
+        "config.registration_email_code",
+        target="registration",
+        detail={"from": previous, "to": enabled},
+    )
+    return {"email_code_enabled": enabled}
+
+
+@router.post("/config/registration/codes")
+async def post_registration_code(
+    payload: RegistrationCodeIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    """签发注册码。**明文只在这个响应里出现一次**。
+
+    邀请制已只保留邀请链接，所以这里不再接受 ``kind=invite``：存量邀请码
+    仍在表里（不迁移），但既不能新发，也不会被注册流程校验。
+    """
+    kind = regcodes.normalize_kind(payload.kind)
+    if kind is None:
+        raise HTTPException(status_code=400, detail="未知的凭证类型")
+    if kind == regcodes.KIND_INVITE:
+        raise HTTPException(
+            status_code=400,
+            detail="邀请制已改为仅支持邀请链接，请在签发凭证里选择邀请链接",
+        )
+    # 注册码也能提前指定角色与额度：注册那一刻写进新账号，不必等审批再设一遍
+    role_id = str(payload.role or "viewer").strip()
+    role = await store.get_role(role_id)
+    if not role:
+        raise HTTPException(status_code=400, detail=f"角色 {role_id} 不存在")
+    await security.ensure_can_assign_role(user, role_id)
+    limits = quota.provided_limits(payload.quota)
+    row = await regcodes.create_code(
+        kind=kind,
+        note=payload.note,
+        created_by=str(user.get("username") or ""),
+        ttl_minutes=payload.ttl_minutes,
+        max_uses=payload.max_uses,
+        role=role_id,
+        quota=limits,
+        requires_approval=payload.requires_approval,
+    )
+    await security.audit(
+        request,
+        user,
+        "config.registration_code_create",
+        target=str(row.get("id") or ""),
+        detail={
+            "kind": kind,
+            "note": row.get("note"),
+            "expires": row.get("expires"),
+            "max_uses": row.get("max_uses"),
+            "role": role_id,
+            "quota": bool(limits),
+            "requires_approval": payload.requires_approval,
+        },
+    )
+    return {**row, "role_name": str(role.get("name") or role_id)}
+
+
+@router.post("/config/registration/codes/{code_id}/revoke")
+async def revoke_registration_code(
+    code_id: str,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    row = await regcodes.get_code(code_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="凭证不存在")
+    if not await regcodes.revoke(code_id):
+        raise HTTPException(status_code=404, detail="凭证不存在")
+    await security.audit(
+        request,
+        user,
+        "config.registration_code_revoke",
+        target=code_id,
+        detail={"kind": row.get("kind"), "note": row.get("note")},
+    )
+    return {"id": code_id, "revoked": True}
+
+
+@router.delete("/config/registration/codes/{code_id}")
+async def delete_registration_code(
+    code_id: str,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    """删除凭证：只允许删「已不可能再用」的（撤销 / 过期 / 次数用尽）。"""
+    row = await regcodes.get_code(code_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="凭证不存在")
+    if not await regcodes.delete_code(code_id):
+        raise HTTPException(
+            status_code=400, detail="仍然有效的凭证不能删除，请先撤销"
+        )
+    await security.audit(
+        request,
+        user,
+        "config.registration_code_delete",
+        target=code_id,
+        detail={"kind": row.get("kind"), "note": row.get("note")},
+    )
+    return {"id": code_id, "deleted": True}
+
+
+# ============================================================ 邀请链接
+# 链接属于「邀请制」：它是邀请凭证的另一种载体（URL 代替文本码），可附角色与
+# 审批策略。模式仍是邀请制，注册入口仍是 /register，校验与审批走同一套规则。
+#
+# 分发出去的是 URL（``/register?invite=<token>``），所以 api 回包里直接给
+# ``path``，前端拿 ``window.location.origin`` 一拼即可，不必自己知道参数名。
+
+
+def _invite_path(token: str) -> str:
+    return f"/register?invite={quote(str(token or ''))}"
+
+
+async def _role_name(role_id: str) -> str:
+    """角色名缓存不了（角色随时可改），但这张表一次只查一条，够用。"""
+    role = await store.get_role(str(role_id or "")) or {}
+    return str(role.get("name") or role_id or "")
+
+
+@router.get("/config/invites")
+async def list_invite_links(
+    _user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+) -> Dict[str, Any]:
+    """邀请链接列表（含 token：链接需要能被再次复制，见 app/invites.py 模块头）。"""
+    rows = await invites.list_invites()
+    roles = {str(r.get("id")): str(r.get("name") or r.get("id")) for r in await store.list_roles()}
+    for row in rows:
+        row["role_name"] = roles.get(row["role"], row["role"])
+        row["path"] = _invite_path(row["token"])
+    return {
+        "invites": rows,
+        "limits": {
+            "max_uses": invites.MAX_USES_LIMIT,
+            "max_ttl_days": invites.MAX_TTL_DAYS,
+            "default_ttl_days": invites.DEFAULT_TTL_DAYS,
+        },
+    }
+
+
+@router.post("/config/invites")
+async def create_invite_link(
+    payload: InviteLinkIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    # 建链接 = 预先决定一批新账号的角色，与「审批」是同一量级的授权行为
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    role_id = str(payload.role or "viewer").strip()
+    role = await store.get_role(role_id)
+    if not role:
+        raise HTTPException(status_code=400, detail=f"角色 {role_id} 不存在")
+    # 授予链边界：不能造一个「进来就比自己权限高」的入口
+    await security.ensure_can_assign_role(user, role_id)
+
+    limits = quota.provided_limits(payload.quota)
+    row = await invites.create_invite(
+        role=role_id,
+        note=payload.note,
+        created_by=str(user.get("username") or ""),
+        requires_approval=payload.requires_approval,
+        max_uses=payload.max_uses,
+        ttl_days=payload.ttl_days,
+        quota=limits,
+    )
+    await security.audit(
+        request,
+        user,
+        "config.invite_create",
+        target=str(row.get("id") or ""),
+        detail={
+            "role": role_id,
+            "requires_approval": bool(payload.requires_approval),
+            "max_uses": row.get("max_uses"),
+            "expires": row.get("expires"),
+            "note": row.get("note"),
+            "quota": bool(limits),
+        },
+    )
+    return {**row, "role_name": str(role.get("name") or role_id), "path": _invite_path(row["token"])}
+
+
+@router.post("/config/invites/{invite_id}/revoke")
+async def revoke_invite_link(
+    invite_id: str,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    row = await invites.get_invite(invite_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="邀请链接不存在")
+    if not await invites.revoke(invite_id):
+        raise HTTPException(status_code=404, detail="邀请链接不存在")
+    await security.audit(
+        request,
+        user,
+        "config.invite_revoke",
+        target=invite_id,
+        detail={"note": row.get("note"), "used_count": row.get("used_count")},
+    )
+    return {"id": invite_id, "revoked": True}
+
+
+@router.delete("/config/invites/{invite_id}")
+async def delete_invite_link(
+    invite_id: str,
+    request: Request,
+    user: Dict[str, Any] = Depends(security.require_permission("settings.manage")),
+    _step_up: Dict[str, Any] = Depends(security.require_step_up()),
+) -> Dict[str, Any]:
+    """删除：只允许删「已不可能再用」的（失效 / 过期 / 次数用尽）。"""
+    row = await invites.get_invite(invite_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="邀请链接不存在")
+    if not await invites.delete_invite(invite_id):
+        raise HTTPException(status_code=400, detail="仍然有效的邀请链接不能删除，请先失效")
+    await security.audit(
+        request,
+        user,
+        "config.invite_delete",
+        target=invite_id,
+        detail={"note": row.get("note"), "used_count": row.get("used_count")},
+    )
+    return {"id": invite_id, "deleted": True}
+
+
 # ============================================================ 会话有效期
 # 管理员可调：访问令牌多久过期、会话（refresh token）保留几天。
 #
 # 存 settings KV，改完**立即生效**、不用重启 —— security.py 里有一份进程内
 # 缓存（签发令牌是同步函数，不能在那里查库），写入路径负责刷新它。
 #
-# 读取只要求登录：设置页要回显当前值，且它不含凭据类信息。
-# 写入要求 settings.manage + 二次确认：把有效期调成 30 天等于放松整个面板的
-# 会话保障，和「关掉验证码」属于同一类操作。
+# 读**不再**「登录即可」：这份读数把会话窗口、上下限与出厂默认值一并回给调用方，
+# 等于告诉对方「偷到的 cookie 还能用多久、多久不动会被踢」。只有设置页用它，
+# 所以整组收进 ``settings.manage``（路由级守卫，见 app/routeguard.py）。
+# 写入还要二次确认：把有效期调成 30 天等于放松整个面板的会话保障。
 
 
 @router.get("/config/session")
@@ -1785,17 +2106,10 @@ async def put_session_policy(
 
 # ============================================================ 面板界面开关
 # 即「设置 → 导航栏功能开关」（见 app/ui.py）：逐项关闭导航栏里的入口。
-# 它决定每个用户的控制台里能看见哪些入口，所以读取只要求登录 —— 控制台外壳
-# 在渲染前就得拿到它，只给管理员读的话，被关掉的入口对其他用户依然可见。
-# 写入要求 settings.manage：这个开关对所有用户生效。
-
-
-@router.get("/config/ui")
-async def get_ui_prefs(
-    user: Dict[str, Any] = Depends(security.get_current_user),
-) -> Dict[str, Any]:
-    """面板界面开关。无需特权：控制台布局在每个用户登录后立即需要。"""
-    return await ui.get_ui_prefs()
+#
+# 读在 ``GET /api/runtime/ui``：控制台外壳在渲染前就得拿到它，只给管理员读的
+# 话，被关掉的入口对其他用户依然可见 —— 所以那条只要求登录。写留在这里：
+# 这个开关对所有用户生效，属于管理动作（``settings.manage``）。
 
 
 @router.put("/config/ui")
@@ -1821,6 +2135,10 @@ async def put_ui_prefs(
 # 站点信息（品牌名 / 副标题 / 版权）。登录页与产品官网都要在「未登录」状态下
 # 展示品牌名，所以这里刻意不做鉴权：读取只返回可公开的品牌文案，不含任何
 # 连接信息或凭据。写入仍然要求 settings.manage。
+#
+# **它是 routeguard 的匿名白名单成员**（``routeguard.PUBLIC_ROUTES``），
+# 和 Logo / 登录页背景图 / FAQ 同一类。往这个前缀下再加端点时不要顺手把它当
+# 例子 —— 白名单是按「方法 + 完整路径」精确匹配的，新端点默认走 settings.manage。
 
 
 @router.get("/config/site")
@@ -2021,12 +2339,22 @@ async def delete_site_login_bg(
 
 
 # --------------------------------------------------------------- 邮件通知
+# SMTP 配置是**纯管理信息**：主机与端口说清了出网方向，发件账号与管理员收件人
+# 直接就是钓鱼的目标清单，``verify_ssl`` 还说明了这条路能不能被中间人利用。
+# 此前它只要登录就能读（同组的 connection / diagnostics 却要 settings.manage），
+# 是审计项点名的泄露点之一。现在整组 ``/api/config`` 统一 ``settings.manage``：
+# 非管理员一律 403，连「有没有配过邮件」都不告诉它。
 @router.get("/config/mail")
 async def get_mail_config(
     request: Request,
     user: Dict[str, Any] = Depends(security.get_current_user),
 ) -> Dict[str, Any]:
-    """邮件配置。SMTP 密码只回 ``password_set``，明文永不出库。"""
+    """邮件配置。SMTP 密码只回 ``password_set``，明文永不出库。
+
+    读权限与写同一档（``settings.manage``，由路由级守卫施加）：这句话的重点是
+    「不回明文」而不是「谁都能读」—— 主机 / 端口 / 发件人 / 收件人已经足够
+    支撑一轮钓鱼或一次 SMTP 侧的攻击面探测。
+    """
     await security.audit_read(request, user, "config.mail.read")
     return mailer.public_mail(await mailer.load_mail())
 
@@ -2061,6 +2389,10 @@ async def update_mail_config(
 # ------------------------------------------------------------- 面板全局地址
 # 邮件里拼「重置密码 / 审批结果」链接时用的对外域名。不配则回落到请求 Host
 # —— 挂在反向代理后面时那个 Host 常是 localhost，收件人根本打不开。
+#
+# 读也收在 ``settings.manage``：这条读数是「面板在外网叫什么」，配上连接配置
+# 就能拼出完整的访问入口；而除了设置页，没有别的地方需要它（登录页的对外地址
+# 由请求 Host 自己决定）。
 
 
 @router.get("/config/panel-url")
@@ -2133,10 +2465,12 @@ async def get_security_posture(
 async def get_vm_quota(
     user: Dict[str, Any] = Depends(security.get_current_user),
 ) -> Dict[str, Any]:
-    """虚拟机下发总配额（全局容量上限）。
+    """虚拟机下发总配额（**管理端回显**，全局容量上限）。
 
-    ``quota`` 为 ``null`` 表示不限制。读取只要求登录：创建向导要把它显示给
-    每一个可创建虚拟机的用户。
+    ``quota`` 为 ``null`` 表示不限制。读权限与写同一档（``settings.manage``，
+    路由级守卫）：这是**全平台**护栏，连同「已用多少台 / 还剩多少」一起，
+    拼起来就是集群规模。普通用户看自己那份用 ``GET /api/quota/me``（按人分配
+    的额度与名下用量，口径不同，别混用）。
     """
     return await quota.usage(user, "vm")
 
@@ -2145,9 +2479,9 @@ async def get_vm_quota(
 async def get_lxc_quota(
     user: Dict[str, Any] = Depends(security.get_current_user),
 ) -> Dict[str, Any]:
-    """容器下发总配额。与虚拟机额度**互相独立**（互不占用）。
+    """容器下发总配额（管理端回显）。与虚拟机额度**互相独立**（互不占用）。
 
-    单独给一条路径而不是复用 ``?kind=``：前端两个创建向导各自拉自己那份，
+    单独给一条路径而不是复用 ``?kind=``：设置页两份读数各拉自己那份，
     显式路径比查询参数少一层「传错了就静默拿错额度」的风险。
     """
     return await quota.usage(user, "lxc")

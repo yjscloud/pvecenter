@@ -20,6 +20,7 @@ import {
   clusterApi,
   mailApi,
   panelApi,
+  rolesApi,
   siteApi,
 } from '../api/endpoints';
 import { errorMessage, isNotImplemented } from '../api/client';
@@ -80,8 +81,10 @@ import {
   IconMenu,
   IconPlug,
   IconKey,
+  IconUser,
   IconWrench,
 } from '../components/Icons';
+import { useConfirm } from '../components/ui/ConfirmDialog';
 import { formatDateTime } from '../utils/format';
 import { useToast } from '../hooks/useToast';
 import { useAuth } from '../hooks/useAuth';
@@ -95,11 +98,15 @@ import type {
   ClusterStatus,
   FaqItem,
   HealthStatus,
+  InviteLink,
   LoginCaptchaMode,
   MailConfigInput,
   MailTlsMode,
   MaintenanceState,
   PanelSettings,
+  QuotaLimits,
+  RegistrationCode,
+  RegisterMode,
   SiteInfo,
   SiteLink,
   UiPrefs,
@@ -120,8 +127,8 @@ import type {
 
    现在改成控制台里通用的那套：
      * 整页铺满，不再设宽度上限（与 Dashboard / Profile / Frp 一致）；
-     * 8 个分区全部按顺序排下来，用分组标题（面板偏好 / 服务端配置 /
-       运行信息）把卡片分段，分组的作用范围直接写在标题旁边；
+     * 所有分区按「运行状态 → 面板与创建 → 登录与访问 → 对外呈现」四段排下来，
+       段与段之间在导航里画一道竖线（段内项的顺序见 allSections 上方注释）；
      * 顶部一条吸顶的区块导航，点一下跳过去，滚动时高亮当前所在分区。
 
    当前分区仍然放在 URL（?tab=）里：刷新、分享链接、浏览器后退都还能回到原处。
@@ -142,12 +149,17 @@ interface SettingsSection {
 }
 
 /**
- * 分组键：面板偏好 / 服务端配置 / 运行信息。
+ * 分组键，按「用户改的是谁」划分，而不是按技术对象：
  *
- * 这三类**不再各自带一行可见标题**（原先标题会压在一组卡片前面，多一层要读的
- * 字），它们只用来界分导航里的节 —— 组与组之间画一道竖线（page-index-sep）。
+ *   runtime  运行状态   —— 只读，先确认系统可管理
+ *   panel    面板与创建 —— 改完立刻影响日常操作：偏好、建机默认值、规格、导航
+ *   access   登录与访问 —— 账号从哪来、进来后能待多久、边界在哪（风险递增）
+ *   content  对外呈现   —— 站点长相、链接域名、邮件、FAQ 内容
+ *
+ * 这四类**不各带一行可见标题**（标题会压在一组卡片前面，多一层要读的字），
+ * 只用来界分导航里的节 —— 组与组之间画一道竖线（page-index-sep）。
  */
-type SettingsGroup = 'prefs' | 'server' | 'runtime';
+type SettingsGroup = 'runtime' | 'panel' | 'access' | 'content';
 
 /** 分区卡片的 DOM id 前缀：吸顶导航的跳转与高亮都按 `前缀 + 分区 id` 找元素 */
 const SECTION_ID_PREFIX = 'section-';
@@ -177,9 +189,20 @@ export function Settings() {
     retry: 1,
   });
 
+  /* 列表顺序即页面顺序，导航里的分段也跟着它走。四组由上到下：
+     运行状态 → 面板与创建 → 登录与访问 → 对外呈现。
+
+     组内排序的依据是「同一件事的配置项必须相邻」：
+       * 创建默认值 + 资源配置规格：一个定预填值，一个定可选范围；
+       * 登录验证 + 注册方式：一个定「怎么证明你是人」，一个定「账号从哪来」；
+       * 会话在注册之后：账号进来之后能待多久；
+       * 加固收在该组末尾：它是整体边界，风险最高；
+       * 站点信息 + 面板全局地址 + 邮件：邮件里的链接就是「站点名 + 域名」；
+       * FAQ 是给别人看的面板内容，跟着站点呈现走，不单独占一个「帮助」组。 */
   const allSections: SettingsSection[] = [
     /* 系统信息排最前：它是「设置」这一页的入口 —— 先看清面板与集群的状态，
-       再去调具体项。列表顺序即页面顺序，导航里的分段也跟着它走。 */
+       再去调具体项。它是全页唯一的只读分区，自成一组的理由也在这里：
+       「改」的东西都在它下面。 */
     {
       id: 'system',
       group: 'runtime',
@@ -199,9 +222,11 @@ export function Settings() {
         />
       ),
     },
+    /* 第二组：改完立刻影响日常操作的东西。面板设置是唯一「人人可用」的分区，
+       放组首；它存的是本浏览器偏好，卡片里要注明这一点（不是站点策略）。 */
     {
       id: 'panel',
-      group: 'prefs',
+      group: 'panel',
       /* 名字取卡片标题本身：导航项与卡片标题不一致时，「点了导航却找不到
          对应卡片」是必然的事 */
       label: t('settings.secPanel'),
@@ -211,16 +236,17 @@ export function Settings() {
     },
     {
       id: 'vm-defaults',
-      group: 'prefs',
+      group: 'panel',
       label: t('settings.secVmDefaults'),
       desc: t('settings.secVmDefaultsDesc'),
       icon: <IconVm size={16} />,
       adminOnly: true,
       render: () => <VMCreateDefaultsSection />,
     },
+    /* 规格紧跟默认值：前者定「预填什么」，后者定「能选什么」。 */
     {
       id: 'specs',
-      group: 'server',
+      group: 'panel',
       label: t('settings.secSpecs'),
       /* 与卡片标题一致：导航项与卡片标题不一样时，用户点了会以为走错了地方 */
       desc: t('settings.secSpecsDesc'),
@@ -228,27 +254,22 @@ export function Settings() {
       adminOnly: true,
       render: () => <ResourceSpecsPanel />,
     },
+    /* 导航开关放组末：全局生效但即时可回退，与「建机能建出什么」无关，
+       夹在默认值与规格之间会打断那条动线。 */
     {
       id: 'sidebar',
-      group: 'server',
+      group: 'panel',
       label: t('settings.secSidebar'),
       desc: t('settings.secSidebarDesc'),
       icon: <IconMenu size={16} />,
       adminOnly: true,
       render: () => <SidebarNavSection />,
     },
-    {
-      id: 'site',
-      group: 'server',
-      label: t('settings.secSite'),
-      desc: t('settings.secSiteDesc'),
-      icon: <IconLayers size={16} />,
-      adminOnly: true,
-      render: () => <SiteInfoSection />,
-    },
+    /* 第三组：准入链条「谁能进 → 从哪来 → 待多久 → 边界在哪」，风险递增。
+       安全项低频但改错代价高，所以不沉到页面最底部 —— 排障时在首屏范围内。 */
     {
       id: 'captcha',
-      group: 'server',
+      group: 'access',
       label: t('settings.secCaptcha'),
       desc: t('settings.secCaptchaDesc'),
       icon: <IconShield size={16} />,
@@ -256,8 +277,17 @@ export function Settings() {
       render: () => <LoginCaptchaSection />,
     },
     {
+      id: 'registration',
+      group: 'access',
+      label: t('settings.secRegistration'),
+      desc: t('settings.secRegistrationDesc'),
+      icon: <IconUser size={16} />,
+      adminOnly: true,
+      render: () => <RegistrationSection />,
+    },
+    {
       id: 'session',
-      group: 'server',
+      group: 'access',
       label: t('settings.secSession'),
       desc: t('settings.secSessionDesc'),
       icon: <IconKey size={16} />,
@@ -266,16 +296,27 @@ export function Settings() {
     },
     {
       id: 'hardening',
-      group: 'server',
+      group: 'access',
       label: t('settings.secHardening'),
       desc: t('settings.secHardeningDesc'),
       icon: <IconShield size={16} />,
       adminOnly: true,
       render: () => <SecurityPostureSection />,
     },
+    /* 第四组：面板对外长什么样。站点名与全局地址是同一封邮件里的两半，
+       改完一个通常要改另一个，所以必须相邻；邮件紧跟它们（最依赖 URL 的出口）。 */
+    {
+      id: 'site',
+      group: 'content',
+      label: t('settings.secSite'),
+      desc: t('settings.secSiteDesc'),
+      icon: <IconLayers size={16} />,
+      adminOnly: true,
+      render: () => <SiteInfoSection />,
+    },
     {
       id: 'panel-url',
-      group: 'server',
+      group: 'content',
       label: t('settings.secPanelUrl'),
       desc: t('settings.secPanelUrlDesc'),
       icon: <IconLink size={16} />,
@@ -283,22 +324,24 @@ export function Settings() {
       render: () => <PanelUrlSection />,
     },
     {
-      id: 'faq',
-      group: 'server',
-      label: t('settings.secFaq'),
-      desc: t('settings.secFaqDesc'),
-      icon: <IconInfo size={16} />,
-      adminOnly: true,
-      render: () => <FaqSection />,
-    },
-    {
       id: 'mail',
-      group: 'server',
+      group: 'content',
       label: t('settings.secMail'),
       desc: t('settings.secMailDesc'),
       icon: <IconBell size={16} />,
       adminOnly: true,
       render: () => <EmailSection />,
+    },
+    /* FAQ 维护的是「面板里呈现给所有用户的内容」，与站点信息同类；
+       放进独立的「帮助」组会把这一组劈成首尾两段（系统信息在最前）。 */
+    {
+      id: 'faq',
+      group: 'content',
+      label: t('settings.secFaq'),
+      desc: t('settings.secFaqDesc'),
+      icon: <IconInfo size={16} />,
+      adminOnly: true,
+      render: () => <FaqSection />,
     },
     ];
   const sections = allSections.filter((item) => !item.adminOnly || canManage);
@@ -1923,6 +1966,1067 @@ interface SessionPolicyData {
   defaults: { access_minutes: number; refresh_days: number };
 }
 
+/* ==========================================================================
+   注册方式：关闭 / 邀请制 / 注册码制 / 自助（四选一，互斥）
+   --------------------------------------------------------------------------
+   模式存后端 settings KV，切完**下一次注册请求就生效** —— 所以保存成功后要把
+   公开接口（登录页、注册页读的那个）的缓存一并失效，否则用户刷新登录页仍看到
+   旧入口。
+
+   邀请凭证与注册码是同一张表的两种 kind：当前模式决定认哪一种。签发接口的
+   明文**只回一次**，列表里没有（库里也只存哈希），所以拿到后必须当场复制。
+   ========================================================================== */
+/* ---------------------------------------------------------------------------
+   资源额度草稿（注册时分配给新账号）
+   后端额度是 vm / ct / snapshot 三组共 16 个字段；注册场景真正会填的只有
+   台数 / 核数 / 内存 / 磁盘，所以只暴露 10 格，留空即「不额外限制」。
+   内存这一格按 GB 输入，提交时换算成后端要求的 MB。
+   --------------------------------------------------------------------------- */
+type QuotaDraft = {
+  vmCount: string;
+  vmCores: string;
+  vmMemory: string;
+  vmDisk: string;
+  ctCount: string;
+  ctCores: string;
+  ctMemory: string;
+  ctDisk: string;
+  snapCount: string;
+  snapPerGuest: string;
+};
+
+const EMPTY_QUOTA_DRAFT: QuotaDraft = {
+  vmCount: '',
+  vmCores: '',
+  vmMemory: '',
+  vmDisk: '',
+  ctCount: '',
+  ctCores: '',
+  ctMemory: '',
+  ctDisk: '',
+  snapCount: '',
+  snapPerGuest: '',
+};
+
+/** 把草稿收成后端要的额度结构；有非法输入时返回 bad。 */
+function buildQuotaPayload(draft: QuotaDraft): { quota?: QuotaLimits; bad: boolean } {
+  const num = (value: string): number | null => {
+    const text = value.trim();
+    if (!text) return null;
+    const parsed = Number(text);
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : NaN;
+  };
+  /* 表单里内存按 GB 填（0.5 = 512 MB），库里仍是 MB：1 GB = 1024 MB。
+     允许小数但不允许出现小数 MB，输入换算后取整。 */
+  const memoryMb = (value: string): number | null => {
+    const text = value.trim();
+    if (!text) return null;
+    const parsed = Number(text);
+    if (!Number.isFinite(parsed) || parsed < 0) return NaN;
+    const mb = Math.round(parsed * 1024);
+    return Number.isFinite(mb) ? mb : NaN;
+  };
+  const vmCount = num(draft.vmCount);
+  const vmCores = num(draft.vmCores);
+  const vmMemory = memoryMb(draft.vmMemory);
+  const vmDisk = num(draft.vmDisk);
+  const ctCount = num(draft.ctCount);
+  const ctCores = num(draft.ctCores);
+  const ctMemory = memoryMb(draft.ctMemory);
+  const ctDisk = num(draft.ctDisk);
+  const fields = [
+    vmCount, vmCores, vmMemory, vmDisk,
+    ctCount, ctCores, ctMemory, ctDisk,
+    num(draft.snapCount), num(draft.snapPerGuest),
+  ];
+  if (fields.some((value) => Number.isNaN(value))) return { bad: true };
+  // 全空 = 不设置：传一份全 null 的额度会被当成「显式全不限制」，把角色额度盖掉
+  if (fields.every((value) => value === null)) return { bad: false };
+
+  const group = (
+    count: number | null,
+    cores: number | null,
+    memory: number | null,
+    disk: number | null,
+  ) => ({
+    count,
+    cores,
+    memory_mb: memory,
+    disk_gb: disk,
+    // 单台封顶不在注册表单里，保持 null（不限制）
+    max_cores: null,
+    max_memory_mb: null,
+    max_disk_gb: null,
+  });
+
+  return {
+    bad: false,
+    quota: {
+      vm: group(vmCount, vmCores, vmMemory, vmDisk),
+      ct: group(ctCount, ctCores, ctMemory, ctDisk),
+      snapshot: { count: num(draft.snapCount), per_guest: num(draft.snapPerGuest) },
+    },
+  };
+}
+
+/* 额度表单：默认收起。签发一条凭证时通常不会逐格填额度，展开反而把
+   「备注 / 角色 / 次数」这些必填项挤到看不见的地方。 */
+function QuotaFields({
+  draft,
+  onChange,
+  error,
+  disabled,
+}: {
+  draft: QuotaDraft;
+  onChange: (patch: Partial<QuotaDraft>) => void;
+  error?: string;
+  disabled?: boolean;
+}) {
+  const t = useT();
+  const field = (key: keyof QuotaDraft, label: string) => (
+    <Input
+      key={key}
+      label={label}
+      value={draft[key]}
+      onChange={(e) => onChange({ [key]: e.target.value } as Partial<QuotaDraft>)}
+      disabled={disabled}
+      inputMode={key === 'vmMemory' || key === 'ctMemory' ? 'decimal' : 'numeric'}
+    />
+  );
+  return (
+    <details className="reg-quota">
+      <summary>{t('settings.quotaSection')}</summary>
+      <p className="reg-quota-hint">{t('settings.quotaSectionHint')}</p>
+      <div className="reg-quota-grid">
+        {field('vmCount', t('settings.quotaVmCount'))}
+        {field('vmCores', t('settings.quotaVmCores'))}
+        {field('vmMemory', t('settings.quotaVmMemory'))}
+        {field('vmDisk', t('settings.quotaVmDisk'))}
+        {field('ctCount', t('settings.quotaCtCount'))}
+        {field('ctCores', t('settings.quotaCtCores'))}
+        {field('ctMemory', t('settings.quotaCtMemory'))}
+        {field('ctDisk', t('settings.quotaCtDisk'))}
+        {field('snapCount', t('settings.quotaSnapCount'))}
+        {field('snapPerGuest', t('settings.quotaSnapPer'))}
+      </div>
+      {error ? <p className="reg-quota-error">{error}</p> : null}
+    </details>
+  );
+}
+
+/** 清单里的「额度」一栏：有配置 = 已指定，没有 = 继承角色 */
+function hasQuota(quota: QuotaLimits | null | undefined): boolean {
+  if (!quota) return false;
+  return Object.values(quota).some((group) =>
+    Object.values(group as Record<string, number | null>).some((value) => value !== null),
+  );
+}
+
+
+function RegistrationSection() {
+  const t = useT();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+  const { hasPermission } = useAuth();
+  const [confirmEl, confirm] = useConfirm();
+  const canManage = hasPermission('settings.manage');
+
+  const query = useQuery({
+    queryKey: ['config', 'registration'],
+    queryFn: configApi.getRegistration,
+    staleTime: 10_000,
+    retry: false,
+  });
+
+  const [mode, setMode] = useState<RegisterMode>('off');
+  const [saving, setSaving] = useState(false);
+  /* 凭证类型是模式的结论，不是可选项：邀请制只发「邀请凭证」，注册码制只发
+     注册码。之前给了「邀请码 / 注册码」二选一，等于允许在邀请制下发注册码 ——
+     登录页认的是模式，发错了也用不上。 */
+  const kind: 'invite' | 'code' = mode === 'code' ? 'code' : 'invite';
+  /*
+    邀请制只签发邀请链接：它是唯一被邀请制认的凭证（app/invites.py）。
+    文本邀请码不再签发、也不再校验 —— 存量记录留在表里不迁移，但邀请制下
+    看不到、用不上。注册码制仍签注册码，两者互不影响。
+  */
+  const [note, setNote] = useState('');
+  const [ttl, setTtl] = useState('');
+  const [maxUses, setMaxUses] = useState('1');
+  /* 两种模式共用的「新用户名分」：角色 + 资源额度 */
+  const [assignRole, setAssignRole] = useState('viewer');
+  const [quotaDraft, setQuotaDraft] = useState<QuotaDraft>(EMPTY_QUOTA_DRAFT);
+  /* 审批策略两种凭证共用：注册码与邀请链接都能关掉审批；次数、有效期按形态分开存 */
+  const [approval, setApproval] = useState(true);
+  const [linkMaxUses, setLinkMaxUses] = useState('0');
+  const [linkTtlDays, setLinkTtlDays] = useState('7');
+  const [issuing, setIssuing] = useState(false);
+  /* 刚签发的东西：邀请码给明文，链接给完整 URL。两者都只在这条里出现 */
+  const [issued, setIssued] = useState<
+    | { type: 'code'; code: string; kind: string; requiresApproval: boolean }
+    | { type: 'link'; url: string; requiresApproval: boolean }
+    | null
+  >(null);
+  /* 字段级校验：有效期 / 次数填错时红框落在输入框上，而不是只在 toast 里
+     闪一句 —— 一次要改的字段就这两个，定位成本比顶部提示低得多 */
+  const [fieldErrors, setFieldErrors] = useState<{
+    ttl?: string;
+    uses?: string;
+    quota?: string;
+  }>({});
+  /* 只在首次拿到服务端值时回填，之后不能被覆盖（用户可能正在切换） */
+  const loadedRef = useRef(false);
+
+  useEffect(() => {
+    if (!query.data || loadedRef.current) return;
+    loadedRef.current = true;
+    setMode(query.data.mode);
+  }, [query.data]);
+
+  /* 邮箱验证码开关：随每次查询回填（保存后 invalidate，服务端值就是真值）。
+     与 mode 不同，这里不设 loadedRef —— 关掉再打开、别处改动后刷新页面都要
+     跟得上，多写两次 state 没有副作用。 */
+  const [emailCode, setEmailCode] = useState(true);
+  const [savingEmailCode, setSavingEmailCode] = useState(false);
+  useEffect(() => {
+    if (!query.data) return;
+    setEmailCode(query.data.email_code_enabled);
+  }, [query.data]);
+
+  const modeDisabled = !canManage || saving;
+  const modeHints = useMemo<Record<RegisterMode, string>>(
+    () => ({
+      off: t('settings.regModeHintOff'),
+      invite: t('settings.regModeHintInvite'),
+      code: t('settings.regModeHintCode'),
+      open: t('settings.regModeHintOpen'),
+    }),
+    [t],
+  );
+  const modeOptions = useMemo(
+    () => [
+      {
+        label: t('settings.regModeOff'),
+        value: 'off' as RegisterMode,
+        hint: modeHints.off,
+        icon: <IconShield size={16} />,
+      },
+      {
+        label: t('settings.regModeInvite'),
+        value: 'invite' as RegisterMode,
+        hint: modeHints.invite,
+        icon: <IconLink size={16} />,
+      },
+      {
+        label: t('settings.regModeCode'),
+        value: 'code' as RegisterMode,
+        hint: modeHints.code,
+        icon: <IconKey size={16} />,
+      },
+      {
+        label: t('settings.regModeOpen'),
+        value: 'open' as RegisterMode,
+        hint: modeHints.open,
+        icon: <IconUser size={16} />,
+      },
+    ],
+    [t, modeHints],
+  );
+  /* 只有「邀请制 / 注册码制」需要凭证：关闭注册没有注册入口，自助注册走
+     审批、不校验凭证。这两种方式下签发表单和已签发清单都不该出现 —— 留着
+     会让人以为「注册已经关了，还能把邀请码发出去」。 */
+  const needsCredential = mode === 'invite' || mode === 'code';
+
+  /* 邀请链接清单：只属于邀请制，其它模式下不查（链接在那些模式下也不生效） */
+  const invitesQuery = useQuery({
+    queryKey: ['config', 'invites'],
+    queryFn: configApi.getInvites,
+    enabled: mode === 'invite',
+    staleTime: 15_000,
+    retry: false,
+  });
+  /* 角色列表与用户页共用 /roles 这一份（带 name）。两种签发模式都要用它：
+     注册码与邀请链接都能预先指定角色。 */
+  const rolesQuery = useQuery({
+    queryKey: ['roles'],
+    queryFn: () => rolesApi.list(),
+    enabled: needsCredential,
+    staleTime: 60_000,
+    retry: false,
+  });
+  const roleNameOf = (roleId: string) => {
+    const found = (rolesQuery.data ?? []).find((r) => r.id === roleId);
+    return found?.name ?? roleId;
+  };
+  const roleOptions = useMemo(
+    () =>
+      (rolesQuery.data ?? []).map((r) => ({
+        label: r.name,
+        value: r.id,
+      })),
+    [rolesQuery.data],
+  );
+  /* 角色被删掉后选中值会悬空，回落到第一个可用角色 */
+  useEffect(() => {
+    const list = rolesQuery.data ?? [];
+    if (!list.length) return;
+    if (list.some((r) => r.id === assignRole)) return;
+    setAssignRole(list[0].id);
+  }, [rolesQuery.data, assignRole]);
+
+  /* 换注册方式后，上一条「只显示一次」的明文就不该再摆着 ——
+     它属于上一次操作，留着会让人误以为是刚签发的 */
+  useEffect(() => {
+    setIssued(null);
+  }, [mode]);
+
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: ['config', 'registration'] });
+    void queryClient.invalidateQueries({ queryKey: ['config', 'invites'] });
+    /* 公开接口：登录页是否显示入口、注册页渲染哪个输入框，都读它 */
+    void queryClient.invalidateQueries({ queryKey: ['registration-mode'] });
+  };
+
+  const saveMode = async (next: RegisterMode) => {
+    if (!canManage || saving || next === mode) return;
+    if (next === 'open') {
+      const ok = await confirm({
+        title: t('settings.regOpenConfirmTitle'),
+        message: t('settings.regOpenConfirmBody'),
+        confirmText: t('settings.regOpenConfirmOk'),
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    setSaving(true);
+    try {
+      const saved = await configApi.saveRegistrationMode(next);
+      setMode(saved.mode);
+      invalidate();
+      toast.success(t('settings.regModeSaved'), modeHints[saved.mode]);
+    } catch (err) {
+      toast.error(t('common.opFailed'), errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /* 邮箱验证码开关：关掉是一个**削弱安全**的动作，先确认再写。
+     打开不需要确认 —— 它只会让注册更严格，不会放开任何东西。 */
+  const saveEmailCode = async (next: boolean) => {
+    if (!canManage || savingEmailCode || next === emailCode) return;
+    if (!next) {
+      const ok = await confirm({
+        title: t('settings.regEmailCodeOffConfirmTitle'),
+        message: t('settings.regEmailCodeOffConfirmBody'),
+        confirmText: t('settings.regEmailCodeOffConfirmOk'),
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    setSavingEmailCode(true);
+    try {
+      const res = await configApi.saveRegistrationEmailCode(next);
+      setEmailCode(res.email_code_enabled);
+      invalidate();
+      toast.success(
+        next ? t('settings.regEmailCodeOn') : t('settings.regEmailCodeOff'),
+      );
+    } catch (err) {
+      toast.error(t('common.opFailed'), errorMessage(err));
+    } finally {
+      setSavingEmailCode(false);
+    }
+  };
+
+  const issue = async () => {
+    if (!canManage || issuing) return;
+    /* 邀请制只签邀请链接；注册码制只签注册码 */
+    const linkMode = kind === 'invite';
+    const ttlNum = ttl.trim() ? Number(ttl) : undefined;
+    const usesNum = maxUses.trim() ? Number(maxUses) : 1;
+    const linkUses = Number(linkMaxUses.trim() || '0');
+    const linkDays = Number(linkTtlDays.trim() || '0');
+    const quotaResult = buildQuotaPayload(quotaDraft);
+    const nextErrors: { ttl?: string; uses?: string; quota?: string } = {};
+    if (quotaResult.bad) {
+      nextErrors.quota = t('settings.quotaBad');
+    }
+    if (linkMode) {
+      if (!Number.isFinite(linkUses) || linkUses < 0) {
+        nextErrors.uses = t('settings.inviteBadUses');
+      }
+      if (!Number.isFinite(linkDays) || linkDays < 0) {
+        nextErrors.ttl = t('settings.inviteBadTtl');
+      }
+    } else {
+      if (ttlNum !== undefined && (!Number.isFinite(ttlNum) || ttlNum <= 0)) {
+        nextErrors.ttl = t('settings.regBadTtl');
+      }
+      if (!Number.isFinite(usesNum) || usesNum < 0) {
+        nextErrors.uses = t('settings.regBadUses');
+      }
+    }
+    setFieldErrors(nextErrors);
+    if (Object.keys(nextErrors).length) return;
+    setIssuing(true);
+    try {
+      if (linkMode) {
+        const row = await configApi.createInvite({
+          note: note.trim(),
+          role: assignRole,
+          requires_approval: approval,
+          max_uses: Math.floor(linkUses),
+          ttl_days: Math.floor(linkDays),
+          quota: quotaResult.quota,
+        });
+        setIssued({
+          type: 'link',
+          url: `${window.location.origin}${row.path}`,
+          requiresApproval: approval,
+        });
+        toast.success(t('settings.inviteCreatedToast'));
+      } else {
+        const row = await configApi.createRegistrationCode({
+          kind,
+          note: note.trim(),
+          ttl_minutes: ttlNum,
+          max_uses: usesNum,
+          role: assignRole,
+          quota: quotaResult.quota,
+          requires_approval: approval,
+        });
+        setIssued({
+          type: 'code',
+          code: row.code,
+          kind: row.kind,
+          requiresApproval: approval,
+        });
+        toast.success(t('settings.regCodeIssued'));
+      }
+      setNote('');
+      setQuotaDraft(EMPTY_QUOTA_DRAFT);
+      invalidate();
+    } catch (err) {
+      toast.error(t('common.opFailed'), errorMessage(err));
+    } finally {
+      setIssuing(false);
+    }
+  };
+
+  const copyIssued = async () => {
+    if (!issued) return;
+    try {
+      await navigator.clipboard.writeText(
+        issued.type === 'code' ? issued.code : issued.url,
+      );
+      toast.success(t('settings.regCopied'));
+    } catch {
+      toast.error(t('settings.regCopyFailed'));
+    }
+  };
+
+  const revoke = async (row: RegistrationCode) => {
+    const ok = await confirm({
+      title: t('settings.regRevokeConfirmTitle'),
+      message: t('settings.regRevokeConfirmBody'),
+      confirmText: t('settings.regRevoke'),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await configApi.revokeRegistrationCode(row.id);
+      invalidate();
+      toast.success(t('settings.regRevoked'));
+    } catch (err) {
+      toast.error(t('common.opFailed'), errorMessage(err));
+    }
+  };
+
+  const remove = async (row: RegistrationCode) => {
+    const ok = await confirm({
+      title: t('settings.regDeleteConfirmTitle'),
+      message: t('settings.regDeleteConfirmBody'),
+      confirmText: t('settings.regDelete'),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await configApi.deleteRegistrationCode(row.id);
+      invalidate();
+      toast.success(t('settings.regDeleted'));
+    } catch (err) {
+      toast.error(t('common.opFailed'), errorMessage(err));
+    }
+  };
+
+  const linkOf = (row: InviteLink) => `${window.location.origin}${row.path}`;
+
+  const copyLink = async (row: InviteLink) => {
+    try {
+      await navigator.clipboard.writeText(linkOf(row));
+      toast.success(t('settings.inviteCopied'));
+    } catch {
+      toast.error(t('settings.inviteCopyFailed'));
+    }
+  };
+
+  const revokeLink = async (row: InviteLink) => {
+    const ok = await confirm({
+      title: t('settings.inviteRevokeTitle'),
+      message: t('settings.inviteRevokeBody'),
+      confirmText: t('settings.inviteRevokeConfirm'),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await configApi.revokeInvite(row.id);
+      invalidate();
+      toast.success(t('settings.inviteRevoked'));
+    } catch (err) {
+      toast.error(t('common.opFailed'), errorMessage(err));
+    }
+  };
+
+  const removeLink = async (row: InviteLink) => {
+    const ok = await confirm({
+      title: t('settings.inviteDeleteTitle'),
+      message: t('settings.inviteDeleteBody'),
+      confirmText: t('settings.inviteDeleteConfirm'),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await configApi.deleteInvite(row.id);
+      invalidate();
+      toast.success(t('settings.inviteDeleted'));
+    } catch (err) {
+      toast.error(t('common.opFailed'), errorMessage(err));
+    }
+  };
+
+  /* 到期时间只到分钟：完整时间串会把条目挤成两行 */
+  const fmtTime = (sec: number) =>
+    new Date(sec * 1000).toLocaleString(undefined, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+  const codes = query.data?.codes ?? [];
+  /* 注册码制只列注册码；历史邀请码（kind=invite）不再出现在任何清单里 ——
+     邀请制只认链接，把它们摆出来只会让人以为「这些还能用」。 */
+  const visibleCodes = codes.filter((row) => row.kind === 'code');
+
+  /* 邀请制清单 = 邀请链接（唯一凭证形态）。两种模式互斥，所以这里不需要混排。 */
+  const links = mode === 'invite' ? (invitesQuery.data?.invites ?? []) : [];
+  type CredentialRow =
+    | { type: 'code'; created: number; row: RegistrationCode }
+    | { type: 'link'; created: number; row: InviteLink };
+  const credentials: CredentialRow[] = [
+    ...visibleCodes.map((row) => ({ type: 'code' as const, created: row.created, row })),
+    ...links.map((row) => ({ type: 'link' as const, created: row.created, row })),
+  ].sort((a, b) => b.created - a.created);
+
+  const statusLabel: Record<string, string> = {
+    active: t('settings.regStatusActive'),
+    used: t('settings.regStatusUsed'),
+    exhausted: t('settings.regStatusExhausted'),
+    expired: t('settings.regStatusExpired'),
+    revoked: t('settings.regStatusRevoked'),
+  };
+
+  return (
+    <Card>
+      {confirmEl}
+      <CardHeader
+        title={t('settings.regTitle')}
+        subtitle={t('settings.regSubtitle')}
+        icon={<IconUser size={17} />}
+        actions={
+          saving ? (
+            <Badge variant="info" size="sm">
+              {t('settings.navSaving')}
+            </Badge>
+          ) : undefined
+        }
+      />
+
+      {/* ① 注册方式：四个等权的单选卡片，标签与后果说明同框；切换即保存。
+             用原生 radio 保证键盘与读屏可用，保存中整块淡出并禁用输入。 */}
+      <div className={`reg-mode mt-16${saving ? ' is-busy' : ''}`}>
+        <div className="reg-mode-head">
+          <span className="reg-mode-label">{t('settings.regModeLabel')}</span>
+          {mode !== 'off' ? (
+            <span className="reg-mode-tag">{t('settings.regActiveTag')}</span>
+          ) : null}
+        </div>
+        <div
+          className="reg-mode-options"
+          role="radiogroup"
+          aria-label={t('settings.regModeLabel')}
+        >
+          {modeOptions.map((option) => {
+            const active = option.value === mode;
+            return (
+              <label
+                key={option.value}
+                className={`reg-mode-option${active ? ' is-active' : ''}${
+                  modeDisabled ? ' is-disabled' : ''
+                }`}
+              >
+                <input
+                  className="reg-mode-input"
+                  type="radio"
+                  name="registration-mode"
+                  value={option.value}
+                  checked={active}
+                  disabled={modeDisabled}
+                  onChange={() => void saveMode(option.value)}
+                />
+                <span className="reg-mode-option-top">
+                  <span className="reg-mode-option-icon" aria-hidden="true">
+                    {option.icon}
+                  </span>
+                  <span className="reg-mode-option-label">{option.label}</span>
+                  <span className="reg-mode-option-check" aria-hidden="true">
+                    <IconCheck size={14} />
+                  </span>
+                </span>
+                <span className="reg-mode-option-hint">{option.hint}</span>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 自助注册的邮箱验证码开关。只对 open 生效，但仍然摆在这里、其它模式下
+          置灰显示「仅在自助注册下生效」—— 藏起来的话，管理员切换模式时根本
+          不知道注册页会多出一个验证码框。 */}
+      {mode !== 'off' ? (
+        <div className="reg-mode-toggle">
+          <Switch
+            checked={emailCode}
+            onChange={(next) => void saveEmailCode(next)}
+            disabled={!canManage || saving || savingEmailCode || mode !== 'open'}
+            label={t('settings.regEmailCodeLabel')}
+            hint={
+              mode === 'open'
+                ? t('settings.regEmailCodeHint')
+                : t('settings.regEmailCodeInactiveHint')
+            }
+          />
+        </div>
+      ) : null}
+
+      {/* ③④ 凭证签发与清单：凭据是这个区块存在的唯一理由，注册方式切到
+             「关闭 / 自助」时整块收起，页面只剩上面那张注册方式卡。 */}
+      {needsCredential ? (
+        <div className={`reg-grid${credentials.length ? '' : ' is-empty'}`}>
+          {/* ③ 签发：全宽表单，短字段两列排布，避免把卡片拉得过高 */}
+          <section className="reg-pane reg-pane-form">
+            <header className="reg-pane-head">
+              <h4>{t('settings.regIssueTitle')}</h4>
+              <span>
+                {mode === 'invite'
+                  ? t('settings.regIssueHintInvite')
+                  : t('settings.regIssueHint')}
+              </span>
+            </header>
+
+            <div className="reg-form-fields">
+              {/* 六个字段同一行：备注 / 角色 / 有效期 / 次数 / 审批 / 凭证类型。
+                  字段都是短输入，拆两行会白占一条纵向空间。 */}
+              <div className="reg-form-row reg-form-row--issue">
+                <div className="reg-field-cell">
+                  <Input
+                    label={t('settings.regNote')}
+                    value={note}
+                    onChange={(e) => setNote(e.target.value)}
+                    placeholder={t('settings.regNotePlaceholder')}
+                    disabled={!canManage || issuing}
+                    maxLength={191}
+                  />
+                </div>
+
+                <div className="reg-field-cell">
+                  <Select
+                    label={t('settings.inviteRole')}
+                    value={assignRole}
+                    onChange={(e) => setAssignRole(e.target.value)}
+                    options={roleOptions}
+                    hint={t('settings.inviteRoleHint')}
+                    disabled={!canManage || issuing}
+                  />
+                </div>
+
+                {mode === 'invite' ? (
+                  <>
+                    <Input
+                      label={t('settings.inviteTtl')}
+                      value={linkTtlDays}
+                      onChange={(e) => {
+                        setLinkTtlDays(e.target.value);
+                        if (fieldErrors.ttl) {
+                          setFieldErrors((prev) => ({ ...prev, ttl: undefined }));
+                        }
+                      }}
+                      hint={t('settings.inviteTtlHint')}
+                      error={fieldErrors.ttl}
+                      disabled={!canManage || issuing}
+                      inputMode="numeric"
+                    />
+                    <Input
+                      label={t('settings.inviteMaxUses')}
+                      value={linkMaxUses}
+                      onChange={(e) => {
+                        setLinkMaxUses(e.target.value);
+                        if (fieldErrors.uses) {
+                          setFieldErrors((prev) => ({ ...prev, uses: undefined }));
+                        }
+                      }}
+                      hint={t('settings.inviteMaxUsesHint')}
+                      error={fieldErrors.uses}
+                      disabled={!canManage || issuing}
+                      inputMode="numeric"
+                    />
+                  </>
+                ) : (
+                  <>
+                    <Input
+                      label={t('settings.regTtl')}
+                      value={ttl}
+                      onChange={(e) => {
+                        setTtl(e.target.value);
+                        if (fieldErrors.ttl) {
+                          setFieldErrors((prev) => ({ ...prev, ttl: undefined }));
+                        }
+                      }}
+                      placeholder={String(query.data?.limits.default_ttl_minutes[kind] ?? 1440)}
+                      hint={t('settings.regTtlHint', {
+                        max: String(query.data?.limits.max_ttl_minutes ?? 43200),
+                      })}
+                      error={fieldErrors.ttl}
+                      disabled={!canManage || issuing}
+                      inputMode="numeric"
+                    />
+
+                    <Input
+                      label={t('settings.regMaxUses')}
+                      value={maxUses}
+                      onChange={(e) => {
+                        setMaxUses(e.target.value);
+                        if (fieldErrors.uses) {
+                          setFieldErrors((prev) => ({ ...prev, uses: undefined }));
+                        }
+                      }}
+                      placeholder="1"
+                      hint={t('settings.regMaxUsesHint')}
+                      error={fieldErrors.uses}
+                      disabled={!canManage || issuing}
+                      inputMode="numeric"
+                    />
+                  </>
+                )}
+
+                <div className="reg-field-cell reg-field-cell--approval">
+                  <span className="field-label">{t('settings.regApprovalLabel')}</span>
+                  <Switch
+                    checked={approval}
+                    onChange={setApproval}
+                    disabled={!canManage || issuing}
+                    label={t('settings.inviteApproval')}
+                    hint={t('settings.regApprovalShortHint')}
+                  />
+                </div>
+
+                <div className="reg-field-cell">
+                  <span className="field-label">{t('settings.regCredentialKind')}</span>
+                  <div className="reg-kind-value">
+                    {kind === 'invite' ? <IconLink size={14} /> : <IconKey size={14} />}
+                    <span>
+                      {kind === 'invite'
+                        ? t('settings.regKindLink')
+                        : t('settings.regKindCode')}
+                    </span>
+                    <Badge
+                      variant={approval ? 'warning' : 'success'}
+                      size="sm"
+                      dot
+                    >
+                      {approval
+                        ? t('settings.inviteApprovalOn')
+                        : t('settings.inviteApprovalOff')}
+                    </Badge>
+                  </div>
+                </div>
+              </div>
+
+              <QuotaFields
+                draft={quotaDraft}
+                onChange={(patch) => {
+                  setQuotaDraft((prev) => ({ ...prev, ...patch }));
+                  if (fieldErrors.quota) {
+                    setFieldErrors((prev) => ({ ...prev, quota: undefined }));
+                  }
+                }}
+                error={fieldErrors.quota}
+                disabled={!canManage || issuing}
+              />
+            </div>
+
+            <div className="reg-actions">
+              <Button
+                variant="primary"
+                loading={issuing}
+                disabled={!canManage}
+                onClick={() => void issue()}
+                icon={kind === 'invite' ? <IconLink size={14} /> : <IconPlus size={14} />}
+              >
+                {kind === 'invite' ? t('settings.regIssueLink') : t('settings.regIssueCode')}
+              </Button>
+              {issued ? (
+                <div
+                  className="reg-result"
+                  role="status"
+                  title={
+                    issued.type === 'code'
+                      ? t('settings.regOnceBody')
+                      : t('settings.inviteCreatedBody')
+                  }
+                >
+                  <div className="reg-result-head">
+                    <IconCheck size={13} />
+                    <span>{t('settings.regOnceTitle')}</span>
+                    <Badge
+                      variant={issued.requiresApproval ? 'warning' : 'success'}
+                      size="sm"
+                      dot
+                    >
+                      {issued.requiresApproval
+                        ? t('settings.inviteApprovalOn')
+                        : t('settings.inviteApprovalOff')}
+                    </Badge>
+                  </div>
+                  <div className="reg-result-line">
+                    <code className="reg-result-code">
+                      {issued.type === 'code' ? issued.code : issued.url}
+                    </code>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => void copyIssued()}
+                    >
+                      {issued.type === 'code'
+                        ? t('settings.regCopy')
+                        : t('settings.inviteCopy')}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <span className="reg-footnote">
+                  {kind === 'invite'
+                    ? t('settings.regIssueFootnoteLink')
+                    : t('settings.regIssueFootnote')}
+                </span>
+              )}
+            </div>
+          </section>
+
+          {/* ④ 清单：全宽自适应网格。邀请制下邀请码与邀请链接混排 —— 它们本来
+                 就是同一份「谁能进来」的名单；条目第一行是状态/类型/备注/到期，
+                 第二行是次数与操作，条数少时整行铺开、条数多时自动分栏。 */}
+          <section className="reg-pane reg-pane-list">
+            <header className="reg-pane-head">
+              <h4>{t('settings.regListTitle')}</h4>
+              <span>
+                {credentials.length
+                  ? t('settings.regCount', { n: credentials.length })
+                  : t('settings.regListHint')}
+              </span>
+            </header>
+
+            {query.isError || (mode === 'invite' && invitesQuery.isError) ? (
+              <ErrorState
+                title={t('settings.regListError')}
+                onRetry={() => {
+                  void query.refetch();
+                  if (mode === 'invite') void invitesQuery.refetch();
+                }}
+              />
+            ) : credentials.length === 0 ? (
+              <div className="reg-empty">
+                <IconKey size={20} />
+                <p>{t('settings.regListEmpty')}</p>
+                <span>
+                  {mode === 'invite'
+                    ? t('settings.regEmptyHintInvite')
+                    : t('settings.regEmptyHint')}
+                </span>
+              </div>
+            ) : (
+              <div className="reg-list">
+                {credentials.map((item) =>
+                item.type === 'code' ? (
+                  <div key={`code-${item.row.id}`} className="reg-item">
+                    <div className="reg-item-main">
+                      <Badge
+                        variant={item.row.status === 'active' ? 'success' : 'neutral'}
+                        size="sm"
+                      >
+                        {statusLabel[item.row.status] ?? item.row.status}
+                      </Badge>
+                      <span className="reg-item-kind">{t('settings.regKindCode')}</span>
+                      {/* 注册码也带角色：清单里直接写清楚这张码会把新人放成什么身份 */}
+                      <span className="reg-item-kind">
+                        {roleNameOf(item.row.role || 'viewer')}
+                      </span>
+                      {item.row.note ? (
+                        <span className="reg-item-note" title={item.row.note}>
+                          {item.row.note}
+                        </span>
+                      ) : null}
+                      <span className="reg-item-time">
+                        {t('settings.regExpiresAt', { time: fmtTime(item.row.expires) })}
+                      </span>
+                    </div>
+                    <div className="reg-item-meta">
+                      <span>
+                        {item.row.remaining === null
+                          ? t('settings.regRemainingUnlimited')
+                          : t('settings.regRemaining', { n: String(item.row.remaining) })}
+                      </span>
+                      <span>
+                        {item.row.requires_approval
+                          ? t('settings.inviteApprovalOn')
+                          : t('settings.inviteApprovalOff')}
+                      </span>
+                      <span>
+                        {hasQuota(item.row.quota)
+                          ? t('settings.quotaSet')
+                          : t('settings.quotaInherit')}
+                      </span>
+                      {item.row.used_by ? (
+                        <span className="reg-item-user">{item.row.used_by}</span>
+                      ) : null}
+                      <span className="reg-item-actions">
+                        {item.row.status === 'active' ? (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={!canManage}
+                            onClick={() => void revoke(item.row)}
+                          >
+                            {t('settings.regRevoke')}
+                          </Button>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={!canManage}
+                            onClick={() => void remove(item.row)}
+                          >
+                            {t('settings.regDelete')}
+                          </Button>
+                        )}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <div key={`link-${item.row.id}`} className="reg-item">
+                    <div className="reg-item-main">
+                      <Badge
+                        variant={item.row.status === 'active' ? 'success' : 'neutral'}
+                        size="sm"
+                      >
+                        {item.row.status === 'revoked'
+                          ? t('settings.inviteStatusRevoked')
+                          : (statusLabel[item.row.status] ?? item.row.status)}
+                      </Badge>
+                      <span className="reg-item-kind">{t('settings.regKindLink')}</span>
+                      <span className="reg-item-kind">
+                        {item.row.role_name || roleNameOf(item.row.role) || t('settings.inviteRoleFallback')}
+                      </span>
+                      {item.row.note ? (
+                        <span className="reg-item-note" title={item.row.note}>
+                          {item.row.note}
+                        </span>
+                      ) : null}
+                      <span className="reg-item-time">
+                        {item.row.expires
+                          ? t('settings.inviteExpiresAt', { time: fmtTime(item.row.expires) })
+                          : t('settings.inviteNoExpiry')}
+                      </span>
+                    </div>
+                    <div className="reg-item-meta">
+                      <span>
+                        {item.row.max_uses === 0
+                          ? t('settings.inviteUsesUnlimited', { used: item.row.used_count })
+                          : t('settings.inviteUses', {
+                              used: item.row.used_count,
+                              max: item.row.max_uses,
+                            })}
+                      </span>
+                      <span>
+                        {item.row.requires_approval
+                          ? t('settings.inviteApprovalOn')
+                          : t('settings.inviteApprovalOff')}
+                      </span>
+                      <span>
+                        {hasQuota(item.row.quota)
+                          ? t('settings.quotaSet')
+                          : t('settings.quotaInherit')}
+                      </span>
+                      {item.row.last_used_by ? (
+                        <span className="reg-item-user" title={item.row.last_used_by}>
+                          {t('settings.inviteLastUsed', { user: item.row.last_used_by })}
+                        </span>
+                      ) : (
+                        <span>{t('settings.inviteNeverUsed')}</span>
+                      )}
+                      <span className="reg-item-actions">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => void copyLink(item.row)}
+                        >
+                          {t('settings.inviteCopy')}
+                        </Button>
+                        {item.row.status === 'active' ? (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={!canManage}
+                            onClick={() => void revokeLink(item.row)}
+                          >
+                            {t('settings.regRevoke')}
+                          </Button>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={!canManage}
+                            onClick={() => void removeLink(item.row)}
+                          >
+                            {t('settings.regDelete')}
+                          </Button>
+                        )}
+                      </span>
+                    </div>
+                  </div>
+                ),
+                )}
+              </div>
+            )}
+          </section>
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
+
 function SessionPolicySection() {
   const t = useT();
   const toast = useToast();
@@ -2520,7 +3624,6 @@ function EmailSection() {
     }
     return '';
   }, [form.port, form.tls, t]);
-
 
 
   return (

@@ -383,9 +383,9 @@ export class TaskWaitError extends Error {
 export async function waitForTask(
   upid: string,
   node?: string,
-  options: { interval?: number; timeout?: number } = {},
+  options: { interval?: number; timeout?: number; connectionId?: string } = {},
 ): Promise<TaskInfo> {
-  const { interval = 1_500, timeout = 600_000 } = options;
+  const { interval = 1_500, timeout = 600_000, connectionId } = options;
   const started = Date.now();
   let last: TaskInfo | null = null;
   let failures = 0;
@@ -393,7 +393,9 @@ export async function waitForTask(
 
   for (;;) {
     try {
-      const task = await tasksApi.detail(upid, node);
+      /* 带上发起这次操作的那条连接：多连接部署里「当前生效连接」未必是它，
+         而任务归属是按连接记的 —— 不带就会拿到 404，被当成「任务记录已不存在」。 */
+      const task = await tasksApi.detail(upid, node, connectionId);
       failures = 0;
       last = task;
       if (task.status !== 'running') return task;

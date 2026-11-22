@@ -256,13 +256,14 @@ def test_same_node_name_on_two_connections_is_disambiguated_by_template(
     """
     from app import guest_created
 
-    async def fake_unique():
-        return {"pve1": 2}
+    async def fake_map():
+        # 同名节点（两条连接上都叫 pve1）；节点集合留空 = 不做跨节点兜底
+        return ({"pve1": 2}, {})
 
     async def fake_templates():
         return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
 
-    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_node_map", fake_map)
     monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
 
     async def seed() -> None:
@@ -293,13 +294,13 @@ def test_unique_node_name_does_not_fetch_template_index(api, monkeypatch) -> Non
     """节点名唯一时不必拉模板清单：行为与引入消歧前完全一致，也不多打一轮 PVE。"""
     from app import guest_created
 
-    async def fake_unique():
-        return {"pve1": 1}
+    async def fake_map():
+        return ({"pve1": 1}, {})
 
     async def boom():
         raise AssertionError("节点名唯一时不该为消歧去拉模板清单")
 
-    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_node_map", fake_map)
     monkeypatch.setattr(guest_created, "_template_keys_by_connection", boom)
 
     async def seed() -> None:
@@ -324,14 +325,15 @@ def test_source_template_absent_on_connection_is_not_filled(api, monkeypatch) ->
     """来源模板不在这条连接上时宁可不填，也不能把别的连接的记录贴上来。"""
     from app import guest_created
 
-    async def fake_unique():
-        return {"pve1": 2}
+    async def fake_map():
+        # 同名节点（两条连接上都叫 pve1）；节点集合留空 = 不做跨节点兜底
+        return ({"pve1": 2}, {})
 
     async def fake_templates():
         # c2 上没有 pve1/9000 这张模板
         return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
 
-    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_node_map", fake_map)
     monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
 
     async def seed() -> None:
@@ -357,13 +359,13 @@ def test_unknown_node_uniqueness_leaves_the_column_empty(api, monkeypatch) -> No
     """
     from app import guest_created
 
-    async def unknown_unique():
-        return {}
+    async def fake_map():
+        return ({}, {})
 
     async def fake_templates():
         return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
 
-    monkeypatch.setattr(guest_created, "_node_names_are_unique", unknown_unique)
+    monkeypatch.setattr(guest_created, "_node_map", fake_map)
     monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
 
     async def seed() -> None:
@@ -385,13 +387,14 @@ def test_container_clone_is_disambiguated_across_connections(api, monkeypatch) -
     """容器克隆：与虚拟机同一套消歧，同号容器各归各的连接。"""
     from app import guest_created
 
-    async def fake_unique():
-        return {"pve1": 2}
+    async def fake_map():
+        # 同名节点（两条连接上都叫 pve1）；节点集合留空 = 不做跨节点兜底
+        return ({"pve1": 2}, {})
 
     async def fake_templates():
         return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
 
-    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_node_map", fake_map)
     monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
 
     async def seed() -> None:
@@ -426,13 +429,14 @@ def test_container_os_template_stays_empty_when_node_name_is_shared(
     """
     from app import guest_created
 
-    async def fake_unique():
-        return {"pve1": 2}
+    async def fake_map():
+        # 同名节点（两条连接上都叫 pve1）；节点集合留空 = 不做跨节点兜底
+        return ({"pve1": 2}, {})
 
     async def fake_templates():
         return {"c1": {("pve1", 9000)}, "c2": {("pve1", 9001)}}
 
-    monkeypatch.setattr(guest_created, "_node_names_are_unique", fake_unique)
+    monkeypatch.setattr(guest_created, "_node_map", fake_map)
     monkeypatch.setattr(guest_created, "_template_keys_by_connection", fake_templates)
 
     async def seed() -> None:

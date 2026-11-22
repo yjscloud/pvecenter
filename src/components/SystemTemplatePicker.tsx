@@ -13,12 +13,14 @@
 
    · **模板少（≤ inlineMax，默认 4 张）**：直接平铺成行，没有搜索、没有分类
      chip、没有分组头、没有「更换」这一步 —— 一共四行，多一次点击都是浪费。
-   · **模板多**：默认只留一张「将使用此模板」摘要卡（克隆源已经自动选好），
-     其余模板收在「更换模板」后面。展开后才出现搜索、分类 chip、分组与
-     折叠行 —— 与重装选模板完全同一套视觉语言，用户不用学第二遍。
+   · **模板多**：同样直接把可选列表铺出来（搜索 / 分类 chip / 分组 / 折叠行），
+     与重装选模板完全同一套视觉语言，用户不用学第二遍。
 
-   默认选中的那张卡不是「推荐算法」的结果，而是调用方已经自动选好的值：
-   这里只负责把它说清楚（系统、版本、容量、节点/存储），并给一条换掉它的路。
+   **不预选、不替用户决定装哪套系统。** 调用方不会给默认值，所以这里也没有
+   「已选」态可言：没选中值时列表常驻，选中一行之后才收成一张摘要卡（系统、
+   版本、容量、节点/存储），并留一条「更换模板」把它重新展开 —— 收起只是把
+   占位还给表单，不是把决定权收回去。选错的代价要到开机才看得见，所以这一步
+   必须是用户亲自点的。
 
    列表细节沿用重装那套密集行：一行 38px、字段横向对齐、内部滚动封顶、
    每个分组默认铺 5 行、搜索/选分类时自动全展开。选择结果只回传 value：
@@ -35,6 +37,7 @@ import {
   IconSearch,
 } from './Icons';
 import { OsLogo } from './OsLogo';
+import { normalizeSizeText } from '../utils/format';
 import { useT } from '../i18n';
 import {
   groupTemplates,
@@ -70,18 +73,6 @@ function versionOf(name: string): string {
   return hit ? hit[0] : '';
 }
 
-/**
- * 容量文本统一成 `100 GB`：模板来源不同，`sizeText` 可能是 `100G`、`100 GB`
- * 或 `8 GB`，同一列里混着两种写法、右对齐后就对不齐了。
- */
-function normalizeSize(text?: string | null): string {
-  const raw = String(text ?? '').trim();
-  if (!raw) return '—';
-  const hit = /^([\d.]+)\s*([KMGT])(?:B)?$/i.exec(raw);
-  if (!hit) return raw;
-  return `${hit[1]} ${hit[2].toUpperCase()}B`;
-}
-
 export function SystemTemplatePicker({
   kind,
   items,
@@ -100,8 +91,8 @@ export function SystemTemplatePicker({
   const [familyFilter, setFamilyFilter] = useState<OsFamilyKey | 'all'>('all');
   const [collapsed, setCollapsed] = useState<Set<OsFamilyKey>>(() => new Set());
   const [expanded, setExpanded] = useState<Set<OsFamilyKey>>(() => new Set());
-  /** 展开完整列表（多模板场景下默认只显示摘要卡） */
-  const [switching, setSwitching] = useState(false);
+  /** 多模板场景下是否展开完整列表（没选中时无论如何都会展开，见 showList） */
+  const [listOpen, setListOpen] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   /* 候选集整个换掉（切主机 / 切节点）时把筛选状态清干净：上一台的搜索词或
@@ -115,7 +106,7 @@ export function SystemTemplatePicker({
     setFamilyFilter('all');
     setCollapsed(new Set());
     setExpanded(new Set());
-    setSwitching(false);
+    setListOpen(false);
   }, [signature]);
 
   const matched = useMemo(() => {
@@ -159,7 +150,7 @@ export function SystemTemplatePicker({
 
   /* 摘要读全集：模板被当前筛选藏起来时，用户仍要看到自己选的是哪一张 */
   const selected = items.find((item) => item.value === value);
-  const showList = inline || switching || !selected;
+  const showList = inline || listOpen || !selected;
   const narrowing = search.trim().length > 0 || activeFamily !== 'all';
 
   /* 列表出现时把选中的行滚进可视区（默认选中的那张常在第三、四个分组） */
@@ -189,7 +180,7 @@ export function SystemTemplatePicker({
 
   if (!items.length) return null;
 
-  /* ---- 默认态：一张「将使用此模板」摘要卡 ---- */
+  /* ---- 已选态：一张「将使用此模板」摘要卡（选中并收起列表之后才出现） ---- */
   if (!showList && selected) {
     const family = templateFamily(selected);
     const version = versionOf(selected.name);
@@ -213,10 +204,10 @@ export function SystemTemplatePicker({
             <div className="os-current-meta">
               {osFamilyLabel(family, t)}
               {selected.sizeText
-                ? ` · ${sizeLabel} ${normalizeSize(selected.sizeText)}`
+                ? ` · ${sizeLabel} ${normalizeSizeText(selected.sizeText)}`
                 : ''}
               {selected.metaText
-                ? ` · ${metaLabel} ${normalizeSize(selected.metaText)}`
+                ? ` · ${metaLabel} ${normalizeSizeText(selected.metaText)}`
                 : ''}
             </div>
             <div className="os-current-scene">
@@ -229,7 +220,7 @@ export function SystemTemplatePicker({
               size="sm"
               variant="secondary"
               iconRight={<IconChevronRight size={14} />}
-              onClick={() => setSwitching(true)}
+              onClick={() => setListOpen(true)}
               disabled={disabled}
             >
               {t('templatePicker.change')}
@@ -260,7 +251,12 @@ export function SystemTemplatePicker({
           value={item.value}
           checked={checked}
           disabled={disabled}
-          onChange={() => onChange(item.value)}
+          onChange={() => {
+            /* 点完一行不要把列表收成摘要卡：展开态交给用户（右上角的「收起」），
+               否则「从一堆里挑一个」的动线会在点中的瞬间被打断，想改还得再展开 */
+            setListOpen(true);
+            onChange(item.value);
+          }}
         />
 
         <span className="os-row-radio" aria-hidden="true" />
@@ -274,8 +270,8 @@ export function SystemTemplatePicker({
         <span className="os-row-scene" title={osFamilyScene(family, t)}>
           {osFamilyScene(family, t)}
         </span>
-        <span className="os-row-disk">{normalizeSize(item.sizeText)}</span>
-        <span className="os-row-used">{normalizeSize(item.metaText)}</span>
+        <span className="os-row-disk">{normalizeSizeText(item.sizeText)}</span>
+        <span className="os-row-used">{normalizeSizeText(item.metaText)}</span>
         <span className="os-row-tags">
           {(item.tags ?? []).map((tag) => (
             <span className="os-row-tag" key={tag}>
@@ -315,7 +311,7 @@ export function SystemTemplatePicker({
               <button
                 type="button"
                 className="os-pick-collapse"
-                onClick={() => setSwitching(false)}
+                onClick={() => setListOpen(false)}
                 aria-label={t('templatePicker.collapse')}
                 title={t('templatePicker.collapse')}
               >
@@ -481,10 +477,10 @@ export function SystemTemplatePicker({
           <span className="os-pick-foot-meta">
             {osFamilyLabel(templateFamily(selected), t)}
             {selected.sizeText
-              ? ` · ${sizeLabel} ${normalizeSize(selected.sizeText)}`
+              ? ` · ${sizeLabel} ${normalizeSizeText(selected.sizeText)}`
               : ''}
             {selected.metaText
-              ? ` · ${metaLabel} ${normalizeSize(selected.metaText)}`
+              ? ` · ${metaLabel} ${normalizeSizeText(selected.metaText)}`
               : ''}
           </span>
         </div>

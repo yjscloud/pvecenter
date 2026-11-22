@@ -21,6 +21,12 @@
   非客户机级任务（``aptupdate`` / ``ceph`` / 存储任务，UPID 里没有 vmid）一律不返回
   —— 严格隔离，与 ``GET /api/vms`` 口径一致。
 
+节点这一维有一个例外：**克隆 / 迁移任务的 UPID 节点是源节点，归属记的是目标节点**
+（见 ``vms._create_from_clone``）。所以任务判定在「节点 + vmid」落空后，还会按
+「同连接 + 同 vmid」再试一次（:meth:`TaskScope._allows_vmid`）。同一连接内 vmid
+唯一，这一步不扩大可见范围；不放宽的话，跨节点克隆出来的机器对普通用户是永久
+「待确认」，而管理员看到的是成功。
+
 历史数据
 --------
 升级前记录的归属 ref 可能是 ``-:<node>:<vmid>``（当时未指定连接）。这类记录无法
@@ -81,7 +87,33 @@ class TaskScope:
         guest = task_guest(upid)
         if guest is None:
             return False
-        return self.allows_guest(connection_id, guest[0], guest[1])
+        if self.allows_guest(connection_id, guest[0], guest[1]):
+            return True
+        # 克隆（以及迁移）在**源节点**上跑，而归属记的是**目标节点**：跨节点克隆时
+        # 这条 UPID 的节点永远对不上归属里的节点，按 (节点, vmid) 精确比对必然落空。
+        # 结果是普通用户在批量下发结果页读不到自己刚建好的机器，只能显示「待确认」，
+        # 而管理员（范围不受限）看到的是绿色成功 —— 同一件事两种结论。
+        #
+        # 同一个连接内 vmid 唯一（PVE 的 vmid 是集群级唯一的），所以「同连接 + 同
+        # vmid」已经足以指向同一台机器；跨连接仍然严格按 id 隔离，见
+        # ``test_owner_sees_only_his_guest``。这里只放宽任务这一路，指标推送
+        # （``allows_guest``）保持精确，不去动它的语义。
+        return self._allows_vmid(connection_id, guest[1])
+
+    def _allows_vmid(self, connection_id: str, vmid: Any) -> bool:
+        """按 vmid 判定（不看节点）：给「任务跑在源节点、归属记在目标节点」兜底。"""
+        if self.regions is not None:
+            # 区域管理员在上面那次 allows_guest 里已经按连接判过了，走到这里说明
+            # 连接不在本区域，不能再放宽
+            return False
+        wanted = str(vmid or "")
+        if not wanted:
+            return False
+        if not str(connection_id or ""):
+            if any(wanted == guest[1] for guest in self.legacy):
+                return True
+            return any(wanted == guest[1] for refs in self.owned.values() for guest in refs)
+        return any(wanted == guest[1] for guest in self.owned.get(str(connection_id), ()))
 
     def allows_guest(self, connection_id: str, node: str, vmid: Any) -> bool:
         """这台客户机在不在可见范围内。

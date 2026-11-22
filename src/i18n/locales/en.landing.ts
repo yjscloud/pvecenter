@@ -94,7 +94,7 @@ export const enLanding: Partial<Record<MessageKey, string>> = {
   'landing.architecture.entriesLabel': 'Entry points',
   'landing.architecture.coreName': 'Panel service',
   'landing.architecture.corePill': 'Same-origin',
-  'landing.architecture.coreSub': 'FastAPI :8080 · MySQL 8 · one exposed process',
+  'landing.architecture.coreSub': 'FastAPI :8080 · MySQL · one exposed process',
   'landing.architecture.linkOut': 'PVE API · outbound',
   'landing.architecture.clustersLabel': 'Proxmox connections',
   'landing.architecture.clusterMeta': '{nodes} · nodes / storage / VMs and containers',

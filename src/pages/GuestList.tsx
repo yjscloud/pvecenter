@@ -35,7 +35,7 @@ import {
   sshFleetApi,
   templatesApi,
   vmMetaApi,
-  vmMetaKey,
+  vmMetaEntryOf,
   vmsApi,
 } from '../api/endpoints';
 import { guestPath, guestPower, guestsApi, guestTypeOf } from '../api/guests';
@@ -840,24 +840,35 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
     () => metaQuery.data?.items ?? {},
     [metaQuery.data],
   );
-  const manualIpOf = useCallback(
+  /* 备注条目按「连接 + VMID」回落：条目键里的节点是可变的那一段，机器迁移之后
+     条目还挂在旧节点下，只按当前键查会让系统标识 / 关联模板凭空消失（见
+     `vmMetaEntryOf`）。 */
+  const metaEntryOf = useCallback(
     (vm: VmSummary) =>
-      metaItems[vmMetaKey(vm.connection_id, vm.node, vm.vmid)]?.ip ?? '',
+      vmMetaEntryOf(metaItems, vm.connection_id, vm.node, vm.vmid),
     [metaItems],
+  );
+  /* 系统信息快照（隔离 / 解除隔离 / 开机时后端采集）：OS 列的兜底证据，
+     也是「解除隔离后信息仍在」的验证点（备注弹窗里会显示采集时间与内容）。 */
+  const metaSnapshotOf = useCallback(
+    (vm: VmSummary) => metaEntryOf(vm)?.snapshot ?? null,
+    [metaEntryOf],
+  );
+  const manualIpOf = useCallback(
+    (vm: VmSummary) => metaEntryOf(vm)?.ip ?? '',
+    [metaEntryOf],
   );
   /* 面板侧记录的操作系统（家族 key）。优先级高于「来源模板名推断」：
      来源只说「从谁克隆的」，而这个字段说的是「它是什么系统」。 */
   const metaOsOf = useCallback(
-    (vm: VmSummary) =>
-      familyByKey(metaItems[vmMetaKey(vm.connection_id, vm.node, vm.vmid)]?.os),
-    [metaItems],
+    (vm: VmSummary) => familyByKey(metaEntryOf(vm)?.os),
+    [metaEntryOf],
   );
   /* 面板侧手工关联的来源模板（备注弹窗里选的那张）。与 `vm.source_template`
      不是一回事：那份来自审计里真实的克隆记录，这份是运维补的线索。 */
   const metaTemplateOf = useCallback(
-    (vm: VmSummary) =>
-      metaItems[vmMetaKey(vm.connection_id, vm.node, vm.vmid)]?.template ?? null,
-    [metaItems],
+    (vm: VmSummary) => metaEntryOf(vm)?.template ?? null,
+    [metaEntryOf],
   );
   /* 「备注」弹窗的系统标识候选：与列表列读的是同一张家族表，"自动" 用空串 */
   const osOptions = useMemo(
@@ -1304,6 +1315,15 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
   const confirmDelete = async () => {
     const vm = deleteTarget;
     if (!vm) return;
+    /* 兜一道：隔离中的机器不发删除请求（弹窗已改成引导去解除隔离，这里防缓存
+       数据滞后 —— 列表刚被远程隔离时,行上的 isolated 仍是旧值）。 */
+    if (vm.isolated) {
+      toast.error(
+        t('guestList.deleteIsolatedTitle', { noun: L.noun }),
+        t('guestList.deleteIsolatedTail'),
+      );
+      return;
+    }
     setPendingAction(true);
     try {
       await runner.run(guestsApi.remove(vm), {
@@ -1413,6 +1433,17 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         ? archivedTemplate
         : null);
     setIpBusy(true);
+    /* 「没读到」不等于「要清空」。
+       `os` / `template_*` 在后端是「传了就覆盖」，而这个弹窗的草稿来自
+       `metaOsOf(vm)` / `metaTemplateOf(vm)` —— 隔离期间机器关着、快照上锁、
+       或列表刚刷新导致条目暂时读不到时，草稿是空的；此时若照旧把空串提交上去，
+       已有的系统标识与关联模板就会被**静默清掉**，解隔离 / 重启也回不来。
+       所以只在用户真的改过时才提交这几个字段（后端语义：省略 = 保持原值）。 */
+    const currentOs = metaOsOf(vm)?.key ?? '';
+    const currentTemplate = (() => {
+      const linkedNow = metaTemplateOf(vm);
+      return linkedNow ? `${linkedNow.node}|${linkedNow.vmid}` : '';
+    })();
     try {
       await vmMetaApi.save({
         node: vm.node,
@@ -1421,10 +1452,14 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         // 容器的归属与权限都在 ct 侧，后端靠这个字段选对那一套
         type: isLxc ? 'lxc' : 'qemu',
         ip,
-        os: osDraft,
-        template_node: picked?.node ?? '',
-        template_vmid: picked?.vmid ?? null,
-        template_name: picked?.name ?? '',
+        ...(osDraft !== currentOs ? { os: osDraft } : {}),
+        ...(templateDraft !== currentTemplate
+          ? {
+              template_node: picked?.node ?? '',
+              template_vmid: picked?.vmid ?? null,
+              template_name: picked?.name ?? '',
+            }
+          : {}),
       });
       await queryClient.invalidateQueries({ queryKey: ['vm-meta'] });
       toast.success(
@@ -1536,6 +1571,13 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
               {t('guestList.status.template')}
             </Badge>
           ) : null}
+          {/* 隔离标记（应急响应页登记过的隔离动作）：网络已被切断、处于取证状态，
+              删除前必须先解除隔离 —— 见下面的删除确认分支。 */}
+          {vm.isolated ? (
+            <Badge variant="danger" size="sm" title={t('guestList.isolatedTitle')}>
+              {t('guestList.isolated')}
+            </Badge>
+          ) : null}
           {vm.lock ? (
             <Badge
               variant="warning"
@@ -1637,7 +1679,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
            手动值是回落，只在平台确实拿不到时顶上来。 */
         const shown = auto || manual;
         const fromManual = !auto && Boolean(manual);
-        const manualBy = metaItems[vmMetaKey(vm.connection_id, vm.node, vm.vmid)]?.by ?? '';
+        const manualBy = metaEntryOf(vm)?.by ?? '';
         /* 虚拟机这条提示不写「Cloud-Init」：Windows 客户机用的是 Cloudbase-Init，
            而列表接口里没有 ostype（只有详情接口有），判断不出该叫哪个名字，
            所以按「初始化」统称，两种都覆盖。 */
@@ -1823,6 +1865,13 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
            图标，靠的就是这一级证据。机器名作为最后一档文字线索（`ubuntu24`
            这类命名很常见），认不出仍是「···」，不会乱配。 */
         const guestOstype = vm.ostype || '';
+        /* 第三级证据：面板在隔离 / 解除隔离 / 开机时采集的「系统信息快照」。
+           隔离会把机器关掉、取证快照会给 VM 上锁，那些瞬间 ostype 与来源都可能
+           读不到 —— 之前的实现直接退回「—」，看起来就是「系统信息丢了」。快照
+           是上一次确认过的值，放在**现有证据之后**兜底：当前证据能判出更具体的
+           发行版时仍以当前为准，快照只负责「不至于什么都没有」。 */
+        const snapshot = metaSnapshotOf(vm);
+        const snapshotFamily = familyByKey(snapshot?.family);
         const family =
           metaFamily ??
           (name || sourceOstype || guestOstype || vm.name
@@ -1830,7 +1879,8 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
                 name: name || vm.name,
                 ostype: guestOstype || sourceOstype,
               })
-            : null);
+            : null) ??
+          snapshotFamily;
 
         /* 名字取不到（来源模板被改名 / 被删，或不在当前这一页的清单里）时退回
            `#VMID` —— VMID 是来源里唯一不会变的部分，比「—」有用得多。
@@ -1860,7 +1910,11 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             ? fromLinked
               ? t('guestList.osFromLinkedTemplate', { name })
               : t('guestList.osFromTemplate', { name })
-            : label;
+            : snapshotFamily && family === snapshotFamily
+              ? t('guestList.osFromSnapshot', {
+                  time: formatDateTime(snapshot?.taken_at ?? 0),
+                })
+              : label;
         /* 读屏把系统名与判定依据一起念出来（图标对读屏不可见） */
         return (
           <span
@@ -2575,6 +2629,24 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             hint={t('guestList.osHint')}
           />
           <span className="fs-xs text-muted">{t('guestList.osNotice')}</span>
+          {/* 系统信息快照：隔离 / 解除隔离 / 开机时后端自动采集的那一份。
+              它不参与编辑，只在设置标识之前告诉你「面板手上到底有什么」——
+              解隔离后图标回来了，凭的就是这里。 */}
+          {(() => {
+            const snap = ipTarget ? metaSnapshotOf(ipTarget) : null;
+            if (!snap) return null;
+            const detail = [snap.ostype, snap.hostname || snap.name]
+              .filter(Boolean)
+              .join(' · ');
+            return (
+              <span className="fs-xs text-muted">
+                {t('guestList.osSnapshot', {
+                  detail: detail || t('guestList.osSnapshotEmpty'),
+                  time: formatDateTime(snap.taken_at ?? 0),
+                })}
+              </span>
+            );
+          })()}
           {/* 来源模板：恢复备份 / 在 PVE 界面克隆 / 装 ISO 建的机器审计里没有
               克隆记录，列表认不出系统。手工指一张模板等于把那条线索补上。
               模板可能上百张，所以不用原生 <select>：收起态只占一行，展开后
@@ -2654,28 +2726,69 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
           先问一次；启动不经过这里（见 doPower） */}
       {powerConfirmEl}
 
-      {/* ---- 删除确认 ---- */}
+      {/* ---- 删除确认 ----
+          隔离中的机器不走删除流程：那台机器就是证据（取证快照 + 断网状态）。
+          这里先把「为什么不能删、下一步去哪儿」讲清楚，并直接跳到应急响应页
+          选中它，而不是发一个注定被后端拒绝的请求。 */}
       <ConfirmDialog
         open={Boolean(deleteTarget)}
         onCancel={() => setDeleteTarget(null)}
-        onConfirm={confirmDelete}
-        title={t('guestList.deleteTitle', { noun: L.noun })}
-        danger
-        confirmText={t('common.delete')}
-        loading={pendingAction}
-        requireText={deleteTarget?.name || String(deleteTarget?.vmid ?? '')}
+        onConfirm={
+          deleteTarget?.isolated
+            ? () => {
+                const target = deleteTarget;
+                setDeleteTarget(null);
+                if (target) {
+                  navigate(
+                    `/incident?target=${encodeURIComponent(
+                      `${target.node}/${target.vmid}`,
+                    )}`,
+                  );
+                }
+              }
+            : confirmDelete
+        }
+        title={
+          deleteTarget?.isolated
+            ? t('guestList.deleteIsolatedTitle', { noun: L.noun })
+            : t('guestList.deleteTitle', { noun: L.noun })
+        }
+        danger={!deleteTarget?.isolated}
+        irreversible={!deleteTarget?.isolated}
+        confirmText={
+          deleteTarget?.isolated
+            ? t('guestList.deleteIsolatedGo')
+            : t('common.delete')
+        }
+        loading={deleteTarget?.isolated ? false : pendingAction}
+        requireText={
+          deleteTarget?.isolated
+            ? undefined
+            : deleteTarget?.name || String(deleteTarget?.vmid ?? '')
+        }
         message={
-          <>
-            {t('guestList.deleteSoon', { noun: L.noun })}{' '}
-            <strong>
-              {deleteTarget?.name ||
-                `${meta.codePrefix} ${deleteTarget?.vmid ?? ''}`}
-            </strong>
-            {t('guestList.deleteTail', {
-              vmid: deleteTarget?.vmid,
-              node: deleteTarget?.node,
-            })}
-          </>
+          deleteTarget?.isolated ? (
+            <>
+              {t('guestList.deleteIsolatedSoon')}{' '}
+              <strong>
+                {deleteTarget.name ||
+                  `${meta.codePrefix} ${deleteTarget.vmid}`}
+              </strong>{' '}
+              {t('guestList.deleteIsolatedTail')}
+            </>
+          ) : (
+            <>
+              {t('guestList.deleteSoon', { noun: L.noun })}{' '}
+              <strong>
+                {deleteTarget?.name ||
+                  `${meta.codePrefix} ${deleteTarget?.vmid ?? ''}`}
+              </strong>
+              {t('guestList.deleteTail', {
+                vmid: deleteTarget?.vmid,
+                node: deleteTarget?.node,
+              })}
+            </>
+          )
         }
       />
 

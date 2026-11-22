@@ -138,6 +138,11 @@ export interface ColumnSettingsApi<T> {
   hiddenCount: number;
   /** 恢复默认列（清掉这份偏好） */
   reset: () => void;
+  /**
+   * 把 from 列挪到 to 列的位置（拖动表头时由 Table 回调）。
+   * 与窗口里拖拽排序共用同一份顺序与持久化，两条入口不会各记各的。
+   */
+  move: (from: string, to: string) => void;
 }
 
 export function useColumnSettings<T>(
@@ -272,7 +277,7 @@ export function useColumnSettings<T>(
     />
   );
 
-  return { columns: visibleColumns, menu, hiddenCount, reset };
+  return { columns: visibleColumns, menu, hiddenCount, reset, move };
 }
 
 /* ---------------------------------------------------------------------------

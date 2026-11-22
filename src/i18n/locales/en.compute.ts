@@ -321,6 +321,15 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'guestList.empty': 'No {noun} yet',
   'guestList.deleteTitle': 'Delete {noun}',
   'guestList.deleteSoon': 'About to delete the {noun} ',
+  /* Isolation: list badge + the "release it first" guidance before deleting */
+  'guestList.isolated': 'Isolated',
+  'guestList.isolatedTitle':
+    'Isolated: the network is cut. Release the isolation on the Incident Response page before deleting it',
+  'guestList.deleteIsolatedTitle': 'This {noun} is isolated',
+  'guestList.deleteIsolatedSoon': 'Cannot delete yet:',
+  'guestList.deleteIsolatedTail':
+    'is still isolated (network cut + forensic snapshot), so deleting it would destroy evidence. Release the isolation on the Incident Response page first, then come back.',
+  'guestList.deleteIsolatedGo': 'Go release it',
   'guestList.bulkDeleteTitle': 'Delete {noun} in bulk',
   'guestList.bulkDeleteConfirm': 'Delete {count} {unit}',
   'guestList.bulkDeleteSoon': 'About to delete the selected',
@@ -450,6 +459,10 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'guestList.osFromMeta': 'Manual tag',
   'guestList.osFromTemplate': 'From template {name}',
   'guestList.osFromLinkedTemplate': 'Linked template {name}',
+  'guestList.osFromSnapshot': 'OS snapshot ({time})',
+  'guestList.osSnapshot':
+    'OS snapshot: {detail} (taken {time}). Refreshed on isolate / release / power-on; a failed read never clears what is already stored.',
+  'guestList.osSnapshotEmpty': 'Only the capture time is recorded',
   'guestList.templateLabel': 'Source template',
   'guestList.templateNone': 'Not linked (infer from clone history)',
   'guestList.templateHint':
@@ -1500,13 +1513,10 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'backups.notImplMessage': 'The backend /backups returns not-implemented. The frontend is wired up already and starts working once the backend provides data.',
   'backups.kpiFiles': 'Backup files',
   'backups.kpiSpace': 'Space used',
-  'backups.kpiSpaceHintPbs': 'PBS datastore used (deduplicated and compressed)',
   'backups.kpiSpaceHintDir': 'Actual archive file size',
-  'backups.kpiSpaceHintFallback':
-    'Some storages are unreadable — estimated from archive sizes',
   'backups.colDataSize': 'Data size',
   'backups.colDataSizeHint':
-    'For PBS archives this is the pre-dedup data size, not on-disk usage; see the “Space used” card for real disk usage',
+    'For PBS archives this is the size recorded for this snapshot, not on-disk usage (chunks are shared between archives); the “Space used” card above reports the datastore’s real usage, not the total of this column',
   'backups.kpiVms': 'VMs covered',
   'backups.kpiSuccess': 'Recent success rate',
   'backups.kpiRecent': '{ok} succeeded / {failed} failed in the last {days} days',
@@ -1845,10 +1855,6 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'lxcDetail.deleteSnapMessage': 'It cannot be recovered after deletion.',
   'guestList.snap.quotaRemaining': '{n} snapshots left in your quota',
   'guestList.snap.quotaUsedUp': 'Snapshot quota is used up (limit {limit}) — delete some snapshots first.',
-  'quota.fieldLabel.count': 'count',
-  'quota.fieldLabel.cores': 'CPU cores',
-  'quota.fieldLabel.memory': 'memory',
-  'quota.fieldLabel.disk': 'disk',
   'quota.askAdmin': 'Please ask an administrator to raise the limit.',
   'quota.detailsTitle': '{noun} quota',
   'quota.detailsHint': 'Click for a quota breakdown',
@@ -2017,6 +2023,10 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
     'Task status is temporarily unavailable; the task may still be running. Check the task queue.',
   'batchCreate.missingNote':
     'The task record no longer exists; check the guest list to confirm the result',
+  'batchCreate.verifiedNote':
+    'The task record is unreadable, but the guest exists in the cluster',
+  'batchCreate.absentNote':
+    'The guest was not found in the cluster; creation did not complete. Check the PVE task log.',
   'batchCreate.unknownNote':
     'The task result could not be confirmed; check the guest list or task queue',
   'batchCreate.close': 'Done',
@@ -2038,8 +2048,31 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'quickDeploy.createdLxcHint': 'CT {vmid}; follow the progress in the task queue',
   'quickDeploy.createdDiskMismatch': 'Created, but the system disk did not reach the plan size',
   'quickDeploy.createFailed': 'Creation failed',
-  'quickDeploy.summaryDisk': '{n}G disk',
-  'quickDeploy.summary': '{cores}C · {mem}G memory · {disk}',
+  'quickDeploy.summaryDisk': '{n} GB disk',
+  'quickDeploy.summary': '{cores} vCPU · {mem} GB RAM · {disk}',
+  'quickDeploy.summarySpecKey': 'Plan',
+  'quickDeploy.quotaKindLabel': '{label} quota',
+  'quickDeploy.quotaUsedOf': '{used} of {quota} {unit} used',
+  'quickDeploy.quotaThisBatch': '{qty} {unit} this batch',
+  'quickDeploy.quotaAfter': '{n} {unit} left after creation',
+  'quickDeploy.quotaShortLeft': 'only {n} {unit} left — ',
+  'quickDeploy.quotaShortNeed': 'cannot create {qty} {unit}',
+  'quickDeploy.quotaUnlimitedUsed': 'Unlimited ({used} {unit} used)',
+  'quickDeploy.quotaNoCapUsed': 'No cap on count ({used} {unit} used)',
+  'quickDeploy.templateTitle': 'Template',
+  'quickDeploy.templateEmpty': 'No template selected',
+  'quickDeploy.templateMem': '{size} RAM',
+  'quickDeploy.templateDisk': '{size} disk',
+  'quickDeploy.templateSize': 'size {size}',
+  'quickDeploy.templateVmid': 'VMID {vmid}',
+  'quickDeploy.templateStorage': 'storage {storage}',
+  'quickDeploy.templateNode': 'node {node}',
+  'quickDeploy.specPerGuest': 'per guest',
+  'quickDeploy.specCores': '{n} vCPU',
+  'quickDeploy.specMem': '{n} GB RAM',
+  /* 英文的台数单位是空串，所以乘数里只留数量 */
+  'quickDeploy.specTimes': '× {qty}',
+  'quickDeploy.specTotalLabel': 'total',
   'quickDeploy.noPermTitle': 'No provisioning permission',
   'quickDeploy.noPermBody': 'The vm.create permission is required.',
   'quickDeploy.quotaBlockedTitle': 'The {label} quota is exhausted',
@@ -2142,9 +2175,9 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'quickDeploy.segmentHint':
     'Picking one aligns the bridge and VLAN to it: the DHCP request leaves on that L2 network and its address comes from that subnet’s DHCP server (the panel reserves nothing).',
   'quickDeploy.labelIp': 'IP address',
-  'quickDeploy.ipPlaceholder': 'e.g. 172.16.149.50',
+  'quickDeploy.ipPlaceholder': 'e.g. 10.0.0.50',
   'quickDeploy.labelGateway': 'Gateway',
-  'quickDeploy.gatewayPlaceholder': 'e.g. 172.16.149.1',
+  'quickDeploy.gatewayPlaceholder': 'e.g. 10.0.0.1',
   'quickDeploy.sectionLogin': 'Login information',
   'quickDeploy.loginSubtitleVm': 'Written via cloud-init (the template must support it)',
   'quickDeploy.loginSubtitleLxc': 'The root password is written at creation',
@@ -2154,9 +2187,6 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'quickDeploy.passwordPlaceholder': 'Blank sets none',
   'quickDeploy.createVm': 'Create VM',
   'quickDeploy.createLxc': 'Create container',
-  'quickDeploy.quotaLimited': '{label} quota: {used} of {quota} used, {remaining} left',
-  'quickDeploy.quotaUnlimited': '{label} quota: unlimited',
-  'quickDeploy.willCreate': ' · will create: {summary}',
   'quickDeploy.loadingQuota': 'Loading quota…',
   /* ---------------------------------------------------------------- Console */
   'console.mode': 'Console type',
@@ -2265,7 +2295,8 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'console.fileHint':
     'The file is uploaded to the panel first, and a download command is generated. The guest must be able to reach the panel address; the command already includes the file name.',
   'console.chooseFile': 'Choose a file or drop it here',
-  'console.chooseFileHint': 'Up to 1 GB; the link expires after 24 hours',
+  'console.chooseFileHint':
+    'Up to 1 GB; the link is short-lived (60 minutes by default), so fetch it promptly',
   'console.uploading': 'Uploading',
   'console.uploadFile': 'Upload to panel',
   'console.fileUploaded': 'File uploaded',
@@ -2459,6 +2490,23 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'incident.isoSection': 'VM isolation',
   'incident.isoSectionHint':
     'Snapshot first, cut the network next, power off last — reverse the order and the scene is gone',
+  /* Isolation list: actions recorded by the panel, still visible after a refresh */
+  'incident.isoListSection': 'Isolation list',
+  'incident.isoListSectionHint':
+    'Isolations recorded by the panel; they survive a page refresh (the live state still comes from PVE)',
+  'incident.isoListTitle': 'Isolated VMs ({n})',
+  'incident.isoListSubtitle':
+    'Release an isolation right here; this list is only an index — per-VM state is read from PVE',
+  'incident.isoListEmptyTitle': 'No isolation on record',
+  'incident.isoListEmptyDesc':
+    'Pick a VM above and click “Isolate now”; the record will show up here.',
+  'incident.isoListCaption': 'Isolation list',
+  'incident.isoListLoadFailed': 'Could not load the isolation list',
+  'incident.isoColGuest': 'VM',
+  'incident.isoColAt': 'Isolated at',
+  'incident.isoColNics': 'NICs cut',
+  'incident.isoColSnapshot': 'Forensic snapshot',
+  'incident.isoStatePartial': 'Partial failure',
   'incident.targetTitle': 'Target and actions',
   'incident.targetSubtitle':
     'Isolation is an irreversible scene-preservation action: check the status before acting',
@@ -2530,7 +2578,14 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'incident.verifyNow': 'Verify now',
   'incident.fieldStorage': 'Storage',
   'incident.colVolid': 'Backup volume',
-  'incident.volidHint': 'Copy it from the archive list on the "Backups" page',
+  'incident.volidSelectPlaceholder': 'Select a backup volume',
+  'incident.volidSelectHint':
+    'Lists only the archives on this storage; picking one shows its size and creation time',
+  'incident.volidDetail': '{size} · created {time}',
+  'incident.noVolids': 'No backup archives on this storage',
+  'incident.noNodes': 'No nodes available',
+  'incident.pickNodeFirst': 'Select a node first',
+  'incident.pickStorageFirst': 'Select a storage first',
   'incident.notePlaceholder': 'e.g. pre-launch baseline backup, kept for 30 days',
   'incident.protectBtn': 'Register as protected',
   'incident.listLoadFailed': 'Could not load the protected list',
@@ -2551,7 +2606,7 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'incident.quarantineFailed': 'Isolation failed',
   'incident.released': 'Isolation released',
   'incident.releaseFailed': 'Failed to release isolation',
-  'incident.fillFields': 'Fill in the node, storage and backup volume ID',
+  'incident.fillFields': 'Select the node, storage and backup volume',
   'incident.protectDone': 'Registered as a protected backup',
   'incident.protectFailed': 'Registration failed',
   'incident.verifyProblem': 'Verification found problems',

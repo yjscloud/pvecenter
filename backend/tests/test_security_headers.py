@@ -25,6 +25,9 @@ def test_security_headers_on_every_response() -> None:
     assert headers["cross-origin-embedder-policy"] == "require-corp"
     assert headers["cross-origin-resource-policy"] == "same-origin"
 
+    # 整站反索引：robots.txt 之外的第二道保险（有些引擎只认响应头）
+    assert headers["x-robots-tag"] == "noindex, nofollow"
+
     csp = headers["content-security-policy"]
     assert "default-src 'self'" in csp
     # 普通页面的脚本只能是同源 —— 这是 XSS 的纵深防线，别被文档需求带偏
@@ -43,3 +46,19 @@ def test_docs_csp_is_relaxed_only_for_docs_paths() -> None:
     assert "cdn.jsdelivr.net" not in middleware.CSP
     assert "cdn.jsdelivr.net" in middleware.DOCS_CSP
     assert middleware.DOCS_PATHS == {"/api/docs", "/api/redoc"}
+
+
+def test_robots_txt_disallows_everything() -> None:
+    """robots.txt 必须真的存在且禁止全站索引。
+
+    此前这条路径落到 SPA 兜底，返回的是 JSON 404 —— 扫描器看到「没有
+    robots.txt」，搜索引擎则可能把登录页和接口路径收进索引。
+    """
+    client = TestClient(main.app)
+    response = client.get("/robots.txt")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.text == "User-agent: *\nDisallow: /\n"
+    # 不依赖爬虫自觉：同一条响应也带反索引头
+    assert response.headers["x-robots-tag"] == "noindex, nofollow"

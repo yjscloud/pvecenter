@@ -260,12 +260,12 @@ FORWARDED_ALLOW_IPS=127.0.0.1
    deny  all;
    ```
    前面还有 CDN / 云 WAF 的话，记得用 `set_real_ip_from` + `real_ip_header` 还原真实来源，否则 `$remote_addr` 全是 CDN 地址。
-3. **管理员强制 2FA**：`TOTP_REQUIRED_ROLES=admin`。管理员没绑 TOTP 之前，除 2FA 接口外一律 403（可在「个人中心」绑定）。登录失败锁定（账号 + IP 双维度）和人机验证公网环境别关；人机验证对**登录与自助注册同时生效**，否则注册接口会被脚本拿去刷审批队列。
+3. **管理员强制 2FA**：`TOTP_REQUIRED_ROLES=admin`。管理员没绑 TOTP 之前，除 2FA 接口外一律 403（可在「个人中心」绑定）。登录失败锁定（账号 + IP 双维度）和人机验证公网环境别关；人机验证对**登录、自助注册、忘记密码、重置密码四个匿名入口同时生效**，否则注册接口会被脚本拿去刷审批队列，而一条重置链接就足以改掉口令。
 4. **新 IP 登录告警**：默认开（`LOGIN_IP_ALERT=true`）。某账号第一次从新 IP 登录成功时，所有管理员收到站内消息；配了 SMTP 再发一封邮件。审计里对应 `auth.new_ip`。
 5. **别把 8080 裸奔到公网**：Docker 部署建议 `PANEL_BIND=127.0.0.1`，只让同机反代连。`FORWARDED_ALLOW_IPS` 绝不要填 `*` —— 客户端能伪造来源 IP，白名单、登录锁定、审计 IP 会一起失真。
 6. **定期审计**：`/api/audit`、`/api/host-audit` 默认只有管理员可读。重点看登录失败、`auth.new_ip`、用户 / 权限变更，以及删机、改凭据这类敏感操作。
 7. **接口文档默认关闭**：`/api/docs`、`/api/redoc`、`/api/openapi.json` 一律 404。完整 OpenAPI 等于一份全量攻击地图。排障确需查看时用 `API_DOCS_ENABLED=true` 临时打开，打开后这三个地址仍要求「已登录 + `settings.manage`」。
-8. **`/api/health` 对匿名只答「活着」**：未登录只返回 `{"status":"ok"}`，不再给 PVE 版本、节点数和连接状态（版本号能直接对公开漏洞库）。登录后仍是完整读数，深度诊断走 `/api/config/diagnostics`（管理员）。
+8. **`/api/health` 对匿名只答「活着」**：未登录只返回 `{"status":"ok","authenticated":false}`，不再给 PVE 版本、节点数和连接状态（版本号能直接对公开漏洞库）。登录后仍是完整读数（`authenticated:true`），深度诊断走 `/api/config/diagnostics`（管理员）。`authenticated` 用来把「探测结果未知」和「配了但连不上」分开，界面不会把前者误报成 PVE 故障。
 9. **安全响应头由面板统一下发**：CSP（普通页面 `script-src 'self'`）、`X-Content-Type-Options: nosniff`、`Referrer-Policy: strict-origin-when-cross-origin`、`Permissions-Policy`、`frame-ancestors 'none'`、`X-Frame-Options: DENY` 和 HSTS 都在应用层加（`backend/app/main.py` 的 `SecurityHeadersMiddleware`）。反代只做 TLS 终结，不要重复添加同名头。
 10. **面板→PVE 默认不校验证书**：新建连接的 `verify_ssl` 默认 `false`（`PVE_VERIFY_SSL` 也是）。PVE 出厂是自签证书（cluster CA 签发、`CN=pve.local`、无 IP SAN），默认开着校验会在握手阶段失败，很容易误判成地址或令牌填错。要校验就别只勾开关：把 PVE 证书 PEM 填进连接的「证书 PEM」（`ca_cert`），按该证书钉扎 —— 只信这一张，比系统信任库更严，也不受那个开关影响。取证书：`openssl s_client -connect <PVE-IP>:8006 </dev/null 2>/dev/null | openssl x509`，或从任意节点 `cat /etc/pve/pve-root-ca.pem`。正规 CA 签发（或已钉扎）时再把开关打开。连接未校验时启动日志会告警。
 11. **挂了反代就把后端绑回回环**：`HOST=127.0.0.1` 时 8080 不对内网开放，全部入口经 nginx（默认安装是 `0.0.0.0`，可直接用 `IP:8080`）。反代侧再配 `client_header_timeout` / `client_body_timeout` / `send_timeout` 与 `limit_conn`，抵御慢速连接耗尽 worker。
@@ -489,7 +489,7 @@ PVE 里把 PBS 注册成存储之后，存储页就会显示 PBS 徽标、最近
 <!-- 截图占位：docs/screenshots/users-rbac.png -->
 ![多用户与 RBAC：角色、权限、配额与审批](docs/screenshots/users-rbac.png)
 
-- 自助注册 + 管理员审批：注册后账号是 `pending`，登不了；审批时一次把角色和权限分配好。邮箱必填，审批结果发邮件（邮件是旁路，发不出去只记审计）。找回密码走一次性链接，不管账号存不存在都回同一句话，不给人试账号的机会。
+- 注册方式四选一（**默认关闭**，在「设置 → 注册方式」里切换，即时生效）：关闭 / 邀请制 / 注册码制 / 自助。邀请制与注册码制都在同一张凭证表里签发（明文只显示一次、只存哈希、原子消费，一码一人；可撤销、可设有效期与次数），切模式后另一种凭证立即失效。签发邀请链接 / 注册码时可预先指定角色、额度与「注册后是否需要管理员审批」：默认要审批、账号为 `pending`；关掉则注册成功即可直接登录，审批时沿用凭证预置的角色。审批结果发邮件（邮件是旁路，发不出去只记审计）。找回密码走一次性链接，不管账号存不存在都回同一句话，不给人试账号的机会。
 - 所有写操作（含失败的）进审计日志，记用户、动作、目标、结果、详情、来源 IP，可按条件筛；结果是 `success` / `failed` / `partial` / `denied` / `accepted` 之一。普通账号即便有 `audit.view` 也只能看自己的记录，读审计本身同样留痕。
 - 防呆：不能删、禁用或降级最后一个管理员，不能删当前登录账号。
 - 资源额度分两层：先看用户自己有没有配，没配就继承角色默认值，两层都没配才不限制。维度是虚拟机与容器各自的台数、核数、内存、磁盘，另有单台核数 / 内存 / 磁盘封顶与快照数（总数 + 单机上限）。「继承」和「自定义但留空」不是一回事，后者表示显式不限制，会盖掉角色默认值。额度不只拦创建：改配置、加盘扩容、建快照同样校验，只守进门那一步等于没守。普通用户的读数只统计自己名下的机器，全平台已用 / 上限只在管理员和设置页展示 —— 免得把「集群还剩几台」当成「我还能建几台」，也不暴露集群规模。

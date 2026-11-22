@@ -77,6 +77,9 @@ from .routers import (
     # 统一处置（预览 → 二次确认 → 执行）；动作实现在 app.remediation
     remediation as remediation_router,
     roles,
+    # 面板运行时读数（/api/runtime/*）：所有登录用户都要用的只读视图。
+    # 与 /api/config/*（settings.manage）按读者分家，见 app/routeguard.py。
+    runtime as runtime_router,
     # 后台作业状态与配置（/api/scheduler/*）；调度实现在 app.scheduler
     scheduler as scheduler_router,
     ssh,
@@ -110,7 +113,10 @@ from . import certs as cert_manager
 from . import certworkflow_run
 from . import certworkflow_store
 from . import connregister
+# 自助注册的一次性邮箱验证码（发码 / 校验 / 限频，见 app/emailcodes）
+from . import emailcodes
 from . import frp
+from . import invites
 from . import ippool
 from . import metrics as metrics_history
 from . import notifications
@@ -119,6 +125,7 @@ from . import panel_url
 from . import password_reset
 from . import prefs
 from . import pvecache
+from . import regcodes
 from . import scheduler
 from . import security
 from . import site
@@ -136,6 +143,8 @@ from . import hostaudit as host_audit
 from . import i18n
 from .routers import frp as frp_router
 from . import backupguard
+# 面板发起过的隔离动作（虚拟机列表的「隔离」标签与应急响应清单都读它）
+from . import quarantine_store
 from . import buildinfo
 from . import verifyguard
 from . import pbsguard
@@ -198,6 +207,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await sshremote.init_table()
     # 受保护备份登记表（防删 / 防篡改核对）
     await backupguard.init_table()
+    # 面板发起的隔离动作登记表：虚拟机列表靠它打「隔离」标签，应急响应页靠它
+    # 列出「现在有哪些机器被隔离」（见 app.quarantine_store）
+    await quarantine_store.init_table()
     # 面板发起的建机 / 克隆 / 恢复记录（创建时间字段的准确来源，见 app.guest_created）
     await guest_created.init_table()
     # 归属表的一次性迁移：把升级前记在 KIND_VM 下的容器归属改到 KIND_CT
@@ -230,6 +242,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await prefs.init_table()
     # PVE 一键接入注册码表（脚本用它建连接，绕开 step-up，见 app.connregister）
     await connregister.init_table()
+    # 自助注册的邀请凭证 / 注册码表（见 app.regcodes）
+    await regcodes.init_table()
+    # 邀请链接表（链接自带角色 / 审批策略 / 次数，见 app.invites）
+    await invites.init_table()
+    # 注册邮箱验证码表（自助注册的一步性口令，见 app.emailcodes）
+    await emailcodes.init_table()
     # 清掉过期的令牌黑名单条目与早已过期的会话记录（纯残留清理，失败不影响启动）
     try:
         await purge_expired_tokens()
@@ -757,7 +775,7 @@ app.add_middleware(HttpsEnforcementMiddleware)
 
 
 class SecurityHeadersMiddleware:
-    """给所有 HTTP 响应补齐浏览器安全头（CSP / nosniff / Referrer / Permissions）。
+    """给所有 HTTP 响应补齐浏览器安全头（CSP / nosniff / Referrer / Permissions / 反索引）。
 
     为什么写在应用里而不是只交给 nginx：反代配置属于部署方，漏了就整站裸奔；
     面板自己下发，裸 8080、Docker、反代三种部署口径一致。反代那边只需**不要
@@ -817,6 +835,10 @@ class SecurityHeadersMiddleware:
         (b"cross-origin-opener-policy", b"same-origin"),
         (b"cross-origin-embedder-policy", b"require-corp"),
         (b"cross-origin-resource-policy", b"same-origin"),
+        # 整站不许索引（管理面板被搜索引擎收录只会扩大攻击面）。robots.txt
+        # 只管守规矩的爬虫，这条响应头把「已经抓到了也别展示」一起覆盖；
+        # 有些引擎 / 预览服务并不读 robots.txt，只认这个头。
+        (b"x-robots-tag", b"noindex, nofollow"),
     )
 
     def __init__(self, app: Any) -> None:
@@ -1041,10 +1063,21 @@ async def proxmox_error_handler(request: Request, exc: ProxmoxError) -> JSONResp
         exc.code or "-",
         exc.message,
     )
+    # 5xx 是上游内部失败：原文常带 VM 名 / 存储路径 / 锁信息，对外一律换成
+    # 通用文案，细节靠 trace_id 回查日志（审计项 L-3）。4xx 是请求本身的问题
+    # （未开机、权限不足、参数冲突），保留语义，用户才知道下一步该做什么。
+    if status >= 500:
+        detail: Any = i18n.pick(
+            "上游 Proxmox 操作失败，请稍后重试（如需排查请提供 trace_id）",
+            "The upstream Proxmox operation failed. Please try again later "
+            "(quote the trace_id when asking for help).",
+        )
+    else:
+        detail = exc.message
     return JSONResponse(
         status_code=status,
         content={
-            "detail": exc.message,
+            "detail": detail,
             # 机器可读原因仍保留：前端靠它区分 428 的两种来源
             "code": exc.code,
             "trace_id": trace_id,
@@ -1077,7 +1110,10 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
 
 # ------------------------------------------------------------------ routers
 app.include_router(auth.router)
+# 面板配置（/api/config/*）：整组 settings.manage，路由级守卫在 routeguard.py
 app.include_router(config.router)
+# 运行时读数（/api/runtime/*）：登录即可读的脱敏视图（UI 开关 / 创建默认值 / 规格）
+app.include_router(runtime_router.router)
 app.include_router(dashboard.router)
 # 监控历史：/api/metrics/history 与 /api/metrics/coverage（实时那条走 /ws/metrics）
 app.include_router(metrics_router.router)
@@ -1127,6 +1163,8 @@ app.include_router(ai_router.router)
 app.include_router(ports_router.router)
 # 应急隔离挂在 /api/vms/{node}/{vmid}/quarantine，与 vms 共用归属校验
 app.include_router(isolation.router)
+# 隔离清单（面板登记过的隔离动作）：/api/isolation
+app.include_router(isolation.list_router)
 # 统一处置：/api/remediation/actions|preview|apply（预览 + 二次确认 + 审计）
 app.include_router(remediation_router.router)
 app.include_router(hostaudit.router)
@@ -1362,6 +1400,29 @@ async def security_txt(request: Request) -> PlainTextResponse:
         media_type="text/plain; charset=utf-8",
         # 渠道很少变，但也不该被代理长期据旧；一小时足够。
         headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt() -> PlainTextResponse:
+    """禁止一切搜索引擎索引。
+
+    管理面板被收录的代价不是「多几条搜索结果」：登录页、接口路径、带查询
+    参数的 URL 都会出现在别人的索引里，等于替攻击者做了资产测绘。
+
+    用路由而不是塞一个 ``public/robots.txt``：后端没构建前端产物（``dist/``
+    不存在）时也要答得出这份文件，Docker / 裸 8080 / 反代三种部署口径一致。
+    原先这条路径会落到 SPA 兜底的「像静态文件就 404」，扫描器看到的是
+    JSON 404（审计项：缺少 robots.txt）。
+
+    与 :class:`SecurityHeadersMiddleware` 里的 ``X-Robots-Tag`` 双保险：
+    robots.txt 只约束守规矩的爬虫，响应头则把「抓到了也别索引」一起说了。
+    """
+    return PlainTextResponse(
+        "User-agent: *\nDisallow: /\n",
+        media_type="text/plain; charset=utf-8",
+        # 内容固定，一天缓存足够；改规则属于部署变更，不需要秒级生效。
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 

@@ -10,7 +10,7 @@
   display: flex;
   height: 100vh;
   overflow: hidden;
-  /* 冷调底 + 科技网格 + 青紫双辉光，构成整个面板的“控制舱”基调 */
+  /* 冷调底 + 科技网格 + 青紫双辉光，构成整个面板的"控制舱"基调 */
   background-color: var(--bg-base);
   background-image:
     linear-gradient(var(--grid-line) 1px, transparent 1px),
@@ -6039,6 +6039,54 @@
   width: 136px;
   font-size: var(--font-size-sm);
   color: var(--text-muted);
+}
+
+/* 人机校验「已通过」状态：发码消耗掉那道题之后，用它替掉整块验证码区域。
+   高度刻意与验证码块接近（一行 + 内边距），避免表单在发码瞬间整体跳动。 */
+.login-captcha-done {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.login-captcha-done svg {
+  color: var(--success);
+  flex-shrink: 0;
+}
+
+.login-captcha-done .login-code-btn {
+  margin-left: auto;
+}
+
+/* 注册页邮箱验证码的「发送」按钮：挂在输入框的 suffix 里，所以不需要自己
+   处理与输入框的对齐。倒计时期间只是禁用它，不把文字换成灰色提示条 ——
+   用户要能一眼看到「还要等几秒才能重发」。 */
+.login-code-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--transition-fast);
+}
+
+.login-code-btn:hover:not(:disabled) {
+  color: var(--accent-hover);
+}
+
+.login-code-btn:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
 }
 
 /* ---------------------------------------------------------------------------

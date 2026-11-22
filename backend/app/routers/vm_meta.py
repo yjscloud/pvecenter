@@ -58,8 +58,20 @@ def _entry_key(node: str, vmid: int, connection_id: Optional[str]) -> str:
 
     一定要带连接：两台 PVE 上完全可能同时存在 node1/100，
     不带连接会把两台不同的机器当成同一台，IP 互相覆盖。
+
+    **节点是可变的那一段**：机器迁移之后键就变了，按旧键写的条目会变成孤儿
+    （列表里那份「系统标识 / 关联模板」就此消失）。所以凡是要「按机器」操作的
+    地方都用 :func:`_same_identity` 再兜一层 —— 连接 + VMID 才是这台机器的身份
+    （VMID 在一条连接内唯一）。
     """
     return f"{connection_id or ''}|{node}|{vmid}"
+
+
+def _same_identity(left: str, right: str) -> bool:
+    """两个条目键是不是同一台机器：只看「连接 + VMID」，忽略节点。"""
+    a = str(left).rsplit("|", 2)
+    b = str(right).rsplit("|", 2)
+    return len(a) == 3 and len(b) == 3 and a[0] == b[0] and a[2] == b[2]
 
 
 async def _load() -> Dict[str, Dict[str, Any]]:
@@ -94,8 +106,20 @@ async def _load() -> Dict[str, Dict[str, Any]]:
                     "vmid": tpl_vmid,
                     "name": str(tpl.get("name") or "").strip(),
                 }
-        # 三个字段都空才算没有条目：只关联了模板的机器同样不该被丢掉
-        if not ip and not os_key and not template:
+        # 系统信息快照（隔离 / 解除隔离 / 开机时采集，见 app.guest_osinfo）。
+        # 只做展示与恢复用，空字段一律丢掉。
+        snap_raw = value.get("snapshot")
+        snapshot: Optional[Dict[str, Any]] = None
+        if isinstance(snap_raw, dict):
+            snapshot = {
+                str(name): item
+                for name, item in snap_raw.items()
+                if item not in (None, "")
+            }
+            if not snapshot:
+                snapshot = None
+        # 三个字段都空才算没有条目：只关联了模板 / 只留了快照的机器同样不该被丢掉
+        if not ip and not os_key and not template and not snapshot:
             continue
         entry: Dict[str, Any] = {
             "ip": ip,
@@ -105,8 +129,80 @@ async def _load() -> Dict[str, Dict[str, Any]]:
         }
         if template:
             entry["template"] = template
+        if snapshot:
+            entry["snapshot"] = snapshot
+            entry["snapshot_at"] = int(value.get("snapshot_at") or 0)
+            if value.get("auto"):
+                entry["auto"] = True
         result[str(key)] = entry
     return result
+
+
+async def save_snapshot(
+    connection_id: Optional[str],
+    node: str,
+    vmid: int,
+    snapshot: Dict[str, Any],
+    *,
+    os_family: str = "",
+    by: str = "",
+) -> None:
+    """把一次系统信息采集写进这台机器的备注条目（**只补不删**）。
+
+    * 合并而不是替换：这次没采集到的字段不覆盖旧值（PVE 返回精简 config、某个
+      字段被清空，都不该让「上一次的版本 / 主机名」跟着消失）；
+    * ``os_family`` 只在条目**还没有** ``os`` 时补上 —— 人工标注永远优先；且
+      ``linux`` / ``other`` 这种大类不回填（它们只进快照兜底）；
+    * 记录写在「连接 + VMID」这个身份上：机器迁移过之后照样认领，并顺手把旧节点
+      那一条收掉（与 :func:`save_vm_meta` 同一口径）。
+
+    失败只记日志：它是隔离 / 开关机的附加动作，不能反过来影响主流程。
+    """
+    if not node or not vmid:
+        return
+    try:
+        items = await _load()
+        key = _entry_key(node, vmid, connection_id)
+        entry: Dict[str, Any] = {}
+        inherited = False
+        for other, value in items.items():
+            if other == key or _same_identity(other, key):
+                entry = dict(value)
+                inherited = other != key
+                break
+        if not entry:
+            entry = {"ip": "", "os": ""}
+
+        merged = dict(entry.get("snapshot") or {})
+        for name, value in (snapshot or {}).items():
+            if value not in (None, ""):
+                merged[name] = value
+        if not merged:
+            return
+        entry["snapshot"] = merged
+        entry["snapshot_at"] = int(time.time())
+        entry["auto"] = True
+        family = str(os_family or "").strip().lower()
+        # 只有**具体**家族才回填：``linux`` / ``other`` 这类大类一旦写进 ``os``，
+        # 就会永远压过来源模板名带来的更具体判断（列表以 os 优先），把一台 Ubuntu
+        # 显示成通用 Linux。大类只留在快照里兜底。
+        if family and family not in ("linux", "other"):
+            if not str(entry.get("os") or "").strip():
+                entry["os"] = family
+        entry["ip"] = str(entry.get("ip") or "")
+        entry["by"] = str(entry.get("by") or by or "")
+        entry["at"] = int(entry.get("at") or time.time())
+
+        items[key] = entry
+        # 同一台机器只留一条（迁移前后各写过一次的话）
+        for other in [k for k in items if k != key and _same_identity(k, key)]:
+            items.pop(other, None)
+        await store.set_setting(META_KEY, json.dumps(items, ensure_ascii=False))
+        logger.debug(
+            "已保存系统信息快照（%s/%s，%s）", node, vmid, "认领旧条目" if inherited else "新条目"
+        )
+    except Exception:  # noqa: BLE001 - 附加动作，失败不该影响隔离 / 开关机
+        logger.warning("保存系统信息快照失败（%s/%s）", node, vmid, exc_info=True)
 
 
 async def os_of(node: str, vmid: int, connection_id: Optional[str]) -> str:
@@ -115,9 +211,18 @@ async def os_of(node: str, vmid: int, connection_id: Optional[str]) -> str:
     AI 租约与重装向导用它纠正 PVE 的 ``ostype``：后者对 Linux 一律记 ``l26``，
     对导入 / 手工建的机器还可能停在建机时的默认值（例如 ``win11``），而这里是
     运维在面板里确认过的标注。
+
+    条目可能还挂在机器迁移前的节点下，所以按「连接 + VMID」再兜一次。
     """
-    item = (await _load()).get(_entry_key(node, vmid, connection_id)) or {}
-    return str(item.get("os") or "")
+    items = await _load()
+    key = _entry_key(node, vmid, connection_id)
+    item = items.get(key)
+    if not item:
+        for other, value in items.items():
+            if _same_identity(other, key):
+                item = value
+                break
+    return str((item or {}).get("os") or "")
 
 
 async def _drop(connection_id: Optional[str], node: str, vmid: int, *, keep_ip: bool) -> None:
@@ -125,16 +230,21 @@ async def _drop(connection_id: Optional[str], node: str, vmid: int, *, keep_ip: 
     try:
         items = await _load()
         key = _entry_key(node, vmid, connection_id)
-        item = items.get(key)
-        if not item:
+        # 同一台机器可能在多个节点下都有条目（迁移前写的 + 迁移后写的）：
+        # 一次清干净，别让孤儿行在 VMID 被回收时贴到新机器上。
+        targets = [other for other in items if _same_identity(other, key)]
+        if not targets:
             return
-        if keep_ip and item.get("ip"):
-            # 重装换了系统盘：系统标识与「来源模板」关联都描述的是旧盘，一起作废
-            kept = {**item, "os": ""}
-            kept.pop("template", None)
-            items[key] = kept
-        else:
-            items.pop(key, None)
+        for other in targets:
+            item = items.get(other) or {}
+            if keep_ip and item.get("ip"):
+                # 重装换了系统盘：系统标识与「来源模板」关联描述的都是旧盘，一起作废；
+                # 手动 IP 与系统盘无关，留着
+                kept = {**item, "os": ""}
+                kept.pop("template", None)
+                items[other] = kept
+            else:
+                items.pop(other, None)
         await store.set_setting(META_KEY, json.dumps(items, ensure_ascii=False))
     except Exception:  # noqa: BLE001 - 删机器 / 重装不能因为清备注失败而回滚
         logger.warning("清理面板备注失败（%s/%s）", node, vmid, exc_info=True)
@@ -161,25 +271,25 @@ async def drop_os(connection_id: Optional[str], node: str, vmid: int) -> None:
     await _drop(connection_id, node, vmid, keep_ip=True)
 
 
-async def manual_ip_index(user: Dict[str, Any]) -> Dict[Tuple[str, str, int], str]:
-    """手动备注 IP 的索引 ``(连接, 节点, vmid) -> ip``，供列表 / 导出算「网络」。
+async def manual_ip_index(user: Dict[str, Any]) -> Dict[Tuple[str, int], str]:
+    """手动备注 IP 的索引 ``(连接, vmid) -> ip``，供列表 / 导出算「网络」。
 
     可见性与 :func:`get_vm_meta` 一致：管理员全量，普通用户只看自己填的 ——
     否则别人的虚拟机手动地址会顺着「网络归属」这个侧信道漏出来（虽然只漏池名，
     但推池名的输入是别人填的 IP，不能拿它当自己的数据用）。
 
-    键用三元组而非原串：调用方（``collect_vms`` / ``list_containers``）拿到的
-    就是这三个字段，不必再和这里的串格式耦合。
+    键刻意不含节点：机器迁移之后条目还挂在旧节点下，按节点取会让「网络」列
+    丢掉那台机器的手动地址。VMID 在一条连接内唯一，同号只可能是它自己。
     """
     items = await _load()
     if user.get("role") != "admin":
         username = str(user.get("username") or "")
         items = {k: v for k, v in items.items() if v.get("by") == username}
-    out: Dict[Tuple[str, str, int], str] = {}
+    out: Dict[Tuple[str, int], str] = {}
     for key, value in items.items():
         try:
-            conn, node, vmid_s = str(key).rsplit("|", 2)
-            out[(conn, node, int(vmid_s))] = str(value.get("ip") or "")
+            conn, _node, vmid_s = str(key).rsplit("|", 2)
+            out[(conn, int(vmid_s))] = str(value.get("ip") or "")
         except ValueError:
             continue
     return out
@@ -251,7 +361,14 @@ async def save_vm_meta(
     items = await _load()
     key = _entry_key(node, payload.vmid, payload.connection_id)
 
+    # 迁移过的机器：原条目还挂在旧节点下。先认领再写，否则「只改 IP」的时候
+    # 会把原来那条的系统标识 / 关联模板孤立在旧节点，等于把它们丢了。
     existing = items.get(key) or {}
+    if not existing:
+        for other, value in items.items():
+            if _same_identity(other, key):
+                existing = value
+                break
     # 没传 ``os`` 时保留记录里已有的值：删地址不该把系统标注一起抹掉
     os_key = str(existing.get("os") or "")
     if payload.os is not None:
@@ -284,6 +401,11 @@ async def save_vm_meta(
         items[key] = entry
     else:
         items.pop(key, None)
+
+    # 同一台机器在其它节点下的旧条目（迁移前写的）随这次保存一起收掉：
+    # 界面上按「连接 + VMID」回落读取，留着两条会读到过期那一条。
+    for other in [k for k in items if k != key and _same_identity(k, key)]:
+        items.pop(other, None)
 
     await store.set_setting(META_KEY, json.dumps(items, ensure_ascii=False))
     await security.audit(

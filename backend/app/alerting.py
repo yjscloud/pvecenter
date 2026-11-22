@@ -1922,7 +1922,8 @@ async def test_template(
         "status": i18n.pick("已停止", "stopped")
         if state_metric
         else i18n.pick("运行中", "running"),
-        "ip": "172.16.149.220",
+        # 示例值：模板预览会原样渲染到界面上，不能写某套真实网段的地址
+        "ip": "10.0.0.50",
         "time": _now_text(now),
     }
     if metric == "mem":

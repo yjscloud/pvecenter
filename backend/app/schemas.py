@@ -332,10 +332,20 @@ class ResetTokenIn(BaseModel):
 
 
 class ResetPasswordIn(BaseModel):
-    """自助重置密码第 2 步：凭链接里的令牌设置新密码。"""
+    """自助重置密码第 2 步：凭链接里的令牌设置新密码。
+
+    与登录 / 注册 / 忘记密码同级的人机校验：这一步同样匿名可用，且会**写库
+    （改掉账号口令）并吊销该账号的全部会话**。没有验证码，脚本可以拿偷来的
+    或猜到的链接反复试；更直接的是它能被当成「口令强度探测接口」来刷。
+    具体用图形码还是滑块由「设置 → 登录验证」决定；关闭时不校验。
+    """
 
     token: str
     password: str = Field(min_length=12)
+    captcha_id: str = ""
+    captcha_code: str = ""
+    captcha_x: Optional[float] = None
+    captcha_path: Optional[List[Dict[str, float]]] = None
 
 
 class VmQuotaIn(BaseModel):
@@ -1665,12 +1675,83 @@ class RegisterRequest(BaseModel):
     captcha_x: Optional[float] = None
     # 拖动轨迹采样点，语义同 LoginRequest.captcha_path
     captcha_path: Optional[List[Dict[str, float]]] = None
+    # 注册凭证：邀请制填邀请码、注册码制填注册码。自助注册模式下忽略；
+    # 需要凭证的模式下缺失会被 400 拒绝（见 app/regcodes.py）。
+    invite_code: str = ""
+    # 邀请链接的 token（注册页从 ``?invite=`` 取）。带了它就走链接那条路：
+    # 校验次数 / 有效期、按链接写入角色与审批策略，与上面的 invite_code 互斥
+    # （见 app/invites.py）。
+    invite_token: str = ""
+    # 邮箱验证码（自助注册模式必填，见 app/emailcodes.py）。只对「自助注册」
+    # 生效：邀请制 / 注册码制的凭证本身就是管理员线下分发的，不需要再验一次邮箱。
+    email_code: str = ""
+
+
+class RegisterEmailCodeIn(BaseModel):
+    """自助注册第 1 步：给填写的邮箱发一条一次性验证码。
+
+    人机校验字段与注册请求同源：发信是「对外投递」，没有它就是个免费的邮件
+    轰炸接口（收件人可以是任意地址）。
+    """
+
+    email: str
+    captcha_id: str = ""
+    captcha_code: str = ""
+    captcha_x: Optional[float] = None
+    captcha_path: Optional[List[Dict[str, float]]] = None
+
+
+class RegistrationModeIn(BaseModel):
+    """注册方式：off / invite / code / open（四选一，互斥）。"""
+
+    mode: str
+
+
+class RegistrationEmailCodeIn(BaseModel):
+    """自助注册的邮箱验证码开关（设置页那个拨动开关）。"""
+
+    enabled: bool
+
+
+class RegistrationCodeIn(BaseModel):
+    """签发注册码。``kind`` 缺省为注册码。"""
+
+    kind: str = "code"
+    note: str = ""
+    # 有效期（分钟）：默认 24 小时；见 app/regcodes.py
+    ttl_minutes: Optional[int] = None
+    # 可用次数：0 = 不限，默认一次性
+    max_uses: int = 1
+    # 新账号的角色：注册那一刻写进账号，因此注册码制也能提前指定角色
+    role: str = "viewer"
+    # 新账号的资源额度；None / 全空 = 不额外限制，继承角色默认额度
+    quota: Optional[QuotaLimitsIn] = None
+    # 注册后是否要管理员审批：true → 账号建出来是 pending；false → 建好即可登录
+    requires_approval: bool = True
+
+
+class InviteLinkIn(BaseModel):
+    """新建邀请链接：链接自带角色、审批策略与使用上限。"""
+
+    note: str = ""
+    # 新用户的角色（roles 表主键）。路由层校验它存在、且不高于操作者自己的角色
+    role: str = "viewer"
+    # 注册后是否要管理员审批：true → 账号建出来是 pending；false → 建好即可登录
+    requires_approval: bool = True
+    # 可用次数：0 = 不限
+    max_uses: int = 0
+    # 有效期（天）：0 = 永久
+    ttl_days: int = 7
+    # 新账号的资源额度；None / 全空 = 不额外限制，继承角色默认额度
+    quota: Optional[QuotaLimitsIn] = None
 
 
 class ApprovalRequest(BaseModel):
     """管理员审批注册申请：通过的同时直接定好角色与权限。"""
 
-    role: str = "viewer"
+    # None = 沿用账号当前角色。邀请链接注册时角色在注册那一刻就写进去了，
+    # 管理员只是「放行」，不该因为它没重新选一次就把角色打回 viewer。
+    role: Optional[str] = None
     # 与 UserUpdate 同义：None = 继承角色；列表（含空列表）= 以它为准
     permissions: Optional[List[str]] = None
     set_permissions: bool = False
@@ -2182,7 +2263,12 @@ class TaskRef(BaseModel):
 # -------------------------------------------------------------------- misc
 class HealthOut(BaseModel):
     status: str
-    pve_connected: bool
+    # 诊断字段是否可信：匿名请求只答 status，此时 pve_* 一律缺省，不能据此
+    # 断言「PVE 连不上」（见 routers/config.py 的两档设计）。
+    authenticated: bool = False
+    pve_connected: Optional[bool] = None
+    pve_configured: Optional[bool] = None
+    pve_paused: Optional[bool] = None
     version: Optional[str] = None
     pve_version: Optional[str] = None
     node_count: int = 0

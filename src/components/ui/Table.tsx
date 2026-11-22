@@ -269,6 +269,15 @@ export interface TableProps<T> {
    */
   storageKey?: string;
   /**
+   * 表头拖动排序：把 ``from`` 列挪到 ``to`` 列的位置。
+   *
+   * 顺序的持久化不在这里做 —— 调用方接的是 useColumnSettings 的 ``move``，
+   * 与「列设置」窗口里那份顺序、那份 localStorage 是同一条链路：
+   * 两条入口各记一份的话，用户从表头拖完再从窗口里看，顺序会对不上。
+   * 不传则表头不可拖动；``locked`` 列（选择框 / 操作列）始终不参与。
+   */
+  onColumnMove?: (from: string, to: string) => void;
+  /**
    * 表格上方右对齐的列工具条（放「列设置」齿轮）。
    *
    * 刻意渲染在 `.table-container` **之外**：容器要横向滚动，overflow 会把
@@ -306,6 +315,7 @@ export function Table<T>({
   onRowHover,
   resizable = true,
   storageKey,
+  onColumnMove,
   columnMenu,
   isRowExpanded,
   renderExpanded,
@@ -323,6 +333,10 @@ export function Table<T>({
   const dragRef = useRef<{ key: string; startX: number; startW: number } | null>(
     null,
   );
+  /* 表头拖动排序：正在拖的列。ref 与 state 各一份 —— dragEnter 回调里必须
+     读到「刚按下的是哪一列」，而 state 在连续 dragEnter 之间可能还没更新。 */
+  const [dragColumn, setDragColumn] = useState<string | null>(null);
+  const dragColumnRef = useRef<string | null>(null);
   /* 拖拽结束（pointerup）时读的是最新宽度：回调闭包里的 widths 是旧的，
      用 ref 同步一份，避免把拖拽中途的值写进存储 */
   const widthsRef = useRef<Record<string, number> | null>(widths);
@@ -506,20 +520,52 @@ export function Table<T>({
               const isSorted = sort?.key === col.key;
               const canResize = resizable && col.resizable !== false;
               const active = draggingKey === col.key;
+              /* 锁定列（选择框 / 操作列）不参与拖动：操作列被拖到中间，
+                 整张表就找不到「删除」在哪了。 */
+              const canMove = Boolean(onColumnMove) && !col.locked;
+              const isDragSource = dragColumn === col.key;
               return (
                 <th
                   key={col.key}
                   scope="col"
                   className={`${col.align ? `ta-${col.align}` : ''} ${
                     col.sortable ? 'th-sortable' : ''
-                  } ${isSorted ? 'is-sorted' : ''} ${col.className ?? ''}`}
+                  } ${isSorted ? 'is-sorted' : ''} ${
+                    canMove ? 'th-movable' : ''
+                  } ${isDragSource ? 'is-col-dragging' : ''} ${col.className ?? ''}`}
                   style={{
                     ...(col.width ? { width: col.width } : {}),
                     ...(widths?.[col.key]
                       ? { width: `${widths[col.key]}px` }
                       : {}),
                   }}
-                  title={col.title}
+                  title={col.title ?? (canMove ? t('table.reorderColumnTitle') : undefined)}
+                  draggable={canMove}
+                  onDragStart={(event) => {
+                    if (!canMove) return;
+                    event.dataTransfer.effectAllowed = 'move';
+                    // 必须写入数据，否则 Firefox 不认为这是一次合法拖拽
+                    event.dataTransfer.setData('text/plain', col.key);
+                    dragColumnRef.current = col.key;
+                    setDragColumn(col.key);
+                  }}
+                  onDragOver={(event) => {
+                    // 不 preventDefault 就不会触发 drop / 后续 dragEnter，
+                    // 光标也一直是「禁止」形状。同列之间不算一次移动。
+                    const from = dragColumnRef.current;
+                    if (!canMove || !from || from === col.key) return;
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = 'move';
+                  }}
+                  onDragEnter={() => {
+                    const from = dragColumnRef.current;
+                    if (!canMove || !from || from === col.key) return;
+                    onColumnMove?.(from, col.key);
+                  }}
+                  onDragEnd={() => {
+                    dragColumnRef.current = null;
+                    setDragColumn(null);
+                  }}
                   aria-sort={
                     isSorted
                       ? sort.direction === 'asc'

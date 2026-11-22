@@ -486,6 +486,13 @@
     flex: 1 1 100%;
   }
 
+  /* 窄 / 宽字段（节点、存储、备份卷这些下拉框）在手机上同样撑满一行：
+     160px 的宽度连存储名都显示不全，更别说从列表里挑卷 */
+  .field-row > .field.field-narrow,
+  .field-row > .field.field-wide {
+    flex: 1 1 100%;
+  }
+
   .field-row > .btn {
     margin-top: 0;
   }

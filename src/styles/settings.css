@@ -312,3 +312,630 @@
 .settings-page .switch-content {
   gap: 4px;
 }
+
+/* ==========================================================================
+   注册凭证（邀请码 / 注册码）
+   卡片通栏时不固定左右两栏：签发与清单按任务顺序纵向排列，表单按内容分组
+   并限制输入框最大宽度，额度字段随容器自动换列，清单用自适应卡片网格。
+   这样清单只有一两条时不会在右侧留下与左侧长表单等高的空白，条目多时又能
+   自动分栏。
+   ========================================================================== */
+
+/* ---- 注册方式：四个等权的单选卡片，标题与后果说明同框 ---- */
+.settings-page .reg-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  transition: opacity var(--transition-fast);
+}
+
+/* 保存中整块淡出并禁止交互：避免连点切换打出两次 PATCH */
+.settings-page .reg-mode.is-busy {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.reg-mode-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 注册方式卡片里附带的开关行（目前是「邮箱验证码」）：与上面的模式选项之间
+   用一条虚线分开 —— 它是模式的一个附加条件，不是第五种模式。 */
+.settings-page .reg-mode-toggle {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border-muted);
+}
+
+.reg-mode-label {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.reg-mode-tag {
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--success-dim);
+  color: var(--success);
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+}
+
+.reg-mode-options {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.reg-mode-option {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  min-height: 68px;
+  padding: 10px 11px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  cursor: pointer;
+  transition:
+    border-color var(--transition-fast),
+    background var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+.reg-mode-option:hover {
+  border-color: var(--accent-border);
+  background: var(--bg-hover);
+}
+
+.reg-mode-option.is-active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+
+.reg-mode-option.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.reg-mode-option.is-disabled:hover {
+  border-color: var(--border-muted);
+  background: var(--bg-surface);
+}
+
+.reg-mode-option:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 原生 radio 保留键盘与读屏语义，视觉上由整张卡片承载 */
+.reg-mode-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.reg-mode-option-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.reg-mode-option-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+}
+
+.reg-mode-option.is-active .reg-mode-option-icon {
+  background: var(--accent);
+  color: var(--bg-surface);
+}
+
+.reg-mode-option-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.reg-mode-option-check {
+  margin-left: auto;
+  color: var(--accent);
+  opacity: 0;
+}
+
+.reg-mode-option.is-active .reg-mode-option-check {
+  opacity: 1;
+}
+
+.reg-mode-option-hint {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+/* ---- 生成结果：紧挨主按钮，凭证值与复制入口同一行 ---- */
+.reg-result {
+  flex: 1 1 460px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius);
+  background: var(--accent-dim);
+}
+
+.reg-result-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  color: var(--accent);
+}
+
+.reg-result-head > span:first-of-type {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 审批策略跟着这一次签发结果走，右对齐后一眼能看到「需审批 / 免审批」 */
+.reg-result-head .badge {
+  flex: none;
+  margin-left: auto;
+}
+
+.reg-result-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 6px;
+}
+
+.reg-result-code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  padding: 6px 8px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* 双击即全选，省掉「拖选一串大小写混排」的麻烦 */
+  user-select: all;
+}
+
+/* ---- 布局骨架 ----
+   签发与清单按任务顺序纵向排列：表单和清单各自用横向网格吸收宽屏空间，
+   不再固定左右两栏 —— 结果很少时右列会空出一大片，和左侧长表单失衡。 */
+.reg-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 18px;
+  margin-top: 14px;
+  align-items: start;
+}
+
+.reg-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+/* 表单收进一块浅色面板：分组、限宽、对齐都由网格统一控制 */
+.reg-form-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  min-width: 0;
+}
+
+.reg-form-row {
+  display: grid;
+  gap: 14px 16px;
+  align-items: start;
+}
+
+/* 备注 / 角色 / 有效期 / 次数 / 审批策略 / 凭证类型：六个短字段同一行。
+   备注与角色是可伸展的文本列，两个数字输入给最小可用宽度，末尾两列按内容定宽 */
+.reg-form-row--issue {
+  grid-template-columns:
+    minmax(0, 1.6fr)
+    minmax(0, 1.1fr)
+    minmax(96px, 0.6fr)
+    minmax(96px, 0.6fr)
+    minmax(140px, 0.9fr)
+    minmax(140px, 0.9fr);
+}
+
+.reg-field-cell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--field-gap);
+  min-width: 0;
+}
+
+.reg-field-cell--approval {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.reg-field-cell--approval .switch-field {
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 34px;
+}
+
+/* 开关本体 22px、输入框 34px：下移 6px 让两者的视觉中心落在同一条线上 */
+.reg-field-cell--approval .switch {
+  margin-top: 6px;
+}
+
+/* 凭证类型是只读展示，做成和输入框同高的信息条 */
+.reg-kind-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+}
+
+.reg-kind-value > svg {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.reg-kind-value .badge {
+  margin-left: auto;
+}
+
+/* 清单用自适应列：条目少时一张卡吃满整行，条目多时自动分栏 */
+.reg-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 8px;
+}
+
+/* 分栏自己的标题：标题 + 一句说明，底部分隔线把标题和内容切开 */
+.reg-pane-head {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.reg-pane-head h4 {
+  margin: 0;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.reg-pane-head span {
+  font-size: var(--font-size-xs);
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+/* 主操作 + 一句脚注：脚注跟着按钮走，不单独占一整行 */
+.reg-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+.reg-footnote {
+  flex: 1 1 140px;
+  min-width: 0;
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+/* ---- 资源额度（签发凭据时分配给新账号）----
+   默认收起：签发一条凭证通常不会逐格填额度。展开后按容器宽度自动换列，
+   字段宽度有上限；放在浅色表单面板里时用白底，保留一点层次。 */
+.reg-quota {
+  padding: 0 12px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+}
+
+.reg-quota > summary {
+  padding: 9px 0;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.reg-quota-hint {
+  margin: 0 0 10px;
+  font-size: var(--font-size-xs);
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.reg-quota-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 190px));
+  gap: 10px 12px;
+  padding-bottom: 12px;
+}
+
+.reg-quota-error {
+  margin: 0 0 12px;
+  font-size: var(--font-size-xs);
+  color: var(--danger);
+}
+
+/* ---- 空态：虚线框 + 主文案 + 一句「怎么让它有东西」 ---- */
+.reg-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 34px 20px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  text-align: center;
+}
+
+.reg-empty svg {
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+.reg-empty p {
+  margin: 0;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-secondary);
+}
+
+.reg-empty span {
+  max-width: 320px;
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* 空凭证时清单收成一条横向提示，不再用大虚线框占掉半张卡 */
+.reg-grid.is-empty .reg-empty {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  text-align: left;
+}
+
+.reg-grid.is-empty .reg-empty p {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+}
+
+.reg-grid.is-empty .reg-empty span {
+  max-width: none;
+}
+
+/* ---- 清单条目 ----
+   第一行：状态—类型—备注—到期；第二行：剩余次数—使用者—操作。
+   两层而不是一层，是因为把这些全压进一行后，操作按钮会跟着备注一起被
+   推来推去，条数一多就找不到「撤销」在哪。 */
+.reg-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 13px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  transition:
+    border-color var(--transition-fast),
+    background var(--transition-fast);
+}
+
+.reg-item:hover {
+  border-color: var(--border);
+  background: var(--bg-elevated);
+}
+
+.reg-item-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.reg-item-kind {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+/* 备注可能是一整句话：截断 + title 兜全文，别让它把时间挤到第二行去 */
+.reg-item-note {
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+/* 等宽数字：多条并列时时间的小时位能对齐，扫起来快一截 */
+.reg-item-time {
+  margin-left: auto;
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.reg-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+/* 使用者是变量名一类的短串，等宽字体 + 浅底 chip 才不会被读成正文 */
+.reg-item-user {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+/* 操作沉到第二行右端：上面那行怎么换行都不会把它顶走 */
+.reg-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+/* 中等宽度：一行六列挤不下，改成 3×2 两行 */
+@media (max-width: 1180px) {
+  .reg-form-row--issue {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* 窄屏：选项卡减列，额度按容器自动换列 */
+@media (max-width: 1080px) {
+  .reg-mode-options {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .reg-grid {
+    gap: 16px;
+  }
+}
+
+/* 平板竖屏 / 手机：所有表单行合成单列，生成结果也换到按钮下方 */
+@media (max-width: 720px) {
+  .reg-form-row--issue {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .reg-form-fields {
+    padding: 14px;
+  }
+
+  .reg-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .reg-result {
+    flex: 1 1 auto;
+    width: 100%;
+    max-width: 100%;
+  }
+}
+
+/* 更窄：选项卡与清单都拆成单列，保持整行点击区域 */
+@media (max-width: 560px) {
+  .settings-page .reg-mode {
+    padding: 10px 12px;
+  }
+
+  .reg-mode-options {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .reg-mode-option {
+    min-height: 0;
+    padding: 9px 10px;
+  }
+
+  .reg-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .reg-form-fields {
+    gap: 16px;
+    padding: 12px;
+  }
+
+  /* 手机窄列：额度字段允许更窄，常见 390px 宽度能排两列，320px 自动回落一列 */
+  .reg-quota-grid {
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  }
+
+  .reg-grid.is-empty .reg-empty {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .reg-item-note {
+    max-width: 100%;
+    flex: 1 1 100%;
+  }
+
+  .reg-item-time {
+    margin-left: 0;
+  }
+}

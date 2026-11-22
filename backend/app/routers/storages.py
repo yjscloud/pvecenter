@@ -296,9 +296,13 @@ async def pbs_summary(
 
     返回项按 ``(连接, 节点, 存储)`` 唯一 —— 两台 PVE 上的同名 PBS 存储是两份
     独立的数据，前端用它跟存储列表逐行对齐。
+
+    ``console_url`` 只回给管理员（见下），其余字段仍是普通用户存备份所需的
+    最小集：容量 / 归档数 / 最近一次备份时间。
     """
     from ..store import get_active_connection_id
 
+    admin = security.is_admin(user)
     fallback = requested_connection() or str(get_active_connection_id() or "")
     pairs = all_connection_clients()
     wanted = requested_connection()
@@ -373,7 +377,10 @@ async def pbs_summary(
                     "last_ctime": int(latest.get("ctime") or 0) if latest else None,
                     "last_vmid": latest.get("vmid") if latest else None,
                     "last_verified": _verify_state(latest),
-                    "console_url": _pbs_console_url(definition),
+                    # 控制台入口是 PBS 的**管理面地址**（内网主机 + 8007 端口）。
+                    # 只有管理员能拿到：普通用户看备份概况是为了确认「有没有备」，
+                    # 不需要顺着这个 URL 摸到备份服务器的管理入口。
+                    "console_url": _pbs_console_url(definition) if admin else None,
                     "datastore": str(definition.get("datastore") or ""),
                 }
             )

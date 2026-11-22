@@ -957,6 +957,206 @@
   }
 }
 
+/* ---------------------------------------------------------------------------
+   内网穿透：服务端配置的分区表单
+   ---------------------------------------------------------------------------
+   原先四个字段一路平铺，地址 / 端口 / token / 对外地址看起来是同一层的四件事；
+   实际上前两项决定「连不连得上」，第三项决定「连上了会不会被拒」，第四项多数
+   部署根本用不到。这里按语义分三段：段标题 + 一句说明，段间一条细线；用不到
+   的那段收进 <details>，收起时标题行右侧直接显示当前值 —— 不展开也知道配没配过。 */
+
+/* 卡片自己作为容器：标题栏与段说明的换行看的是卡片宽度（见下方 @container） */
+.frp-server-card {
+  container-type: inline-size;
+}
+
+.frp-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.frp-form-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* 段与段之间用一条横线分开：比加方框轻，卡片本身已经是一层容器了 */
+.frp-form-section + .frp-form-section,
+.frp-form-section + .frp-advanced {
+  padding-top: 18px;
+  border-top: 1px solid var(--border-muted);
+}
+
+.frp-form-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+}
+
+.frp-form-legend-title {
+  position: relative;
+  margin: 0;
+  padding-left: 9px;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+/* 标题前那根竖条：三段共用同一枚标记，扫视时先看见分段再看见字段 */
+.frp-form-legend-title::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 3px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--accent);
+  transform: translateY(-50%);
+}
+
+.frp-form-legend-hint {
+  flex: 1 1 16rem;
+  min-width: 0;
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* 标签 + 状态徽章：紧挨着标签，而不是甩到行尾（Field 的 labelExtra 是给
+   「忘记密码？」这类右侧链接用的，一条状态跟着跑会隔着半张卡） */
+.frp-field-label-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* token 输入框 +「清空」按钮：按钮与输入框同一条中线，而不是跟着标签走。
+   Input 自己会包一层 .field，这里让它吃掉剩余宽度，按钮保持原尺寸。 */
+.frp-token-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.frp-token-row > .field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.frp-token-row > .btn {
+  flex: 0 0 auto;
+}
+
+/* 高级选项：与上面两段同一套标题字号，但用折叠箭头当标记（没有竖条） */
+.frp-advanced > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--text-primary);
+  cursor: pointer;
+  list-style: none;
+}
+
+.frp-advanced > summary::-webkit-details-marker {
+  display: none;
+}
+
+.frp-advanced-chevron {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-muted);
+  transition: transform var(--transition-fast);
+}
+
+.frp-advanced[open] .frp-advanced-chevron {
+  transform: rotate(180deg);
+}
+
+/* 收起状态下的当前值：等宽 + 省略号，长域名不会把标题行撑开 */
+.frp-advanced-state {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frp-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 12px;
+}
+
+/* 结尾那句「保存后会自动重启」属于注释，不该和字段说明抢同一档字号 */
+.frp-form-footnote {
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* 「窄」的判断按**卡片的宽度**，不按窗口宽度：这张卡在 768–1000px 的窗口里
+   跟「frpc 客户端」并排，自己只有三百来像素，而窗口远没到手机尺寸。只写媒体
+   查询时标题栏不会折行，「未保存 / 撤销 / 保存修改」三个东西会把标题挤成
+   一列单字。container query 让卡片自己决定 —— 这也正是它比媒体查询准的地方。 */
+@container (max-width: 430px) {
+  .frp-server-card .card-header {
+    flex-wrap: wrap;
+    row-gap: 10px;
+  }
+
+  .frp-server-card .card-header-main {
+    flex: 1 1 12rem;
+  }
+
+  .frp-server-card .card-header-actions {
+    margin-left: auto;
+    flex: 1 1 auto;
+    min-width: 0;
+    flex-wrap: wrap;
+    row-gap: 6px;
+    justify-content: flex-end;
+  }
+
+  .frp-form-legend {
+    gap: 4px;
+  }
+
+  .frp-form-legend-hint {
+    flex-basis: 100%;
+    padding-left: 9px;
+  }
+}
+
+/* 同一套规则给不认 container query 的浏览器兜底（视口已经很小，卡片必然更小） */
+@media (max-width: 640px) {
+  .frp-form-legend {
+    gap: 4px;
+  }
+
+  .frp-form-legend-hint {
+    flex-basis: 100%;
+    padding-left: 9px;
+  }
+
+  .frp-server-card .card-header-actions {
+    row-gap: 6px;
+  }
+}
+
 /* 卡片里的提示条与表格之间统一留白（原先 Notice 与相邻区块贴在一起） */
 .frp-rules-card > .notice {
   margin: 12px 0;
@@ -1663,6 +1863,103 @@
 .user-select-empty {
   padding: 8px;
   font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+/* --- TargetSelect（可搜索的目标地址选择器，见 ui/TargetSelect.tsx） ---
+   与 UserSelect 同一套交互语言：展开时输入框保持高亮（框里是搜索词而不是已选值），
+   列表内联展开（Modal 里不能浮层）。一行里三样东西并列：主机名 / 类型+VMID / IP。 */
+.target-select.is-open .input-wrap {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.target-select-menu {
+  margin-top: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+}
+
+.target-select-option {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+/* 键盘高亮优先于鼠标悬停：两边同时命中时，方向键刚按下，意图比鼠标停留更新 */
+.target-select-option.is-active {
+  background: var(--bg-hover);
+}
+
+.target-select-option.is-selected .target-select-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.target-select-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 类型 + VMID：与主机名同行的次级信息，不抢宽度 */
+.target-select-meta {
+  flex-shrink: 0;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+/* IP 右对齐成一列：同一批结果里的地址能竖着对读 */
+.target-select-ip {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.target-select-sep {
+  margin: 4px 2px;
+  border-top: 1px solid var(--border-muted);
+}
+
+.target-select-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px;
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+.target-select-action {
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.target-select-action:hover {
+  text-decoration: underline;
+}
+
+.target-select-more {
+  padding: 4px 8px;
+  font-size: var(--font-size-xs);
   color: var(--text-muted);
 }
 
@@ -2588,6 +2885,458 @@
 }
 
 /* ---------------------------------------------------------------------------
+   快速部署：提交摘要（额度 / 规格）
+   ---------------------------------------------------------------------------
+   改版前这两件事挤在按钮右边同一行灰字里：`虚拟机额度：已用 3 / ，还剩 台 · 将创建：
+   1C · 1G 内存 · 20G 磁盘`。三个问题叠在一起 —— 空数字（quota 为 null 时）、单位
+   缩写混排（1C / 1G）、以及「还能建几台」和「每台多大」被当成一句话。
+
+   现在拆成两行两列：左列是固定标签（额度 / 规格），右列是数值。标签等宽成列，
+   两行的数字左边缘对齐，扫读时先看标签再看值；「创建后剩 N 台」单独加重，因为
+   那才是用户真正在算的数。窄屏时标签不缩（max-content + 不换行），值自然换行。 */
+
+.deploy-submit {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.deploy-summary {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  /* 摘要自己成为一个宽度容器：引导线要不要出现，看的是这张表的宽度而不是
+     视口宽度（弹窗在桌面端只占屏宽的一部分，media query 判不准） */
+  container-type: inline-size;
+  /* 列间距交给 label 的 padding-right：column-gap 会在行间虚线中间留一个豁口，
+     让第二行的分隔线看起来断成两截 */
+  column-gap: 0;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+/* dt / dd 落进上面那张栅格：两行共用第一列，所以「平台额度」与「规格」的值
+   起点严格对齐（各自成 grid 时英文长标签会让两行错位）。 */
+.deploy-summary-row {
+  display: contents;
+}
+
+.deploy-summary-key {
+  /* 撑满行高再居中：这样 key 与 value 的 border-top 落在同一条水平线上，
+     值折行时虚线不会错位 */
+  display: flex;
+  align-items: center;
+  padding: 10px 16px 10px 13px;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+  /* 标签比数值暗一档、但比原来的 --text-muted 实：它是这张表的行头，
+     不是注释 */
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.deploy-summary-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 13px 10px 0;
+  min-width: 0;
+  font-size: var(--font-size-base);
+  line-height: 1.6;
+  /* 数值用主色：一张摘要表里「还剩几台」是结论，灰到底就分不出哪行是答案 */
+  color: var(--text-primary);
+  /* 数字等宽：批量下「本次 6 台」与「剩 5 台」不会因字形宽度左右跳 */
+  font-variant-numeric: tabular-nums;
+}
+
+/* 行间分隔线画在第二行的两个单元格上（列间距为 0，两段正好接成一条）。
+   用实线而不是虚线：虚线在两张行都偏浅的底色上会显得像「未完成」，而这里
+   只是把两行分开。 */
+.deploy-summary-row + .deploy-summary-row > .deploy-summary-key,
+.deploy-summary-row + .deploy-summary-row > .deploy-summary-value {
+  border-top: 1px solid var(--border-muted);
+}
+
+/* 规格是次要信息：它解释「每台多大」，不该和额度结论抢注意力 */
+.deploy-summary-spec {
+  color: var(--text-muted);
+}
+
+/* ---- 规格行：单台三个胶囊 → 乘数 → 合计一组 ----
+   原先是一整句「单台 2 核 · 2 GB 内存 · 20 GB 磁盘，共 3 台（合计 6 核 · 6 GB
+   内存 · 60 GB 磁盘）」：两组同样结构的三元组塞进一个句子，括号一出现，读者
+   就得回头找「合计」对应的是哪三个数。拆成三段并排后，倍数关系直接摆在眼前，
+   两项之间也不用靠逗号去猜边界。 */
+.deploy-spec {
+  display: flex;
+  align-items: center;
+  gap: 6px 8px;
+  flex-wrap: wrap;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.deploy-spec-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.deploy-spec-chips {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* 单台的三个维度做成实底胶囊：数字短、要能一眼扫过，不靠「·」断句 */
+.deploy-spec-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 合计是换算结果，不是第二份清单：无边框 + 浅底 + 灰字，明确弱于单台那一组。
+   原来用虚线框，和左边的实线胶囊并排时像「画了一半」的框，底色更安静。 */
+.deploy-spec-chip.is-total {
+  border-color: transparent;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+/* 乘数是「单台」与「合计」之间唯一的连接符，用品牌色标出来 */
+.deploy-spec-times {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-pill);
+  background: var(--accent-dim);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  line-height: 1.7;
+  color: var(--accent);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 「单台」与「合计」之间的引导线：一段可伸缩的虚线。两列数字原本各占一头、
+   中间空出一大片，看起来像两件事；补上这条线之后视线会顺着「× 3 台」走到
+   合计，空白也变成了排版的一部分。窄屏折行时不需要它（见文末媒体查询）。 */
+.deploy-spec-leader {
+  flex: 1 1 24px;
+  min-width: 16px;
+  align-self: center;
+  height: 0;
+  margin: 0 2px;
+  border-top: 1px dotted var(--border);
+}
+
+/* 合计贴到行尾：由中间那条可伸缩的引导线把它推过去（见 .deploy-spec-leader），
+   这样它的右边缘与上一行右侧的「模板信息」对齐，两行才像一张对得齐的表。 */
+.deploy-spec-total {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* 摘要本身不够宽（弹窗窄 / 分栏里放）：引导线没有足够的长度可走，收掉它，
+   让合计直接贴右 —— 比留一截断在中间的虚线干净 */
+@container (max-width: 620px) {
+  .deploy-spec-leader {
+    display: none;
+  }
+
+  .deploy-spec-total {
+    margin-left: auto;
+  }
+}
+
+/* 窄屏：乘数与合计各自成组折行，组内不拆。合计不再推右 —— 折行后它独占
+   一行，再右侧留白会与上面的「单台」脱节 */
+@media (max-width: 560px) {
+  .deploy-spec {
+    gap: 6px;
+  }
+
+  /* 折行后「合计」独占一行，引导线会变成一串没有去处的点 */
+  .deploy-spec-leader {
+    display: none;
+  }
+}
+
+/* 「已用 15 / 30 台」不允许断行：数字与单位拆开就失去意义 */
+.deploy-quota-text {
+  white-space: nowrap;
+}
+
+/* 额度占用条：一条 6px 的轨道，只表达「已用多少」。
+   颜色跟额度徽标同一套：正常品牌蓝、≥80% 琥珀、放不下时红色。 */
+.deploy-quota-bar {
+  flex: none;
+  width: 104px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--border-muted);
+  overflow: hidden;
+}
+
+.deploy-quota-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--transition-fast), background var(--transition-fast);
+}
+
+.deploy-quota-bar.is-warn .deploy-quota-fill {
+  background: var(--warning);
+}
+
+.deploy-quota-bar.is-danger .deploy-quota-fill {
+  background: var(--danger);
+}
+
+/* 批量创建时「本次 3 台」做成小胶囊：它是一个修饰量，不该读成正文的一部分 */
+.deploy-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px solid var(--border-muted);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* 细竖线：把「使用情况」和「结论」分开，比「·」更有停顿感 */
+.deploy-summary-divider {
+  flex: none;
+  width: 1px;
+  height: 12px;
+  background: var(--border);
+}
+
+/* 额度不足时的两截文案：前半不折行，后半可折 */
+.deploy-quota-short {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* 结论性数字（创建后剩多少）：加粗 + 主色，一行里只有一个。
+   nowrap 是为了「创建后剩 / 4 台」不要在窄屏上被拆成两行 —— 整句换行可以，
+   把数字和它的单位拆开不行。 */
+.deploy-summary-em {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+/* 额度不足时只把结论染红，前面的「已用 8 / 10 台」保持中性 ——
+   整行飘红会让用户以为已经超额，其实只是这一次的数量放不下。 */
+.deploy-summary-em.is-warn,
+.deploy-summary-warn {
+  color: var(--danger);
+}
+
+/* 后半句允许折行，前半句（数字 + 单位 + 逗号）不折 —— 两截配合，
+   窄屏上就不会出现「剩 2 / 台」这种把数字和单位拆开的断法 */
+.deploy-summary-warn {
+  white-space: normal;
+}
+
+.deploy-summary-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+}
+
+/* ---- 额度行右侧的模板信息 ----
+   额度说完「还能建几台」，右边紧接着交代「按哪张模板建」。它做成这一行的右半
+   栏、贴住右边缘（margin-left: auto）：既不和额度数字抢注意力，右边缘又与下面
+   规格行的「合计」对齐 —— 两行合起来是一张对得齐的表。
+   不用白底描边的卡片那种画法：摘要本身就是一层浅底，里面再套一个白框会显得
+   像贴上去的贴纸，还把两行拆成两种视觉语言。一条竖分隔线足够说明「这一栏是
+   另一件事」。 */
+.deploy-summary-quota {
+  justify-content: space-between;
+  gap: 6px 18px;
+}
+
+.deploy-quota-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.deploy-tpl-brief {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 0 2px 12px;
+  border-left: 1px solid var(--border);
+}
+
+/* 还没选模板：与有模板时同一栏、同一条分隔线，内容换成一句提示 —— 不画虚线
+   空框，免得和左边的胶囊、右边的合计抢注意力 */
+.deploy-tpl-brief.is-empty {
+  gap: 6px;
+}
+
+/* 头像底用家族色（data-os 带下来的 --os-tint）：同一张模板在选择器、摘要卡
+   与这里颜色一致，扫一眼就能确认「选的是这张」 */
+.deploy-tpl-mark {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-sm);
+  background: var(--os-tint);
+}
+
+.deploy-tpl-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.deploy-tpl-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 「模板」两个字：这块是模板信息，不是第二份额度读数 */
+.deploy-tpl-kicker {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.deploy-tpl-name {
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 系统家族（Ubuntu / Debian…）：名称里通常已有版本号，这里只说家族 */
+.deploy-tpl-os {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.deploy-tpl-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 模板自带的规格读得重一点；VMID / 克隆方式 / 节点是补充说明，压暗。
+   一项一个 span：单项内不许断（「4 GB」与「内存」拆开就没了意义），
+   项与项之间才折行。「·」补在前一项的尾巴上而不是后一项的开头 —— 折行时
+   宁可上一行以「·」收尾，也不要让下一行以「·」起头。 */
+.deploy-tpl-specs {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* 存储 / 节点名可能很长（`local-zfs-raid10` 这类）：这一组允许在词内折行，
+   宁可多占一行，也不让它顶破卡片、更不打省略号 —— 省掉的正是「按哪张模板、
+   落到哪」这个关键配置。 */
+.deploy-tpl-config {
+  min-width: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* 只有同一组内相邻的两项之间才补「·」：规格组与配置组之间已经有一道竖线，
+   在竖线前再挂一个点是重复的分隔符 */
+.deploy-tpl-specs.has-sep::after,
+.deploy-tpl-config.has-sep::after {
+  content: '·';
+  margin-left: 5px;
+  color: var(--text-muted);
+}
+
+/* 规格组与配置组之间用一道细竖线隔开：前者是「模板多大」，后者是「怎么克隆
+   到哪」。写在第一个配置项上，折行后它自然落在行首，不会像独立分隔符那样
+   被留在上一行的行尾。 */
+.deploy-tpl-config.is-first {
+  padding-left: 6px;
+  border-left: 1px solid var(--border);
+}
+
+.deploy-tpl-empty {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.deploy-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* 窄屏：只收窄两列之间的间距，不让标签和值上下分家 ——
+   标签那列最多五个字，值仍有大半行可用；拆成上下排反而让「哪一行属于哪个标签」
+   变得要靠颜色去猜。 */
+@media (max-width: 560px) {
+  .deploy-summary-key {
+    padding: 9px 10px 9px 11px;
+  }
+  .deploy-summary-value {
+    padding: 9px 11px 9px 0;
+  }
+  /* 窄屏缩一档进度条，把宽度留给「创建后剩 N 台」这句结论 */
+  .deploy-quota-bar {
+    width: 72px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
    连接测试：可见节点列表
    ---------------------------------------------------------------------------
    节点名用「、」拼成一段文本时，十几个节点就是一整块无法扫读的内容：
@@ -3351,6 +4100,24 @@ button.kpi-card {
 .th-resizer:hover::after,
 .th-resizer.is-active::after {
   background: var(--accent);
+}
+
+/* 表头拖动排序（Table.onColumnMove）
+   抓手与缩放手柄挤在同一格表头里，所以日常不额外画图标：指针形状 + 按下后
+   整格淡出，已经足够说明「这一列正在被搬走」。锁定列（选择框 / 操作列）不带
+   这个类，指针保持箭头，拖不动。 */
+.table thead th.th-movable {
+  cursor: grab;
+}
+
+.table thead th.th-movable:active {
+  cursor: grabbing;
+}
+
+.table thead th.is-col-dragging {
+  opacity: 0.45;
+  /* 拖拽中的列下面留一道主色线：松手前能看出是从哪一列搬出来的 */
+  box-shadow: inset 0 -2px 0 var(--accent);
 }
 
 /* 拖拽期间：整页保持缩放手势，并禁止选中文本拖出一片高亮 */
@@ -12251,13 +13018,94 @@ button.pbs-task-row:focus-visible {
   color: var(--warning);
 }
 
+/* ==========================================================================
+   模型设置弹窗（AiSettingsModal）
+   --------------------------------------------------------------------------
+   .modal-body 本身**不带子元素间距**，而这个正文叠了提示条 / 总开关 / 限额
+   字段 / 若干模型卡片。原先靠零散的内联 mt-* 撑着，结果是提示条直接贴着
+   总开关、相邻两张模型卡片贴成一块（两条边框并成一条线）。这里给整列一个
+   统一行距，再按「同一件事」把它们分成三组。
+   ========================================================================== */
+.ai-settings-modal .modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* 顶部一组：范围提示与总开关说的都是「谁能用 / 开不开」，
+   组内间距比段落间距小一档，读起来是同一段。 */
+.ai-settings-intro {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 总开关：文字在左、控件在右的一整行。
+   原先是一个贴着提示条的孤立小开关，既不像可点的东西，也和下面的字段
+   混在同一列里看不出层次；给它一条描边就把「平台级开关」这层关系立住了。
+   容器不按开关状态染色（与 .ai-scope-block / .frp-policy 同一套语言），
+   状态只由右侧那个滑块表达，免得和上面那条蓝色提示条抢颜色。 */
+.ai-master {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  /* 描边取 --border 而不是 --border-muted：深色主题下 --bg-elevated 与弹窗底色
+     只差一档，靠更淡的线就几乎看不出这是一块独立的行 */
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+.ai-master-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ai-master-title {
+  font-size: var(--font-size-base);
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.ai-master-hint {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+/* 开关本体固定宽度，文字折行时不会被挤窄 */
+.ai-master > .switch-field {
+  flex: none;
+}
+
+/* 限额一组：档位预设与四个数字是同一件事（预设改的就是这些数字），
+   所以贴得比段落近 —— 否则预设行看起来像独立的一段。 */
+.ai-limits {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 模型卡片由若干 Field 平铺而成，卡片本身也不给子元素间距：
+   上一个字段的说明文字会直接贴着下一个字段的标签。补 12px。 */
+.ai-settings-modal .card > * + * {
+  margin-top: 12px;
+}
+
+/* 标题栏自带 14px 下边距，别再叠一层 */
+.ai-settings-modal .card > .card-header + * {
+  margin-top: 0;
+}
+
 /* 回复详略档位预设 */
 .ai-reply-preset {
   display: flex;
   align-items: center;
   gap: 4px;
   flex-wrap: wrap;
-  margin-top: 12px;
 }
 
 .ai-reply-preset-label {

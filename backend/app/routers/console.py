@@ -38,8 +38,19 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
-from .. import console_files, guestguard, i18n, ownership, panel_url, security, store
+from .. import (
+    console_files,
+    guestguard,
+    i18n,
+    ownership,
+    panel_url,
+    security,
+    store,
+    throttle,
+)
+from ..config import settings
 from ..pve import (
     ProxmoxError,
     ProxmoxClient,
@@ -397,25 +408,72 @@ async def upload_console_file(
     }
 
 
-async def _console_file_response(token: str, request: Request) -> FileResponse:
+async def _console_file_response(
+    token: str,
+    request: Request,
+    user: Optional[Dict[str, Any]] = None,
+) -> FileResponse:
+    ip = security.client_ip(request) or ""
+    # 唯一的匿名文件出口，按来源 IP 给一条明确的闸：token 不可枚举，但限流能
+    # 把「拿着泄露链接的脚本反复拉」压到可观测的量级。
+    allowed, retry_after = await throttle.allow(
+        f"console-file:ip:{ip or 'unknown'}", 120, 3600
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=i18n.t("console.fileTooMany"),
+            headers={"Retry-After": str(max(1, retry_after))},
+        )
+
     found = await console_files.load(token)
     if found is None:
         raise HTTPException(status_code=404, detail=i18n.t("console.fileMissing"))
     path, meta = found
-    # 这里刻意不要求登录：来拉文件的是客户机，它没有面板凭据，token 就是
-    # capability。能做的不是「再绑一层会话」，而是把使用痕迹留下来 —— 谁在
-    # 什么时候从哪个 IP 取走了哪个 token，出了问题至少查得到（审计项 V-07）。
+
+    # 下载本身仍不要求登录：来拉文件的是客户机，它没有面板 Cookie，token 就是
+    # 它的凭据。但**带了会话**时必须校验归属 —— 否则 A 的链接在 B 的浏览器里
+    # 也能下载（浏览器历史 / 聊天转发拿到链接的场景）。管理员不受限。
+    if user is not None and not security.is_admin(user):
+        uploader = str(meta.get("uploader") or "")
+        if uploader and uploader != str(user.get("username") or ""):
+            raise HTTPException(status_code=404, detail=i18n.t("console.fileMissing"))
+
+    # 使用痕迹落库（审计项 V-07）：谁在什么时候从哪个 IP 取走了哪条 token。
+    # 匿名下载没有登录用户，``username`` 记文件归属者 —— 他才是这条记录的当事人。
+    try:
+        await store.add_audit(
+            username=str(meta.get("uploader") or ""),
+            action="console.file_download",
+            target=str(meta.get("target") or ""),
+            detail={
+                "name": meta.get("name"),
+                "size": meta.get("size"),
+                "ua": (request.headers.get("user-agent") or "")[:120],
+                "signed_in": user is not None,
+            },
+            ip=ip,
+        )
+    except Exception:  # noqa: BLE001 - 审计写失败不该挡住下载
+        logger.warning("控制台中转文件下载审计写入失败", exc_info=True)
     logger.info(
-        "控制台中转文件下载：token=%s size=%s ip=%s ua=%s",
-        token,
+        "控制台中转文件下载：id=%s size=%s ip=%s ua=%s",
+        meta.get("id"),
         meta.get("size"),
-        security.client_ip(request) or "-",
+        ip or "-",
         (request.headers.get("user-agent") or "-")[:120],
     )
+
+    # 一次性（默认关）：文件流发完之后再删，删早了 FileResponse 读不到内容。
+    background = None
+    if bool(getattr(settings, "console_file_one_shot", False)):
+        background = BackgroundTask(console_files.drop, str(meta.get("id") or ""))
+
     return FileResponse(
         path,
         media_type="application/octet-stream",
         filename=str(meta.get("name") or "download.bin"),
+        background=background,
         headers={
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
@@ -430,21 +488,31 @@ async def _console_file_response(token: str, request: Request) -> FileResponse:
 
 
 @router.get("/console/files/{token}")
-async def download_console_file(token: str, request: Request) -> FileResponse:
-    """客户机拉取中转文件（凭 token，不需要登录）。"""
-    return await _console_file_response(token, request)
+async def download_console_file(
+    token: str,
+    request: Request,
+    user: Optional[Dict[str, Any]] = Depends(security.get_current_user_optional),
+) -> FileResponse:
+    """客户机拉取中转文件（凭签过名的 token，不强制登录）。
+
+    带会话访问时会校验 token 归属（见 :func:`_console_file_response`）。
+    """
+    return await _console_file_response(token, request, user)
 
 
 @router.get("/console/files/{token}/{filename:path}")
 async def download_console_file_named(
-    token: str, request: Request, filename: str = ""
+    token: str,
+    request: Request,
+    filename: str = "",
+    user: Optional[Dict[str, Any]] = Depends(security.get_current_user_optional),
 ) -> FileResponse:
     """同一条下载，多带一段文件名。
 
     文件名只是让 URL 与命令行看起来更像回事（``curl -O`` 也能直接用），
     真正的裁决者仍是 token；路径段不参与拼盘上路径。
     """
-    return await _console_file_response(token, request)
+    return await _console_file_response(token, request, user)
 
 
 @router.delete("/console/files/{token}")

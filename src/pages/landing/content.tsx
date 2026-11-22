@@ -1125,7 +1125,7 @@ export const STACK: { icon: ReactNode; title: Bi; items: Bi[] }[] = [
     icon: <IconServer size={16} />,
     title: ['后端', 'Backend'],
     items: [
-      same('Python 3.13 + FastAPI'),
+      same('Python + FastAPI'),
       ['httpx（异步）', 'httpx (async)'],
       ['WebSocket 双向透传', 'WebSocket passthrough'],
       ['后台作业调度', 'Background job scheduling'],
@@ -1135,7 +1135,7 @@ export const STACK: { icon: ReactNode; title: Bi; items: Bi[] }[] = [
     icon: <IconCloud size={16} />,
     title: ['数据与集成', 'Data & integrations'],
     items: [
-      same('MySQL 8'),
+      same('MySQL'),
       same('Proxmox VE API'),
       ['飞书开放平台', 'Feishu Open Platform'],
       ['腾讯云 SSL', 'Tencent Cloud SSL'],

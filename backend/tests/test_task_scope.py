@@ -54,6 +54,39 @@ def test_missing_connection_falls_back_to_any() -> None:
     assert not scope.allows("", _upid("pve", 106))
 
 
+def test_clone_task_on_source_node_is_visible() -> None:
+    """跨节点克隆：任务跑在模板所在的节点，机器落在目标节点。
+
+    归属记的是目标节点（``vms._create_from_clone`` 里的 ``target_node``），而 UPID
+    的节点是源节点 —— 精确比对会落空。批量下发结果页据此把「已建好的机器」报成
+    「待确认」，普通用户看到红色，管理员看到绿色。
+    """
+    scope = TaskScope(owned={"c1": {("pve1", "106")}})
+    # qmclone 在源节点 pve2 上跑，id 是新建的 vmid
+    clone_upid = "UPID:pve2:000A1B2C:0:1700000000:qmclone:106:root@pam:"
+    assert scope.allows("c1", clone_upid)
+    # 换一条连接仍然不行：vmid 可能撞号，跨连接必须严格隔离
+    assert not scope.allows("c2", clone_upid)
+
+
+def test_unknown_connection_matches_owned_vmid_anywhere() -> None:
+    scope = TaskScope(owned={"c1": {("pve1", "106")}})
+    assert scope.allows("", "UPID:pve2:001:0:1:qmclone:106:root@pam:")
+    assert not scope.allows("", "UPID:pve2:001:0:1:qmclone:107:root@pam:")
+
+
+def test_region_admin_does_not_gain_vmid_fallback(monkeypatch) -> None:
+    """区域管理员不能靠 vmid 兜底跨区域读任务。"""
+    monkeypatch.setattr(
+        task_scope.store,
+        "connection_region",
+        lambda cid: {"c1": "east", "c2": "west", "": ""}.get(str(cid), ""),
+    )
+    scope = TaskScope(regions=["east"])
+    assert scope.allows("c1", "UPID:pve2:001:0:1:qmclone:106:root@pam:")
+    assert not scope.allows("c2", "UPID:pve1:001:0:1:qmclone:106:root@pam:")
+
+
 def test_non_guest_task_hidden() -> None:
     scope = TaskScope(owned={"c1": {("pve", "105")}})
     assert not scope.allows("c1", "UPID:pve:001:0:1:aptupdate::root@pam:")

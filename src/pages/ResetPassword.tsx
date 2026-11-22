@@ -6,14 +6,24 @@
    别让人填完密码才发现提交不上去。
    ========================================================================== */
 
-import { useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
+import { useQuery } from '@tanstack/react-query';
 import { authApi } from '../api/endpoints';
 import { errorMessage } from '../api/client';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Notice } from '../components/ui/EmptyState';
-import { IconAlert, IconCheck, IconEye, IconEyeOff, IconKey } from '../components/Icons';
+import { SliderCaptcha } from '../components/SliderCaptcha';
+import type { SliderTracePoint } from '../api/types';
+import {
+  IconAlert,
+  IconCheck,
+  IconEye,
+  IconEyeOff,
+  IconKey,
+  IconShield,
+} from '../components/Icons';
 import { AuthShell } from '../components/AuthShell';
 import { useT } from '../i18n';
 
@@ -32,8 +42,37 @@ export function ResetPassword() {
   const [confirm, setConfirm] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [errors, setErrors] = useState<Record<string, string | undefined>>({});
   const [submitting, setSubmitting] = useState(false);
+
+  /*
+    人机校验：与登录 / 注册 / 忘记密码共用同一套「设置 → 登录验证」配置。
+    这一步会改掉账号口令并吊销全部会话，是四个匿名入口里破坏力最大的一个，
+    所以必须和登录同级 —— 早先这里什么都没校验，滑块模式下页面也看不到滑块。
+
+    queryKey 单独一份：挑战一次性，和别的页面共用缓存会互相把对方的题作废。
+  */
+  const captchaQ = useQuery({
+    queryKey: ['reset-captcha'],
+    queryFn: authApi.captcha,
+    refetchOnWindowFocus: false,
+    staleTime: 0,
+    retry: 1,
+  });
+  const captchaMode =
+    captchaQ.data?.mode ?? (captchaQ.data?.required ? 'image' : 'off');
+  const captchaRequired = captchaMode !== 'off';
+
+  const [captchaCode, setCaptchaCode] = useState('');
+  const sliderXRef = useRef(0);
+  const sliderPathRef = useRef<SliderTracePoint[]>([]);
+  const handleSliderPosition = useCallback((x: number, path: SliderTracePoint[]) => {
+    sliderXRef.current = x;
+    sliderPathRef.current = path;
+    if (x > 0) {
+      setErrors((prev) => (prev.captcha ? { ...prev, captcha: undefined } : prev));
+    }
+  }, []);
 
   useEffect(() => {
     if (!token) {
@@ -57,7 +96,7 @@ export function ResetPassword() {
   }, [token]);
 
   const validate = (): boolean => {
-    const next: Record<string, string> = {};
+    const next: Record<string, string | undefined> = {};
     if (!password) {
       next.password = t('reset.err.passwordRequired');
     } else if (password.length < 12) {
@@ -69,6 +108,11 @@ export function ResetPassword() {
       next.confirm = t('reset.err.confirmRequired');
     } else if (confirm !== password) {
       next.confirm = t('reset.err.confirmMismatch');
+    }
+    if (captchaMode === 'image' && !captchaCode.trim()) {
+      next.captcha = t('auth.err.captchaRequired');
+    } else if (captchaMode === 'slider' && sliderXRef.current <= 0) {
+      next.captcha = t('auth.err.sliderRequired');
     }
     setErrors(next);
     return Object.keys(next).length === 0;
@@ -82,11 +126,27 @@ export function ResetPassword() {
 
     setSubmitting(true);
     try {
-      await authApi.resetPassword(token, password);
+      await authApi.resetPassword({
+        token,
+        password,
+        captcha_id: captchaRequired ? (captchaQ.data?.id ?? '') : undefined,
+        captcha_code: captchaMode === 'image' ? captchaCode.trim() : undefined,
+        captcha_x: captchaMode === 'slider' ? sliderXRef.current : undefined,
+        captcha_path: captchaMode === 'slider' ? sliderPathRef.current : undefined,
+      });
       // 成功后回登录页：令牌已作废，留在本页没有意义
       navigate('/login', { replace: true });
     } catch (err) {
-      setError(errorMessage(err));
+      const msg = errorMessage(err);
+      if (captchaRequired && /验证码|滑块/.test(msg)) {
+        setErrors({ captcha: msg });
+        // 挑战一次性：失败后换一道，顺带清掉上次作答
+        setCaptchaCode('');
+        sliderXRef.current = 0;
+        void captchaQ.refetch();
+      } else {
+        setError(msg);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -195,6 +255,61 @@ export function ResetPassword() {
                   error={errors.confirm}
                   required
                 />
+
+                {/* 人机校验：文案复用登录页（同为「验证码 / 拖动滑块」） */}
+                {captchaMode === 'image' ? (
+                  <div className="login-captcha">
+                    <div className="login-captcha-input">
+                      <Input
+                        label={t('auth.login.captcha')}
+                        value={captchaCode}
+                        onChange={(e) => setCaptchaCode(e.target.value)}
+                        placeholder={t('auth.login.captchaPlaceholder')}
+                        autoComplete="off"
+                        autoCapitalize="characters"
+                        disabled={submitting}
+                        maxLength={8}
+                        prefix={<IconShield size={15} />}
+                        error={errors.captcha}
+                        required
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      className="login-captcha-img"
+                      onClick={() => {
+                        setCaptchaCode('');
+                        setErrors((prev) => ({ ...prev, captcha: undefined }));
+                        void captchaQ.refetch();
+                      }}
+                      title={t('auth.login.captchaRefresh')}
+                      aria-label={t('auth.login.captchaRefreshAria')}
+                    >
+                      {captchaQ.data?.image ? (
+                        <img src={captchaQ.data.image} alt={t('auth.login.captchaAlt')} />
+                      ) : (
+                        <span>
+                          {captchaQ.isFetching
+                            ? t('auth.login.captchaLoading')
+                            : t('auth.login.captchaFailed')}
+                        </span>
+                      )}
+                    </button>
+                  </div>
+                ) : captchaMode === 'slider' ? (
+                  <SliderCaptcha
+                    challenge={captchaQ.data ?? { required: true, mode: 'slider' }}
+                    onPosition={handleSliderPosition}
+                    onRefresh={() => {
+                      sliderXRef.current = 0;
+                      setErrors((prev) => ({ ...prev, captcha: undefined }));
+                      void captchaQ.refetch();
+                    }}
+                    loading={captchaQ.isFetching}
+                    disabled={submitting}
+                    error={errors.captcha}
+                  />
+                ) : null}
 
                 <Button
                   type="submit"

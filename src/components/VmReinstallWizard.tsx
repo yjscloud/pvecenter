@@ -25,7 +25,7 @@ import {
   ipPoolsApi,
   storagesApi,
   vmMetaApi,
-  vmMetaKey,
+  vmMetaEntryOf,
   vmReinstallApi,
 } from '../api/endpoints';
 import { fitsPools } from '../utils/ippool';
@@ -247,9 +247,12 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
   const originalFamily = useMemo(() => {
     const recorded = vm
       ? familyByKey(
-          metaQuery.data?.items?.[
-            vmMetaKey(vm.connection_id, vm.node, vm.vmid)
-          ]?.os,
+          vmMetaEntryOf(
+            metaQuery.data?.items,
+            vm.connection_id,
+            vm.node,
+            vm.vmid,
+          )?.os,
         )
       : null;
     return (
@@ -317,7 +320,12 @@ export function VmReinstallWizard({ open, vm, onClose, onDone }: VmReinstallWiza
   /* 面板侧记录的手动 IP：**只在 PVE 里读不到网络配置时**才拿它兜底 ——
      它是人手填的，可能带掩码也可能不带，不如 ipconfigN 可靠。 */
   const metaIp = vm
-    ? metaQuery.data?.items?.[vmMetaKey(vm.connection_id, vm.node, vm.vmid)]?.ip ?? ''
+    ? vmMetaEntryOf(
+        metaQuery.data?.items,
+        vm.connection_id,
+        vm.node,
+        vm.vmid,
+      )?.ip ?? ''
     : '';
 
   /* 打开时重置成「一次干净的重装」 */

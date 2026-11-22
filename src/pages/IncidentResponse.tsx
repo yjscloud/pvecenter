@@ -11,11 +11,15 @@
       或 S3 Object Lock，只靠 PVE API 做不到。
    ========================================================================== */
 
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router';
 import {
+  backupsApi,
   isolationApi,
+  nodesApi,
   protectedBackupsApi,
+  storagesApi,
   vmsApi,
   type QuarantineInput,
 } from '../api/endpoints';
@@ -46,7 +50,12 @@ import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../hooks/useToast';
 import { useT, type MessageKey } from '../i18n';
 import { formatBytes, formatDateTime } from '../utils/format';
-import type { ProtectedBackup, ProtectedBackupState, QuarantineResult } from '../api/types';
+import type {
+  ProtectedBackup,
+  ProtectedBackupState,
+  QuarantineRecord,
+  QuarantineResult,
+} from '../api/types';
 
 const STATE_META: Record<
   ProtectedBackupState,
@@ -133,6 +142,39 @@ export function IncidentResponse() {
     retry: false,
   });
 
+  /* ---- 受保护备份表单的选项来源：节点 → 该节点的备份存储 → 该存储下的归档 ----
+
+     逐级 enabled：上一级没选就不发请求。节点作用域接口必须带 connection_id ——
+     /api/nodes 是跨 PVE 聚合的，只拿节点名去问「当前连接」，名字属于别的主机时
+     存储列表就是空的（PVE 回 hostname lookup failed）。 */
+  const nodesQuery = useQuery({
+    queryKey: ['incident', 'nodes'],
+    queryFn: () => nodesApi.list(),
+    staleTime: 60_000,
+    retry: false,
+  });
+
+  const bConn = useMemo(
+    () => (nodesQuery.data ?? []).find((n) => n.node === bNode)?.connection_id,
+    [nodesQuery.data, bNode],
+  );
+
+  const bStoragesQuery = useQuery({
+    queryKey: ['incident', 'storages', bConn ?? '', bNode],
+    queryFn: () => storagesApi.list(bNode, bConn),
+    enabled: Boolean(bNode),
+    staleTime: 30_000,
+    retry: false,
+  });
+
+  const bArchivesQuery = useQuery({
+    queryKey: ['incident', 'archives', bConn ?? '', bNode, bStorage],
+    queryFn: () => backupsApi.list({ node: bNode, storage: bStorage }, bConn),
+    enabled: Boolean(bNode && bStorage),
+    staleTime: 30_000,
+    retry: false,
+  });
+
   const parsed = useMemo(() => {
     const [node, vmidText] = target.split('/');
     const vmid = Number(vmidText);
@@ -146,6 +188,30 @@ export function IncidentResponse() {
     retry: false,
   });
 
+  /* 面板登记过的隔离清单。页面不再只依赖「上一次操作返回的对象」：
+     刷新之后仍然能看到现在有哪些机器被隔离、谁在什么时候做的。 */
+  const isolationQuery = useQuery({
+    queryKey: ['incident', 'isolation-list'],
+    queryFn: () => isolationApi.list(),
+    enabled: hasPermission('vm.view'),
+    staleTime: 15_000,
+    retry: false,
+  });
+  const isolationItems = isolationQuery.data?.items ?? [];
+
+  /* 从虚拟机列表的「请先解除隔离」跳过来时带 ``?target=节点/VMID``：
+     直接选中那台机器，不用在几十台的下拉里再找一遍。 */
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    const wanted = searchParams.get('target');
+    if (!wanted || target) return;
+    if (!/^[^/]+\/\d+$/.test(wanted)) return;
+    setTarget(wanted);
+    const next = new URLSearchParams(searchParams);
+    next.delete('target');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams, target]);
+
   const vmOptions = useMemo(
     () =>
       (vmsQuery.data ?? []).map((vm) => ({
@@ -154,6 +220,119 @@ export function IncidentResponse() {
       })),
     [vmsQuery.data],
   );
+
+  /* 隔离清单里的节点可能已经过期（机器在面板外迁移过）：以当前虚拟机清单为准。
+     否则「解除隔离」会打到一台已经不在那个节点上的机器，只能收到一句
+     「找不到这台虚拟机」。 */
+  const liveNodeOf = useCallback(
+    (row: QuarantineRecord) => {
+      if (vmOptions.some((o) => o.value === `${row.node}/${row.vmid}`)) {
+        return row.node;
+      }
+      const moved = vmOptions.find((o) => o.value.endsWith(`/${row.vmid}`));
+      return moved
+        ? moved.value.slice(0, moved.value.lastIndexOf('/'))
+        : row.node;
+    },
+    [vmOptions],
+  );
+
+  /* 节点下拉的 value 就是节点名（与「备份」页保持一致，登记时后端只认这个）。
+     多台 PVE 上出现同名节点时只取第一条：这种集群请分别用各自的面板连接操作。 */
+  const bNodeOptions = useMemo(() => {
+    const seen = new Set<string>();
+    const options: Array<{ label: string; value: string }> = [];
+    for (const n of nodesQuery.data ?? []) {
+      if (seen.has(n.node)) continue;
+      seen.add(n.node);
+      options.push({ label: n.node, value: n.node });
+    }
+    return options;
+  }, [nodesQuery.data]);
+
+  /* 只留启用了 backup 内容的存储：images / rootdir 这类存储放不下 vzdump 归档，
+     列出来只会让人选中后吃到 PVE 的 "storage does not support content type"。 */
+  const bStorageOptions = useMemo(() => {
+    const all = bStoragesQuery.data ?? [];
+    const canBackup = all.filter((s) =>
+      (s.content || '')
+        .split(',')
+        .map((c) => c.trim())
+        .includes('backup'),
+    );
+    /* content 字段缺失时（精简响应）不过滤，免得把选项清空 */
+    const usable = canBackup.length ? canBackup : all;
+    return [...new Set(usable.map((s) => s.storage))]
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => ({ label: name, value: name }));
+  }, [bStoragesQuery.data]);
+
+  /* 归档按创建时间倒序：最近的那份通常就是要保护的那份 */
+  const bArchiveOptions = useMemo(
+    () =>
+      [...(bArchivesQuery.data ?? [])]
+        .sort((a, b) => (b.ctime ?? 0) - (a.ctime ?? 0))
+        .map((a) => ({ label: a.volid, value: a.volid })),
+    [bArchivesQuery.data],
+  );
+
+  const bSelectedArchive = useMemo(
+    () => (bArchivesQuery.data ?? []).find((a) => a.volid === volid),
+    [bArchivesQuery.data, volid],
+  );
+
+  /* 列表刷新后原先选中的存储 / 归档可能已经不在了：自动退回未选状态，
+     否则提交的是一个后端根本找不到的卷名 */
+  useEffect(() => {
+    if (!bStorage || bStoragesQuery.isLoading) return;
+    if (!bStorageOptions.some((o) => o.value === bStorage)) setBStorage('');
+  }, [bStorage, bStorageOptions, bStoragesQuery.isLoading]);
+
+  useEffect(() => {
+    if (!volid || bArchivesQuery.isLoading) return;
+    if (!bArchiveOptions.some((o) => o.value === volid)) setVolid('');
+  }, [volid, bArchiveOptions, bArchivesQuery.isLoading]);
+
+  /* ---- 三个下拉的占位与说明：只在「还不能选」或「选不了」时给出文字 ---- */
+  const bNodeHint = nodesQuery.isLoading
+    ? t('backups.nodeLoading')
+    : nodesQuery.isError
+      ? errorMessage(nodesQuery.error)
+      : bNodeOptions.length === 0
+        ? t('incident.noNodes')
+        : undefined;
+
+  const bNodePlaceholder =
+    bNodeOptions.length === 0
+      ? nodesQuery.isLoading
+        ? t('backups.nodeLoading')
+        : t('incident.noNodes')
+      : t('backups.nodePlaceholder');
+
+  const bStorageHint = !bNode
+    ? t('incident.pickNodeFirst')
+    : bStoragesQuery.isLoading
+      ? t('backups.nodeLoading')
+      : bStoragesQuery.isError
+        ? errorMessage(bStoragesQuery.error)
+        : bStorageOptions.length === 0
+          ? t('backups.noBackupStorage')
+          : undefined;
+
+  const bVolidHint = !bStorage
+    ? t('incident.pickStorageFirst')
+    : bArchivesQuery.isLoading
+      ? t('backups.nodeLoading')
+      : bArchivesQuery.isError
+        ? errorMessage(bArchivesQuery.error)
+        : bArchiveOptions.length === 0
+          ? t('incident.noVolids')
+          : bSelectedArchive
+            ? t('incident.volidDetail', {
+                size: formatBytes(bSelectedArchive.size),
+                time: formatDateTime(bSelectedArchive.ctime),
+              })
+            : t('incident.volidSelectHint');
 
   const refreshProtected = async () => {
     await queryClient.invalidateQueries({ queryKey: ['incident', 'protected'] });
@@ -183,6 +362,9 @@ export function IncidentResponse() {
       }
       await queryClient.invalidateQueries({ queryKey: ['incident'] });
       await queryClient.invalidateQueries({ queryKey: ['vms'] });
+      /* 隔离会把系统信息采集进备注条目（见 app.guest_osinfo）：列表的「操作系统」
+         徽标与备注弹窗都读它，不失效就还停在旧的那份上。 */
+      await queryClient.invalidateQueries({ queryKey: ['vm-meta'] });
     } catch (err) {
       toast.error(t('incident.quarantineFailed'), errorMessage(err));
     } finally {
@@ -190,11 +372,14 @@ export function IncidentResponse() {
     }
   };
 
-  const runRelease = async (powerOn: boolean) => {
-    if (!parsed) return;
+  /* ``row`` 有值 = 从清单里直接解除某一条；没有 = 用上方选中的机器 */
+  const runRelease = async (powerOn: boolean, row?: QuarantineRecord) => {
+    const node = row?.node ?? parsed?.node;
+    const vmid = row?.vmid ?? parsed?.vmid;
+    if (!node || !vmid) return;
     setBusy(true);
     try {
-      const result = await isolationApi.release(parsed.node, parsed.vmid, {
+      const result = await isolationApi.release(node, vmid, {
         restore_network: true,
         unprotect: true,
         power_on: powerOn,
@@ -204,6 +389,9 @@ export function IncidentResponse() {
       toast.success(t('incident.released'), result.summary);
       await queryClient.invalidateQueries({ queryKey: ['incident'] });
       await queryClient.invalidateQueries({ queryKey: ['vms'] });
+      /* 解除隔离会重新采集一次系统信息并补回缺失的 os 家族：备注缓存必须一起失效，
+         否则「解除后图标回来了」在界面上要等下一次整页刷新才看得见。 */
+      await queryClient.invalidateQueries({ queryKey: ['vm-meta'] });
     } catch (err) {
       toast.error(t('incident.releaseFailed'), errorMessage(err));
     } finally {
@@ -301,6 +489,81 @@ export function IncidentResponse() {
         powerAction === 'stop' ? 'incident.planOff.stop' : 'incident.planOff.shutdown',
     },
     { on: protect, key: 'incident.plan.protect', offKey: 'incident.planOff.protect' },
+  ];
+
+  /* 隔离清单的列：只放「处置时要知道的」——哪台机器、哪台宿主机、什么时候、
+     断了几张网卡、取证快照叫什么、谁做的 + 备注。 */
+  const isolationColumns: Array<Column<QuarantineRecord>> = [
+    {
+      key: 'guest',
+      header: t('incident.isoColGuest'),
+      render: (row) => (
+        <span>
+          <span className="fs-sm">{row.name || `VM ${row.vmid}`}</span>
+          <span className="mono fs-xs text-muted"> · {row.vmid}</span>
+          {row.state !== 'ok' ? (
+            <Badge variant="warning" size="sm">
+              {t('incident.isoStatePartial')}
+            </Badge>
+          ) : null}
+        </span>
+      ),
+    },
+    {
+      key: 'node',
+      header: t('common.node'),
+      width: 120,
+      render: (row) => <span className="mono fs-xs">{liveNodeOf(row)}</span>,
+    },
+    {
+      key: 'at',
+      header: t('incident.isoColAt'),
+      width: 165,
+      render: (row) => <span className="fs-xs">{formatDateTime(row.started_at)}</span>,
+    },
+    {
+      key: 'nics',
+      header: t('incident.isoColNics'),
+      width: 90,
+      render: (row) => <span className="fs-xs">{row.interfaces.length}</span>,
+    },
+    {
+      key: 'snapshot',
+      header: t('incident.isoColSnapshot'),
+      render: (row) => <span className="mono fs-xs">{row.snapshot || '—'}</span>,
+    },
+    {
+      key: 'detail',
+      header: t('incident.colDetail'),
+      render: (row) => (
+        <span className="fs-xs text-muted">
+          {[row.recorded_by, row.note].filter(Boolean).join(' · ') || '—'}
+        </span>
+      ),
+    },
+    {
+      key: 'actions',
+      header: t('common.actions'),
+      width: 110,
+      render: (row) =>
+        canIsolate ? (
+          <Button
+            size="sm"
+            variant="secondary"
+            loading={busy}
+            onClick={() => {
+              /* 顺手把上方「处置目标」切到这一台：解除之后的状态横幅、
+                 证据快照列表都跟着这台走，不会停在上一台的读数上。
+                 节点取实时清单里的那个（清单里的可能是迁移前的旧节点）。 */
+              const node = liveNodeOf(row);
+              setTarget(`${node}/${row.vmid}`);
+              void runRelease(false, { ...row, node });
+            }}
+          >
+            {t('incident.release')}
+          </Button>
+        ) : null,
+    },
   ];
 
   const columns: Array<Column<ProtectedBackup>> = [
@@ -578,6 +841,46 @@ export function IncidentResponse() {
         </Card>
       </div>
 
+      {/* ============================================== 隔离清单（面板登记） */}
+      <div className="section-block">
+        <div className="section-title">
+          <IconLock size={15} />
+          <span className="section-name">{t('incident.isoListSection')}</span>
+          <span className="section-hint">{t('incident.isoListSectionHint')}</span>
+        </div>
+
+        <Card collapsible={false}>
+          <CardHeader
+            title={t('incident.isoListTitle', { n: isolationItems.length })}
+            subtitle={t('incident.isoListSubtitle')}
+            icon={<IconLock size={16} />}
+          />
+
+          {isolationQuery.isError ? (
+            <ErrorState
+              title={t('incident.isoListLoadFailed')}
+              message={errorMessage(isolationQuery.error)}
+              onRetry={() => void isolationQuery.refetch()}
+            />
+          ) : isolationItems.length ? (
+            <Table
+              columns={isolationColumns}
+              rows={isolationItems}
+              rowKey={(row) => `${row.conn_id}:${row.node}/${row.vmid}`}
+              caption={t('incident.isoListCaption')}
+              dense
+              emptyTitle={t('incident.isoListEmptyTitle')}
+            />
+          ) : (
+            <EmptyState
+              title={t('incident.isoListEmptyTitle')}
+              description={t('incident.isoListEmptyDesc')}
+              icon={<IconLock size={26} />}
+            />
+          )}
+        </Card>
+      </div>
+
       {/* ============================================== 备份防删 */}
       <div className="section-block">
         <div className="section-title">
@@ -659,31 +962,63 @@ export function IncidentResponse() {
         {canBackup ? (
           <div className="create-bar">
             <div className="field-row">
-              <Field label={t('common.node')} required className="field-narrow">
-                <Input
-                  placeholder="pve1"
+              <Field
+                label={t('common.node')}
+                required
+                className="field-narrow"
+                hint={bNodeHint}
+              >
+                <Select
                   value={bNode}
-                  onChange={(event) => setBNode(event.target.value)}
+                  onChange={(event) => {
+                    /* 换节点 = 换一台主机：存储与卷都不一定在那儿，一并清掉，
+                       免得拿着上一台的旧值提交 */
+                    setBNode(event.target.value);
+                    setBStorage('');
+                    setVolid('');
+                  }}
+                  options={bNodeOptions}
+                  placeholder={bNodePlaceholder}
+                  disabled={nodesQuery.isLoading || bNodeOptions.length === 0}
                 />
               </Field>
-              <Field label={t('incident.fieldStorage')} required className="field-narrow">
-                <Input
-                  placeholder="backup"
+              <Field
+                label={t('incident.fieldStorage')}
+                required
+                className="field-narrow"
+                hint={bStorageHint}
+              >
+                <Select
                   value={bStorage}
-                  onChange={(event) => setBStorage(event.target.value)}
+                  onChange={(event) => {
+                    setBStorage(event.target.value);
+                    setVolid('');
+                  }}
+                  options={bStorageOptions}
+                  placeholder={t('backups.storagePlaceholder')}
+                  disabled={
+                    !bNode ||
+                    bStoragesQuery.isLoading ||
+                    bStorageOptions.length === 0
+                  }
                 />
               </Field>
               <Field
                 label={t('incident.colVolid')}
                 required
-                hint={t('incident.volidHint')}
+                hint={bVolidHint}
                 className="field-wide"
               >
-                <Input
-                  placeholder="backup:backup/vzdump-qemu-100-2026_09_25-00_00_00.vma.zst"
-                  mono
+                <Select
                   value={volid}
                   onChange={(event) => setVolid(event.target.value)}
+                  options={bArchiveOptions}
+                  placeholder={t('incident.volidSelectPlaceholder')}
+                  disabled={
+                    !bStorage ||
+                    bArchivesQuery.isLoading ||
+                    bArchiveOptions.length === 0
+                  }
                 />
               </Field>
               <Field label={t('incident.fieldNote')}>

@@ -6,7 +6,8 @@
 * 未登录枚举 API 时，存在与不存在的路径都回 401；
 * 已登录访问不存在的路径回**通用** 404，不泄露路径 / 版本 / 运维动作；
 * ``X-PVE-Calls`` / ``X-DB-Queries`` 只在 DEBUG 下出现；
-* ``/robots.txt`` 这类静态后缀不被 SPA 兜底成 200 首页。
+* ``/favicon.ico`` 这类静态后缀不被 SPA 兜底成 200 首页（``/robots.txt``
+  已有真实路由，见 ``test_security_headers``）。
 """
 from __future__ import annotations
 
@@ -69,15 +70,19 @@ def test_internal_metrics_headers_visible_in_debug(api, monkeypatch) -> None:
 
 # ------------------------------------------------------------- BUG-006 软 404
 def test_static_like_paths_are_not_spa_fallbacks(api) -> None:
-    for path in (
-        "/robots.txt",
-        "/favicon.ico",
-        "/.env",
-    ):
+    for path in ("/favicon.ico", "/.env"):
         response = api.get(path)
         assert response.status_code == 404, path
         # 不能把首页 HTML 伪装成这些资源
         assert "text/html" not in response.headers.get("content-type", ""), path
+
+    # robots.txt 现在有真实路由（禁全站索引），但同样不能被 SPA 兜底成首页：
+    # 必须是 text/plain，且不能出现 <html>。这一条守的仍是「不软 404」。
+    robots = api.get("/robots.txt")
+    assert robots.status_code == 200
+    assert robots.headers["content-type"].startswith("text/plain")
+    assert "Disallow: /" in robots.text
+    assert "<html" not in robots.text.lower()
 
 
 def test_security_txt_is_served(api) -> None:

@@ -469,6 +469,24 @@ def normalise_limits(raw: Any) -> Dict[str, Dict[str, Optional[int]]]:
     return out
 
 
+def provided_limits(raw: Any) -> Optional[Dict[str, Dict[str, Optional[int]]]]:
+    """把请求里的额度收成「一份结构」或 ``None``。
+
+    全部字段都没填 == 没设置（``None``），注册出来的账号继续继承角色额度；
+    只要有一格填了（含 0），就整份落库 —— 与 :func:`set_user_limits` 的语义
+    一致：空对象是「显式全不限制」，会盖掉角色默认，不能拿它当「没填」。
+    """
+    if raw is None:
+        return None
+    data = raw.model_dump() if hasattr(raw, "model_dump") else raw
+    limits = normalise_limits(data)
+    if not any(
+        value is not None for group in limits.values() for value in group.values()
+    ):
+        return None
+    return limits
+
+
 def _decode_limits(text: Any) -> Dict[str, Dict[str, Optional[int]]]:
     try:
         raw = json.loads(text or "{}")

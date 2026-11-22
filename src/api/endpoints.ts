@@ -137,6 +137,7 @@ import type {
   PortReport,
   ProtectedBackupList,
   ProtectedVerifyResult,
+  QuarantineRecord,
   QuarantineResult,
   QuarantineStatus,
   SshHost,
@@ -157,6 +158,10 @@ import type {
   MailConfigInput,
   UpdateApplyResult,
   UpdateStatus,
+  InviteLink,
+  InviteLinkInput,
+  InviteOverview,
+  InvitePreview,
   MyPermissions,
   NetworkInterface,
   NetworkInterfaceInput,
@@ -166,7 +171,16 @@ import type {
   ForgotPasswordInput,
   ForgotPasswordResult,
   ProfileUpdateInput,
+  RegisterAvailability,
+  RegisterEmailCodeInput,
+  RegisterEmailCodeResult,
   RegisterInput,
+  RegisterMode,
+  RegistrationCode,
+  RegistrationCodeInput,
+  RegistrationModeInfo,
+  RegistrationOverview,
+  ResetPasswordInput,
   ResetTokenCheck,
   NodeStatus,
   DiskHealth,
@@ -291,9 +305,36 @@ export const authApi = {
   login: (body: LoginRequest) => post<LoginResponse>('/auth/login', body),
   /** 登录页验证码（公开接口）：required=false 时前端隐藏输入框 */
   captcha: () => get<CaptchaChallenge>('/auth/captcha'),
-  /** 自助注册（公开接口）：提交后账号进入待审批队列，不能立即登录 */
+  /** 自助注册是否开放（公开接口）：关闭时登录页隐藏入口、注册页显示关闭提示 */
+  registerAvailability: () =>
+    get<RegisterAvailability>('/auth/register-availability'),
+  /**
+   * 当前注册方式（公开接口）：off / invite / code / open。
+   * 登录页据此决定是否展示入口，注册页据此决定渲染哪个凭证输入框。
+   */
+  registrationMode: () =>
+    get<RegistrationModeInfo>('/auth/registration-mode'),
+  /**
+   * 自助注册（公开接口）：默认进入待审批队列；免审批的邀请链接 / 注册码会
+   * 直接返回 `status: "active"`。成功页必须读这个字段，不能只按邀请预览推断。
+   */
   register: (body: RegisterInput) =>
     post<{ ok: boolean; status: string; message: string }>('/auth/register', body),
+  /**
+   * 自助注册第 1 步（公开接口）：把一次性验证码发到填写的邮箱。
+   *
+   * 单独一步是刻意的：发信要有自己的限频与冷却，和「提交注册」绑在一起会变成
+   * 一个可被脚本无限触发的发信接口。返回值里带有效期 / 可错次数 / 冷却秒数，
+   * 前端直接拿去显示与倒计时，不在前端重算一份配置。
+   */
+  sendRegisterEmailCode: (body: RegisterEmailCodeInput) =>
+    post<RegisterEmailCodeResult>('/auth/register/email-code', body),
+  /**
+   * 邀请链接预览（公开）：注册页打开 ``?invite=`` 时先问一句「还能不能用、
+   * 给什么角色、要不要审批」。链接无效时也是 200 + ``valid: false``。
+   */
+  invitePreview: (token: string) =>
+    get<InvitePreview>(`/auth/invite/${encodeURIComponent(token)}`),
   /**
    * 自助重置第 1 步（公开接口）：给账号邮箱发一次性链接。
    * 无论账号是否存在都返回同一句话，防止被用来枚举账号。
@@ -303,11 +344,11 @@ export const authApi = {
   /** 校验重置链接是否还有效（不消耗令牌） */
   checkResetToken: (token: string) =>
     post<ResetTokenCheck>('/auth/reset-password/check', { token }),
-  /** 自助重置第 2 步：凭令牌设置新密码，令牌一次性 */
-  resetPassword: (token: string, password: string) =>
+  /** 自助重置第 2 步：凭令牌设置新密码，令牌一次性（含人机校验） */
+  resetPassword: (body: ResetPasswordInput) =>
     post<{ ok: boolean; username: string; message: string }>(
       '/auth/reset-password',
-      { token, password },
+      body,
     ),
   /**
    * 登录第二步：mfa_token + 动态码（或一次性恢复码）。
@@ -438,35 +479,94 @@ export const configApi = {
    */
   diagnostics: (connectionId?: string) =>
     get<DiagnosticsResult>('/config/diagnostics', scoped(connectionId)),
-  /** 面板级创建默认值（默认 DNS + 默认克隆方式），创建向导向所有用户预填 */
-  getVmDefaults: () => get<VmDefaults>('/config/vm-defaults'),
+  /**
+   * 面板级创建默认值（默认 DNS + 默认克隆方式），创建向导向所有用户预填。
+   *
+   * **读走 `/runtime`**：这份读数每个登录用户都要，所以它与 `/config/*`（整组
+   * settings.manage）分家 —— 见 `app/routeguard.py`。写仍在 `/config`。
+   */
+  getVmDefaults: () => get<VmDefaults>('/runtime/vm-defaults'),
   /** 整份保存（与 IP 池同一契约）：漏传的字段会被写回默认值，所以要传全 */
   saveVmDefaults: (body: VmDefaults) => put<VmDefaults>('/config/vm-defaults', body),
   /**
-   * 资源规格（套餐）。管理员在设置页维护、下单页读取，因此**读取只要求登录**；
+   * 资源规格（套餐）。管理员在设置页维护、下单页读取：
+   * **读走 `/runtime/specs`**（只要求登录，下单的人得能挑），
    * 保存是整份覆盖（与 IP 池同一契约），需要 settings.manage，
    * 不合法的条目会被后端逐条丢弃，返回值才是真正落库的那份。
    */
-  getSpecs: () => get<{ specs: ResourceSpec[] }>('/config/specs'),
+  getSpecs: () => get<{ specs: ResourceSpec[] }>('/runtime/specs'),
   saveSpecs: (specs: ResourceSpec[]) =>
     put<{ specs: ResourceSpec[] }>('/config/specs', specs),
   /**
    * 内置的一组常用规格（只读）。`getSpecs` 给的是「当前生效的配置」——老部署里早已
    * 存了自己的那套，内置表就读不到了；设置页的「添加常用规格」用它兜住这批部署。
    */
-  getSpecPresets: () => get<{ specs: ResourceSpec[] }>('/config/specs/presets'),
+  getSpecPresets: () => get<{ specs: ResourceSpec[] }>('/runtime/specs/presets'),
   /**
    * 登录页的验证方式：关闭 / 图形验证码 / 拖动滑块。
-   * 读取只要求登录（设置页要显示当前值）；写入需要 settings.manage + 二次确认。
+   * 读与写都要 settings.manage（读写同一档，见 `app/routeguard.py`），
+   * 写入还要二次确认。
    */
   getLoginCaptcha: () => get<{ mode: LoginCaptchaMode }>('/config/login-captcha'),
   saveLoginCaptcha: (mode: LoginCaptchaMode) =>
     put<{ mode: LoginCaptchaMode }>('/config/login-captcha', { mode }),
   /**
+   * 注册方式（关闭 / 邀请制 / 注册码制 / 自助）：四种互斥，改完**下一次注册
+   * 请求就生效**。读写都要 settings.manage，写入还要二次确认，并落审计。
+   */
+  getRegistration: () => get<RegistrationOverview>('/config/registration'),
+  saveRegistrationMode: (mode: RegisterMode) =>
+    put<{ mode: RegisterMode; requires: '' | 'invite' | 'code' }>(
+      '/config/registration/mode',
+      { mode },
+    ),
+  /**
+   * 自助注册的邮箱验证码开关：只改这一个字段。
+   *
+   * 关掉之后注册退回「只要人机校验」，邮箱不再被验证 —— 邮件服务没配好的部署
+   * 可以这样用，但确认弹窗里要讲清这层代价。
+   */
+  saveRegistrationEmailCode: (enabled: boolean) =>
+    put<{ email_code_enabled: boolean }>('/config/registration/email-code', {
+      enabled,
+    }),
+  /** 签发邀请凭证 / 注册码：明文只在这个响应里出现一次 */
+  createRegistrationCode: (payload: RegistrationCodeInput) =>
+    post<RegistrationCode & { code: string; ttl_minutes: number }>(
+      '/config/registration/codes',
+      payload,
+    ),
+  revokeRegistrationCode: (id: string) =>
+    post<{ id: string; revoked: boolean }>(
+      `/config/registration/codes/${encodeURIComponent(id)}/revoke`,
+    ),
+  deleteRegistrationCode: (id: string) =>
+    del<{ id: string; deleted: boolean }>(
+      `/config/registration/codes/${encodeURIComponent(id)}`,
+    ),
+  /**
+   * 邀请链接：链接 = 注册入口 + 角色 + 审批策略 + 次数上限。
+   *
+   * 与上面的「邀请凭证 / 注册码」并存：带 ``?invite=`` 的注册走链接这条路，
+   * 不带链接的仍按注册方式处理。写操作都要 settings.manage + step-up。
+   */
+  getInvites: () => get<InviteOverview>('/config/invites'),
+  createInvite: (payload: InviteLinkInput) =>
+    post<InviteLink>('/config/invites', payload),
+  revokeInvite: (id: string) =>
+    post<{ id: string; revoked: boolean }>(
+      `/config/invites/${encodeURIComponent(id)}/revoke`,
+    ),
+  deleteInvite: (id: string) =>
+    del<{ id: string; deleted: boolean }>(
+      `/config/invites/${encodeURIComponent(id)}`,
+    ),
+  /**
    * 会话有效期：访问令牌多少分钟过期、会话（refresh token）保留几天。
    *
-   * 读取只要求登录（设置页要回显）；写入需要 settings.manage + 二次确认，
-   * 改完**立即生效**，不需要重启面板（后端有一份进程内缓存）。
+   * 读与写都要 settings.manage：这份读数会告诉调用方「偷到的会话还能撑多久」，
+   * 只有设置页用它。写入还要二次确认，改完**立即生效**，不需要重启面板
+   * （后端有一份进程内缓存）。
    */
   getSessionPolicy: () =>
     get<{
@@ -484,19 +584,20 @@ export const configApi = {
     put<{ access_minutes: number; refresh_days: number }>('/config/session', body),
   /**
    * 面板界面开关（导航栏里被逐个关闭的入口）。
-   * 读取只要求登录：控制台外壳在每个用户登录后立刻要用。写入需要
-   * settings.manage，但不需要二次确认 —— 它不降低安全门槛，只改新版式。
+   * **读走 `/runtime/ui`**：控制台外壳在每个用户登录后立刻要用，所以那条只要求
+   * 登录。写入仍在 `/config/ui`（settings.manage，不需要二次确认 —— 它不降低
+   * 安全门槛，只改新版式）。
    *
    * 提交时两个字段都带上：后端对缺省字段的处理是「保持原值」，前端显式给全，
    * 免得两份状态各改一半。
    */
-  getUiPrefs: () => get<UiPrefs>('/config/ui'),
+  getUiPrefs: () => get<UiPrefs>('/runtime/ui'),
   saveUiPrefs: (prefs: UiPrefs) => put<UiPrefs>('/config/ui', prefs),
   /**
-   * 虚拟机下发总配额。
+   * 虚拟机下发总配额（**管理端**读数：全平台护栏与已用台数）。
    *
-   * 读数的口径取决于调用者：能管理设置的人（含管理员）拿到的是**全平台**护栏，
-   * 普通用户拿到的是**自己名下**那一份（见 `VmQuotaInfo.scope`）。
+   * 读与写都要 settings.manage —— 这是集群规模信息。用户自己那份额度与用量走
+   * `quotaApi.mine`（`GET /quota/me`），两者口径不同，别混用。
    * `quota` 传 null 表示「不限制」；传 0 表示普通用户完全不能下发。
    */
   getVmQuota: () => get<VmQuotaInfo>('/config/vm-quota'),
@@ -509,6 +610,7 @@ export const configApi = {
   /**
    * 面板全局地址：邮件（重置密码 / 审批结果）与飞书回调里拼链接用的对外域名。
    * 空串 = 未配置，后端回落到本次请求的 Host。
+   * 读与写都要 settings.manage：它是「面板在外网叫什么」，只有设置页用得到。
    */
   getPanelUrl: () => get<{ url: string }>('/config/panel-url'),
   savePanelUrl: (url: string) => put<{ url: string }>('/config/panel-url', { url }),
@@ -564,7 +666,11 @@ export const faqApi = {
    --------------------------------------------------------------------------- */
 
 export const mailApi = {
-  /** 读配置（登录即可）。返回体不含 SMTP 密码，只有 password_set */
+  /**
+   * 读配置：**要 settings.manage**（SMTP 主机 / 端口 / 发件账号 / 管理员收件人
+   * 拼起来就是一张钓鱼情报图，不是「登录即可」的读数）。
+   * 返回体不含 SMTP 密码，只有 password_set。
+   */
   get: () => get<MailConfig>('/config/mail'),
   /** 保存配置，需要 settings.manage；password 留空 = 沿用旧值 */
   save: (body: MailConfigInput) => put<MailConfig>('/config/mail', body),
@@ -741,6 +847,33 @@ export function vmMetaKey(
   vmid: number,
 ): string {
   return `${connectionId ?? ''}|${node}|${vmid}`;
+}
+
+/**
+ * 取某台机器在面板侧的备注条目（手动 IP / 系统标识 / 关联的来源模板）。
+ *
+ * 条目键里带节点，而**节点是可变的那一段**：机器迁移之后条目还挂在旧节点下，
+ * 按当前节点查就是空的 —— 界面表现为「系统标识、关联模板突然没了」。VMID 在
+ * 一条连接（= 一个 PVE 集群）内唯一，所以精确键取不到时按「连接 + VMID」回落
+ * （同一台机器万一留下两条，取最近保存的那条）。
+ */
+export function vmMetaEntryOf(
+  items: Record<string, VmMetaEntry> | undefined,
+  connectionId: string | null | undefined,
+  node: string,
+  vmid: number,
+): VmMetaEntry | null {
+  if (!items) return null;
+  const exact = items[vmMetaKey(connectionId, node, vmid)];
+  if (exact) return exact;
+  const ident = `${connectionId ?? ''}|${vmid}`;
+  let found: VmMetaEntry | null = null;
+  for (const [key, entry] of Object.entries(items)) {
+    const parts = key.split('|');
+    if (parts.length !== 3 || `${parts[0]}|${parts[2]}` !== ident) continue;
+    if (!found || (entry.at ?? 0) > (found.at ?? 0)) found = entry;
+  }
+  return found;
 }
 
 
@@ -1621,10 +1754,16 @@ export const tasksApi = {
   /**
    * `node` 可选：UPID 本身已编码节点名，后端会自动解析。
    * 仅在极少数无法解析的场景才需要显式传入。
+   *
+   * ``connectionId`` 也建议带上：批量下发是在用户选定的那条连接上发起的，而
+   * 轮询请求若不带连接，后端只能按「当前生效连接」判定归属 —— 多连接部署里
+   * 两者不一致时，普通用户会拿到 404（表现为「任务记录已不存在」），管理员
+   * 因为不受归属限制反而正常。
    */
-  detail: (upid: string, node?: string) =>
+  detail: (upid: string, node?: string, connectionId?: string) =>
     get<TaskDetail>(`/tasks/${encodeURIComponent(upid)}`, {
       params: node ? { node } : {},
+      ...scoped(connectionId),
     }),
   remove: (upid: string, node?: string) =>
     del<{ ok: boolean }>(`/tasks/${encodeURIComponent(upid)}`, {
@@ -2069,7 +2208,15 @@ export const frpApi = {
       }),
   },
   /** 目标白名单 / 端口区间 / 已占用端口 —— 前端即时校验与提示用 */
-  policy: () => get<FrpPolicy>("/frp/policy"),
+  /**
+   * 策略快照。`withTargets` 只对管理员有意义：带上它才会计算「全平台目标清单」
+   * （逐连接读 PVE，离线连接会拖到超时），所以只在新建规则弹窗打开时按需取。
+   */
+  policy: (opts?: { withTargets?: boolean }) =>
+    get<FrpPolicy>(
+      "/frp/policy",
+      opts?.withTargets ? { params: { with_targets: true } } : undefined,
+    ),
   /** 开关「阻止把穿透目标指向面板所在网段」（admin only，需二次确认） */
   setBlockPanelSubnet: (enabled: boolean) =>
     put<{ block_panel_subnet: boolean }>("/frp/policy/panel-subnet", {
@@ -3037,6 +3184,9 @@ export interface QuarantineReleaseInput {
 }
 
 export const isolationApi = {
+  /** 面板登记过的隔离清单（最近的排前面）—— 刷新页面后仍能看到的那些 */
+  list: () =>
+    get<{ items: QuarantineRecord[]; count: number }>('/isolation'),
   /** 当前隔离状态（断了几张网卡、是否保护、有哪些取证快照） */
   status: (node: string, vmid: number) =>
     get<QuarantineStatus>(`/vms/${node}/${vmid}/quarantine`),
@@ -3535,12 +3685,16 @@ export const aiApi = {
   /** 客户机内受限执行器（diagd）的安装脚本 */
   vmDiagd: () => get<{ version: string; script: string; hint: string }>('/ai/vm/diagd'),
 
-  /** 回滚：按动作还原单个文件，或整机回到授权前打的快照 */
+  /**
+   * 回滚：按动作还原单个文件，或整机回到授权前打的快照。
+   * 整机回滚会等 PVE 任务跑完再回话：ok=true 表示确认成功，pending=true 表示
+   * 任务已提交但等待超时、结果未知，失败时 output 里是 PVE 给出的具体原因。
+   */
   vmRollback: (
     id: string,
     payload: { action_id?: string; mode?: 'file' | 'snapshot' },
   ) =>
-    post<{ ok: boolean; output: string }>(
+    post<{ ok: boolean; output: string; pending?: boolean }>(
       `/ai/vm/leases/${encodeURIComponent(id)}/rollback`,
       payload,
     ),

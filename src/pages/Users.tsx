@@ -16,6 +16,7 @@ import { Badge } from '../components/ui/Badge';
 import { Button, IconButton } from '../components/ui/Button';
 import { Input, Select, Switch, Textarea, Field } from '../components/ui/Input';
 import { Table, type Column } from '../components/ui/Table';
+import { useColumnSettings } from '../components/ui/ColumnSettings';
 import { Modal } from '../components/ui/Modal';
 import { ProgressBar } from '../components/ui/ProgressBar';
 import { ErrorState, Notice, CollapsibleCard } from '../components/ui/EmptyState';
@@ -371,11 +372,15 @@ export function Users() {
     invalidateQuota(queryClient);
   };
 
-  /* ---- 表格列 ---- */
+  /* ---- 表格列 ----
+     宽度一律用百分比：这一页有 10 列，只给其中几列写死像素的话，剩下的列会把
+     整条剩余宽度全吃进自己那一格里（「备注」那一大片空白就是这么来的）。
+     百分比之和为 100，各列按比例摊开，容器变宽变窄都不会再出现死白。 */
   const columns: Array<Column<UserOut>> = [
     {
       key: 'username',
       header: t('users.colUsername'),
+      width: '15%',
       render: (u) => (
         <div className="vm-name-cell">
           <span className="fw-500 flex items-center gap-6">
@@ -397,7 +402,7 @@ export function Users() {
     {
       key: 'quotaLimit',
       header: t('users.colQuota'),
-      width: 118,
+      width: '8%',
       render: (u) => {
         const row = overviewByUser.get(u.username);
         if (!row) return <span className="fs-xs text-muted">—</span>;
@@ -407,7 +412,7 @@ export function Users() {
     {
       key: 'quotaUsed',
       header: t('users.colQuotaUsed'),
-      width: 132,
+      width: '9%',
       render: (u) => {
         const row = overviewByUser.get(u.username);
         if (!row) return <span className="fs-xs text-muted">—</span>;
@@ -417,8 +422,8 @@ export function Users() {
     {
       key: 'role',
       header: t('users.colRole'),
-      /* 自定义角色名比内置词条长（用户自己起的），120 会把它压成省略号 */
-      width: 150,
+      /* 自定义角色名比内置词条长（用户自己起的），给太少会把它压成省略号 */
+      width: '9.5%',
       render: (u) => {
         const meta = roleMeta(u.role, tStatic);
         const label = customRoleNames.get(u.role) ?? meta.label;
@@ -438,7 +443,7 @@ export function Users() {
     {
       key: 'enabled',
       header: t('common.status'),
-      width: 110,
+      width: '8%',
       render: (u) => {
         // 待审批 / 已拒绝比「启用与否」更值得先说：这类账号根本登不进来，
         // 再显示一个绿色的「已启用」只会自相矛盾。
@@ -455,7 +460,7 @@ export function Users() {
     {
       key: 'expires',
       header: t('users.colExpires'),
-      width: 168,
+      width: '12.5%',
       sortable: true,
       sortValue: (u) => u.expires_at ?? 0,
       render: (u) => <UserExpiryCell user={u} />,
@@ -463,6 +468,9 @@ export function Users() {
     {
       key: 'comment',
       header: t('users.fieldComment'),
+      /* 这一列原来不写宽度，就成了整行剩余空间的兜底 —— 备注绝大多数是「—」，
+         于是一格空白吃掉几百像素。给个固定比例，多条字在格内省略、悬停看全 */
+      width: '9%',
       render: (u) => (
         <span className="fs-sm text-secondary truncate" title={u.comment}>
           {u.comment || '—'}
@@ -470,9 +478,19 @@ export function Users() {
       ),
     },
     {
+      key: 'last_login',
+      header: t('users.colLastLogin'),
+      width: '10%',
+      render: (u) => (
+        <span className="mono fs-sm">
+          {u.last_login ? formatDateTime(u.last_login) : t('users.neverLoggedIn')}
+        </span>
+      ),
+    },
+    {
       key: 'created',
       header: t('common.createdAt'),
-      width: 170,
+      width: '10%',
       render: (u) => (
         <span className="mono fs-sm">
           {u.created ? formatDateTime(u.created) : '—'}
@@ -482,8 +500,10 @@ export function Users() {
     {
       key: 'actions',
       header: t('common.actions'),
-      width: 130,
+      width: '9%',
       align: 'right',
+      /* 操作列钉在最右：它被拖到中间，用户就找不到「删除」在哪了 */
+      locked: true,
       render: (u) => (
         <span className="row-actions">
           <IconButton
@@ -523,6 +543,12 @@ export function Users() {
       ),
     },
   ];
+
+  /* 列显隐 / 顺序 / 宽度都按账号记在本机：
+     * 顺序与显隐走 useColumnSettings（表头拖动与「列」窗口共用同一份）；
+     * 宽度由 Table 自己按 storageKey 存，两个键各管一段，互不覆盖。 */
+  const cols = useColumnSettings(columns, 'users');
+  const widthStorageKey = `${currentUser?.username || 'anonymous'}:users`;
 
   /* ---- 待审批列表列：只有「通过」「拒绝」两个动作 ---- */
   const pendingColumns: Array<Column<UserOut>> = [
@@ -858,6 +884,10 @@ export function Users() {
           <span className="fs-sm text-muted">
             {t('users.showing', { n: filtered.length })}
           </span>
+          {/* 「列」按钮排进工具栏而不是交给 Table 的单条工具条：一个按钮不值得
+              多占一行，也不会把工具栏与表格从中间切开。手里有它，表头拖乱了
+              还能一键恢复默认列序（表头拖拽本身不提供这个入口）。 */}
+          {cols.menu}
         </div>
       </div>
 
@@ -877,11 +907,15 @@ export function Users() {
       ) : (
         <>
           <Table<UserOut>
-            columns={columns}
+            columns={cols.columns}
             rows={userPage.rows}
             rowKey={(u) => u.id ?? u.username}
             loading={usersQuery.isLoading}
             caption={t('users.listCaption')}
+            /* 列宽（拖表头右缘）与列序（拖表头本身）都持久化在本机：
+               刷新、切页、下次登录都还原上次的样子 */
+            storageKey={widthStorageKey}
+            onColumnMove={cols.move}
             emptyTitle={
               search || roleFilter ? t('users.emptySearch') : t('users.empty')
             }

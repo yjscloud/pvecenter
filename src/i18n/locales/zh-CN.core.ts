@@ -307,6 +307,7 @@ export const zhCore = {
   'auth.login.noAccount': '还没有账号？',
   'auth.login.registerLink': '注册申请',
   'auth.login.registerSuffix': '后由管理员审批开通',
+  'auth.login.registerClosed': '自助注册已关闭，请联系管理员开通账号',
 
   'auth.mfa.title': '两步验证',
   'auth.mfa.subtitle': '请输入认证器 App 里的动态码',
@@ -356,6 +357,7 @@ export const zhCore = {
   'table.empty': '暂无数据',
   'table.resizeColumnAria': '拖拽调整列宽，双击恢复默认',
   'table.resizeColumnTitle': '拖拽调整列宽（双击恢复默认）',
+  'table.reorderColumnTitle': '拖到其它表头上可调整列顺序',
   'table.paginationAria': '分页导航',
   'table.pageSizePrefix': '每页',
   'table.pageSizeUnit': '{size} 条',
@@ -369,6 +371,38 @@ export const zhCore = {
   /* --------------------------------------------------------------- 注册 */
   'register.title': '注册账号',
   'register.titleDone': '申请已提交',
+  'register.inviteCode': '邀请码',
+  'register.inviteCodePlaceholder': 'zpinv_...',
+  'register.inviteCodeHint': '向管理员索取邀请码，一码只能注册一个账号',
+  'register.regCode': '注册码',
+  'register.regCodePlaceholder': 'zpreg_...',
+  'register.regCodeHint': '填写管理员分发的注册码',
+  /* 邀请链接：链接由管理员创建，自带角色与审批策略（见 app/invites.py） */
+  'register.inviteLinkTitle': '邀请制注册',
+  'register.inviteLinkBody':
+    '你正在通过管理员分享的邀请链接加入，角色为「{role}」，{approval}',
+  'register.inviteLinkModeTitle': '当前注册方式不是邀请制',
+  'register.inviteLinkModeBody':
+    '这个链接只在邀请制下可用，请联系管理员调整注册方式，或按当前方式直接注册。',
+  'register.inviteNeedsLinkTitle': '邀请制仅支持邀请链接注册',
+  'register.inviteNeedsLinkBody':
+    '请向管理员索取邀请链接，打开链接即可注册；直接访问注册页无法完成注册。',
+  'register.inviteLinkApproval': '需要管理员审批',
+  'register.inviteLinkNoApproval': '注册后可直接登录',
+  'register.inviteLinkInvalidTitle': '这个邀请链接不能用了',
+  'register.inviteLinkInvalidBody':
+    '可能已失效、已过期或次数已用完，请向管理员索取新的链接。',
+  'register.inviteLinkChecking': '正在校验邀请链接…',
+  'register.inviteLinkRemaining': '剩余 {n} 次',
+  'register.inviteLinkUnlimited': '次数不限',
+  'register.successActiveTitle': '注册成功',
+  'register.successActiveBody': '：账号已开通，现在可以直接登录。',
+  'register.subtitleActive': '这个邀请链接免审批，注册后即可直接登录',
+  'register.subtitleActiveDone': '账号已开通，现在可以直接登录',
+  'register.err.inviteRequired': '请填写邀请码',
+  'register.err.codeRequired': '请填写注册码',
+  'register.closedTitle': '自助注册已关闭',
+  'register.closedBody': '本面板不开放自助注册，请联系管理员开通账号。',
   'register.subtitle': '提交后需管理员审批，通过后才能登录',
   'register.subtitleDone': '接下来等待管理员审批',
   'register.successTitle': '注册成功，等待审批',
@@ -385,6 +419,18 @@ export const zhCore = {
   'register.passwordPlaceholder': '至少 12 位，含字母与数字',
   'register.confirmPassword': '确认密码',
   'register.confirmPlaceholder': '再次输入密码',
+  /* 自助注册的邮箱验证码：先发码、再回填，两步都在这一页完成 */
+  'register.humanCheck': '人机校验',
+  'register.humanCheckDone': '人机校验已通过',
+  'register.humanCheckReset': '重新验证',
+  'register.emailCode': '邮箱验证码',
+  'register.emailCodePlaceholder': '输入邮件里的 6 位数字',
+  'register.emailCodeHint': '验证码 {minutes} 分钟内有效，最多可输错 {attempts} 次',
+  'register.emailCodeSend': '发送验证码',
+  'register.emailCodeSending': '发送中…',
+  'register.emailCodeResend': '重新发送',
+  'register.emailCodeResendIn': '{seconds}s 后可重发',
+  'register.emailCodeSent': '验证码已发送至 {email}，请查收（也看看垃圾邮件）',
   'register.submit': '提交注册申请',
   'register.submitting': '正在提交…',
   'register.haveAccount': '已经有账号了？',
@@ -397,6 +443,8 @@ export const zhCore = {
   'register.err.passwordWeak': '密码需同时包含字母与数字',
   'register.err.confirmRequired': '请再次输入密码',
   'register.err.confirmMismatch': '两次输入的密码不一致',
+  'register.err.emailCodeRequired': '请先点「发送验证码」，再填写收到的 6 位数字',
+  'register.err.emailCodeInvalid': '验证码是 6 位数字',
 
   /* ----------------------------------------------------------- 忘记密码 */
   'forgot.title': '重置密码',
@@ -486,6 +534,7 @@ export const zhCore = {
   'status.console.connectionsOnline': '{online}/{total} 条连接在线',
   'status.console.connected': '已连接',
   'status.console.disconnected': '未连接',
+  'status.console.unknown': '状态未知',
   'status.console.pveVersion': 'PVE 版本',
   'status.console.nodesAll': 'PVE 节点（所有连接合计）',
   'status.console.nodesCluster': '集群节点',
@@ -496,6 +545,7 @@ export const zhCore = {
   'status.console.summaryFleet': '后端服务正常，{online}/{total} 条 PVE 连接在线，共 {nodes} 个节点',
   'status.console.summaryConnected': '后端服务正常，已连接 Proxmox VE',
   'status.console.summaryDisconnected': '后端服务正常，但未连接到 Proxmox VE',
+  'status.console.summaryUnknown': '后端服务正常，正在确认 Proxmox VE 连接状态',
   'notif.ariaUnread': '消息中心，{count} 条未读',
   'notif.ariaNone': '消息中心，无未读',
   'notif.title': '消息中心',
@@ -808,4 +858,17 @@ export const zhCore = {
     '文件太大，被服务器拒收了（超出上传上限）。镜像很大时更稳的做法是先把文件放进 PVE 存储的 import 目录，再用「选择文件」直接导入 —— 不经过浏览器，也就没有这个限制。',
   'api.gatewayDown': '面板正在重启或暂时不可用，请稍候几秒；页面会在恢复后自动接上。',
   'api.unknown': '发生未知错误',
+
+  /* ------------------------------------------------------------ 额度维度名
+     维度名，**不带单位**：额度过限提示点名「超的是哪一项」、剩余额度摘要
+     （remainingSummary）都用它 —— 单位由摘要自己拼，传带单位的字段名会拼出
+     「内存 (GB) 8 GB」。
+
+     放 core 而不是 compute：用户管理页的「谁快满了」也读它，而那一页不加载
+     compute 词典（只有虚拟机 / 容器页面才加载），放在那边会直接显示
+     `quota.fieldLabel.count` 这样的键名。 */
+  'quota.fieldLabel.count': '数量',
+  'quota.fieldLabel.cores': 'CPU 核数',
+  'quota.fieldLabel.memory': '内存',
+  'quota.fieldLabel.disk': '磁盘',
 } as const;

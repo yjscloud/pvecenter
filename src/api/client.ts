@@ -316,6 +316,21 @@ async function refreshSession(): Promise<boolean> {
   return refreshPromise;
 }
 
+/**
+ * 主动续期一次会话（成功返回 true）。
+ *
+ * 给「发现自己其实没有被认证」的调用点用：`/api/health` 是公开端点，access
+ * cookie 过期时它**不会** 401（后端按匿名答 liveness），于是拦截器那条
+ * 「401 → 续期」的自动续期永远轮不到它。轮询里看到 `authenticated: false`
+ * 时调这里补一次，续期成功后再取一次就能拿到诊断字段。
+ *
+ * 并发安全：内部走同一个 single-flight（见 refreshSession），不会把轮换中的
+ * refresh token 互相作废。
+ */
+export async function renewSession(): Promise<boolean> {
+  return refreshSession();
+}
+
 /* ---- 响应拦截器：统一错误处理 + 自动续期 ---- */
 http.interceptors.response.use(
   (response) => response,

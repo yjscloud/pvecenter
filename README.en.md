@@ -313,9 +313,10 @@ in the matching entries under Settings → Security posture.
    `$remote_addr` is always the CDN address.
 3. **Require 2FA for admins**: `TOTP_REQUIRED_ROLES=admin`. An admin who hasn't bound TOTP gets 403 on
    everything except the 2FA endpoints (bind it under Profile). Keep login lockout (per account and per
-   IP) and the human check on in a public deployment; the check guards **sign-in and self-registration
-   alike** (slider / image code), otherwise the registration endpoint gets scripted into flooding the
-   approval queue.
+   IP) and the human check on in a public deployment; the check guards all four anonymous entrances —
+   **sign-in, self-registration, forgot-password and set-new-password** (slider / image code) — otherwise
+   the registration endpoint gets scripted into flooding the approval queue, and a reset link alone is
+   enough to change a password.
 4. **New-IP sign-in alerts**: on by default (`LOGIN_IP_ALERT=true`). The first successful sign-in of an
    account from a new IP notifies every admin in-app, plus email once SMTP is set up. It shows in the audit
    log as `auth.new_ip`, searchable per account.
@@ -329,9 +330,11 @@ in the matching entries under Settings → Security posture.
    OpenAPI definition is a complete attack map — every endpoint, field constraint and hidden route. For
    troubleshooting, open it temporarily with `API_DOCS_ENABLED=true`; even then those three addresses need
    a signed-in user with `settings.manage`, and anonymous callers only get 401.
-8. **`/api/health` tells anonymous callers only “alive”**: `{"status":"ok"}`, no PVE version, node count or
-   connection state (a version string matches straight against public vulnerability lists). Signed-in
-   callers still get the full reading; deep diagnostics live at `/api/config/diagnostics` (admin).
+8. **`/api/health` tells anonymous callers only “alive”**: `{"status":"ok","authenticated":false}`, no PVE
+   version, node count or connection state (a version string matches straight against public vulnerability
+   lists). Signed-in callers still get the full reading (`authenticated:true`); deep diagnostics live at
+   `/api/config/diagnostics` (admin). The `authenticated` flag keeps “probe result unknown” apart from
+   “configured but unreachable”, so the UI never misreports the former as a PVE fault.
 9. **Security headers come from the panel**: CSP (`script-src 'self'` on normal pages),
    `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
    `Permissions-Policy`, `frame-ancestors 'none'`, `X-Frame-Options: DENY` and HSTS are all added at the
@@ -784,8 +787,13 @@ in use cannot be deleted either.
 <!-- screenshot: docs/screenshots/users-rbac.png -->
 ![Multi-user and RBAC: roles, permissions, quota and approvals](docs/screenshots/users-rbac.png)
 
-- Self-registration with admin approval: a new account stays `pending` and can't sign in; approval assigns
-  role and permissions in one step. Email is required and the result is mailed (mail is a side channel — a
+- Four registration modes, one at a time (**closed by default**; switch in Settings → Registration mode,
+  effective immediately): closed / invitation only / registration code / self-service. Invitation codes and
+  registration codes live in one credential table (plaintext shown once, only hashes stored, atomic single-use,
+  revocable, with TTL and usage limits); switching modes invalidates the other kind instantly. An invite link or
+  registration code can preselect the role, quota and whether approval is required: by default the account is
+  `pending`; with approval disabled it is active immediately, and approval keeps the preselected role. Email is
+  required and the result is mailed (mail is a side channel — a
   failed send is only audited). Password reset uses a one-time link and answers the same sentence whether or
   not the account exists, so it can't be used to probe accounts.
 - Every write operation (including failures) goes to the audit log with user, action, target, result, details

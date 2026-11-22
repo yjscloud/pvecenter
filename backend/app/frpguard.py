@@ -314,35 +314,14 @@ def allowed_cidrs() -> List[Network]:
 
 
 # ------------------------------------------------------- 用户名下的客户机 IP
-async def own_guest_targets(
-    username: str, *, include_connection: bool = False
-) -> List[Dict[str, Any]]:
-    """某个用户名下虚机 / 容器的地址清单（带展示信息）。
+async def _visible_guests() -> Tuple[List[Dict[str, Any]], Dict[Tuple[str, Any], int]]:
+    """所有连接上的 qemu / lxc 清单行，以及「节点 + VMID」在各连接里出现的次数。
 
-    返回按 VMID 排序的 ``[{"ip","name","vmid","node","type"}]`` —— 这就是普通
-    用户被允许指向的**全部**目标，前端拿它做「目标地址」下拉，后端拿同一份
-    判定能不能建规则（见 :func:`check_target`）。
-
-    取舍与 :func:`own_guest_ips` 一致：
-
-    * 归属按 :mod:`app.ownership` —— 没有归属记录的存量机器不算「自己的」；
-    * IP 交给 :mod:`app.guestip`（有进程内 + 落库两级缓存，DHCP 机器也能拿到）；
-    * 单条连接读不到、单台机器解析失败都只跳过它自己 —— 但整体拿不到任何地址
-      时返回空列表，调用方据此拒绝（fail-closed）。
-
-    早期归属记录的连接前缀是 ``-``（单连接时代）：只有当「节点 + VMID」在所有
-    连接里唯一时才认它，否则两台 PVE 上同名节点、同号机器会把对方的地址算到
-    这个人头上。
+    rows 里额外挂着 ``_client``（解析 IP 用，不对外）：多连接时每台机器必须用它
+    **自己那条连接**去查，不能共用「当前连接」。某条连接读不到只跳过它自己 ——
+    宁可少几个下拉选项，也不该让整页拿不到数据。
     """
-    if not username:
-        return []
-
-    from . import guestip, ownership
-    from .pve import all_connection_clients, get_client, parallel
-
-    refs = set(await ownership.list_owned_guests(username))
-    if not refs:
-        return []
+    from .pve import all_connection_clients, get_client
 
     connections = list(all_connection_clients())
     if not connections:
@@ -350,7 +329,7 @@ async def own_guest_targets(
         try:
             connections = [(None, get_client())]
         except Exception:  # noqa: BLE001 - 没配连接时就是「确认不了」
-            return []
+            return [], {}
 
     rows: List[Dict[str, Any]] = []
     seen: Dict[Tuple[str, Any], int] = {}
@@ -379,35 +358,35 @@ async def own_guest_targets(
                     "name": str(item.get("name") or ""),
                     "type": kind,
                     "status": str(item.get("status") or ""),
+                    "_client": client,
                 }
             )
+    return rows, seen
 
-    owned_rows: List[Dict[str, Any]] = []
-    for row in rows:
-        key = (str(row["node"]), row["vmid"])
-        exact = ownership.vm_ref(row["connection_id"], row["node"], row["vmid"])
-        legacy = ownership.vm_ref("", row["node"], row["vmid"])
-        if exact in refs or (seen.get(key) == 1 and legacy in refs):
-            owned_rows.append(row)
 
-    if not owned_rows:
+async def _targets_from_rows(
+    rows: List[Dict[str, Any]], *, include_connection: bool = False
+) -> List[Dict[str, Any]]:
+    """把清单行解析成 ``{ip,name,vmid,node,type}``，按 IP 去重、按 VMID 排序。
+
+    IP 交给 :mod:`app.guestip`（有进程内 + 落库两级缓存，DHCP 机器也能拿到）；
+    解析不出来的机器跳过。
+    """
+    if not rows:
         return []
 
+    from . import guestip
+    from .pve import parallel
+
     # 逐台解析地址：guestip 内部有缓存，并发上限压住对 PVE 的压力
-    clients: Dict[str, Any] = {
-        str((profile or {}).get("id") or ""): client for profile, client in connections
-    }
     ip_list = await parallel(
-        (
-            guestip.resolve(clients.get(str(row["connection_id"]), connections[0][1]), row)
-            for row in owned_rows
-        ),
+        (guestip.resolve(row["_client"], row) for row in rows),
         limit=8,
     )
 
     out: List[Dict[str, Any]] = []
     seen_ips: Set[str] = set()
-    for row, ip in zip(owned_rows, ip_list):
+    for row, ip in zip(rows, ip_list):
         text = str(ip).strip() if isinstance(ip, str) else ""
         if not text or text in seen_ips:
             continue
@@ -430,6 +409,62 @@ async def own_guest_targets(
         out.append(entry)
     out.sort(key=lambda item: (item["vmid"], item["ip"]))
     return out
+
+
+async def own_guest_targets(
+    username: str, *, include_connection: bool = False
+) -> List[Dict[str, Any]]:
+    """某个用户名下虚机 / 容器的地址清单（带展示信息）。
+
+    返回按 VMID 排序的 ``[{"ip","name","vmid","node","type"}]`` —— 这就是普通
+    用户被允许指向的**全部**目标，前端拿它做「目标地址」下拉，后端拿同一份
+    判定能不能建规则（见 :func:`check_target`）。
+
+    取舍与 :func:`own_guest_ips` 一致：
+
+    * 归属按 :mod:`app.ownership` —— 没有归属记录的存量机器不算「自己的」；
+    * IP 交给 :mod:`app.guestip`（有进程内 + 落库两级缓存，DHCP 机器也能拿到）；
+    * 单条连接读不到、单台机器解析失败都只跳过它自己 —— 但整体拿不到任何地址
+      时返回空列表，调用方据此拒绝（fail-closed）。
+
+    早期归属记录的连接前缀是 ``-``（单连接时代）：只有当「节点 + VMID」在所有
+    连接里唯一时才认它，否则两台 PVE 上同名节点、同号机器会把对方的地址算到
+    这个人头上。
+    """
+    if not username:
+        return []
+
+    from . import ownership
+
+    refs = set(await ownership.list_owned_guests(username))
+    if not refs:
+        return []
+
+    rows, seen = await _visible_guests()
+    owned_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        key = (str(row["node"]), row["vmid"])
+        exact = ownership.vm_ref(row["connection_id"], row["node"], row["vmid"])
+        legacy = ownership.vm_ref("", row["node"], row["vmid"])
+        if exact in refs or (seen.get(key) == 1 and legacy in refs):
+            owned_rows.append(row)
+
+    return await _targets_from_rows(owned_rows, include_connection=include_connection)
+
+
+async def all_guest_targets() -> List[Dict[str, Any]]:
+    """全部虚机 / 容器的地址清单 —— 管理员建规则时下拉里的「预设目标」。
+
+    与 :func:`own_guest_targets` 是同一套清单 / 解析 / 去重逻辑，只是不按归属
+    过滤。这**不是权限边界**：管理员本来就不受目标白名单限制（见
+    :func:`check_target`，只拒绝 0.0.0.0 / ::）。它解决的是「手边有哪些地址
+    可以点」—— 让管理员不必为了指一台自家机器先去 PVE 里翻 IP。
+
+    注意成本：要逐条连接读客户机清单，再逐台解析 IP（:mod:`app.guestip` 有
+    两级缓存）。所以调用方（``/api/frp/policy``）不该把它挂在高频轮询上。
+    """
+    rows, _seen = await _visible_guests()
+    return await _targets_from_rows(rows)
 
 
 async def own_guest_ips(username: str) -> Set[str]:

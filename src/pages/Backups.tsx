@@ -283,6 +283,18 @@ function archiveGuestKind(
   return 'qemu';
 }
 
+/**
+ * 是否为 PBS 归档：PVE 用 ``pbs-vm`` / ``pbs-ct`` 标格式，目录型存储是
+ * ``tar`` / ``tgz`` / ``vma`` 等。
+ *
+ * 「数据量」汇总按**每行自己的格式**判定，而不是只看存储类型 —— 存储状态可能
+ * 读不到（缺 ``storage.view`` / 存储已卸载），那时仍要能分出 PBS 与目录型：
+ * 目录型的大小就是真实占用，PBS 的只是快照记录值。
+ */
+function isPbsArchive(format?: string): boolean {
+  return (format || '').toLowerCase().startsWith('pbs');
+}
+
 export function Backups() {
   const t = useT();
   const [params, setParams] = useSearchParams();
@@ -978,16 +990,59 @@ function BackupFilesTab({
      否则排的只是当前这一页。 */
   const pager = usePaged(items, `${search}|${node}|${storage}`);
 
-  /* 「占用空间」必须是盘上的**真实占用**：PBS 归档行里的 size 是去重前的逻辑大小
-     （10 份归档加起来 334 GB，仓库实际只占 567 MB —— 同一批数据块被反复计数），
-     直接相加会把数字放大约两个数量级。真实数字只能到存储侧取：
-       · PBS 存储 → 存储状态里的 used（PBS 已去重 / 压缩，就是仓库真实占用）；
-       · 目录型存储 → 归档文件大小之和（本地文件本来就等于真实字节）。
-     同一存储被多个节点挂载时 PVE 每个节点各报一行，按「连接 + 存储名」取最大值去重，
-     否则一份容量会被算成 N 份。 */
-  const storagesQuery = useQuery({
-    queryKey: ['storages', 'backup-usage'],
-    queryFn: () => storagesApi.list(),
+  /* 「占用空间」必须是盘上的**真实占用**，而 PBS 归档行里的 size 是去重前的
+     逻辑大小：同一批数据块在多份归档之间反复计数 —— 15 份归档能加出 1.5 TB，
+     仓库实际只占 44.5 GB。真实数字只能到存储侧取：
+       · PBS 存储 → 存储状态里的 used（PBS 已去重 / 压缩后的物理占用）；
+       · 目录型存储 → 归档文件大小之和（文件本来就等于真实字节）。
+     所以先按当前列表里出现的 PBS 归档，归出「连接 + 节点 + 存储」再去读存储。 */
+  const pbsTargets = useMemo(() => {
+    const map = new Map<string, { conn?: string; node: string; storage: string }>();
+    for (const b of listQuery.data ?? []) {
+      if (!isPbsArchive(b.format) || !b.node || !b.storage) continue;
+      map.set(`${b.connection_id ?? ''}|${b.node}|${b.storage}`, {
+        conn: b.connection_id,
+        node: b.node,
+        storage: b.storage,
+      });
+    }
+    return [...map.values()];
+  }, [listQuery.data]);
+
+  /* 同一存储被多个节点挂载时 PVE 每台各报一行、used 是同一个值：下面按
+     「连接 + 存储」取最大值，避免一份容量被算成 N 份。 */
+  const pbsUsageQuery = useQuery({
+    queryKey: [
+      'storages',
+      'pbs-usage',
+      pbsTargets.map((target) => `${target.conn ?? ''}|${target.node}`).join(','),
+    ],
+    queryFn: async () => {
+      const nodes = new Map<string, { conn?: string; node: string }>();
+      for (const target of pbsTargets) {
+        nodes.set(`${target.conn ?? ''}|${target.node}`, {
+          conn: target.conn,
+          node: target.node,
+        });
+      }
+      const rows = await Promise.all(
+        [...nodes.values()].map(async (target) => {
+          try {
+            const list = await storagesApi.list(target.node, target.conn);
+            return list.map((s) => ({
+              key: `${target.conn ?? ''}|${s.storage ?? ''}`,
+              type: String(s.type ?? '').toLowerCase(),
+              used: typeof s.used === 'number' && s.used >= 0 ? s.used : null,
+            }));
+          } catch {
+            /* 单个节点读不到只丢它自己：对应存储会在下面被标成「未知」 */
+            return [];
+          }
+        }),
+      );
+      return rows.flat();
+    },
+    enabled: pbsTargets.length > 0,
     staleTime: 30_000,
     retry: false,
   });
@@ -996,54 +1051,46 @@ function BackupFilesTab({
     const list = listQuery.data ?? [];
     const vms = new Set(list.map((b) => b.vmid)).size;
 
-    const usage = new Map<string, { type: string; used: number | null }>();
-    for (const s of storagesQuery.data ?? []) {
-      const name = s.storage ?? '';
-      if (!name) continue;
-      const key = `${s.connection_id ?? ''}|${name}`;
-      const used = typeof s.used === 'number' && s.used >= 0 ? s.used : null;
-      const prev = usage.get(key);
-      if (!prev || (used ?? -1) > (prev.used ?? -1)) {
-        usage.set(key, { type: String(s.type ?? '').toLowerCase(), used });
-      }
-    }
-
-    /* 每个存储的归档文件大小之和：目录型存储的真实占用就是这个数 */
-    const fileBytes = new Map<string, number>();
-    for (const b of list) {
-      const key = `${b.connection_id ?? ''}|${b.storage ?? ''}`;
-      fileBytes.set(key, (fileBytes.get(key) ?? 0) + (b.size ?? 0));
-    }
-
-    let totalSize = 0;
-    let allReal = true;
+    /* 目录型存储：归档文件大小之和就是盘上占用 */
+    let dirBytes = 0;
     let hasPbs = false;
-    for (const [key, bytes] of fileBytes) {
-      const meta = usage.get(key);
-      if (meta?.type === 'pbs') {
-        if (meta.used !== null) {
-          /* PBS：用仓库已用，整个仓库只算一次 */
-          totalSize += meta.used;
-          hasPbs = true;
-          continue;
-        }
-        /* 仓库容量读不到（缺 Datastore.Audit / 老版本）→ 退回逻辑大小，
-           并在提示里说清这是估算，避免又给出一个看起来精确的假数字 */
-        totalSize += bytes;
-        allReal = false;
-        continue;
-      }
-      if (meta) {
-        totalSize += bytes;
-        continue;
-      }
-      /* 存储状态读不到（缺 storage.view / 存储已卸载）：同样退回归档大小 */
-      totalSize += bytes;
-      allReal = false;
+    for (const b of list) {
+      if (isPbsArchive(b.format)) hasPbs = true;
+      else dirBytes += b.size ?? 0;
     }
 
-    return { count: list.length, totalSize, vms, allReal, hasPbs };
-  }, [listQuery.data, storagesQuery.data]);
+    const usage = new Map<string, { type: string; used: number | null }>();
+    for (const row of pbsUsageQuery.data ?? []) {
+      const prev = usage.get(row.key);
+      if (!prev || (row.used ?? -1) > (prev.used ?? -1)) {
+        usage.set(row.key, { type: row.type, used: row.used });
+      }
+    }
+
+    /* 仓库已用：同一存储只算一次。任何一个读不到就把整体标成「未知」——
+       给出部分和会让人以为剩下的存储是空的。 */
+    let pbsBytes: number | null = 0;
+    const seen = new Set<string>();
+    for (const target of pbsTargets) {
+      const key = `${target.conn ?? ''}|${target.storage}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const meta = usage.get(key);
+      if (!meta || meta.type !== 'pbs' || meta.used === null) {
+        pbsBytes = null;
+        break;
+      }
+      pbsBytes += meta.used;
+    }
+
+    return {
+      count: list.length,
+      vms,
+      hasPbs,
+      /** 真实占用；null = PBS 侧读不到，宁可不显示也不拿逻辑大小充数 */
+      space: pbsBytes === null ? null : dirBytes + pbsBytes,
+    };
+  }, [listQuery.data, pbsTargets, pbsUsageQuery.data]);
 
   /* 下载：新标签页会自动带上 HttpOnly Cookie，不再把令牌拼进 URL */
   const download = (item: BackupRow) => {
@@ -1259,20 +1306,15 @@ function BackupFilesTab({
             loading={listQuery.isLoading}
           />
           <KpiCard
+            /* 主数字是**盘上真实占用**，与上面 PBS 仓库的「已用」同一个口径：
+               目录型存储取归档文件大小之和，PBS 取存储状态里的 used（已去重）。
+               归档行自带的 size 只是快照记录的逻辑大小，相加会放大约两个数量级。 */
             label={t('backups.kpiSpace')}
-            value={formatBytes(stats.totalSize)}
-            /* 口径写在卡片里：PBS 去重后的数字会明显小于「把归档大小相加」，
-               不说明反而像少了数据 */
-            hint={
-              !stats.allReal
-                ? t('backups.kpiSpaceHintFallback')
-                : stats.hasPbs
-                  ? t('backups.kpiSpaceHintPbs')
-                  : t('backups.kpiSpaceHintDir')
-            }
+            value={stats.space === null ? '—' : formatBytes(stats.space)}
+            hint={stats.hasPbs ? undefined : t('backups.kpiSpaceHintDir')}
             icon={<IconShield size={18} />}
             tone="neutral"
-            loading={listQuery.isLoading || storagesQuery.isLoading}
+            loading={listQuery.isLoading || pbsUsageQuery.isLoading}
           />
           <KpiCard
             label={t('backups.kpiVms')}

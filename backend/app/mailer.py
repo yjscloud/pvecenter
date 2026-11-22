@@ -768,6 +768,62 @@ def password_reset_mail(username: str, reset_url: str) -> Tuple[str, str, str]:
     return subject, "\n".join(lines), html
 
 
+def email_code_mail(
+    code: str, minutes: int, attempts: int, *, purpose: str = "register"
+) -> Tuple[str, str, str]:
+    """注册邮箱验证码。
+
+    验证码要**一眼能找到**：邮件客户端常把正文折叠成预览，所以主题里也带一份；
+    正文里再单独成块、大字号等宽显示，方便照着抄。
+
+    语言：由调用方用 ``i18n.use_language`` 设定（注册请求的 Accept-Language）。
+    收件人此时还没有账号，没有 user_prefs 可查。
+    """
+    subject = i18n.pick(
+        f"[邮箱验证] 你的注册验证码：{code}",
+        f"[Email verification] Your sign-up code: {code}",
+    )
+    title = i18n.pick("验证你的邮箱", "Verify your email address")
+    lines = [
+        i18n.pick(
+            "你正在注册面板账号，本次验证码是：",
+            "You are signing up for a panel account. Your verification code is:",
+        ),
+        code,
+        "",
+        i18n.pick(
+            f"验证码 {minutes} 分钟内有效，最多可以输错 {attempts} 次；"
+            "过期或错误次数用尽后需要重新获取。",
+            f"The code is valid for {minutes} minute(s) and can be entered wrongly "
+            f"{attempts} time(s). Request a new one if it expires or runs out of attempts.",
+        ),
+        "",
+        i18n.pick(
+            "如果这不是你本人操作，忽略这封邮件即可，不会有任何账号被创建。",
+            "If you did not request this, simply ignore this email — no account will be created.",
+        ),
+    ]
+    html = (
+        f"<div style='{_HTML_BASE_STYLE}'>"
+        f"<h2 style='margin:0 0 12px;font-size:18px;line-height:1.4'>{title}</h2>"
+        f"<p style='margin:6px 0'>"
+        f"{i18n.pick('你正在注册面板账号，本次验证码是：', 'You are signing up for a panel account. Your verification code is:')}"
+        "</p>"
+        # 等宽 + 大字号 + 字距：邮件客户端不会给验证码任何特殊待遇，只能自己撑出来
+        "<p style='margin:16px 0;padding:14px 0;text-align:center;background:#f2f5f9;"
+        "border-radius:8px;font-family:Menlo,Consolas,monospace;font-size:28px;"
+        f"letter-spacing:6px;font-weight:700;color:#1f2329'>{code}</p>"
+        "<p style='margin:6px 0'>"
+        f"{i18n.pick(f'验证码 {minutes} 分钟内有效，最多可以输错 {attempts} 次；过期或错误次数用尽后需要重新获取。', f'The code is valid for {minutes} minute(s) and can be entered wrongly {attempts} time(s). Request a new one if it expires or runs out of attempts.')}"
+        "</p>"
+        "<p style='margin:18px 0 0;color:#8a8f99;font-size:12px'>"
+        f"{i18n.pick('如果这不是你本人操作，忽略这封邮件即可，不会有任何账号被创建。', 'If you did not request this, simply ignore this email — no account will be created.')}"
+        "</p>"
+        "</div>"
+    )
+    return subject, "\n".join(lines), html
+
+
 def alert_mail(title: str, items: List[str]) -> Tuple[str, str, str]:
     """告警 / 恢复通知。没有 URL 可用，正文里不放链接。"""
     text = "\n".join(items)

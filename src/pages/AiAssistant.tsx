@@ -4223,6 +4223,9 @@ function SettingsModal({
       title={t('ai.settingsTitle')}
       description={t('ai.settingsDesc')}
       size="lg"
+      /* 正文的分块节奏（间距）在这个弹窗里统一由 .ai-settings-modal 给，
+         见 components.css 的「模型设置弹窗」一节 */
+      className="ai-settings-modal"
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>
@@ -4244,15 +4247,25 @@ function SettingsModal({
 
       {!configQuery.isLoading ? (
         <>
-          {/* 普通用户看到的是「我的模型」：平台共享项置灰，别人配的压根不出现 */}
-          {!isAdmin ? <Notice tone="info">{t('ai.myModelsOnly')}</Notice> : null}
-
-          <Switch
-            checked={enabled}
-            onChange={setEnabled}
-            label={t('ai.enable')}
-            hint={t('ai.enableHint')}
-          />
+          {/* 顶部一组：范围提示 + 总开关。两者回答的都是「谁能用 / 开不开」，
+              与下面的模型列表不是一个层次，所以单独成组（间距比段落小一档），
+              并让总开关占一整行 —— 原先它是一个贴着提示条的孤立小控件，
+              既看不出这是平台级开关，也不像可点的东西。 */}
+          <div className="ai-settings-intro">
+            {/* 普通用户看到的是「我的模型」：平台共享项置灰，别人配的压根不出现 */}
+            {!isAdmin ? <Notice tone="info">{t('ai.myModelsOnly')}</Notice> : null}
+            <div className="ai-master">
+              <div className="ai-master-text">
+                <span className="ai-master-title">{t('ai.enable')}</span>
+                <span className="ai-master-hint">{t('ai.enableHint')}</span>
+              </div>
+              <Switch
+                checked={enabled}
+                onChange={setEnabled}
+                ariaLabel={t('ai.enable')}
+              />
+            </div>
+          </div>
 
           {/* 虚拟机授权策略是平台级开关（生产标签禁写、双人审批、快照保留），
               只有管理员能改。普通用户看不到这一段：他们需要知道的是「我这台
@@ -4264,86 +4277,89 @@ function SettingsModal({
               **上面** —— 它们管的是整次排查而不是某一个模型。而且普通用户用的是自己
               的模型、花自己的额度（见后端 visible_providers 的说明），这些数理应由他
               自己定，不必全平台共用一个值。 */}
-          {/* 两个字数档对普通用户来说是两个数字，不好判断「多少算合适」。
-              给三档预设一键填好，想细调再改数字。 */}
-          <div className="ai-reply-preset">
-            <span className="ai-reply-preset-label">{t('ai.replyPreset')}</span>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                setReplyCharsTerse(100);
-                setReplyCharsDeep(250);
-              }}
-            >
-              {t('ai.replyPresetTerse')}
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                setReplyCharsTerse(150);
-                setReplyCharsDeep(400);
-              }}
-            >
-              {t('ai.replyPresetNormal')}
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                setReplyCharsTerse(300);
-                setReplyCharsDeep(800);
-              }}
-            >
-              {t('ai.replyPresetDeep')}
-            </Button>
-          </div>
+          {/* 预设与这四个数字是同一件事：两个字数档对普通用户来说是两个数字，不好
+              判断「多少算合适」，所以给三档预设一键填好。收进同一个容器里，组内
+              10px、与上下段落 18px —— 否则预设行看起来像是独立于这些数字的另一段。 */}
+          <div className="ai-limits">
+            <div className="ai-reply-preset">
+              <span className="ai-reply-preset-label">{t('ai.replyPreset')}</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setReplyCharsTerse(100);
+                  setReplyCharsDeep(250);
+                }}
+              >
+                {t('ai.replyPresetTerse')}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setReplyCharsTerse(150);
+                  setReplyCharsDeep(400);
+                }}
+              >
+                {t('ai.replyPresetNormal')}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setReplyCharsTerse(300);
+                  setReplyCharsDeep(800);
+                }}
+              >
+                {t('ai.replyPresetDeep')}
+              </Button>
+            </div>
 
-          <div className="flex items-end gap-12 flex-wrap mt-16">
-            <div style={{ maxWidth: 260, flex: '1 1 200px' }}>
-              <Field label={t('ai.hours')} hint={t('ai.hoursHint')}>
-                <Input
-                  type="number"
-                  min={1}
-                  max={168}
-                  value={hours}
-                  onChange={(e) => setHours(Number(e.target.value) || 24)}
-                />
-              </Field>
-            </div>
-            <div style={{ maxWidth: 260, flex: '1 1 200px' }}>
-              <Field label={t('ai.tokenBudget')} hint={t('ai.tokenBudgetHint')}>
-                <Input
-                  type="number"
-                  min={4000}
-                  max={100000000}
-                  value={tokenBudget}
-                  onChange={(e) => setTokenBudget(Number(e.target.value) || 60000)}
-                />
-              </Field>
-            </div>
-            <div style={{ maxWidth: 260, flex: '1 1 200px' }}>
-              <Field label={t('ai.replyCharsTerse')} hint={t('ai.replyCharsTerseHint')}>
-                <Input
-                  type="number"
-                  min={50}
-                  max={5000}
-                  value={replyCharsTerse}
-                  onChange={(e) => setReplyCharsTerse(Number(e.target.value) || 150)}
-                />
-              </Field>
-            </div>
-            <div style={{ maxWidth: 260, flex: '1 1 200px' }}>
-              <Field label={t('ai.replyCharsDeep')} hint={t('ai.replyCharsDeepHint')}>
-                <Input
-                  type="number"
-                  min={50}
-                  max={5000}
-                  value={replyCharsDeep}
-                  onChange={(e) => setReplyCharsDeep(Number(e.target.value) || 400)}
-                />
-              </Field>
+            <div className="flex items-end gap-12 flex-wrap">
+              <div style={{ maxWidth: 260, flex: '1 1 200px' }}>
+                <Field label={t('ai.hours')} hint={t('ai.hoursHint')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={168}
+                    value={hours}
+                    onChange={(e) => setHours(Number(e.target.value) || 24)}
+                  />
+                </Field>
+              </div>
+              <div style={{ maxWidth: 260, flex: '1 1 200px' }}>
+                <Field label={t('ai.tokenBudget')} hint={t('ai.tokenBudgetHint')}>
+                  <Input
+                    type="number"
+                    min={4000}
+                    max={100000000}
+                    value={tokenBudget}
+                    onChange={(e) => setTokenBudget(Number(e.target.value) || 60000)}
+                  />
+                </Field>
+              </div>
+              <div style={{ maxWidth: 260, flex: '1 1 200px' }}>
+                <Field label={t('ai.replyCharsTerse')} hint={t('ai.replyCharsTerseHint')}>
+                  <Input
+                    type="number"
+                    min={50}
+                    max={5000}
+                    value={replyCharsTerse}
+                    onChange={(e) => setReplyCharsTerse(Number(e.target.value) || 150)}
+                  />
+                </Field>
+              </div>
+              <div style={{ maxWidth: 260, flex: '1 1 200px' }}>
+                <Field label={t('ai.replyCharsDeep')} hint={t('ai.replyCharsDeepHint')}>
+                  <Input
+                    type="number"
+                    min={50}
+                    max={5000}
+                    value={replyCharsDeep}
+                    onChange={(e) => setReplyCharsDeep(Number(e.target.value) || 400)}
+                  />
+                </Field>
+              </div>
             </div>
           </div>
 
@@ -4539,7 +4555,7 @@ function SettingsModal({
             </Card>
           ))}
 
-          <div className="flex items-center gap-12 flex-wrap mt-12">
+          <div className="flex items-center gap-12 flex-wrap">
             <Button
               variant="secondary"
               icon={<IconPlus size={15} />}
@@ -4549,9 +4565,7 @@ function SettingsModal({
             </Button>
           </div>
 
-          <div className="mt-16">
-            <Notice tone="info">{t('ai.readonlyTip')}</Notice>
-          </div>
+          <Notice tone="info">{t('ai.readonlyTip')}</Notice>
         </>
       ) : null}
     </Modal>
