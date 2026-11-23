@@ -627,8 +627,12 @@ export function Certificates() {
 
   // Guest Agent 部署只能选运行中的虚拟机（虚拟机没开机时 Agent 无法工作）
   const agentOptions = useMemo(() => {
+    /* 「先选目标 PVE 集群、再选目标虚拟机」：选定了集群就只列那套 PVE 上的机器，
+       否则下拉里混着别的集群的同名节点 / 同号机器，选错就写到另一台上。 */
+    const scope = form?.connection_id || "";
     const vms = (vmsQuery.data ?? [])
       .filter((vm) => isRunning(vm.status) && !vm.template)
+      .filter((vm) => !scope || (vm.connection_id ?? "") === scope)
       .map((vm) => ({
         label: `${t('cert.agentOption', { name: vm.name, vmid: vm.vmid, node: vm.node })}${
           vm.connection_name ? ` · ${vm.connection_name}` : ''
@@ -637,7 +641,7 @@ export function Certificates() {
         value: `${vm.connection_id ?? ''}|${vm.node}|${vm.vmid}`,
       }));
     return vms;
-  }, [vmsQuery.data, t]);
+  }, [vmsQuery.data, t, form?.connection_id]);
 
   const agentValue = useMemo(() => {
     if (!form?.agent_node || !form?.agent_vmid) return "";
@@ -2593,6 +2597,39 @@ export function Certificates() {
                 </div>
               </>
             ) : null}
+            {multiConnection &&
+            ["agent", "lxc", "pve"].includes(String(form.deploy_method || "")) ? (
+              <Select
+                label={t('cert.fieldPveConnection')}
+                value={form.connection_id || ""}
+                options={[
+                  { label: t('cert.connectionAuto'), value: "" },
+                  ...connectionOptions,
+                ]}
+                hint={t('cert.pveConnectionHint')}
+                onChange={(e) => {
+                  const connectionId = e.target.value;
+                  /* 先选集群、再选机器：换了集群，原来那台不一定还在这套 PVE 上。
+                     不清掉的话表单里会留着一条跨集群的 node/vmid，提交后写到另一套
+                     集群里同名节点上的同号机器（agent 方式还会在那台客户机里执行命令）。 */
+                  const identity = `${form.agent_node}|${form.agent_vmid}`;
+                  const keepsVm =
+                    Boolean(form.agent_node && form.agent_vmid) &&
+                    (vmsQuery.data ?? []).some(
+                      (vm) =>
+                        isRunning(vm.status) &&
+                        !vm.template &&
+                        `${vm.node}|${vm.vmid}` === identity &&
+                        (!connectionId || (vm.connection_id ?? "") === connectionId),
+                    );
+                  setForm({
+                    ...form,
+                    connection_id: connectionId,
+                    ...(keepsVm ? {} : { agent_node: "", agent_vmid: "" }),
+                  });
+                }}
+              />
+            ) : null}
             {form.deploy_method === "agent" ? (
               <Select
                 label={t('cert.fieldAgentVm')}
@@ -2600,6 +2637,9 @@ export function Certificates() {
                 placeholder={t('cert.agentVmPlaceholder')}
                 options={agentPickerOptions}
                 hint={t('cert.agentVmHint')}
+                /* 机器一多逐个按键找太慢：输入即按「名称 / VMID」过滤（label 里
+                   本来就带 VMID 与节点，见 cert.agentOption） */
+                searchable
                 onChange={(e) => {
                   // 值形如「连接|节点|VMID」：选择机器时把连接一并记下来
                   const [connectionId = "", node = "", vmid = ""] = String(
@@ -2612,19 +2652,6 @@ export function Certificates() {
                     agent_vmid: vmid || "",
                   });
                 }}
-              />
-            ) : null}
-            {multiConnection &&
-            ["agent", "lxc", "pve"].includes(String(form.deploy_method || "")) ? (
-              <Select
-                label={t('cert.fieldPveConnection')}
-                value={form.connection_id || ""}
-                options={[
-                  { label: t('cert.connectionAuto'), value: "" },
-                  ...connectionOptions,
-                ]}
-                hint={t('cert.pveConnectionHint')}
-                onChange={(e) => setForm({ ...form, connection_id: e.target.value })}
               />
             ) : null}
             {form.deploy_method === "lxc" ? (
