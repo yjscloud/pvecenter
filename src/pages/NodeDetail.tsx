@@ -189,6 +189,18 @@ export function NodeDetail() {
     [nodesQuery.data, node, conn],
   );
 
+  /* 直链 / 收藏打开时 URL 上没有 ?conn=：按节点名在聚合列表里反查一次补上。
+     只在**唯一命中**时补 —— 两台 PVE 都有同名节点时猜一条，等于替用户选错
+     机器；那种情况保持下面的提示，让他回列表里明确选。 */
+  useEffect(() => {
+    if (conn || !node || !nodesQuery.data) return;
+    const hits = nodesQuery.data.filter((n) => n.node === node && n.connection_id);
+    if (hits.length !== 1) return;
+    const params = new URLSearchParams(searchParams);
+    params.set('conn', String(hits[0].connection_id));
+    setSearchParams(params, { replace: true });
+  }, [conn, node, nodesQuery.data, searchParams, setSearchParams]);
+
   const statusQuery = useQuery({
     queryKey: ['nodes', conn, node, 'status'],
     queryFn: () => nodesApi.status(node, conn),
@@ -297,7 +309,7 @@ export function NodeDetail() {
                 queryKey: ['storages', conn, node],
               });
               void queryClient.invalidateQueries({
-                queryKey: ['cluster', 'tasks', node],
+                queryKey: ['cluster', 'tasks'],
               });
             }}
             loading={statusQuery.isFetching && !statusQuery.isLoading}
@@ -358,7 +370,7 @@ export function NodeDetail() {
         ) : null}
         {tab === 'network' ? <NetworkTab node={node} conn={conn} /> : null}
         {tab === 'storage' ? <NodeStorageTab node={node} conn={conn} /> : null}
-        {tab === 'tasks' ? <NodeTasksTab node={node} /> : null}
+        {tab === 'tasks' ? <NodeTasksTab node={node} conn={conn} /> : null}
         {tab === 'monitor' ? <NodeMonitorTab node={node} conn={conn} /> : null}
       </div>
     </div>
@@ -1531,12 +1543,12 @@ function NodeStorageTab({ node, conn }: { node: string; conn: string }) {
    任务 Tab
    ========================================================================== */
 
-function NodeTasksTab({ node }: { node: string }) {
+function NodeTasksTab({ node, conn }: { node: string; conn: string }) {
   const t = useT();
   const refresh = useRefreshInterval();
   const tasksQuery = useQuery({
-    queryKey: ['cluster', 'tasks', node, 50],
-    queryFn: () => clusterApi.tasks({ node, limit: 50 }),
+    queryKey: ['cluster', 'tasks', conn, node, 50],
+    queryFn: () => clusterApi.tasks({ node, limit: 50 }, conn),
     refetchInterval: refresh,
     retry: false,
   });

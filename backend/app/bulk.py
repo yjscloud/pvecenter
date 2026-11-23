@@ -28,6 +28,7 @@ from . import (
     frp,
     i18n,
     ippool,
+    migrateguard,
     ownership,
     prefs,
     pvecache,
@@ -385,15 +386,44 @@ async def _run_one(
             result = await client.qemu_set_config(node, vmid, {"balloon": params.balloon})
 
         elif action == "migrate":
-            target_node = (params.target_node or "").strip()
+            # 目标节点必须与这台机器同属一个 PVE 集群：批量选择可能横跨多条连接，
+            # 用户在下拉里选的节点对某些机器并不在同一个集群里 —— 逐台判、逐台报错，
+            # 而不是让 PVE 回一句看不懂的英文（见 migrateguard）。
+            target_node = await migrateguard.ensure_target_node(
+                client, node, (params.target_node or "").strip()
+            )
+            # 节点级可见性：与单机迁移 / 界面下拉同一口径
+            await security.ensure_node_allowed(user, conn_id, target_node)
             if gtype == "qemu":
-                result = await client.qemu_migrate(
-                    node, vmid, target_node, online=params.online
-                )
+                # 与单机端点同一道拦截：运行中的虚拟机不能停机迁移。批量里更要
+                # 逐台说清楚，否则结果清单里全是 PVE 那句
+                # "can't migrate running VM without --online"。
+                if not params.online:
+                    status = await client.qemu_status(node, vmid) or {}
+                    if str(status.get("status") or "") != "stopped":
+                        raise ProxmoxError(
+                            migrateguard.offline_blocked_detail(vmid), 409
+                        )
+                try:
+                    result = await client.qemu_migrate(
+                        node, vmid, target_node, online=params.online
+                    )
+                except ProxmoxError as exc:
+                    # 兜底：本地盘 / 目标缺存储等 PVE 英文原文翻成可操作提示
+                    mapped = migrateguard.qemu_migrate_detail(exc, vmid)
+                    if mapped:
+                        raise ProxmoxError(mapped, 409) from exc
+                    raise
             else:
+                # LXC 没有在线迁移：把「在线」意图翻译成「迁完自动启动」，
+                # 否则 PVE 会回 "lxc live migration is currently not implemented"
                 result = await client.lxc_migrate(
-                    node, vmid, target_node, online=params.online
+                    node, vmid, target_node, restart=bool(params.online)
                 )
+            # 归属跟着机器走（缓存整批末尾统一作废一次，见 run_bulk）
+            item["ownership"] = await migrateguard.carry_ownership(
+                conn_id, node, target_node, vmid, notify=False
+            )
 
         elif action == "snapshot":
             name = (params.name or "").strip()
@@ -584,6 +614,11 @@ async def run_bulk(
         await ownership.invalidate_caches()
         if any(item.get("frp_rules_suspended") for item in results):
             await frp.restart_if_running()
+
+    if action == "migrate" and ok_count:
+        # 迁移把归属记录从旧节点搬到了新节点（见 ownership.move_guest）：按「人」
+        # 分档的读数（仪表盘 / 额度 / 搜索）里，旧位置那批已经不该再算了。
+        await ownership.invalidate_caches()
 
     return {
         "action": action,

@@ -36,6 +36,7 @@ from .. import (
     vmconfig,
 )
 from ..formatters import pve_flag
+from ..vm_scope import bind_node_connection
 from ..pve import (
     ProxmoxError,
     connection_label,
@@ -494,7 +495,7 @@ async def _scan_vztmpl(targets: List[Any]) -> List[Dict[str, Any]]:
     return output
 
 
-@router.get("/templates/images")
+@router.get("/templates/images", dependencies=[Depends(bind_node_connection)])
 async def list_cloud_images(
     node: str,
     user: Dict[str, Any] = Depends(security.require_permission("template.view")),
@@ -583,6 +584,9 @@ async def build_template_from_image(
     user: Dict[str, Any] = Depends(security.require_permission("template.manage")),
 ) -> Dict[str, Any]:
     """Build a cloud-init template from a cloud image, step by step."""
+    # ``node`` 在请求体里，路由级依赖看不到它：不补这一次，请求会固定落到
+    # 「当前连接」，在另一套集群的节点上建模板就变成 hostname lookup 失败。
+    await bind_node_connection(payload.node)
     # 建模板也是一台新机器（模板同样计入用量），走同一套额度校验。
     # ``disk_size`` 可能为空 —— 那样磁盘由镜像自身决定，这一项就不查。
     await quota.enforce_create(

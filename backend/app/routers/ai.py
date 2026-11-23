@@ -55,6 +55,7 @@ from .. import (
     store,
 )
 from ..config import settings
+from ..vm_scope import bind_vm_connection
 from . import vm_meta as vm_meta_router
 
 logger = logging.getLogger(__name__)
@@ -845,7 +846,7 @@ async def vm_targets(user: Dict[str, Any] = Depends(VIEW)) -> Dict[str, Any]:
     return {"items": visible}
 
 
-@router.get("/vm/agent")
+@router.get("/vm/agent", dependencies=[Depends(bind_vm_connection)])
 async def vm_agent(
     node: str, vmid: int, user: Dict[str, Any] = Depends(VIEW)
 ) -> Dict[str, Any]:
@@ -952,7 +953,7 @@ async def vm_lease_create(
 
     # 纳管的前提是 Guest Agent 在线：没有它连不上客户机，票签出来也是死票。
     # 这一点在签发时再确认一次 —— 列表加载与点「签发」之间机器可能已经停了。
-    if not await aivm.probe_agent(node, vmid):
+    if not await aivm.probe_agent(node, vmid, connection_id=connection_id):
         raise HTTPException(
             status_code=400,
             detail=i18n.pick(

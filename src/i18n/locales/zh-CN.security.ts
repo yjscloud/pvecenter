@@ -796,6 +796,8 @@ export const zhSecurity = {
   'firewall.selectCtAria': '选择容器',
   'firewall.ownerOnlyNote': '普通用户只能看到自己名下的机器',
   'firewall.clusterNote': '集群级：规则对所有宿主机生效',
+  'firewall.clusterTargetPlaceholder': '选择目标 PVE 集群',
+  'firewall.clusterTargetAria': '选择要管理的 PVE 集群（集群级防火墙每套 PVE 各自一份）',
   'firewall.clusterReadonly': '集群级规则影响所有主机，需要 firewall.cluster 权限：你可以查看，但不能修改。',
   'firewall.optionsError': '读不到防火墙设置',
   'firewall.enableLabel': '防火墙',

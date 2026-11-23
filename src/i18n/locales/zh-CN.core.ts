@@ -36,6 +36,10 @@ export const zhCore = {
   'common.selectAll': '全选',
   'common.selectedCount': '已选 {count} 项',
   'common.selectPlaceholder': '请选择',
+  'common.selectSearchPlaceholder': '输入名称或 VMID 搜索…',
+  'common.selectSearchNoMatch': '没有匹配项，换个关键字试试',
+  'common.selectSearchMore': '还有 {n} 项，继续输入以缩小范围',
+  'common.selectSearchHint': '输入即筛选 · ↑↓ 选择 · 回车确认',
   'common.noOptions': '暂无可选项',
   'common.listSeparator': '、',
 

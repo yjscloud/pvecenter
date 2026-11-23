@@ -1,7 +1,10 @@
 """应急响应接口：虚拟机一键隔离与解除。
 
-路径挂在 ``/api/vms/{node}/{vmid}/quarantine`` 下，与 vms 路由共用同一套归属
-校验（``require_vm_access``）：普通用户只能处置自己名下的机器。
+路径挂在 ``/api/vms/{node}/{vmid}/quarantine`` 下，与 vms 路由共用同一套依赖：
+先 ``bind_vm_connection`` 把请求绑定到这台机器真正所在的 PVE 连接，再
+``require_vm_access`` 做归属校验（普通用户只能处置自己名下的机器）。少了绑定，
+``get_client()`` 会落到顶栏作用域 / 当前连接，在另一套集群上处置就是
+``hostname lookup 'node02' failed``。
 
 * ``GET  …/quarantine`` —— 当前隔离状态（断了几张网卡、是否保护、有哪些取证快照），
   读权限用 ``vm.view``，让被隔离机器的所有者能看到发生了什么；
@@ -21,6 +24,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -30,21 +34,59 @@ from .. import (
     i18n,
     isolation,
     ownership,
+    pve_errors,
     quarantine_store,
     security,
 )
 from ..pve import ProxmoxError
 from ..schemas import QuarantineIn, QuarantineReleaseIn
+from ..vm_scope import bind_vm_connection
 from .vms import _op_connection, require_vm_access
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/vms", tags=["isolation"])
+#: 与 vms 路由同一套依赖，顺序也一致：先把请求绑定到这台虚拟机真正所在的 PVE
+#: 连接，再做归属校验。隔离接口也是 ``/vms/{node}/{vmid}/...`` 的单机语义，
+#: 缺了绑定就会落到「顶栏作用域 / 当前连接」：机器在 B 上、作用域是 A 时，
+#: ``get_client()`` 打 A，A 把节点名当主机名去解析，报
+#: ``hostname lookup 'node02' failed``；管理员还因为不受归属限制而一路打到 PVE，
+#: 最终变成 502「读取虚拟机状态失败」。
+router = APIRouter(
+    prefix="/api/vms",
+    tags=["isolation"],
+    dependencies=[Depends(bind_vm_connection), Depends(require_vm_access)],
+)
 #: 隔离清单单独一条前缀：``/vms/{node}/{vmid}`` 是「单台」语义，清单不是。
 list_router = APIRouter(prefix="/api/isolation", tags=["isolation"])
 
 ISOLATE = security.require_permission("vm.isolate")
 VIEW = security.require_permission("vm.view")
+
+def _status_error(node: str, vmid: int, exc: ProxmoxError) -> HTTPException:
+    """读取隔离状态的错误出口：语义化文案 + trace id，PVE 原文只进日志。
+
+    与 vms 的读取分支同一口径：不把 PVE 报错（可能带宿主机路径 / 主机名）透传给
+    前端。节点名解析失败单独给一句能照着做的中文 —— 那基本是「这台机器属于另一条
+    连接」，让用户去切作用域 / 查 /etc/hosts，而不是看到一个莫名其妙的 502。
+    识别逻辑见 :mod:`app.pve_errors`（防火墙同一个出口）。
+    """
+    trace = uuid.uuid4().hex[:12]
+    raw = str(getattr(exc, "message", "") or exc)
+    logger.warning(
+        "读取隔离状态失败 node=%s vmid=%s trace=%s：%s", node, vmid, trace, raw
+    )
+    if pve_errors.is_unresolved(raw):
+        return HTTPException(
+            status_code=502,
+            detail=i18n.t(
+                "pve.error.nodeUnresolved",
+                node=pve_errors.unresolved_node(raw) or node,
+            ),
+        )
+    return HTTPException(
+        status_code=502,
+        detail=i18n.t("isolation.error.stateRead", trace=trace),
+    )
 
 
 def _record_owner(record: Dict[str, Any], vm_owners: Dict[str, str]) -> Optional[str]:
@@ -79,7 +121,7 @@ async def list_isolated(user: Dict[str, Any] = Depends(VIEW)) -> Dict[str, Any]:
     return {"items": items, "count": len(items)}
 
 
-@router.get("/{node}/{vmid}/quarantine", dependencies=[Depends(require_vm_access)])
+@router.get("/{node}/{vmid}/quarantine")
 async def quarantine_status(
     node: str,
     vmid: int,
@@ -90,7 +132,7 @@ async def quarantine_status(
     try:
         payload = await isolation.status(node, vmid)
     except ProxmoxError as exc:
-        raise HTTPException(status_code=502, detail=f"读取虚拟机状态失败：{exc}") from exc
+        raise _status_error(node, vmid, exc) from exc
     await security.audit_read(
         request,
         user,
@@ -104,7 +146,7 @@ async def quarantine_status(
     return payload
 
 
-@router.post("/{node}/{vmid}/quarantine", dependencies=[Depends(require_vm_access)])
+@router.post("/{node}/{vmid}/quarantine")
 async def quarantine_vm(
     node: str,
     vmid: int,
@@ -191,9 +233,7 @@ async def quarantine_vm(
     return result
 
 
-@router.post(
-    "/{node}/{vmid}/quarantine/release", dependencies=[Depends(require_vm_access)]
-)
+@router.post("/{node}/{vmid}/quarantine/release")
 async def release_vm(
     node: str,
     vmid: int,

@@ -382,6 +382,75 @@ class TestQuery:
         assert len(result["series"]) == 1
         assert result["series"][0]["vmid"] == 100
 
+    def test_same_node_name_on_two_connections_stays_two_series(
+        self, history_db
+    ) -> None:
+        """多套 PVE 上同名节点 + 同号机器是两台机器，不能揉成一条曲线。
+
+        只按 (node, vmid) 分组时，两台 pve1 的读数会被 AVG 成一条曲线：
+        用户看到的是「CPU 在 20%~80% 之间抖」，实际是两台稳定在不同水位。
+        """
+        _insert_point(
+            ts=NOW, scope="node", node="pve1", connection_id="-",
+            cpu=0.2, status="online",
+        )
+        _insert_point(
+            ts=NOW, scope="node", node="pve1", connection_id="conn-b",
+            cpu=0.8, status="online",
+        )
+
+        result = _run(metrics.query(scope="node", start=NOW, end=NOW + 60, step=60))
+
+        assert len(result["series"]) == 2
+        # 默认连接对外用空串表示（与 X-PVE-Connection 的空值同义）
+        assert [s["connection_id"] for s in result["series"]] == ["", "conn-b"]
+        assert sorted(s["points"][0]["cpu"] for s in result["series"]) == pytest.approx(
+            [0.2, 0.8]
+        )
+
+    def test_connection_filter_selects_one_pve(self, history_db) -> None:
+        _insert_point(ts=NOW, scope="node", node="pve1", connection_id="-", cpu=0.2, status="online")
+        _insert_point(
+            ts=NOW, scope="node", node="pve1", connection_id="conn-b",
+            cpu=0.8, status="online",
+        )
+
+        result = _run(
+            metrics.query(
+                scope="node",
+                start=NOW,
+                end=NOW + 60,
+                step=60,
+                connection_id="conn-b",
+            )
+        )
+
+        assert len(result["series"]) == 1
+        assert result["series"][0]["connection_id"] == "conn-b"
+        assert result["series"][0]["points"][0]["cpu"] == pytest.approx(0.8)
+
+    def test_empty_connection_filter_means_default_connection(self, history_db) -> None:
+        """``connection_id=``（空串）只看默认连接，与落库时的 ``"-"`` 对齐。"""
+        _insert_point(ts=NOW, scope="node", node="pve1", connection_id="-", cpu=0.2, status="online")
+        _insert_point(
+            ts=NOW, scope="node", node="pve1", connection_id="conn-b",
+            cpu=0.8, status="online",
+        )
+
+        result = _run(
+            metrics.query(
+                scope="node",
+                start=NOW,
+                end=NOW + 60,
+                step=60,
+                connection_id="",
+            )
+        )
+
+        assert len(result["series"]) == 1
+        assert result["series"][0]["connection_id"] == ""
+        assert result["series"][0]["points"][0]["cpu"] == pytest.approx(0.2)
+
     def test_unknown_scope_is_rejected(self, history_db) -> None:
         with pytest.raises(ValueError):
             _run(metrics.query(scope="storage", start=NOW, end=NOW + 60, step=60))
@@ -425,6 +494,35 @@ class TestMetricsApi:
         assert len(series) == 1
         assert series[0]["node"] == "pve1"
         assert series[0]["points"][0]["cpu"] == pytest.approx(0.5)
+
+    def test_history_can_be_filtered_by_connection(self, api) -> None:
+        headers = auth_headers(api)
+        _insert_point(
+            ts=NOW, scope="node", node="pve1", connection_id="-",
+            cpu=0.2, status="online",
+        )
+        _insert_point(
+            ts=NOW, scope="node", node="pve1", connection_id="conn-b",
+            cpu=0.75, status="online",
+        )
+
+        resp = api.get(
+            "/api/metrics/history",
+            params={
+                "scope": "node",
+                "connection_id": "conn-b",
+                "start": NOW - 60,
+                "end": NOW + 60,
+            },
+            headers=headers,
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["connection_id"] == "conn-b"
+        assert len(body["series"]) == 1
+        assert body["series"][0]["connection_id"] == "conn-b"
+        assert body["series"][0]["points"][0]["cpu"] == pytest.approx(0.75)
 
     def test_empty_history_is_not_an_error(self, api) -> None:
         headers = auth_headers(api)

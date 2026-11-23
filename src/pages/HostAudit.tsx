@@ -65,7 +65,9 @@ export function HostAudit() {
   const [view, setView] = useState<View>('success');
   const [hours, setHours] = useState(24);
   const [busy, setBusy] = useState(false);
-  const [vmKey, setVmKey] = useState('');   // "node/vmid"
+  /* "连接|节点/VMID"：两台 PVE 上同名的节点、同号机器是**两台不同的机器**，
+     只记 "node/vmid" 会让下拉出现两个无法区分的选项，请求也只能靠猜 */
+  const [vmKey, setVmKey] = useState('');
   /** 成功 / 失败登录列表的本地搜索词（账号、来源 IP、终端、状态） */
   const [keyword, setKeyword] = useState('');
 
@@ -100,13 +102,19 @@ export function HostAudit() {
     enabled: view === 'vm',
     staleTime: 60_000,
   });
+  const vmTarget = useMemo(() => {
+    const [conn = '', rest = ''] = vmKey.split('|');
+    const [node, vmid] = rest.split('/');
+    const number = Number(vmid);
+    return node && Number.isFinite(number) && number > 0
+      ? { conn, node, vmid: number }
+      : null;
+  }, [vmKey]);
   const vmQuery = useQuery({
     queryKey: ['host-audit', 'vm', vmKey, hours],
-    queryFn: () => {
-      const [node, vmid] = vmKey.split('/');
-      return hostAuditApi.vm(node, Number(vmid), hours);
-    },
-    enabled: view === 'vm' && Boolean(vmKey),
+    queryFn: () =>
+      hostAuditApi.vm(vmTarget!.node, vmTarget!.vmid, hours, vmTarget!.conn),
+    enabled: view === 'vm' && Boolean(vmTarget),
     retry: false,
   });
 
@@ -122,11 +130,21 @@ export function HostAudit() {
     if (hostsQuery.isLoading) return;
     setHostId(hosts[0]?.id ?? '');
   }, [isAdmin, localHostInfo.state, localHostInfo.enabled, hostId, hosts, hostsQuery.isLoading]);
-  const hostOptions = hosts.map((item) => ({ label: item.name, value: item.id }));
+  /* 受管主机名通常就是虚拟机名；把 VMID 一并写进 label，选择器既能按名称
+     也能按 VMID 搜（面板下发的机器才有 vmid，本机 / 手填主机就只有名称）。 */
+  const hostOptions = hosts.map((item) => ({
+    label:
+      item.vmid != null && String(item.vmid) !== ''
+        ? `${item.name}（VMID ${item.vmid}）`
+        : item.name,
+    value: item.id,
+  }));
   const vms = (vmsQuery.data ?? []).filter((vm) => !vm.template);
   const vmOptions = vms.map((vm) => ({
-    label: `${vm.name}（${vm.node}/${vm.vmid}）`,
-    value: `${vm.node}/${vm.vmid}`,
+    label: `${vm.name}（${vm.node}/${vm.vmid}${
+      vm.connection_name ? ` · ${vm.connection_name}` : ''
+    }）`,
+    value: `${vm.connection_id ?? ''}|${vm.node}/${vm.vmid}`,
   }));
 
   /* ---- 成功 / 失败登录的搜索 ----
@@ -337,6 +355,7 @@ export function HostAudit() {
                       : []
                 }
                 aria-label={t('hostAudit.selectHostAria')}
+                searchable
               />
             </div>
           }
@@ -379,6 +398,7 @@ export function HostAudit() {
                       { label: t('hostAudit.selectVm'), value: '' },
                       ...vmOptions,
                     ]}
+                    searchable
                   />
                 </Field>
                 <Field label={t('hostAudit.timeRange')} hint={t('hostAudit.hours')}>

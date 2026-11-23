@@ -2615,7 +2615,13 @@ export interface LxcMoveRequest {
 
 export interface LxcMigrateRequest {
   target_node: string;
-  online?: boolean;
+  /**
+   * 迁移完成后在目标节点启动容器。
+   *
+   * 注意：LXC **没有在线迁移**（PVE 会回 ``lxc live migration is currently not
+   * implemented``），所以这里没有 online 字段 —— 迁移期间容器必然停机，`restart`
+   * 只决定迁完要不要自动拉起。
+   */
   restart?: boolean;
 }
 
@@ -3413,6 +3419,8 @@ export interface Snapshot {
   /** 前端补充：所属 VM（全局快照视图用） */
   vmid?: number;
   node?: string;
+  /** 这台机器所在的 PVE 连接：跳详情页 / 批量操作都要带上 */
+  connection_id?: string;
   vmname?: string;
   /** 后端 /snapshots 聚合接口给的字段名（前端映射成 vmname） */
   vm_name?: string;
@@ -3438,6 +3446,8 @@ export interface SnapshotBulkDeleteItem {
   vmid: number;
   type: 'qemu' | 'lxc';
   name: string;
+  /** 这台机器所在的 PVE 连接：跨集群同名节点时必须带 */
+  connection_id?: string;
 }
 
 /**
@@ -3452,6 +3462,8 @@ export interface SnapshotBulkRestoreItem {
   type: 'qemu' | 'lxc';
   /** 目标快照名（不能是 `current`，那是 PVE 的伪条目） */
   name: string;
+  /** 这台机器所在的 PVE 连接：跨集群同名节点时必须带 */
+  connection_id?: string;
 }
 
 /* ---------------------------------------------------------------------------
@@ -4208,6 +4220,8 @@ export interface CertTarget {
   ssh_password?: string;
   ssh_key?: string;
   ssh_host_key?: string;
+  /** 部署目标所在的 PVE 连接（agent / lxc / pve 三种方式用） */
+  connection_id?: string;
   agent_node?: string;
   agent_vmid?: string;
   /** 云负载均衡 / CDN 参数 */
@@ -4264,6 +4278,8 @@ export interface CertSite {
   /** 首次连接后记录的主机指纹 */
   ssh_host_key: string;
   /* ---- PVE 虚拟机 Guest Agent 部署 ---- */
+  /** 目标机器 / 节点所在的 PVE 连接（空 = 当前连接；多集群时必须指定） */
+  connection_id?: string;
   agent_node: string;
   agent_vmid: string;
   auto_renew: boolean;
@@ -4645,6 +4661,8 @@ export interface BotConfig {
   allow_write: boolean;
   allow_create: boolean;
   default_template_vmid: string;
+  /** 创建走哪套 PVE（空 = 按模板所处连接推断） */
+  default_connection_id?: string;
   default_node: string;
   default_storage: string;
   default_backup_storage: string;
@@ -5202,6 +5220,10 @@ export interface HostAuditHost {
   host: string;
   /** 是否面板本机 */
   local: boolean;
+  /** 来源虚拟机（面板下发的受管主机才有）：选择器据此显示/搜索 VMID */
+  node?: string;
+  vmid?: number | null;
+  conn_id?: string;
 }
 
 export interface HostLoginEntry {
@@ -5765,6 +5787,8 @@ export interface QuarantineRecord {
 export type ProtectedBackupState = 'ok' | 'missing' | 'changed' | 'unknown';
 
 export interface ProtectedBackup {
+  /** 登记时所在的 PVE 连接；旧记录为空串（= 当时的当前连接） */
+  connection?: string;
   volid: string;
   node: string;
   storage: string;

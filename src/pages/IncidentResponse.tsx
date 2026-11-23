@@ -128,7 +128,8 @@ export function IncidentResponse() {
   const [bNode, setBNode] = useState('');
   const [bStorage, setBStorage] = useState('');
   const [bNote, setBNote] = useState('');
-  const [unprotectTarget, setUnprotectTarget] = useState<string | null>(null);
+  /* 整条记录（含 connection）：同一个 volid 可能在两套集群各有一条 */
+  const [unprotectTarget, setUnprotectTarget] = useState<ProtectedBackup | null>(null);
 
   const vmsQuery = useQuery({
     queryKey: ['incident', 'vms'],
@@ -175,15 +176,33 @@ export function IncidentResponse() {
     retry: false,
   });
 
+  const [searchParams, setSearchParams] = useSearchParams();
+  /* 从虚拟机列表跳过来时可能带 ``?connection=``：列表还没回来、或旧链接里没有
+     连接信息时，用它兜住处置目标的连接。 */
+  const connectionParam = searchParams.get('connection') ?? '';
+
   const parsed = useMemo(() => {
     const [node, vmidText] = target.split('/');
     const vmid = Number(vmidText);
     return node && Number.isFinite(vmid) && vmid > 0 ? { node, vmid } : null;
   }, [target]);
 
+  /* 处置目标真正属于哪条 PVE 连接：虚拟机列表的每一行都带 connection_id。
+     隔离状态 / 隔离 / 解除一律**硬指定**它 —— 只靠顶栏作用域的话，在另一套
+     集群上处置会打到「当前连接」，那台 PVE 把节点名当主机名解析，回
+     hostname lookup 失败。 */
+  const targetConn = useMemo(() => {
+    if (!parsed) return connectionParam;
+    const hit = (vmsQuery.data ?? []).find(
+      (vm) => vm.node === parsed.node && vm.vmid === parsed.vmid,
+    );
+    return hit?.connection_id ?? connectionParam;
+  }, [parsed, vmsQuery.data, connectionParam]);
+
   const statusQuery = useQuery({
-    queryKey: ['incident', 'quarantine', target],
-    queryFn: () => isolationApi.status(parsed!.node, parsed!.vmid),
+    /* 连接进 key：切换顶栏作用域 / 换机器时不能命中上一次的读数缓存 */
+    queryKey: ['incident', 'quarantine', targetConn, target],
+    queryFn: () => isolationApi.status(parsed!.node, parsed!.vmid, targetConn),
     enabled: Boolean(parsed),
     retry: false,
   });
@@ -201,7 +220,6 @@ export function IncidentResponse() {
 
   /* 从虚拟机列表的「请先解除隔离」跳过来时带 ``?target=节点/VMID``：
      直接选中那台机器，不用在几十台的下拉里再找一遍。 */
-  const [searchParams, setSearchParams] = useSearchParams();
   useEffect(() => {
     const wanted = searchParams.get('target');
     if (!wanted || target) return;
@@ -214,10 +232,14 @@ export function IncidentResponse() {
 
   const vmOptions = useMemo(
     () =>
-      (vmsQuery.data ?? []).map((vm) => ({
-        label: `${vm.name || `VM ${vm.vmid}`}（${vm.vmid} · ${vm.node} · ${vm.status}）`,
-        value: `${vm.node}/${vm.vmid}`,
-      })),
+      /* 模板不是可处置对象：混在清单里既选不中正确的目标，也容易误把模板当
+         机器隔离。这里直接不列出来（与「快照 / 告警」的选择器同一口径）。 */
+      (vmsQuery.data ?? [])
+        .filter((vm) => !vm.template)
+        .map((vm) => ({
+          label: `${vm.name || `VM ${vm.vmid}`}（${vm.vmid} · ${vm.node} · ${vm.status}）`,
+          value: `${vm.node}/${vm.vmid}`,
+        })),
     [vmsQuery.data],
   );
 
@@ -352,7 +374,12 @@ export function IncidentResponse() {
     };
     setBusy(true);
     try {
-      const result = await isolationApi.quarantine(parsed.node, parsed.vmid, body);
+      const result = await isolationApi.quarantine(
+        parsed.node,
+        parsed.vmid,
+        body,
+        targetConn,
+      );
       setLastResult(result);
       if (result.ok) {
         /* 隔离会断网并关机，属于不可撤销的处置动作：成功也要让人一眼看到 */
@@ -372,19 +399,27 @@ export function IncidentResponse() {
     }
   };
 
-  /* ``row`` 有值 = 从清单里直接解除某一条；没有 = 用上方选中的机器 */
+  /* ``row`` 有值 = 从清单里直接解除某一条；没有 = 用上方选中的机器。
+     清单行里记着登记时的连接（conn_id），优先用它：那才是这台机器真正所在的
+     PVE，解除动作不能按当前作用域去猜。 */
   const runRelease = async (powerOn: boolean, row?: QuarantineRecord) => {
     const node = row?.node ?? parsed?.node;
     const vmid = row?.vmid ?? parsed?.vmid;
+    const conn = row?.conn_id || targetConn;
     if (!node || !vmid) return;
     setBusy(true);
     try {
-      const result = await isolationApi.release(node, vmid, {
-        restore_network: true,
-        unprotect: true,
-        power_on: powerOn,
-        note: '',
-      });
+      const result = await isolationApi.release(
+        node,
+        vmid,
+        {
+          restore_network: true,
+          unprotect: true,
+          power_on: powerOn,
+          note: '',
+        },
+        conn,
+      );
       setLastResult(result);
       toast.success(t('incident.released'), result.summary);
       await queryClient.invalidateQueries({ queryKey: ['incident'] });
@@ -411,7 +446,7 @@ export function IncidentResponse() {
         storage: bStorage.trim(),
         volid: volid.trim(),
         note: bNote.trim(),
-      });
+      }, bConn);
       toast.success(t('incident.protectDone'), result.detail);
       setVolid('');
       setBNote('');
@@ -456,7 +491,10 @@ export function IncidentResponse() {
   const doUnprotect = async () => {
     if (!unprotectTarget) return;
     try {
-      await protectedBackupsApi.unprotect(unprotectTarget);
+      await protectedBackupsApi.unprotect(
+        unprotectTarget.volid,
+        unprotectTarget.connection,
+      );
       toast.success(t('incident.unprotectDone'), t('incident.unprotectDoneDetail'));
       await refreshProtected();
     } catch (err) {
@@ -619,7 +657,7 @@ export function IncidentResponse() {
       width: 90,
       render: (row) =>
         canBackup ? (
-          <Button size="sm" variant="ghost" onClick={() => setUnprotectTarget(row.volid)}>
+          <Button size="sm" variant="ghost" onClick={() => setUnprotectTarget(row)}>
             {t('incident.remove')}
           </Button>
         ) : null,
@@ -718,6 +756,7 @@ export function IncidentResponse() {
                       value={target}
                       onChange={(event) => setTarget(event.target.value)}
                       options={vmOptions}
+                      searchable
                     />
                     <Select
                       label={t('incident.step.power')}
@@ -1050,7 +1089,7 @@ export function IncidentResponse() {
           <Table
             columns={columns}
             rows={items}
-            rowKey={(row) => row.volid}
+            rowKey={(row) => `${row.connection ?? ''}:${row.volid}`}
             caption={t('incident.caption')}
             dense
             emptyTitle={t('incident.emptyTitle')}
@@ -1074,7 +1113,7 @@ export function IncidentResponse() {
       <ConfirmDialog
         open={Boolean(unprotectTarget)}
         title={t('incident.unprotectTitle')}
-        message={t('incident.unprotectMessage', { volid: unprotectTarget ?? '' })}
+        message={t('incident.unprotectMessage', { volid: unprotectTarget?.volid ?? '' })}
         confirmText={t('incident.unprotectConfirm')}
         danger
         onCancel={() => setUnprotectTarget(null)}

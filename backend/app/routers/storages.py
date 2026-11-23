@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 
-from .. import guestguard, ownership, pvecache, security, store, vmconfig
+from .. import guestguard, i18n, ownership, pvecache, pve_errors, security, store, vmconfig
 from ..pve import (
     ProxmoxClient,
     ProxmoxError,
@@ -576,6 +576,10 @@ async def upload_to_storage(
     Streams the upload straight through to Proxmox so large ISOs never need to
     be buffered in memory.
     """
+    # ``node`` 在 Form 里，路由器级的绑定依赖只能解析查询参数 / 路径参数，
+    # 看不到它：不补这一次，请求固定落到「当前连接」，在另一套集群的节点上
+    # 上传就会收到 ``hostname lookup 'node02' failed``（甚至传进同名的另一台）。
+    await bind_node_connection(node)
     client = get_client()
     http = await client._http()
 
@@ -635,6 +639,16 @@ async def upload_to_storage(
             request, user, "storage.upload", target=f"{node}/{storage}/{filename}",
             result="failed", detail=raw,
         )
+        # 节点名被 PVE 当主机名解析：连接选错了，给一句能照着做的话，
+        # 而不是把英文原文丢进「上传失败」里
+        if pve_errors.is_unresolved(raw):
+            raise HTTPException(
+                status_code=502,
+                detail=i18n.t(
+                    "pve.error.nodeUnresolved",
+                    node=pve_errors.unresolved_node(raw) or node,
+                ),
+            )
         # Proxmox 的 401/403 表示上游凭据问题，不能透传给前端当会话失效
         code = 502 if resp.status_code in (401, 403) else resp.status_code
         raise HTTPException(

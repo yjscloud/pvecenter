@@ -137,6 +137,7 @@ import {
   powerConfirmOptions,
   type DestructivePower,
 } from '../utils/powerConfirm';
+import { migrationTargetNodes } from '../utils/clusterNodes';
 import { useTaskRunner } from '../hooks/useTaskRunner';
 import { useToast } from '../hooks/useToast';
 import { useAuth } from '../hooks/useAuth';
@@ -1099,6 +1100,35 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
     () => guestRows.filter((vm) => selected.has(rowKeyOf(vm))),
     [guestRows, selected],
   );
+
+  /* 批量迁移的目标节点：只保留「选中这些机器所在集群」的节点（取交集）。
+     跨集群的批量迁移本身没有合法目标 —— PVE 的迁移只能在同一个集群里换节点，
+     把所有连接的节点混在一起只会让用户选到一堆注定失败的选项（见 utils/clusterNodes）。
+     交集为空时弹窗会显示「没有可迁移的目标节点」，比让人试一次再吃报错清楚。 */
+  const bulkMigrateNodes = useMemo(() => {
+    const rows = nodesQuery.data ?? [];
+    const clusters = new Set(
+      selectedGuests.map((vm) => String(vm.connection_id ?? '')),
+    );
+    if (clusters.size === 0) return [];
+    let names: Set<string> | null = null;
+    for (const cid of clusters) {
+      const ofCluster = new Set(
+        rows
+          .filter((n) => String(n.connection_id ?? '') === cid)
+          .map((n) => n.node),
+      );
+      /* 参数类型必须显式写出来：TypeScript 7 推断 filter 的重载时会把回调参数
+         算成 never（报「'(name: never) => boolean' 不能赋给 '(value: string)
+         => unknown'」），而 [...names] 明明已经是 string[]。补上 (name: string)
+         就好 —— 运行期没有任何变化，别为了「简洁」把它删回去。 */
+      names = names
+        ? new Set([...names].filter((name: string) => ofCluster.has(name)))
+        : ofCluster;
+      if (names.size === 0) break;
+    }
+    return [...(names ?? [])].sort();
+  }, [nodesQuery.data, selectedGuests]);
 
   /* 筛选变化时清理已不可见的选择 */
   useEffect(() => {
@@ -2863,7 +2893,6 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
       <MigrateDialog
         noun={L.noun}
         vm={migrateTarget}
-        nodes={(nodesQuery.data ?? []).map((n) => n.node)}
         onClose={() => setMigrateTarget(null)}
         onDone={() => {
           invalidateGuests();
@@ -2920,7 +2949,7 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
         count={selected.size}
         unit={L.unit}
         noun={L.noun}
-        nodes={(nodesQuery.data ?? []).map((n) => n.node)}
+        nodes={bulkMigrateNodes}
         hasContainer={isLxc}
         busy={pendingAction}
         onClose={() => setBulkDialog(null)}
@@ -3133,42 +3162,79 @@ function CloneDialog({
 function MigrateDialog({
   vm,
   noun,
-  nodes,
   onClose,
   onDone,
 }: {
   vm: VmSummary | null;
   noun: string;
-  nodes: string[];
   onClose: () => void;
   onDone: () => void;
 }) {
   const t = useT();
   const runner = useTaskRunner();
   const [target, setTarget] = useState('');
-  const [online, setOnline] = useState(true);
+  /**
+   * 一个开关，两种语义：虚拟机是「在线迁移」，容器是「迁移完成后启动」。
+   * 容器**没有在线迁移**（PVE 直接回 lxc live migration is currently not
+   * implemented），给它显示「不停机」只会是做不到的承诺。
+   */
+  const [option, setOption] = useState(true);
   const [busy, setBusy] = useState(false);
+  const container = guestTypeOf(vm) === 'lxc';
+
+  /* 节点清单按**这台机器所属的连接**单独查：页面级那份受「连接 / 节点」筛选项
+     影响，可能压根不包含这台机器的集群，而迁移下拉绝不能混进别的集群 ——
+     跨集群的节点 PVE 搬不过去（见 utils/clusterNodes）。 */
+  const nodesQuery = useQuery({
+    queryKey: ['nodes', vm?.connection_id ?? ''],
+    queryFn: () => nodesApi.list(vm?.connection_id || undefined),
+    enabled: Boolean(vm),
+    staleTime: 60_000,
+    retry: false,
+  });
 
   useEffect(() => {
     if (vm) {
       setTarget('');
-      setOnline(vm.status === 'running');
+      /* 非 stopped 都默认勾上「在线迁移」：paused 也带着内存状态，PVE 同样拒绝
+         不带 online 的迁移（"can't migrate running VM without --online"） */
+      setOption(vm.status !== 'stopped');
     }
   }, [vm]);
 
-  const options = nodes
-    .filter((n) => n !== vm?.node)
-    .map((n) => ({ label: n, value: n }));
+  const options = migrationTargetNodes(nodesQuery.data, vm).map((n) => ({
+    label: n.node,
+    value: n.node,
+  }));
+
+  /* 运行中的虚拟机不能用停机方式迁移：拦在提交前，别让它走一趟 PVE 再拿回
+     一句英文原文（后端同样会拦，这里只是第一道且能当场解释原因） */
+  const offlineBlocked = !container && vm?.status !== 'stopped' && !option;
+  /* 运行中的容器迁移后必须启动：LXC 没有在线迁移，PVE 对运行中的容器只接受
+     --restart（不带就是 "can't migrate running container without --online or
+     --restart"）。停机的容器不受这条约束。 */
+  const containerRunning = container && vm?.status !== 'stopped';
 
   const submit = async () => {
-    if (!vm || !target) return;
+    if (!vm || !target || offlineBlocked) return;
     setBusy(true);
     try {
-      await runner.run(guestsApi.migrate(vm, target, online), {
-        title: t('guestList.migrate.task', { name: vm.name || vm.vmid, node: target }),
-        node: vm.node,
-        invalidate: [['vms'], ['lxc'], ['nodes'], ['cluster']],
-      });
+      await runner.run(
+        guestsApi.migrate(
+          vm,
+          target,
+          container
+            ? { restart: containerRunning ? true : option }
+            : { online: option },
+        ),
+        {
+          title: t('guestList.migrate.task', { name: vm.name || vm.vmid, node: target }),
+          node: vm.node,
+          /* 额度与台数也要作废：归属记录随机器搬到了新节点（后端 move_guest），
+             这两份读数是按归属算的，不作废会停在迁移前的口径。 */
+          invalidate: [['vms'], ['lxc'], ['nodes'], ['cluster'], ['quota'], ['guests']],
+        },
+      );
       onDone();
     } finally {
       setBusy(false);
@@ -3198,14 +3264,14 @@ function MigrateDialog({
             variant="primary"
             onClick={submit}
             loading={busy}
-            disabled={!target}
+            disabled={!target || offlineBlocked}
           >
             {t('guestList.migrate.start')}
           </Button>
         </>
       }
     >
-      {options.length === 0 ? (
+      {options.length === 0 && nodesQuery.isLoading ? null : options.length === 0 ? (
         <Notice tone="warning" title={t('guestList.migrate.noTargetTitle')}>
           {t('guestList.migrate.noTargetDesc')}
         </Notice>
@@ -3219,11 +3285,37 @@ function MigrateDialog({
             onChange={(e) => setTarget(e.target.value)}
             options={options}
           />
-          <Checkbox
-            checked={online}
-            onChange={(e) => setOnline(e.target.checked)}
-            label={t('guestList.migrate.online')}
-          />
+          {container ? (
+            <>
+              <Notice tone="info">{t('lxcMore.migrateDowntime')}</Notice>
+              {containerRunning ? (
+                <>
+                  {/* 运行中的容器做不到「迁移后保持停机」，开关锁定为开 */}
+                  <Switch
+                    checked
+                    onChange={setOption}
+                    disabled
+                    label={t('lxcMore.migrateStartAfter')}
+                    hint={t('lxcMore.migrateRestartRequired')}
+                  />
+                  <Notice tone="info">{t('lxcMore.migrateStopFirstHint')}</Notice>
+                </>
+              ) : (
+                <Notice tone="info">{t('lxcMore.migrateStopped')}</Notice>
+              )}
+            </>
+          ) : (
+            <>
+              <Checkbox
+                checked={option}
+                onChange={(e) => setOption(e.target.checked)}
+                label={t('guestList.migrate.online')}
+              />
+              {offlineBlocked ? (
+                <Notice tone="warning">{t('guestList.migrate.offlineRunningWarn')}</Notice>
+              ) : null}
+            </>
+          )}
         </div>
       )}
     </Modal>
@@ -3432,7 +3524,10 @@ function BulkParamsDialog({
   unit: string;
   noun: string;
   nodes: string[];
-  /** 目标是容器 —— 容器快照没有内存状态，那个开关要说明清楚 */
+  /**
+   * 目标是容器 —— 容器快照没有内存状态，迁移也没有在线迁移，
+   * 这两处的开关 / 文案都要换成容器能兑现的说法
+   */
   hasContainer: boolean;
   busy: boolean;
   onClose: () => void;
@@ -3502,7 +3597,10 @@ function BulkParamsDialog({
   const submit = () => {
     if (!action || !canSubmit) return;
     if (action === 'tag') onSubmit({ tags: tags.trim(), tag_mode: tagMode });
-    else if (action === 'migrate') onSubmit({ target_node: target, online });
+    /* 容器页固定带 restart（后端把 online 意图翻成 restart）；运行中的容器
+       不带就会被 PVE 拒绝，而停机的容器不受影响 */
+    else if (action === 'migrate')
+      onSubmit({ target_node: target, online: hasContainer ? true : online });
     else if (action === 'balloon') onSubmit({ balloon: balloonValue });
     else if (action === 'assign')
       onSubmit({ username: assignUser.trim(), reason: assignReason.trim() });
@@ -3579,20 +3677,47 @@ function BulkParamsDialog({
 
       {action === 'migrate' ? (
         <div className="flex flex-col gap-16">
-          <Select
-            label={t('guestList.migrate.targetLabel')}
-            required
-            placeholder={t('guestList.migrate.targetPlaceholder')}
-            value={target}
-            onChange={(e) => setTarget(e.target.value)}
-            options={nodeOptions}
-          />
-          <Switch
-            checked={online}
-            onChange={setOnline}
-            label={t('guestList.bulkDialog.onlineMigrate')}
-            hint={t('guestList.bulkDialog.onlineMigrateHint')}
-          />
+          {nodeOptions.length === 0 ? (
+            <Notice tone="warning" title={t('guestList.migrate.noTargetTitle')}>
+              {t('guestList.migrate.noTargetDesc')}
+            </Notice>
+          ) : (
+            <Select
+              label={t('guestList.migrate.targetLabel')}
+              required
+              placeholder={t('guestList.migrate.targetPlaceholder')}
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+              options={nodeOptions}
+            />
+          )}
+          {/* 容器**没有在线迁移**（后端也是把「在线」翻译成「迁完启动」，
+              见 bulk.py）：这里换成同一层语义的开关，别承诺不停机 */}
+          {hasContainer ? (
+            <>
+              <Notice tone="info">{t('lxcMore.migrateDowntime')}</Notice>
+              {/* 运行中的容器迁移后必须在目标节点启动（PVE 只接受 --restart）。
+                  批量里各台状态混杂，逐台判会让开关变成一堆条件；这里固定带上
+                  restart —— 对已停机的容器是 no-op，后端也只对运行中的生效 */}
+              <Notice tone="info">{t('guestList.bulkDialog.ctRestartNotice')}</Notice>
+            </>
+          ) : (
+            <>
+              <Switch
+                checked={online}
+                onChange={setOnline}
+                label={t('guestList.bulkDialog.onlineMigrate')}
+                hint={t('guestList.bulkDialog.onlineMigrateHint')}
+              />
+              {/* 关机状态才能停机迁移：运行中的机器会在结果清单里逐台失败，
+                  与其事后解释，不如现在就说明 */}
+              {!online ? (
+                <Notice tone="warning">
+                  {t('guestList.bulkDialog.offlineRunningWarn')}
+                </Notice>
+              ) : null}
+            </>
+          )}
           <Notice tone="warning" title={t('guestList.bulkDialog.migrateWarnTitle')}>
             {t('guestList.bulkDialog.migrateWarnDesc')}
           </Notice>

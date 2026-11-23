@@ -934,6 +934,7 @@ export function SshSecurityConfig() {
                 onChange={(e) => bindGuest(e.target.value)}
                 options={guestOptions}
                 disabled={editingHost?.origin === 'panel' || vmsQuery.isLoading}
+                searchable
               />
             </Field>
 

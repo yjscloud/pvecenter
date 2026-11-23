@@ -19,6 +19,7 @@ from ..pve import (
     requested_connection,
 )
 from ..task_scope import build_scope
+from ..vm_scope import bound_dependencies
 
 router = APIRouter(prefix="/api", tags=["cluster"])
 
@@ -568,7 +569,7 @@ async def connections_status(
     )
 
 
-@router.get("/nodes/{node}/status")
+@router.get("/nodes/{node}/status", dependencies=bound_dependencies())
 async def node_status(
     node: str,
     user: Dict[str, Any] = Depends(security.require_permission("node.view")),
@@ -581,7 +582,7 @@ async def node_status(
         _raise(exc)
 
 
-@router.get("/nodes/{node}/rrddata")
+@router.get("/nodes/{node}/rrddata", dependencies=bound_dependencies())
 async def node_rrddata(
     node: str,
     timeframe: str = Query(default="hour", pattern="^(hour|day|week|month|year)$"),
@@ -595,7 +596,7 @@ async def node_rrddata(
         _raise(exc)
 
 
-@router.get("/nodes/{node}/network")
+@router.get("/nodes/{node}/network", dependencies=bound_dependencies())
 async def node_network(
     node: str,
     user: Dict[str, Any] = Depends(security.require_permission("network.view")),

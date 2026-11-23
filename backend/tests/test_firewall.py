@@ -17,7 +17,11 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
+from fastapi import HTTPException  # noqa: E402
+
+from app import pve_errors  # noqa: E402
 from app.config import settings  # noqa: E402
+from app.pve import ProxmoxError  # noqa: E402
 from app.routers import firewall  # noqa: E402
 from test_api_routes import (  # noqa: E402,F401
     ADMIN,
@@ -476,3 +480,115 @@ class TestCtScope:
         # 容器与虚拟机在 PVE 侧的选项字段一致，两套作用域共用一份清单
         assert firewall._OPTION_FIELDS["ct"] == firewall._OPTION_FIELDS["vm"]
         assert "dhcp" in firewall._OPTION_FIELDS["ct"]
+
+
+# ------------------------------------------- 连接绑定 / 错误口径（多 PVE 回归）
+class TestConnectionBinding:
+    """防火墙的寻址参数是**查询参数**（``?node=&vmid=``），曾经因此整组漏掉绑定：
+    请求落到顶栏作用域 / 兜底连接，在另一套 PVE 上把节点名当主机名解析，回
+    ``hostname lookup 'node02' failed``。这里钉住「接线」与错误出口。
+    """
+
+    @staticmethod
+    def _dep_names(path: str) -> list:
+        from app.main import app
+
+        for route in app.routes:
+            if getattr(route, "path", "") == path:
+                return [dep.call.__name__ for dep in route.dependant.dependencies]
+        raise AssertionError(f"路由未注册：{path}")
+
+    @pytest.mark.parametrize(
+        "path",
+        ["/api/firewall/{scope}/rules", "/api/firewall/{scope}/options"],
+    )
+    def test_routes_bind_connection(self, path: str) -> None:
+        names = self._dep_names(path)
+        assert "bind_vm_connection" in names
+        assert "bind_node_connection" in names
+        # 顺序：VM 级定位必须先跑。节点绑定会写入硬指定，先跑会让「不同 PVE 上
+        # 同名节点 + 同 VMID」的场景再也纠正不到机器真正所在的那台。
+        assert names.index("bind_vm_connection") < names.index("bind_node_connection")
+
+    def test_apply_uses_each_targets_own_connection(self, api, monkeypatch) -> None:
+        """批量下发跨集群时，逐台取自己的连接，不能共用循环外的 get_client()。"""
+        headers = auth_headers(api)
+        created = api.post(
+            "/api/firewall/templates",
+            headers=headers,
+            json={
+                "name": "跨集群",
+                "rules": [{"type": "in", "action": "ACCEPT", "proto": "tcp", "dport": "22"}],
+            },
+        )
+        tpl_id = created.json()["template"]["id"]
+
+        asked = []
+
+        def _fake_client_for_connection(conn_id, **kwargs):
+            asked.append(conn_id)
+            return firewall.get_client()
+
+        async def _never(*args, **kwargs):
+            raise AssertionError("已经带了 connection_id，不该再按归属 / 探测推断")
+
+        monkeypatch.setattr(firewall, "client_for_connection", _fake_client_for_connection)
+        monkeypatch.setattr(firewall, "resolve_vm_connection", _never)
+
+        resp = api.post(
+            f"/api/firewall/templates/{tpl_id}/apply",
+            headers=headers,
+            json={
+                "targets": [
+                    {"node": "pve1", "vmid": 100, "connection_id": "conn-b"},
+                    {"node": "pve1", "vmid": 101, "connection_id": "conn-a"},
+                ],
+                "replace": True,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["applied"] == 2
+        assert asked == ["conn-b", "conn-a"]
+
+
+class TestErrorMapping:
+    """PVE 原文只进日志：解析类错误给可操作文案，5xx 给 trace，4xx 保留原文。"""
+
+    def test_unresolved_node_points_at_connection_and_hosts(self) -> None:
+        exc = ProxmoxError(
+            "hostname lookup 'node02' failed - failed to get address info for: "
+            "node02: Name or service not known",
+            500,
+        )
+        with pytest.raises(HTTPException) as caught:
+            firewall._raise(exc, "node02")
+        assert caught.value.status_code == 502
+        detail = str(caught.value.detail)
+        assert "node02" in detail
+        assert "/etc/hosts" in detail
+        assert "hostname lookup" not in detail
+
+    def test_other_5xx_is_hidden_behind_trace(self) -> None:
+        exc = ProxmoxError("storage '/var/lib/vz' is full", 500)
+        with pytest.raises(HTTPException) as caught:
+            firewall._raise(exc, "pve1")
+        assert caught.value.status_code == 502
+        detail = str(caught.value.detail)
+        assert "trace:" in detail
+        assert "/var/lib/vz" not in detail
+
+    def test_4xx_keeps_actionable_message(self) -> None:
+        exc = ProxmoxError("parameter verification failed - dport", 400)
+        with pytest.raises(HTTPException) as caught:
+            firewall._raise(exc, "pve1")
+        assert caught.value.status_code == 400
+        assert "dport" in str(caught.value.detail)
+
+    def test_detector_reads_the_node_name_from_pve_text(self) -> None:
+        text = "hostname lookup 'node02' failed"
+        assert pve_errors.is_unresolved(text)
+        assert pve_errors.unresolved_node(text) == "node02"
+        # 没有引号时也要认得出「是这类错误」，只是挖不到名字
+        assert pve_errors.is_unresolved("Name or service not known")
+        assert pve_errors.unresolved_node("Name or service not known") == ""
+        assert not pve_errors.is_unresolved("VM is locked (backup)")

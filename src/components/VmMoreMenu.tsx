@@ -29,6 +29,7 @@ import { OwnerAssignDialog } from './OwnerAssignDialog';
 import { ResetGuestPasswordDialog } from './ResetGuestPasswordDialog';
 import { VmExportDialog } from './VmExportDialog';
 import { formatBytes } from '../utils/format';
+import { migrationTargetNodes } from '../utils/clusterNodes';
 import { VmReinstallWizard, reinstallTargetOf } from './VmReinstallWizard';
 import {
   IconCopy,
@@ -434,25 +435,32 @@ function MigrateMiniDialog({
   const [online, setOnline] = useState(true);
   const [busy, setBusy] = useState(false);
 
+  /* 节点清单按**这台机器所属的连接**查：`/nodes` 在多套 PVE 下是合并返回的，
+     而迁移只能在同一个集群里换节点 —— 别的集群的节点搬不过去（见 utils/clusterNodes）。 */
   const nodesQuery = useQuery({
-    queryKey: ['nodes'],
-    queryFn: nodesApi.list,
+    queryKey: ['nodes', vm?.connection_id ?? ''],
+    queryFn: () => nodesApi.list(vm?.connection_id || undefined),
     enabled: Boolean(vm),
     staleTime: 60_000,
     retry: false,
   });
-  /* 排除当前节点：PVE 的 migrate 目标是另一台节点 */
-  const targets = (nodesQuery.data ?? []).filter((item) => item.node !== vm?.node);
+  /* 同集群、且不是当前节点：PVE 的 migrate 目标是另一台节点 */
+  const targets = migrationTargetNodes(nodesQuery.data, vm);
 
   useEffect(() => {
     if (!vm) return;
     setTarget('');
-    setOnline(vm.status === 'running');
+    /* 非 stopped 都默认勾上在线迁移：paused 也带着内存状态，PVE 同样拒绝
+       不带 online 的迁移（"can't migrate running VM without --online"） */
+    setOnline(vm.status !== 'stopped');
     setBusy(false);
   }, [vm?.node, vm?.vmid]);
 
+  /* 运行中的虚拟机不能用停机方式迁移：拦在提交前（后端同样会拦） */
+  const offlineBlocked = Boolean(vm) && vm?.status !== 'stopped' && !online;
+
   const submit = async () => {
-    if (!vm || !target) return;
+    if (!vm || !target || offlineBlocked) return;
     setBusy(true);
     try {
       await runner.run(
@@ -460,7 +468,9 @@ function MigrateMiniDialog({
         {
           title: t('vmMore.migrateTask', { name: vm.name || vm.vmid }),
           node: vm.node,
-          invalidate: [['vms'], ['nodes']],
+          /* 归属记录随机器搬到了新节点（后端 move_guest），按归属算的台数 / 额度
+             读数也要一起作废，否则会停在迁移前的口径。 */
+          invalidate: [['vms'], ['nodes'], ['cluster'], ['quota'], ['guests']],
         },
       );
       onDone();
@@ -491,7 +501,7 @@ function MigrateMiniDialog({
             variant="primary"
             onClick={() => void submit()}
             loading={busy}
-            disabled={!target}
+            disabled={!target || offlineBlocked}
           >
             {t('vmMore.migrateStart')}
           </Button>
@@ -515,6 +525,9 @@ function MigrateMiniDialog({
               label={t('vmMore.migrateOnline')}
               hint={t('vmMore.migrateOnlineHint')}
             />
+            {offlineBlocked ? (
+              <Notice tone="warning">{t('vmMore.migrateOfflineRunningWarn')}</Notice>
+            ) : null}
           </>
         ) : (
           <Notice tone="warning">{t('vmMore.migrateNoTarget')}</Notice>

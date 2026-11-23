@@ -11,7 +11,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from .. import alerting, hostaudit, hostscope, pve, security
-
+from ..vm_scope import bind_vm_connection
 from .vms import require_vm_access
 
 router = APIRouter(prefix="/api/host-audit", tags=["host-audit"])
@@ -38,6 +38,10 @@ async def hosts(
             "name": str(row.get("name") or row.get("host") or row.get("id")),
             "host": str(row.get("host") or ""),
             "local": str(row.get("id")) == "local",
+            # 面板下发的受管主机记着来源虚拟机：选择器据此显示 VMID 并支持按它搜索
+            "node": str(row.get("node") or ""),
+            "vmid": row.get("vmid"),
+            "conn_id": str(row.get("conn_id") or ""),
         }
         for row in rows
     ]
@@ -120,7 +124,14 @@ async def import_now(
     return summary
 
 
-@router.get("/vm/{node}/{vmid}", dependencies=[Depends(require_vm_access)])
+@router.get(
+    "/vm/{node}/{vmid}",
+    # 顺序要紧：先按机器定位到它真正所在的 PVE，再做归属校验。
+    # 反过来的话，归属校验用的是「当前连接」，那台 PVE 上没有这个节点 →
+    # 普通用户拿到 404（看起来像机器不存在）；管理员放行后又会在错连接上
+    # 解析 IP，同号 VMID 就把别人的登录记录当成本机的。
+    dependencies=[Depends(bind_vm_connection), Depends(require_vm_access)],
+)
 async def vm_view(
     node: str,
     vmid: int,

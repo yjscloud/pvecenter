@@ -9,8 +9,17 @@ from .. import security
 from ..nodeaccess import require_node_visible
 from ..pve import ProxmoxError, get_client
 from ..schemas import NetworkUpsert
+from ..vm_scope import bound_dependencies
 
-router = APIRouter(prefix="/api", tags=["network"])
+# 顺序要紧：先按节点定位到它真正所在的 PVE，再做可见性校验。
+# 反过来的话，可见性校验用的是「当前连接」，另一套集群上的节点会被判成 404；
+# 而写接口（新建 / 改 / 删 / reload / revert）若落到错连接，改的是另一台主机
+# 的网络配置 —— 比只读错更严重。
+router = APIRouter(
+    prefix="/api",
+    tags=["network"],
+    dependencies=[*bound_dependencies(), Depends(require_node_visible)],
+)
 
 
 def _raise(exc: ProxmoxError) -> None:
@@ -65,7 +74,6 @@ def _to_pve_payload(payload: NetworkUpsert) -> Dict[str, Any]:
 async def list_network(
     node: str,
     user: Dict[str, Any] = Depends(security.require_permission("network.view")),
-    _visible: None = Depends(require_node_visible),
 ) -> List[Dict[str, Any]]:
     client = get_client()
     try:

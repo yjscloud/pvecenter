@@ -86,6 +86,10 @@ export function SystemTemplatePicker({
     kind === 'vm' ? t('templatePicker.colMem') : t('templatePicker.colSize');
   const metaLabel =
     kind === 'vm' ? t('templatePicker.colDisk') : t('templatePicker.colStorage');
+  /* 虚拟机模板不报内存：模板自带的 maxmem 只是「当时建模板那台机器」的数值，
+     创建时的内存由规格决定（下一行「单台」写的就是它），两处都写反而要互相
+     校对。容器没有这一项（它的 sizeText 是压缩包大小，要留着）。 */
+  const showSize = kind !== 'vm';
   const groupName = `template-pick-${useId().replace(/:/g, '')}`;
   const [search, setSearch] = useState('');
   const [familyFilter, setFamilyFilter] = useState<OsFamilyKey | 'all'>('all');
@@ -203,7 +207,7 @@ export function SystemTemplatePicker({
             </div>
             <div className="os-current-meta">
               {osFamilyLabel(family, t)}
-              {selected.sizeText
+              {showSize && selected.sizeText
                 ? ` · ${sizeLabel} ${normalizeSizeText(selected.sizeText)}`
                 : ''}
               {selected.metaText
@@ -270,7 +274,9 @@ export function SystemTemplatePicker({
         <span className="os-row-scene" title={osFamilyScene(family, t)}>
           {osFamilyScene(family, t)}
         </span>
-        <span className="os-row-disk">{normalizeSizeText(item.sizeText)}</span>
+        {showSize ? (
+          <span className="os-row-disk">{normalizeSizeText(item.sizeText)}</span>
+        ) : null}
         <span className="os-row-used">{normalizeSizeText(item.metaText)}</span>
         <span className="os-row-tags">
           {(item.tags ?? []).map((tag) => (
@@ -285,8 +291,10 @@ export function SystemTemplatePicker({
 
   return (
     // is-tpl：本选择器的列模板（7 列，无版本列）只在它身上生效 ——
-    // 重装 / 更换模板两个选择器仍是 8 列，共用 .os-pick-list 但不能跟着变
-    <div className="os-pick is-compact is-tpl">
+    // 重装 / 更换模板两个选择器仍是 8 列，共用 .os-pick-list 但不能跟着变。
+    // is-tpl-vm：虚拟机模板少一列内存（见 showSize），列模板要跟着少一列，
+    // 否则表头与数据行各自算一次网格，后面的列会整体错位。
+    <div className={`os-pick is-compact is-tpl${showSize ? '' : ' is-tpl-vm'}`}>
       {/* ---- 工具条：平铺态只留标题与总数，多模板时才给搜索与收起 ---- */}
       <div className="os-pick-bar">
         <span className="os-pick-title">{t('templatePicker.listTitle')}</span>
@@ -376,7 +384,7 @@ export function SystemTemplatePicker({
             <span />
             <span>{t('templatePicker.colName')}</span>
             <span className="is-scene">{t('templatePicker.colScene')}</span>
-            <span className="is-disk">{sizeLabel}</span>
+            {showSize ? <span className="is-disk">{sizeLabel}</span> : null}
             <span className="is-used">{metaLabel}</span>
             <span />
           </div>
@@ -476,7 +484,7 @@ export function SystemTemplatePicker({
           <strong>{selected.name}</strong>
           <span className="os-pick-foot-meta">
             {osFamilyLabel(templateFamily(selected), t)}
-            {selected.sizeText
+            {showSize && selected.sizeText
               ? ` · ${sizeLabel} ${normalizeSizeText(selected.sizeText)}`
               : ''}
             {selected.metaText

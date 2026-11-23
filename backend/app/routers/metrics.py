@@ -30,6 +30,10 @@ async def read_metrics_history(
     scope: str = Query(default=metrics.SCOPE_NODE, pattern="^(node|guest)$"),
     node: Optional[str] = Query(default=None, description="只看某个节点"),
     vmid: Optional[int] = Query(default=None, ge=1, description="只看某台虚拟机/容器"),
+    connection_id: Optional[str] = Query(
+        default=None,
+        description="只看某条 PVE 连接（不传 = 全部；空串 = 默认连接）",
+    ),
     hours: int = Query(default=6, ge=1, le=MAX_HOURS),
     start: Optional[int] = Query(default=None, ge=0, description="起始 Unix 秒，优先于 hours"),
     end: Optional[int] = Query(default=None, ge=0, description="结束 Unix 秒，默认现在"),
@@ -84,11 +88,13 @@ async def read_metrics_history(
         step=metrics.pick_step(end_ts - start_ts, step),
         node=node,
         vmid=vmid,
+        connection_id=connection_id,
         owned_refs=owned_refs,
         max_series=max_series,
     )
     result["node"] = node
     result["vmid"] = vmid
+    result["connection_id"] = connection_id
     return result
 
 

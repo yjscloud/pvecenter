@@ -1319,6 +1319,9 @@ function UploadDialog({
         { node: storage.node, storage: storage.storage, content },
         file,
         (p) => setProgress(p),
+        /* 上传目标就是这行存储所在的 PVE：同名节点在两套集群里都叫 pve1 时，
+           只靠 node 推断会传错机器 */
+        storage.connection_id,
       );
       toast.success(
         t('storages.uploadOk'),

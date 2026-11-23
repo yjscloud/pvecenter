@@ -26,6 +26,7 @@ from .. import (
     guest_osinfo,
     i18n,
     ippool,
+    migrateguard,
     ownership,
     panelkey,
     quarantine_store,
@@ -516,19 +517,23 @@ async def collect_vms(
     # 的机器（那种机器在按人分配的那层额度里不算任何人，是一份白送的额度）。
     vm_owners = await ownership.owners_map(ownership.KIND_VM)
     ct_owners = await ownership.owners_map_for(ownership.KIND_CT)
+    # 「连接 + VMID」索引：迁移过的机器归属行还挂在旧节点下，精确 ref 取不到时
+    # 用它认领（VMID 在连接内唯一，见 ownership.identity_index）。
+    vm_owner_index = ownership.identity_index(vm_owners)
+    ct_owner_index = ownership.identity_index(ct_owners)
 
     def _owner_of(item: Dict[str, Any]) -> str:
-        owners = ct_owners if str(item.get("type") or "qemu") == "lxc" else vm_owners
-        return (
-            owners.get(
-                ownership.vm_ref(
-                    str(item.get("connection_id") or ""),
-                    str(item.get("node") or ""),
-                    item.get("vmid"),
-                )
-            )
-            or ""
+        is_ct = str(item.get("type") or "qemu") == "lxc"
+        owners, index = (ct_owners, ct_owner_index) if is_ct else (vm_owners, vm_owner_index)
+        conn = str(item.get("connection_id") or "")
+        vmid = str(item.get("vmid") or "")
+        found = owners.get(
+            ownership.vm_ref(conn, str(item.get("node") or ""), vmid)
         )
+        if found:
+            return found
+        # 旧版本记录的连接前缀是 "-"（当时用的是「当前连接」）
+        return index.get((conn, vmid)) or index.get(("-", vmid)) or ""
 
     region_admin = security.is_region_admin(user)
     if owner is not None:
@@ -2693,21 +2698,50 @@ async def migrate_vm(
     user: Dict[str, Any] = Depends(security.require_permission("vm.migrate")),
 ) -> Dict[str, Any]:
     client = get_client()
+    connection_id = _op_connection()
     try:
-        result = await client.qemu_migrate(
-            node, vmid, payload.target_node, payload.online
+        # 目标节点必须与源节点同属一个 PVE 集群：多套 PVE 合并的节点清单里有别的
+        # 集群的节点名，选中之后 PVE 只会回一句看不懂的错误（见 migrateguard）。
+        target = await migrateguard.ensure_target_node(
+            client, node, payload.target_node
         )
+        # 节点级可见性：界面上这些节点本来就不出现在下拉里，接口必须同一口径
+        await security.ensure_node_allowed(user, connection_id, target)
+
+        # 关机的虚拟机才能用停机方式迁移。PVE 对运行中的虚拟机会回英文原文
+        # "can't migrate running VM without --online"，用户只看到一句「迁移失败」。
+        # 这里先读状态拦下来（paused 也算运行中：它一样带着内存状态，PVE 同样拒），
+        # 明确告诉用户该勾在线迁移还是先关机。
+        if not payload.online:
+            status = await client.qemu_status(node, vmid) or {}
+            if str(status.get("status") or "") != "stopped":
+                detail = migrateguard.offline_blocked_detail(vmid)
+                await security.audit(
+                    request, user, "vm.migrate", target=f"{node}/{vmid}",
+                    result="failed", detail=detail,
+                )
+                raise HTTPException(status_code=409, detail=detail)
+
+        result = await client.qemu_migrate(node, vmid, target, payload.online)
     except ProxmoxError as exc:
+        # 兜底：前置校验没覆盖到的 PVE 英文原文（本地盘、目标缺存储、
+        # 状态在探测之后又变了…）在这里翻成可操作的中文
+        mapped = migrateguard.qemu_migrate_detail(exc, vmid)
         await security.audit(
             request, user, "vm.migrate", target=f"{node}/{vmid}",
-            result="failed", detail=exc.message,
+            result="failed", detail=mapped or exc.message,
         )
+        if mapped:
+            raise HTTPException(status_code=409, detail=mapped) from exc
         _raise(exc)
 
+    # 归属记录跟着机器走：ref 的第二段是节点名，不搬的话迁移一完成这台机器在普通
+    # 用户的列表里就"消失"了（人没变，只是位置变了）。迁移任务还在跑，不能等它。
+    moved = await migrateguard.carry_ownership(connection_id, node, target, vmid)
     task = result if isinstance(result, str) else (result or {}).get("task", "")
     await security.audit(
         request, user, "vm.migrate", target=f"{node}/{vmid}",
-        detail={"target": payload.target_node, "online": payload.online},
+        detail={"target": target, "online": payload.online, "ownership": moved},
     )
     return {"task": task}
 
@@ -2855,28 +2889,33 @@ async def _require_snapshot_access(
     vmid: int,
     name: str,
     kind: str = ownership.KIND_VM,
+    connection_id: str = "",
 ) -> None:
     """快照级隔离：普通用户只能操作「自己创建的」或「自己名下机器上（旧版本
     创建、无归属记录）的」快照；既非创建者也非归属机器的拒绝。
 
     ``kind`` 决定回落判定看哪类机器的归属：虚拟机是 ``KIND_VM``，容器是
     ``KIND_CT``（见 :func:`app.routers.lxc.rollback_container_snapshot`）。
+
+    ``connection_id`` 是这台机器所在的连接：批量端点没有路径参数，路由级绑定
+    不生效，必须由调用方逐条传入，否则同号 VMID 会拿另一套集群的归属来判。
     """
     scope = security.visible_owner(user)
     if scope is None:
         return
+    conn = connection_id or _op_connection()
     # 区域管理员：本区域机器上的快照同样归他管（路由级 require_vm_access 已按
     # 区域放行，这里若继续按「快照创建者」判定，会出现「进得了详情、点不开快照」）
     if security.is_region_admin(user) and security.region_in_scope(
-        user, store.connection_region(_op_connection())
+        user, store.connection_region(conn)
     ):
         return
-    ref = ownership.snapshot_ref(_op_connection(), node, vmid, name)
+    ref = ownership.snapshot_ref(conn, node, vmid, name)
     owner = await ownership.get_owner(ownership.KIND_SNAPSHOT, ref)
     if owner is None:
         # 旧版本创建的快照没有归属记录：回落到所属机器的归属判定
         owners = await ownership.owners_map_for(kind)
-        owner = ownership.vm_owner_from(owners, node, vmid, _op_connection())
+        owner = ownership.vm_owner_from(owners, node, vmid, conn)
     if owner != scope:
         raise HTTPException(
             status_code=403,
@@ -3126,10 +3165,10 @@ async def bulk_delete_snapshots(
     返回形状与 ``/vms/bulk`` 一致（``{action,total,ok,failed,results[]}``），
     前端「批量结果」组件可以直接复用。
     """
-    client = get_client()
 
     async def _one(item: Any) -> Dict[str, Any]:
         node, vmid, name = item.node, int(item.vmid), item.name
+        conn_id = str(getattr(item, "connection_id", "") or "")
         is_lxc = item.type == "lxc"
         record: Dict[str, Any] = {
             "node": node,
@@ -3153,6 +3192,7 @@ async def bulk_delete_snapshots(
             return record
 
         try:
+            client = client_for_connection(conn_id) if conn_id else get_client()
             # 快照级隔离：普通用户只能删自己的 / 自己名下机器上的快照
             await _require_snapshot_access(
                 user,
@@ -3160,6 +3200,7 @@ async def bulk_delete_snapshots(
                 vmid,
                 name,
                 ownership.KIND_CT if is_lxc else ownership.KIND_VM,
+                conn_id,
             )
             delete = (
                 client.lxc_snapshot_delete if is_lxc else client.qemu_snapshot_delete
@@ -3168,7 +3209,7 @@ async def bulk_delete_snapshots(
             task = result if isinstance(result, str) else (result or {}).get("task", "")
             await ownership.delete_owner(
                 ownership.KIND_SNAPSHOT,
-                ownership.snapshot_ref(_op_connection(), node, vmid, name),
+                ownership.snapshot_ref(conn_id or _op_connection(), node, vmid, name),
             )
             await security.audit(
                 request, user, "snapshot.delete", target=target,
@@ -3302,10 +3343,9 @@ async def bulk_restore_snapshots(
     还原前不强制关机（PVE 允许对运行中的机器还原，但**当前内存与磁盘状态会丢失**），
     界面负责把这件事说清楚，服务端只保证「按用户点的那份快照执行」。
     """
-    client = get_client()
-
     async def _one(item: Any) -> Dict[str, Any]:
         node, vmid, name = item.node, int(item.vmid), item.name
+        conn_id = str(getattr(item, "connection_id", "") or "")
         is_lxc = item.type == "lxc"
         record: Dict[str, Any] = {
             "node": node,
@@ -3334,12 +3374,14 @@ async def bulk_restore_snapshots(
             return record
 
         try:
+            client = client_for_connection(conn_id) if conn_id else get_client()
             await _require_snapshot_access(
                 user,
                 node,
                 vmid,
                 name,
                 ownership.KIND_CT if is_lxc else ownership.KIND_VM,
+                conn_id,
             )
             list_snaps = (
                 client.lxc_snapshots if is_lxc else client.qemu_snapshots
@@ -3363,7 +3405,9 @@ async def bulk_restore_snapshots(
             for gone in _discarded_snapshot_names(snaps, name):
                 await ownership.delete_owner(
                     ownership.KIND_SNAPSHOT,
-                    ownership.snapshot_ref(_op_connection(), node, vmid, gone),
+                    ownership.snapshot_ref(
+                        conn_id or _op_connection(), node, vmid, gone
+                    ),
                 )
 
             await security.audit(
@@ -3498,9 +3542,10 @@ async def all_snapshots(
     # 快照级用户隔离：创建者标记优先；无标记（旧版本创建）时按所属机器归属回落。
     # 虚拟机看 KIND_VM、容器看 KIND_CT，逐台按 type 选表。
     scope = security.visible_owner(user)
-    # 区域管理员：当前连接属于他的区域就放开快照过滤（越区直接拒绝）；这页只读
-    # 一条连接，区域外的机器本来就不会出现在他的连接清单里
-    if security.is_region_admin(user):
+    # 区域管理员：当前连接属于他的区域就放开快照过滤（越区直接拒绝）；这页对他们
+    # 仍只读一条连接 —— fan-out 会跨区域，边界先保持原样。
+    regional = security.is_region_admin(user)
+    if regional:
         security.ensure_region_allowed(user, _op_connection())
         scope = None
 
@@ -3509,28 +3554,14 @@ async def all_snapshots(
     key = f"snapshots:{connection or '-'}:{scope or '-'}:{viewer}"
 
     async def _collect() -> List[Dict[str, Any]]:
-        client = get_client()
-        try:
-            resources = await client.cluster_resources("vm")
-        except ProxmoxError as exc:
-            _raise(exc)
-
-        # 容器同样有快照（只是没有 vmstate），一并汇总进来
-        vms = [r for r in (resources or []) if r.get("type") in ("qemu", "lxc")]
-
-        def _snapshots_of(vm: Dict[str, Any]) -> Any:
-            node, vmid = vm["node"], vm["vmid"]
-            if vm.get("type") == "lxc":
-                return client.lxc_snapshots(node, vmid)
-            return client.qemu_snapshots(node, vmid)
-
-        coros = [
-            _snapshots_of(vm)
-            for vm in vms
-            if vm.get("node") and vm.get("vmid")
-        ]
-        limit = max(1, int(settings.pve_snapshot_concurrency))
-        results = await parallel(coros, limit=limit)
+        # 目标连接：硬指定了就只读那一条（顶栏选中的集群）；否则**合并全部**。
+        # 只读一条的话，页头写着「全局」却只显示一套集群的快照，另一套的机器
+        # 就像根本没有快照 —— 与 /nodes、/vms 的「同级合并」口径不一致。
+        targets = (
+            [(None, get_client())]
+            if (connection or regional)
+            else collection_targets()
+        )
 
         # 三张归属表一次取回：快照标记 / 虚拟机 / 容器读的是同一张表，
         # 分成三次调用只是三次独立的 DB 往返。
@@ -3543,40 +3574,73 @@ async def all_snapshots(
         # （与 owners_map_for(KIND_CT) 同一语义）
         ct_owners = {**vm_owners, **maps.get(ownership.KIND_CT, {})}
 
+        limit = max(1, int(settings.pve_snapshot_concurrency))
         output: List[Dict[str, Any]] = []
-        for vm, snaps in zip(vms, results):
-            if isinstance(snaps, Exception):
+        for profile, client in targets:
+            conn_id = str((profile or {}).get("id") or "")
+            try:
+                resources = await client.cluster_resources("vm")
+            except ProxmoxError as exc:
+                if len(targets) == 1:
+                    _raise(exc)
+                # 单条连接不可达只跳过它自己：不能让一套集群掉线把整页清空
+                logger.warning("汇总快照：连接 %s 读取失败：%s", conn_id, exc.message)
                 continue
-            vm_node = str(vm.get("node") or "")
-            owners = ct_owners if vm.get("type") == "lxc" else vm_owners
-            vm_owner = ownership.vm_owner_from(
-                owners, vm_node, vm.get("vmid"), connection
-            )
-            for snap in snaps or []:
-                name = snap.get("name")
-                if not name or name == "current":
+
+            # 容器同样有快照（只是没有 vmstate），一并汇总进来
+            vms = [r for r in (resources or []) if r.get("type") in ("qemu", "lxc")]
+
+            def _snapshots_of(vm: Dict[str, Any], _client: Any = client) -> Any:
+                node, vmid = vm["node"], vm["vmid"]
+                if vm.get("type") == "lxc":
+                    return _client.lxc_snapshots(node, vmid)
+                return _client.qemu_snapshots(node, vmid)
+
+            coros = [
+                _snapshots_of(vm)
+                for vm in vms
+                if vm.get("node") and vm.get("vmid")
+            ]
+            results = await parallel(coros, limit=limit)
+
+            for vm, snaps in zip(vms, results):
+                if isinstance(snaps, Exception):
                     continue
-                owner = snap_owners.get(
-                    ownership.snapshot_ref(connection, vm_node, vm.get("vmid"), name)
-                ) or vm_owner
-                if scope is not None and owner != scope:
-                    continue
-                output.append(
-                    {
-                        "node": vm.get("node"),
-                        "vmid": vm.get("vmid"),
-                        "vm_name": vm.get("name") or f"VM {vm.get('vmid')}",
-                        # 前端据此跳到虚拟机页还是容器页
-                        "vm_type": vm.get("type") or "qemu",
-                        "vm_status": vm.get("status"),
-                        "name": name,
-                        "description": snap.get("description", ""),
-                        "snaptime": snap.get("snaptime"),
-                        "parent": snap.get("parent"),
-                        "vmstate": pve_flag(snap.get("vmstate", 0)) == 1,
-                        "owner": owner,
-                    }
+                vm_node = str(vm.get("node") or "")
+                owners = ct_owners if vm.get("type") == "lxc" else vm_owners
+                # 归属按**这台机器所在的连接**算：两套集群有同名节点 + 同号 VMID 时，
+                # 用「当前连接」去拼 ref 会把另一台机器的快照算到这个用户名下。
+                vm_owner = ownership.vm_owner_from(
+                    owners, vm_node, vm.get("vmid"), conn_id
                 )
+                for snap in snaps or []:
+                    name = snap.get("name")
+                    if not name or name == "current":
+                        continue
+                    owner = snap_owners.get(
+                        ownership.snapshot_ref(conn_id, vm_node, vm.get("vmid"), name)
+                    ) or vm_owner
+                    if scope is not None and owner != scope:
+                        continue
+                    output.append(
+                        {
+                            # 这一行属于哪套集群：前端跳详情页 / 批量操作要带上它，
+                            # 否则同名节点会落到另一台主机。
+                            "connection_id": conn_id,
+                            "node": vm.get("node"),
+                            "vmid": vm.get("vmid"),
+                            "vm_name": vm.get("name") or f"VM {vm.get('vmid')}",
+                            # 前端据此跳到虚拟机页还是容器页
+                            "vm_type": vm.get("type") or "qemu",
+                            "vm_status": vm.get("status"),
+                            "name": name,
+                            "description": snap.get("description", ""),
+                            "snaptime": snap.get("snaptime"),
+                            "parent": snap.get("parent"),
+                            "vmstate": pve_flag(snap.get("vmstate", 0)) == 1,
+                            "owner": owner,
+                        }
+                    )
 
         output.sort(key=lambda s: s.get("snaptime") or 0, reverse=True)
         return output

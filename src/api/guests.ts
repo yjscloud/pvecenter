@@ -127,10 +127,31 @@ export const guestsApi = {
       ? lxcApi.delete(g.node, g.vmid, purge)
       : vmsApi.delete(g.node, g.vmid, purge),
 
-  migrate: (g: GuestRef, targetNode: string, online = false) =>
+  /**
+   * 迁移。
+   *
+   * 两边的选项语义不同：虚拟机 `online` 是在线迁移（不停机）；容器**没有在线
+   * 迁移**（PVE 会回 ``lxc live migration is currently not implemented``），
+   * 只有 `restart` —— 迁完在目标节点自动拉起。所以这里收成一个两边都能表达
+   * 的选项对象，按类型取用，绝不把 `online` 塞进容器端点。
+   *
+   * `restart` 缺失时沿用 `online` 的意图（与批量迁移后端一致：批量那边也是把
+   * 「在线」翻译成「迁完启动」，见 backend/app/bulk.py）。
+   */
+  migrate: (
+    g: GuestRef,
+    targetNode: string,
+    options: { online?: boolean; restart?: boolean } = {},
+  ) =>
     isLxc(g)
-      ? lxcApi.migrate(g.node, g.vmid, { target_node: targetNode, online })
-      : vmsApi.migrate(g.node, g.vmid, { target_node: targetNode, online }),
+      ? lxcApi.migrate(g.node, g.vmid, {
+          target_node: targetNode,
+          restart: options.restart ?? options.online ?? false,
+        })
+      : vmsApi.migrate(g.node, g.vmid, {
+          target_node: targetNode,
+          online: options.online ?? false,
+        }),
 
   snapshots: (g: GuestRef): Promise<Snapshot[]> =>
     isLxc(g) ? lxcApi.snapshots(g.node, g.vmid) : vmsApi.snapshots(g.node, g.vmid),

@@ -41,11 +41,11 @@ export interface TemplatePickItem {
   node?: string;
   /** 家族判定的兜底依据（PVE 的 ostype，可能为空） */
   ostype?: string | null;
-  /** 模板自带的核数（只有虚拟机模板有；提交摘要的「模板信息」会用到） */
+  /** 模板自带的核数（只有虚拟机模板有）。摘要与选择器都不再展示：核数由规格决定 */
   cores?: number;
   /** 虚拟机模板的 VMID（只有虚拟机模板有，用来点明选的是哪一张） */
   vmid?: number;
-  /** 第一列：内存 / 模板大小 */
+  /** 第一列：内存 / 模板大小。内存这一列虚拟机模板已不展示，容器模板仍报大小 */
   sizeText?: string;
   /** 第二列：磁盘 / 存储 */
   metaText?: string;

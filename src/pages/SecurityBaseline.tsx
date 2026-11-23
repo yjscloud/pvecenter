@@ -604,12 +604,16 @@ export function SecurityBaseline() {
 
   const hostOptions = useMemo(
     () =>
-      hosts.map((host) => ({
-        label: host.local
+      hosts.map((host) => {
+        const base = host.local
           ? `${t('baseline.localOption')}（${host.name}）`
-          : host.name || host.address,
-        value: host.id,
-      })),
+          : host.name || host.address;
+        /* 面板下发的受管主机对应一台虚拟机：带上 VMID，选择器就能按它搜索 */
+        return {
+          label: host.vmid != null ? `${base}（VMID ${host.vmid}）` : base,
+          value: host.id,
+        };
+      }),
     [hosts, t],
   );
 
@@ -972,6 +976,7 @@ export function SecurityBaseline() {
                     : []
               }
               style={{ maxWidth: 280 }}
+              searchable
             />
           ) : null}
 

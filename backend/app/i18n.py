@@ -309,6 +309,27 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "zh-CN": "虚拟机 {vmid} 处于隔离状态，请先在「应急响应」页解除隔离后再删除",
         "en": "VM {vmid} is isolated. Release the isolation on the Incident Response page before deleting it",
     },
+    "isolation.error.stateRead": {
+        "zh-CN": "读取虚拟机状态失败，请稍后重试（trace: {trace}）",
+        "en": "Could not read the VM status; try again shortly (trace: {trace})",
+    },
+    # ---- PVE 报错的统一口径（见 app/pve_errors.py）----
+    # 节点名被当成主机名解析：多连接部署里基本等于「请求打错了 PVE」，必须给一句
+    # 能照着做的话，而不是把 PVE 的英文原文透传出去。
+    "pve.error.nodeUnresolved": {
+        "zh-CN": "节点 {node} 在当前 PVE 上不存在或无法解析：这台机器可能属于另一条 "
+        "PVE 连接，请确认它所在的连接（或切换顶栏集群作用域），并检查该 PVE 各节点的 "
+        "/etc/hosts 是否包含短主机名（{node}）。",
+        "en": "Node {node} does not exist on the current PVE or cannot be resolved. "
+        "This machine probably belongs to another PVE connection — check which "
+        "connection it lives on (or switch the cluster scope in the top bar), and make "
+        "sure each PVE node's /etc/hosts contains the short hostname ({node}).",
+    },
+    "pve.error.requestFailed": {
+        "zh-CN": "PVE 返回了错误，请稍后重试；若持续失败，把 trace 与发生时间告诉管理员（trace: {trace}）",
+        "en": "PVE returned an error; try again shortly. If it keeps failing, give an "
+        "administrator the trace and the time it happened (trace: {trace})",
+    },
     # ---- SSH 安全：日志来源与 fail2ban 提示 ----
     "ssh.logUnreadable": {
         "zh-CN": "日志文件存在但当前用户读不到（需要 root）",

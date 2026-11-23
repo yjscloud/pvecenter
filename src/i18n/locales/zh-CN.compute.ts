@@ -177,6 +177,8 @@ export const zhCompute = {
   'vmMore.migratePlaceholder': '请选择节点',
   'vmMore.migrateOnline': '在线迁移',
   'vmMore.migrateOnlineHint': '虚拟机保持运行；需要共享存储，本地存储的虚拟机必须先关机',
+  'vmMore.migrateOfflineRunningWarn':
+    '虚拟机正在运行，无法以停机方式迁移：请开启「在线迁移」，或先关机再迁移',
   'vmMore.migrateNoTarget': '除当前节点外，集群里没有其他在线节点，无法迁移。',
   'vmMore.migrateStart': '开始迁移',
   'vmMore.migrateTask': '迁移「{name}」',
@@ -1433,9 +1435,13 @@ export const zhCompute = {
   'lxcMore.assignOwner': '指派归属',
   'lxcMore.migrate': '迁移到其他节点',
   'lxcMore.migrateTitle': '迁移到其他节点',
-  'lxcMore.migrateOnlineHint': '容器保持运行；需要共享存储，本地存储的容器必须先关机',
-  'lxcMore.migrateRestart': '失败时在原节点重启',
-  'lxcMore.migrateRestartHint': '在线迁移失败时把容器在原节点重新拉起，避免服务一直悬着',
+  /* LXC 没有在线迁移：文案里不要出现「在线 / 保持运行」，避免给 PVE 做不到的承诺 */
+  'lxcMore.migrateDowntime': 'LXC 不支持在线迁移：迁移期间容器会停机，服务短暂中断',
+  'lxcMore.migrateStartAfter': '迁移完成后启动',
+  'lxcMore.migrateRestartRequired':
+    '运行中的容器迁移后必须在目标节点启动：LXC 没有在线迁移，PVE 只接受「迁移后启动」',
+  'lxcMore.migrateStopFirstHint': '若希望迁移后保持停机，请先停止容器，再执行迁移',
+  'lxcMore.migrateStopped': '容器当前已停机，迁移后仍保持停机',
   'lxcMore.migrateTask': '迁移「{name}」',
   'lxcMore.deleteCt': '删除容器',
   'lxcDetail.tfHour': '小时',
@@ -2409,6 +2415,8 @@ export const zhCompute = {
   'guestList.migrate.targetLabel': '目标节点',
   'guestList.migrate.targetPlaceholder': '请选择目标节点',
   'guestList.migrate.online': '在线迁移（不停机，需要共享存储或本地磁盘迁移支持）',
+  'guestList.migrate.offlineRunningWarn':
+    '虚拟机正在运行，无法以停机方式迁移：请勾选「在线迁移」，或先关机再迁移',
   'guestList.snap.title': '新建快照',
   'guestList.snap.task': '创建快照「{name}」',
   'guestList.snap.nameLabel': '快照名称',
@@ -2433,6 +2441,10 @@ export const zhCompute = {
   'guestList.bulkDialog.tagReplaceHint': '用这里的标签替换掉原有的',
   'guestList.bulkDialog.onlineMigrate': '在线迁移',
   'guestList.bulkDialog.onlineMigrateHint': '不停机；需要共享存储或本地磁盘迁移支持',
+  'guestList.bulkDialog.offlineRunningWarn':
+    '未勾选在线迁移时，选中的运行中虚拟机会逐台被拒绝（停机迁移要求虚拟机已关机）',
+  'guestList.bulkDialog.ctRestartNotice':
+    '运行中的容器会在目标节点自动启动；已停止的容器迁移后仍保持停机',
   'guestList.bulkDialog.migrateWarnTitle': '已在目标节点上的机器会失败',
   'guestList.bulkDialog.migrateWarnDesc': '后端不会替你过滤：已经在目标节点的机器 PVE 会直接报错，结果清单里会写明是哪几台。',
   'guestList.bulkDialog.balloonLabel': '最低保留内存（MB）',

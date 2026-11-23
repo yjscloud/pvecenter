@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import uuid
@@ -21,8 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
-from .. import i18n, security, store
-from ..pve import ProxmoxError, get_client
+from .. import i18n, pve_errors, security, store
+from ..pve import ProxmoxError, client_for_connection, get_client, requested_connection
 from ..schemas import (
     FirewallApplyIn,
     FirewallGroupIn,
@@ -32,9 +33,21 @@ from ..schemas import (
     FirewallRuleIn,
     FirewallTemplateIn,
 )
+from ..vm_scope import bound_dependencies, resolve_vm_connection
 from .vms import require_ct_access, require_vm_access
 
-router = APIRouter(prefix="/api", tags=["firewall"])
+logger = logging.getLogger(__name__)
+
+#: 防火墙的寻址参数全是**查询参数**（``?node=&vmid=``），当初整组漏了绑定：
+#: 请求落到顶栏作用域 / 兜底连接，在另一套 PVE 上把节点名当主机名解析，回
+#: ``hostname lookup 'node02' failed``。``bound_dependencies()`` 是「按机器 /
+#: 节点寻址」接口的标准顺序（先 VM 后节点，见 app/vm_scope.py）。
+#: ``cluster`` 作用域两个参数都没有，推断不出来 —— 由前端硬指定连接。
+router = APIRouter(
+    prefix="/api",
+    tags=["firewall"],
+    dependencies=bound_dependencies(),
+)
 
 # 规则模板存在 settings KV 里（与其他面板侧配置一致）
 TEMPLATES_KEY = "firewall_templates"
@@ -73,11 +86,34 @@ _VM_KIND_TTL = 30.0
 _vm_kind_cache: Dict[str, Tuple[float, str]] = {}
 
 
-def _raise(exc: ProxmoxError) -> None:
-    raise HTTPException(
-        status_code=exc.status_code if exc.status_code < 600 else 500,
-        detail=exc.message,
-    )
+def _raise(exc: ProxmoxError, node: str = "") -> None:
+    """防火墙接口的错误出口：PVE 原文只进日志，对外给可操作的话 + trace id。
+
+    * 节点名解析失败（``hostname lookup 'x' failed``）→ 502 + 点名节点，告诉用户
+      去确认所属连接 / 检查 /etc/hosts —— 这不是 DNS 坏了，是多连接下打错了 PVE；
+    * PVE 5xx → 502 + trace id（原文里可能带宿主机路径，不能透传）；
+    * 4xx → 保留状态码与原文（参数写错、权限不足这类提示本身就是给用户看的）。
+    """
+    raw = str(getattr(exc, "message", "") or exc)
+    if pve_errors.is_unresolved(raw):
+        raise HTTPException(
+            status_code=502,
+            detail=i18n.t(
+                "pve.error.nodeUnresolved",
+                node=pve_errors.unresolved_node(raw) or node,
+            ),
+        )
+    status = exc.status_code if exc.status_code < 600 else 500
+    if status >= 500:
+        trace = uuid.uuid4().hex[:12]
+        logger.warning(
+            "防火墙请求失败 node=%s trace=%s：%s", node or "-", trace, raw
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=i18n.t("pve.error.requestFailed", trace=trace),
+        )
+    raise HTTPException(status_code=status, detail=raw)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -92,9 +128,17 @@ def _as_bool(value: Any, default: bool = False) -> bool:
         return bool(value)
 
 
-async def _vm_kind(node: str, vmid: int) -> str:
-    """这台机器是虚拟机（qemu）还是容器（lxc）。"""
-    cache_key = f"{node}/{vmid}"
+async def _vm_kind(
+    node: str, vmid: int, *, conn_id: str = "", client: Any = None
+) -> str:
+    """这台机器是虚拟机（qemu）还是容器（lxc）。
+
+    ``conn_id`` / ``client`` 只在**批量下发**这种「一次请求里跨多条连接」的场景
+    显式传入：那时不能用请求级 ContextVar 表达「这一台在哪」，缓存键也必须带上
+    连接 —— 否则两台 PVE 上的同名节点 + 同号机器会共用一条错误结论。
+    """
+    cid = conn_id or requested_connection()
+    cache_key = f"{cid}:{node}/{vmid}"
     now = time.time()
     hit = _vm_kind_cache.get(cache_key)
     if hit and hit[0] > now:
@@ -102,7 +146,7 @@ async def _vm_kind(node: str, vmid: int) -> str:
 
     kind = "qemu"
     try:
-        resources = await get_client().cluster_resources("vm")
+        resources = await (client or get_client()).cluster_resources("vm")
     except ProxmoxError:
         resources = []
     for item in resources or []:
@@ -281,9 +325,14 @@ def _norm_options(raw: Dict[str, Any], scope: str) -> Dict[str, Any]:
     return out
 
 
-async def _firewall_warning(kind: str, node: str, vmid: int) -> str:
-    """网卡没开 ``firewall=1`` 时规则其实不生效 —— 提前告诉用户，别让他以为配好了。"""
-    client = get_client()
+async def _firewall_warning(
+    kind: str, node: str, vmid: int, client: Any = None
+) -> str:
+    """网卡没开 ``firewall=1`` 时规则其实不生效 —— 提前告诉用户，别让他以为配好了。
+
+    ``client`` 由批量下发逐台传入（目标可能分布在不同的 PVE 连接上）。
+    """
+    client = client or get_client()
     try:
         if kind == "qemu":
             cfg = await client.qemu_config(node, vmid)
@@ -313,7 +362,7 @@ async def list_rules(
     try:
         rows = await client.get(f"{base}/rules")
     except ProxmoxError as exc:
-        _raise(exc)
+        _raise(exc, node)
     return [_norm_rule(r) for r in (rows or [])]
 
 
@@ -343,7 +392,7 @@ async def create_rule(
             result="failed",
             detail=exc.message,
         )
-        _raise(exc)
+        _raise(exc, node)
     await security.audit(
         request, user, "firewall.rule.create", target=_target(scope, node, vmid), detail=data
     )
@@ -377,7 +426,7 @@ async def update_rule(
             result="failed",
             detail=exc.message,
         )
-        _raise(exc)
+        _raise(exc, node)
     await security.audit(
         request,
         user,
@@ -405,7 +454,7 @@ async def delete_rule(
     try:
         await client.delete(f"{base}/rules/{pos}")
     except ProxmoxError as exc:
-        _raise(exc)
+        _raise(exc, node)
     await security.audit(
         request, user, "firewall.rule.delete", target=_target(scope, node, vmid, pos)
     )
@@ -431,7 +480,7 @@ async def move_rule(
     try:
         await client.put(f"{base}/rules/{pos}", data={"move": to})
     except ProxmoxError as exc:
-        _raise(exc)
+        _raise(exc, node)
     await security.audit(
         request,
         user,
@@ -467,7 +516,7 @@ async def get_options(
     try:
         raw = await client.get(f"{base}/options")
     except ProxmoxError as exc:
-        _raise(exc)
+        _raise(exc, node)
     return _norm_options(raw or {}, scope)
 
 
@@ -497,7 +546,7 @@ async def update_options(
             result="failed",
             detail=exc.message,
         )
-        _raise(exc)
+        _raise(exc, node)
     await security.audit(
         request, user, "firewall.options.update", target=_target(scope, node, vmid), detail=data
     )
@@ -925,7 +974,7 @@ async def apply_template(
     except (ValidationError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=f"模板规则不合法：{exc}") from exc
 
-    client = get_client()
+    owner = security.visible_owner(user)
     results: List[Dict[str, Any]] = []
     for target in payload.targets:
         item: Dict[str, Any] = {
@@ -938,9 +987,36 @@ async def apply_template(
             "error": "",
         }
         try:
+            # 这台目标在哪条 PVE 上：前端列表行带了 connection_id（首选）；
+            # 老客户端没带时按「归属表 + 逐台探测」补一次 —— 与单机接口的
+            # bind_vm_connection 同源。一次请求里可能跨多套 PVE，不能在循环外
+            # 共用一个 get_client()（那正是「hostname lookup 'node02' failed」的成因）。
+            conn_id = str(target.connection_id or "")
+            client: Any = None
+            if conn_id:
+                try:
+                    client = client_for_connection(conn_id)
+                except ProxmoxError:
+                    # 连接被删 / id 过期：清掉，让下面的推断重新定位
+                    conn_id = ""
+            if client is None:
+                try:
+                    conn_id = await resolve_vm_connection(
+                        target.node, target.vmid, owner
+                    )
+                except Exception:  # noqa: BLE001 - 定位失败沿用当前连接，让 PVE 报真实错误
+                    logger.debug(
+                        "批量下发定位连接失败：%s/%s", target.node, target.vmid,
+                        exc_info=True,
+                    )
+                    conn_id = ""
+                client = client_for_connection(conn_id)
+
             kind = (target.type or "").strip().lower()
             if kind not in ("qemu", "lxc"):
-                kind = await _vm_kind(target.node, target.vmid)
+                kind = await _vm_kind(
+                    target.node, target.vmid, conn_id=conn_id, client=client
+                )
             # 逐台判权限与归属：普通用户只能操作自己名下的机器，且容器用
             # ct.firewall.manage + KIND_CT，虚拟机用 firewall.manage + KIND_VM
             needed = "ct.firewall.manage" if kind == "lxc" else "firewall.manage"
@@ -977,12 +1053,21 @@ async def apply_template(
             if options:
                 await client.put(f"{base}/options", data=options)
 
-            item["warning"] = await _firewall_warning(kind, target.node, target.vmid)
+            item["warning"] = await _firewall_warning(
+                kind, target.node, target.vmid, client
+            )
             item["ok"] = True
         except HTTPException as exc:
             item["error"] = str(exc.detail)
         except ProxmoxError as exc:
-            item["error"] = exc.message
+            # 逐台失败：解析类错误给可操作文案，其余保留 PVE 原文便于定位到具体机器
+            if pve_errors.is_unresolved(exc):
+                item["error"] = i18n.t(
+                    "pve.error.nodeUnresolved",
+                    node=pve_errors.unresolved_node(exc) or target.node,
+                )
+            else:
+                item["error"] = exc.message
 
         results.append(item)
 

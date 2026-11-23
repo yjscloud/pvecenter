@@ -34,7 +34,9 @@ from .. import (
     guestnotify,
     guest_osinfo,
     guestpasswd,
+    i18n,
     ippool,
+    migrateguard,
     ownership,
     pvecache,
     prefs,
@@ -263,18 +265,16 @@ async def list_containers(
     # 与 /vms 同一套：容器同样要在每行回填归属人（见那边的说明），
     # 否则管理员在这一页看不出哪台是「无人认领」的
     owners = await ownership.owners_map_for(ownership.KIND_CT)
+    # 「连接 + VMID」索引：迁移过的容器归属行还挂在旧节点下（见 /vms 同一段说明）
+    owner_index = ownership.identity_index(owners)
 
     def _owner_of(item: Dict[str, Any]) -> str:
-        return (
-            owners.get(
-                ownership.vm_ref(
-                    str(item.get("connection_id") or ""),
-                    str(item.get("node") or ""),
-                    item.get("vmid"),
-                )
-            )
-            or ""
-        )
+        conn = str(item.get("connection_id") or "")
+        vmid = str(item.get("vmid") or "")
+        found = owners.get(ownership.vm_ref(conn, str(item.get("node") or ""), vmid))
+        if found:
+            return found
+        return owner_index.get((conn, vmid)) or owner_index.get(("-", vmid)) or ""
 
     region_admin = security.is_region_admin(user)
     if owner is not None:
@@ -1280,6 +1280,89 @@ async def move_container_volume(
     return {"task": task}
 
 
+async def _migration_storage_issues(
+    client: Any, target: str, config: Dict[str, Any]
+) -> "tuple[List[str], List[str]]":
+    """容器磁盘在目标节点上的可用性。
+
+    返回 ``(目标节点没有的存储, 本地存储)``。两种都会让 PVE 的迁移失败，但报错
+    原文很难懂：前者是「不知道往哪写」，后者是 LXC 不会自动搬本地盘（PVE 只回
+    一句 ``can't migrate ... local disks``）。在发任务之前先判掉，用户才知道该
+    去补存储还是改存储位置。
+    """
+    wanted: Dict[str, str] = {}
+    for key, value in (config or {}).items():
+        if key != "rootfs" and not key.startswith("mp"):
+            continue
+        text = str(value or "").strip()
+        # ``none`` / 空挂载点没有实际磁盘，不参与判断
+        if not text or text.lower().startswith("none"):
+            continue
+        storage = text.split(":", 1)[0].strip()
+        if storage:
+            wanted.setdefault(storage, key)
+    if not wanted:
+        return [], []
+
+    available = {
+        str(item.get("storage") or ""): item
+        for item in (await client.storages(target) or [])
+    }
+    missing = [name for name in wanted if name not in available]
+    # shared=0：该存储只属于某一台节点，迁移时数据不会跟着走
+    local = [
+        name
+        for name in wanted
+        if name in available and pve_flag(available[name].get("shared")) != 1
+    ]
+    return missing, local
+
+
+def _restart_required_detail() -> str:
+    """运行中的容器不能用「迁移后保持停机」时的提示。
+
+    LXC 没有在线迁移，PVE 的 ``pct migrate`` 对运行中的容器只接受 ``--restart``
+    （``--online`` 至今未实现）：不带就是一句英文
+    ``can't migrate running container without --online or --restart``。
+    前置校验与错误映射共用这一份文案，避免两处说法不一致。
+    """
+    return i18n.pick(
+        "容器正在运行，不能用「迁移后保持停机」：运行中的容器迁移后必须在目标节点启动。"
+        "请勾选「迁移完成后启动」，或先停止容器再迁移",
+        "The container is running, so it cannot stay stopped after the move: a "
+        "running container must be started on the target node. Enable “start after "
+        "migration”, or stop the container first.",
+    )
+
+
+def _lxc_migrate_detail(exc: ProxmoxError) -> Optional[str]:
+    """把 LXC 迁移的 PVE 原文翻成可操作的提示；不认识就返回 None（原样抛）。"""
+    text = str(exc.message or "").lower()
+    if "without --online or --restart" in text:
+        # 前置校验漏掉的兜底（状态刚变、或旧脚本直调）
+        return _restart_required_detail()
+    if "live migration" in text and "not implemented" in text:
+        return i18n.pick(
+            "Proxmox VE 不支持 LXC 在线迁移。请改用停机迁移 —— 容器会短暂中断，"
+            "勾选「迁移完成后启动」可在目标节点自动拉起",
+            "Proxmox VE does not support live migration for LXC. Use offline "
+            "migration instead — the container stops briefly; enable “start after "
+            "migration” to bring it back up on the target node.",
+        )
+    if "local disk" in text:
+        return i18n.pick(
+            "容器磁盘在本地存储上，LXC 迁移不会搬运本地盘。请先把磁盘迁到共享存储",
+            "Container disks are on local storage, which LXC migration cannot carry. "
+            "Move the disks to shared storage first.",
+        )
+    if "not available on node" in text or "no such storage" in text:
+        return i18n.pick(
+            "目标节点上没有容器使用的存储，请先在该节点补齐存储配置",
+            "The target node is missing a storage used by this container.",
+        )
+    return None
+
+
 @router.post("/lxc/{node}/{vmid}/migrate")
 async def migrate_container(
     node: str,
@@ -1290,23 +1373,95 @@ async def migrate_container(
     user: Dict[str, Any] = Depends(security.require_permission("ct.migrate")),
 ) -> Dict[str, Any]:
     client = get_client()
-    try:
-        result = await client.lxc_migrate(
-            node, vmid, payload.target_node, payload.online, payload.restart
+    connection_id = _op_connection()
+
+    # LXC 没有在线迁移。老前端 / 脚本若还传 online=1，明确拒绝：
+    # 既不要把 PVE 的英文原文丢给用户，也不要静默降级成停机迁移 ——
+    # 后者会让人以为服务没中断，出问题才发现。
+    if payload.online is True:
+        raise HTTPException(
+            status_code=400,
+            detail=i18n.pick(
+                "Proxmox VE 不支持 LXC 在线迁移。请改用停机迁移（容器会短暂中断），"
+                "需要迁移后自动恢复就勾选「迁移完成后启动」",
+                "Proxmox VE does not support live migration for LXC. Use offline "
+                "migration (brief downtime); enable “start after migration” if the "
+                "container should come back up on the target node.",
+            ),
         )
+
+    try:
+        # 目标节点必须与源节点同属一个 PVE 集群（与虚拟机迁移同一口径）
+        target = await migrateguard.ensure_target_node(
+            client, node, payload.target_node
+        )
+        # 节点级可见性：与 /nodes 的下拉口径一致，不能靠构造请求绕过
+        await security.ensure_node_allowed(user, connection_id, target)
+
+        # 磁盘先过一遍：目标节点缺存储 / 本地盘都注定失败，别让它等到 PVE 报错
+        config = await client.lxc_config(node, vmid) or {}
+        missing, local = await _migration_storage_issues(client, target, config)
+        if missing or local:
+            detail = (
+                i18n.pick(
+                    f"目标节点 {target} 上没有这些存储：{'、'.join(missing)}。"
+                    "请先在目标节点添加同名存储，或把磁盘迁到共享存储",
+                    f"Storage not available on target node {target}: "
+                    f"{', '.join(missing)}. Add it on that node first, or move the "
+                    "disk to shared storage.",
+                )
+                if missing
+                else i18n.pick(
+                    f"容器磁盘在本地存储（{'、'.join(local)}）上，LXC 迁移不会搬运本地盘。"
+                    "请先把磁盘迁到共享存储，再迁移容器",
+                    f"Container disks live on local storage ({', '.join(local)}); LXC "
+                    "migration cannot carry them. Move the disks to shared storage "
+                    "first, then migrate.",
+                )
+            )
+            await security.audit(
+                request, user, "ct.migrate", target=f"{node}/{vmid}",
+                result="failed", detail=detail,
+            )
+            raise HTTPException(status_code=409, detail=detail)
+
+        # restart 只对运行中的容器有意义，但对运行中的容器它是**必需项**：LXC 没有
+        # 在线迁移，PVE 的 pct migrate 只接受 --online（未实现）或 --restart，
+        # 两者都不给只会回 "can't migrate running container without --online or
+        # --restart"。既不静默改成 true（用户明确要求迁完保持停机，偷偷拉起更糟），
+        # 也不把英文原文丢给用户 —— 在这里明确拒绝并说清两条出路。
+        status = await client.lxc_status(node, vmid) or {}
+        running = str(status.get("status") or "") == "running"
+        if running and not payload.restart:
+            detail = _restart_required_detail()
+            await security.audit(
+                request, user, "ct.migrate", target=f"{node}/{vmid}",
+                result="failed", detail=detail,
+            )
+            raise HTTPException(status_code=409, detail=detail)
+        restart = running
+        result = await client.lxc_migrate(node, vmid, target, restart=restart)
     except ProxmoxError as exc:
+        mapped = _lxc_migrate_detail(exc)
         await security.audit(
             request, user, "ct.migrate", target=f"{node}/{vmid}",
-            result="failed", detail=exc.message,
+            result="failed", detail=mapped or exc.message,
         )
+        if mapped:
+            raise HTTPException(status_code=409, detail=mapped) from exc
         _raise(exc)
 
+    # 归属记录跟着容器走（见 ownership.move_guest）：不搬的话迁移后普通用户在列表
+    # 里看不到自己的容器，它名下的快照标记也一起失联。
+    moved = await migrateguard.carry_ownership(connection_id, node, target, vmid)
     task = result if isinstance(result, str) else (result or {}).get("task", "")
+    # 审计里记「模式」而不是已废弃的 online：事后能看出这次迁移有没有自动拉起
+    mode = "restart" if restart else "offline"
     await security.audit(
         request, user, "ct.migrate", target=f"{node}/{vmid}",
-        detail={"target": payload.target_node, "online": payload.online},
+        detail={"target": target, "mode": mode, "ownership": moved},
     )
-    return {"task": task}
+    return {"task": task, "mode": mode}
 
 
 @router.post("/lxc/{node}/{vmid}/clone")

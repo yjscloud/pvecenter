@@ -46,7 +46,13 @@ from contextvars import ContextVar
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from . import ai_approval, aiterm, aitools, database, formatters, i18n, security, store
-from .pve import ProxmoxError, get_client, target_connection_id, task_exit_ok
+from .pve import (
+    ProxmoxError,
+    client_for_connection,
+    get_client,
+    target_connection_id,
+    task_exit_ok,
+)
 from .vm_scope import bind_node_connection
 
 logger = logging.getLogger(__name__)
@@ -809,14 +815,31 @@ async def describe_guest(
 AGENT_PING_TIMEOUT = 5.0
 
 
-async def probe_agent(node: str, vmid: int, timeout: float = AGENT_PING_TIMEOUT) -> bool:
+async def probe_agent(
+    node: str,
+    vmid: int,
+    timeout: float = AGENT_PING_TIMEOUT,
+    connection_id: str = "",
+) -> bool:
     """客户机是否应答 QEMU Guest Agent —— 也就是能不能被平台安全管控。
 
     只 ping、不执行任何东西：这是签发前唯一一个既便宜又能证明「进得去」的检查。
     没有 agent 的机器即使签了票也跑不了任何工具，应该在签发那一刻就说清楚，
     而不是让用户以为授权成功、第一条命令却全线失败。
+
+    ``connection_id`` 优先：签发请求已明确是哪套集群时不该再靠节点名去猜 ——
+    两台 PVE 都有同名节点时会 ping 错机器，把「agent 正常」判成「不可用」。
     """
-    client = get_client()
+    if connection_id:
+        try:
+            client = client_for_connection(connection_id)
+        except ProxmoxError:
+            return False
+    else:
+        # 节点名在每套 PVE 上都是本地的：不先定位连接，多连接部署下会 ping 到
+        # 「当前连接」上的同名节点（或直接 hostname lookup 失败）。
+        await bind_node_connection(node)
+        client = get_client()
     try:
         await asyncio.wait_for(client.qemu_agent_ping(node, vmid), timeout=timeout)
         return True
@@ -998,7 +1021,17 @@ async def _client_for(lease: Dict[str, Any]):
 
     多连接部署里「节点名」在每台 PVE 上都成立：不显式绑定就会打到当前连接，
     PVE 把节点名当主机名去解析，回一句 ``hostname lookup failed``。
+
+    租约本身记着签发时那台机器所在的连接（``connection_id``），优先照它取：
+    按节点名反查只在唯一命中时才可靠，两套集群有同名节点时会绑错机器 ——
+    而这里执行的是客户机内的命令，落错机器就是改错系统。
     """
+    conn_id = str(lease.get("connection_id") or "")
+    if conn_id:
+        try:
+            return client_for_connection(conn_id)
+        except ProxmoxError:
+            logger.debug("AI VM：租约连接 %s 不可用，回落到节点定位", conn_id)
     node = str(lease.get("node") or "")
     if node:
         try:

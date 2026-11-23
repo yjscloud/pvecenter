@@ -577,14 +577,22 @@ class TestReadRoutes:
     def test_cluster_scope_reaches_connection_resolution(self, api) -> None:
         """``X-PVE-Scope``（顶栏「集群作用域」）必须真的进到连接解析里。
 
-        作用域指向一个不存在的连接时，读接口要**明确**报「连接不存在」，而不是
-        静默回落到兜底连接 —— 否则用户以为在看 A 集群，实际读的是 B。错误里带上
-        那个 id，也证明这次请求是被作用域驱动的（而不是别的原因 404）。
+        作用域指向一个不存在的连接时，读接口要**明确**报「连接不可用」，而不是
+        静默回落到兜底连接 —— 否则用户以为在看 A 集群，实际读的是 B。
+
+        证明「这次 404 是作用域驱动的」看两点：同一条路径不带作用域时是 200，
+        带上之后才 404。文案里**不带**连接 id 是刻意的（审计项 L-3：面板内部的
+        连接编号不交给调用方），所以这里反过来把「不回显」也钉住 —— 以前断言
+        ``"no-such-conn" in resp.text``，实现按 L-3 收紧之后就过时了。
         """
+        # 基线：不带作用域时这条路径是通的
+        assert api.get("/api/nodes", headers=auth_headers(api)).status_code == 200
+
         headers = {**auth_headers(api), "X-PVE-Scope": "no-such-conn"}
         resp = api.get("/api/nodes", headers=headers)
         assert resp.status_code == 404
-        assert "no-such-conn" in resp.text
+        assert resp.json()["detail"] == "目标 Proxmox 连接不可用"
+        assert "no-such-conn" not in resp.text
 
     def test_nextid_returns_int(self, api) -> None:
         resp = api.get("/api/cluster/nextid", headers=auth_headers(api))
@@ -1311,6 +1319,15 @@ class TestHardwareAddRemove:
         assert config_post() == []
 
     def test_viewer_cannot_add_or_remove_hardware(self, api, config_post) -> None:
+        """viewer 没有 ``vm.config``：增删硬件必须被拦下，且一个字节也不发给 PVE。
+
+        两道闸门的顺序是「**先对象、后权限**」：``routers/vms.py`` 的路由级依赖
+        ``require_vm_access`` 先于端点的 ``require_permission`` 执行，而它按严格
+        隔离把「没有归属记录的机器」对普通用户一律回成 404「资源不存在」（连
+        "存在"都不承认，见 ``guestguard`` 与安全审计 L-2）。所以断言要分两步：
+        无归属时是 404；把机器指到 viewer 名下、归属闸门放行之后，权限闸门才是
+        403 —— 后一步才是这条用例真正想守的东西（别把无归属的 404 误当成权限生效）。
+        """
         admin = auth_headers(api)
         api.post(
             "/api/users",
@@ -1324,18 +1341,28 @@ class TestHardwareAddRemove:
         assert login.status_code == 200
         headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
 
-        assert (
-            api.post(
+        def add():
+            return api.post(
                 "/api/vms/pve1/100/hardware/network",
                 json={"bridge": "vmbr0"},
                 headers=headers,
-            ).status_code
-            == 403
-        )
-        assert (
-            api.delete("/api/vms/pve1/100/hardware/scsi0", headers=headers).status_code
-            == 403
-        )
+            )
+
+        def remove():
+            return api.delete("/api/vms/pve1/100/hardware/scsi0", headers=headers)
+
+        # 1) 归属表里没有这台机器：严格隔离下按「不存在」处理
+        for resp in (add(), remove()):
+            assert resp.status_code == 404, resp.text
+            assert resp.json()["detail"] == "资源不存在"
+        assert config_post() == []
+
+        # 2) 机器在 viewer 名下：归属放行，权限闸门必须继续拦住
+        _seed_owner(ownership.KIND_VM, ownership.vm_ref("", "pve1", 100), "hwviewer")
+        for resp in (add(), remove()):
+            assert resp.status_code == 403, resp.text
+            # 具体文案走 i18n（可能是「权限不足」），这里只确认是权限闸门而非别的原因
+            assert "权限" in resp.json()["detail"]
         assert config_post() == []
 
 
@@ -1674,6 +1701,184 @@ class TestGuestListOwnerField:
     def test_containers_carry_it_too(self, api) -> None:
         rows = api.get("/api/lxc", headers=auth_headers(api)).json()
         assert all("owner" in row for row in rows)
+
+
+# ------------------------------------------------- 迁移：目标同集群 + 归属跟随
+class TestGuestMigrationOwnership:
+    """迁移的两条硬约束（实现见 ``app/migrateguard`` / ``ownership.move_guest``）。
+
+    1. 目标节点必须与机器**同属一个 PVE 集群**：界面上的节点清单是多套 PVE 合并
+       出来的，跨集群的迁移 PVE 根本搬不过去，接口不能只靠界面收窄；
+    2. 归属 ref 的第二段是节点名，迁移之后必须跟着机器走 —— 人不变，只是位置变了。
+    """
+
+    NODES_KEY = ("GET", "/api2/json/nodes")
+    MIGRATE_KEY = ("POST", "/api2/json/nodes/pve1/qemu/100/migrate")
+
+    @pytest.fixture()
+    def second_node(self, monkeypatch):
+        """同一集群里的第二台节点（PVE 的迁移本来就只能在集群内换节点）。"""
+        import test_pve_client as mock_mod
+
+        monkeypatch.setitem(
+            mock_mod.ROUTES,
+            self.NODES_KEY,
+            lambda: [dict(mock_mod.NODE), {"node": "pve2", "status": "online"}],
+        )
+        monkeypatch.setitem(
+            mock_mod.ROUTES,
+            self.MIGRATE_KEY,
+            lambda: "UPID:pve1:0000A1C0:00C3D4EE:65F00010:qmigrate:100:root@pam:",
+        )
+        return "pve2"
+
+    def test_rejects_a_node_of_another_cluster(self, api) -> None:
+        """mock 里只有 pve1：pve9 属于别处（或根本不存在），必须 400 且说清楚。"""
+        resp = api.post(
+            "/api/vms/pve1/100/migrate",
+            json={"target_node": "pve9", "online": False},
+            headers=auth_headers(api),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "pve9" in resp.json()["detail"]
+
+    def test_running_vm_cannot_be_migrated_offline(self, api, second_node: str) -> None:
+        """运行中的虚拟机不能停机迁移：给中文原因，且不要真把请求发给 PVE。
+
+        PVE 只会回 ``can't migrate running VM without --online``：既没说清楚是
+        运行中，也没说该勾在线迁移还是先关机。
+        """
+        import test_pve_client as mock_mod
+
+        resp = api.post(
+            "/api/vms/pve1/100/migrate",
+            json={"target_node": second_node, "online": False},
+            headers=auth_headers(api),
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert "运行" in detail
+        assert "在线迁移" in detail
+        # 不能在 PVE 侧留下一次注定失败的迁移请求
+        assert not any(
+            method == "POST" and path.endswith("/qemu/100/migrate")
+            for method, path, _body, _headers in mock_mod.REQUESTS
+        )
+
+    def test_migration_moves_the_ownership_record(
+        self, api, second_node: str
+    ) -> None:
+        """迁移完成后归属仍在那个人名下，只是 ref 的节点段换成了新节点。"""
+        old_ref = ownership.vm_ref("", "pve1", 100)
+        new_ref = ownership.vm_ref("", second_node, 100)
+        _seed_owner(ownership.KIND_VM, old_ref, "alice")
+        _seed_owner(
+            ownership.KIND_SNAPSHOT,
+            ownership.snapshot_ref("", "pve1", 100, "snap-a"),
+            "alice",
+        )
+
+        resp = api.post(
+            "/api/vms/pve1/100/migrate",
+            json={"target_node": second_node, "online": True},
+            headers=auth_headers(api),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["task"].startswith("UPID:")
+
+        rows = _owner_rows()
+        assert (ownership.KIND_VM, new_ref) in rows
+        assert (ownership.KIND_VM, old_ref) not in rows
+        # 快照标记是机器的从属物，跟着一起换位置
+        assert (
+            ownership.KIND_SNAPSHOT,
+            ownership.snapshot_ref("", second_node, 100, "snap-a"),
+        ) in rows
+
+        # 管理员的列表里这一行仍带原来的归属人
+        by_vmid = {row["vmid"]: row.get("owner") for row in api.get("/api/vms", headers=auth_headers(api)).json()}
+        assert by_vmid[100] == "alice"
+
+    def test_owner_is_still_recognised_after_an_out_of_band_migration(
+        self, api
+    ) -> None:
+        """在 PVE 界面里迁的（面板没跟着搬账）也不能把人挡在门外。
+
+        mock 上的 100 号机器在 pve1，归属行故意写在 pve0：列表按「连接 + VMID」
+        兜底认领 —— 严格隔离下只按精确 ref 比对的话，这台机器会整行消失。
+        """
+        viewer = user_with_permissions(api, ["vm.view"], "moved-owner")
+        _seed_owner(ownership.KIND_VM, ownership.vm_ref("", "pve0", 100), "moved-owner")
+
+        rows = api.get("/api/vms", headers=viewer).json()
+        assert [row["vmid"] for row in rows] == [100]
+
+    def test_that_fallback_does_not_claim_someone_elses_machine(self, api) -> None:
+        viewer = user_with_permissions(api, ["vm.view"], "moved-owner")
+        _seed_owner(ownership.KIND_VM, ownership.vm_ref("", "pve0", 100), "someone-else")
+
+        assert api.get("/api/vms", headers=viewer).json() == []
+
+
+# ---------------------------------------- 容器迁移：运行中必须「迁移后启动」
+class TestContainerMigrationRestart:
+    """运行中的容器不能「迁移后保持停机」：PVE 只接受 ``--restart``。
+
+    不带 restart 时 PVE 回 ``can't migrate running container without --online or
+    --restart`` —— 用户看不出该怎么办；接口要在面板侧拦下并说清两条出路。
+    """
+
+    @pytest.fixture()
+    def container_node(self, monkeypatch):
+        import test_pve_client as mock_mod
+
+        monkeypatch.setitem(
+            mock_mod.ROUTES,
+            ("GET", "/api2/json/nodes"),
+            lambda: [dict(mock_mod.NODE), {"node": "pve2", "status": "online"}],
+        )
+        monkeypatch.setitem(
+            mock_mod.ROUTES,
+            ("GET", "/api2/json/nodes/pve1/lxc/101/status/current"),
+            lambda: {"status": "running", "vmid": 101},
+        )
+        monkeypatch.setitem(
+            mock_mod.ROUTES,
+            ("POST", "/api2/json/nodes/pve1/lxc/101/migrate"),
+            lambda: "UPID:pve1:0000A1C1:00C3D4EF:65F00011:vzmigrate:101:root@pam:",
+        )
+        return "pve2"
+
+    def test_running_container_cannot_skip_restart(
+        self, api, container_node: str
+    ) -> None:
+        import test_pve_client as mock_mod
+
+        resp = api.post(
+            "/api/lxc/pve1/101/migrate",
+            json={"target_node": container_node, "restart": False},
+            headers=auth_headers(api),
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert "运行" in detail
+        assert "迁移完成后启动" in detail
+        # 一次注定失败的迁移不该发到 PVE
+        assert not any(
+            method == "POST" and path.endswith("/lxc/101/migrate")
+            for method, path, _body, _headers in mock_mod.REQUESTS
+        )
+
+    def test_running_container_with_restart_migrates(
+        self, api, container_node: str
+    ) -> None:
+        resp = api.post(
+            "/api/lxc/pve1/101/migrate",
+            json={"target_node": container_node, "restart": True},
+            headers=auth_headers(api),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["task"].startswith("UPID:")
 
 
 # --------------------------------------------------- 按用户 / 按角色分配的额度

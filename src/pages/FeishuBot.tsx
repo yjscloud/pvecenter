@@ -4,12 +4,12 @@
 
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { feishuApi } from "../api/endpoints";
+import { connectionsApi, feishuApi } from "../api/endpoints";
 import { PageShell } from "../components/Layout";
 import { Card, CardHeader } from "../components/ui/Card";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
-import { Input, Switch, Textarea } from "../components/ui/Input";
+import { Input, Select, Switch, Textarea } from "../components/ui/Input";
 import { Notice } from "../components/ui/EmptyState";
 import { IconTerminal, IconSave, IconRefresh, IconAlert } from "../components/Icons";
 import { useToast } from "../hooks/useToast";
@@ -34,6 +34,7 @@ const EMPTY: BotConfig = {
   allow_write: true,
   allow_create: true,
   default_template_vmid: "",
+  default_connection_id: "",
   default_node: "",
   default_storage: "",
   default_backup_storage: "",
@@ -54,6 +55,15 @@ export function FeishuBot() {
   const [testChat, setTestChat] = useState("");
 
   const query = useQuery({ queryKey: ["feishu", "bot"], queryFn: feishuApi.get, retry: false });
+
+  /* 连接列表：与顶栏作用域 / 连接管理共用同一份缓存（queryKey 一致） */
+  const connectionsQuery = useQuery({
+    queryKey: ["connections"],
+    queryFn: connectionsApi.list,
+    staleTime: 300_000,
+    retry: false,
+  });
+  const conns = connectionsQuery.data ?? [];
 
   useEffect(() => {
     if (query.data?.config && form === null) setForm({ ...EMPTY, ...query.data.config });
@@ -184,6 +194,21 @@ export function FeishuBot() {
               placeholder="100" className="mono" disabled={!canManage}
               hint={t('feishu.templateVmidHint')}
               onChange={(e) => setForm({ ...form, default_template_vmid: e.target.value })} />
+            <Select label={t('feishu.defaultConnectionLabel')}
+              value={form.default_connection_id ?? ""}
+              placeholder={t('feishu.defaultConnectionAuto')}
+              hint={t('feishu.defaultConnectionHint')}
+              disabled={!canManage}
+              options={(() => {
+                const opts = conns.map((c) => ({ value: c.id, label: c.name || c.host || c.id }));
+                /* 存的连接已被删除时，别让下拉框悄悄显示成「自动」 */
+                const saved = form.default_connection_id;
+                if (saved && !conns.some((c) => c.id === saved)) {
+                  opts.unshift({ value: saved, label: `${saved}${t('feishu.defaultConnectionMissing')}` });
+                }
+                return opts;
+              })()}
+              onChange={(e) => setForm({ ...form, default_connection_id: e.target.value })} />
             <Input label={t('feishu.defaultNodeLabel')} value={form.default_node} placeholder="pve"
               className="mono" disabled={!canManage}
               onChange={(e) => setForm({ ...form, default_node: e.target.value })} />

@@ -15,8 +15,9 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { firewallApi, lxcApi, nodesApi, vmsApi } from '../api/endpoints';
+import { connectionsApi, firewallApi, lxcApi, nodesApi, vmsApi } from '../api/endpoints';
 import { errorMessage, isNotConfigured } from '../api/client';
+import { useGlobalScope } from '../hooks/useGlobalScope';
 import { SetupRequired } from '../components/SetupRequired';
 import { PageShell } from '../components/Layout';
 import { Card, CardHeader } from '../components/ui/Card';
@@ -77,6 +78,20 @@ function targetText(rule: FirewallRule): string {
   return `${proto}/${port}`;
 }
 
+/* 机器 / 节点的身份键：多套 PVE 上的同名节点 + 同 VMID 是**两台不同的机器**，
+   只按 vmid 或节点名做键 / 选项值会串台（选 A 上的机器，读的却是 B 上的）。 */
+function guestKeyOf(guest: {
+  node: string;
+  vmid: number;
+  connection_id?: string;
+}): string {
+  return `${guest.connection_id ?? ''}|${guest.node}|${guest.vmid}`;
+}
+
+function nodeKeyOf(node: { node: string; connection_id?: string }): string {
+  return `${node.connection_id ?? ''}|${node.node}`;
+}
+
 export function Firewall() {
   const t = useT();
   const { hasPermission } = useAuth();
@@ -112,6 +127,15 @@ export function Firewall() {
   const [vmid, setVmid] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
 
+  /* 当前选中的目标落在哪条 PVE 连接上。单靠 node / vmid 不够：多套 PVE 上
+     同名节点 + 同 VMID 是两台不同的机器。三个作用域各记一份，切换作用域时
+     不会拿着上一套的连接去查这一套。 */
+  const [vmConn, setVmConn] = useState('');
+  const [nodeConn, setNodeConn] = useState('');
+  const [clusterConn, setClusterConn] = useState('');
+
+  const globalScope = useGlobalScope();
+
   /* ---- 编辑器 ---- */
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingRule, setEditingRule] = useState<FirewallRule | null>(null);
@@ -144,6 +168,14 @@ export function Firewall() {
     queryFn: () => lxcApi.list(),
     staleTime: 30_000,
   });
+  /* 可选的 PVE 连接：集群级防火墙 / 安全组 / IP 集合都是**每套 PVE 各自一份**，
+     无法由 node/vmid 推断，必须让用户明确选一套。 */
+  const connectionsQuery = useQuery({
+    queryKey: ['connections'],
+    queryFn: connectionsApi.list,
+    staleTime: 300_000,
+    retry: false,
+  });
 
   const nodes = nodesQuery.data ?? [];
   const vms = useMemo(
@@ -157,22 +189,75 @@ export function Firewall() {
   /** 当前作用域要看的机器：虚拟机作用域只列虚拟机，容器作用域只列容器 */
   const guests = scope === 'ct' ? cts : vms;
 
+  const clusterOptions = useMemo(
+    () =>
+      (connectionsQuery.data ?? []).map((c) => ({
+        label: c.name || c.id,
+        value: c.id,
+      })),
+    [connectionsQuery.data],
+  );
+
   /* 默认选中第一台机器 / 第一个节点，省掉「先选一次」的空屏。
      在虚拟机 ⇄ 容器之间换作用域后，原选中的那台不在新清单里（新清单甚至可能是
-     空的）——这时落回第一台或清空，否则会拿着虚拟机的 VMID 去查 lxc 的防火墙。 */
+     空的）——这时落回第一台或清空，否则会拿着虚拟机的 VMID 去查 lxc 的防火墙。
+     匹配用「连接 + 节点 + VMID」三元组：多套 PVE 上同名节点 + 同 VMID 是两台
+     不同的机器，只按 vmid 判会以为「已经选中了」。 */
   useEffect(() => {
     if (scope !== 'vm' && scope !== 'ct') return;
-    if (guests.some((item) => item.vmid === vmid)) return;
-    if (guests.length > 0) {
-      setVmid(guests[0].vmid);
-      setNode(guests[0].node);
-    } else {
+    const current = guests.find(
+      (item) =>
+        item.vmid === vmid &&
+        item.node === node &&
+        (item.connection_id ?? '') === vmConn,
+    );
+    if (current) return;
+    const first = guests[0];
+    if (first) {
+      setVmid(first.vmid);
+      setNode(first.node);
+      setVmConn(first.connection_id ?? '');
+    } else if (vmid !== null) {
       setVmid(null);
+      setVmConn('');
     }
-  }, [scope, guests, vmid]);
+  }, [scope, guests, vmid, node, vmConn]);
+
+  /* 节点作用域同理：同名节点可能出现在两套 PVE 上，连接一起记下来 */
   useEffect(() => {
-    if (scope === 'node' && !node && nodes.length > 0) setNode(nodes[0].node);
-  }, [scope, node, nodes]);
+    if (scope !== 'node') return;
+    const current = nodes.some(
+      (item) =>
+        item.node === node && (item.connection_id ?? '') === nodeConn,
+    );
+    if (current) return;
+    const first = nodes[0];
+    if (first) {
+      setNode(first.node);
+      setNodeConn(first.connection_id ?? '');
+    }
+  }, [scope, nodes, node, nodeConn]);
+
+  /* 集群作用域：跟随顶栏「集群作用域」，没有就落到当前连接 / 第一套。
+     选过一次之后以页面上的「目标 PVE 集群」为准（用户看得见，不再静默兜底）。 */
+  useEffect(() => {
+    if (scope !== 'cluster') return;
+    const list = connectionsQuery.data ?? [];
+    if (!list.length) return;
+    if (clusterConn && list.some((c) => c.id === clusterConn)) return;
+    const target =
+      list.find((c) => c.id === globalScope) ??
+      list.find((c) => c.active) ??
+      list[0];
+    setClusterConn(target?.id ?? '');
+  }, [scope, clusterConn, connectionsQuery.data, globalScope]);
+
+  useEffect(() => {
+    if (scope !== 'cluster' || !globalScope) return;
+    const list = connectionsQuery.data ?? [];
+    if (list.length && !list.some((c) => c.id === globalScope)) return;
+    setClusterConn(globalScope);
+  }, [globalScope, scope, connectionsQuery.data]);
 
   /* 默认作用域可能是当前用户无权查看的那个（例如只被授予容器权限的自定义角色），
      这时落到清单里的第一项，别让页面停在一个 403 的作用域上 */
@@ -182,10 +267,20 @@ export function Firewall() {
     }
   }, [scopes, scope]);
 
+  /* 集群级要等「目标集群」定下来再发请求：还没拿到连接清单时先别用兜底连接，
+     否则会先打一套不相干的 PVE（可能正好就是报 hostname lookup 的那台）。
+     清单为空 / 读不到时放行，让页面照旧显示「未配置 / 只读」而不是一直转圈。 */
+  const clusterReady =
+    Boolean(clusterConn) ||
+    connectionsQuery.isError ||
+    (connectionsQuery.isFetched && (connectionsQuery.data?.length ?? 0) === 0);
+
   const scopeReady =
-    scope === 'cluster' ||
-    (scope === 'node' && Boolean(node)) ||
-    ((scope === 'vm' || scope === 'ct') && Boolean(node) && vmid !== null);
+    (scope === 'cluster'
+      ? clusterReady
+      : scope === 'node'
+        ? Boolean(node)
+        : Boolean(node) && vmid !== null);
 
   const scopeParams = useMemo((): [FirewallScope, string, number | undefined] => {
     if (scope === 'cluster') return ['cluster', '', undefined];
@@ -194,6 +289,13 @@ export function Firewall() {
     return [scope, node, vmid ?? undefined];
   }, [scope, node, vmid]);
 
+  /* 当前这一页在操作哪套 PVE：所有防火墙请求都硬指定它（X-PVE-Connection）。
+     后端也会按 node/vmid 纠正，但前端本来就知道答案（列表行带着
+     connection_id），没必要让每次请求都去推断 —— 推断失败时就会落到兜底连接，
+     那台 PVE 上没有这个节点名，回 `hostname lookup 'node02' failed`。 */
+  const targetConn =
+    scope === 'cluster' ? clusterConn : scope === 'node' ? nodeConn : vmConn;
+
   const scopeLabel = useMemo(() => {
     if (scope === 'cluster') return t('firewall.scopeClusterLabel');
     if (scope === 'node') {
@@ -201,48 +303,55 @@ export function Firewall() {
         node: node || t('firewall.scopeNodeFallback'),
       });
     }
-    const vm = guests.find((item) => item.vmid === vmid);
+    const vm = guests.find(
+      (item) =>
+        item.vmid === vmid &&
+        item.node === node &&
+        (item.connection_id ?? '') === vmConn,
+    );
     return vm
       ? t('firewall.scopeVmLabel', { name: vm.name, vmid: vm.vmid })
       : t('firewall.scopeVmFallback', {
           vmid: vmid ?? '',
           noun: t(scope === 'ct' ? 'firewall.scopeCt' : 'firewall.scopeVm'),
         });
-  }, [scope, node, vmid, guests, t]);
+  }, [scope, node, vmid, vmConn, guests, t]);
 
+  /* 连接进 query key：切顶栏作用域 / 换目标机器时必须重新取数，
+     否则会命中上一次那套 PVE 的规则（看起来像「改了没生效」）。 */
   const rulesQuery = useQuery({
-    queryKey: ['firewall', 'rules', ...scopeParams],
-    queryFn: () => firewallApi.rules(...scopeParams),
+    queryKey: ['firewall', 'rules', targetConn, ...scopeParams],
+    queryFn: () => firewallApi.rules(...scopeParams, targetConn),
     enabled: scopeReady,
     retry: false,
   });
   const optionsQuery = useQuery({
-    queryKey: ['firewall', 'options', ...scopeParams],
-    queryFn: () => firewallApi.options(...scopeParams),
+    queryKey: ['firewall', 'options', targetConn, ...scopeParams],
+    queryFn: () => firewallApi.options(...scopeParams, targetConn),
     enabled: scopeReady,
     retry: false,
   });
   const refsQuery = useQuery({
-    queryKey: ['firewall', 'refs'],
-    queryFn: firewallApi.refs,
+    queryKey: ['firewall', 'refs', targetConn],
+    queryFn: () => firewallApi.refs(targetConn),
     staleTime: 300_000,
     retry: false,
   });
   const groupsQuery = useQuery({
-    queryKey: ['firewall', 'groups'],
-    queryFn: firewallApi.groups,
+    queryKey: ['firewall', 'groups', targetConn],
+    queryFn: () => firewallApi.groups(targetConn),
     enabled: tab === 'groups' || tab === 'rules',
     retry: false,
   });
   const groupRulesQuery = useQuery({
-    queryKey: ['firewall', 'group-rules', activeGroup],
-    queryFn: () => firewallApi.groupRules(activeGroup),
+    queryKey: ['firewall', 'group-rules', targetConn, activeGroup],
+    queryFn: () => firewallApi.groupRules(activeGroup, targetConn),
     enabled: tab === 'groups' && Boolean(activeGroup),
     retry: false,
   });
   const ipsetsQuery = useQuery({
-    queryKey: ['firewall', 'ipsets'],
-    queryFn: firewallApi.ipsets,
+    queryKey: ['firewall', 'ipsets', targetConn],
+    queryFn: () => firewallApi.ipsets(targetConn),
     enabled: tab === 'ipsets',
     retry: false,
   });
@@ -273,18 +382,28 @@ export function Firewall() {
     try {
       if (editingGroup) {
         if (editingRule) {
-          await firewallApi.updateGroupRule(editingGroup, editingRule.pos, rule);
+          await firewallApi.updateGroupRule(
+            editingGroup,
+            editingRule.pos,
+            rule,
+            targetConn,
+          );
         } else {
-          await firewallApi.createGroupRule(editingGroup, rule);
+          await firewallApi.createGroupRule(editingGroup, rule, targetConn);
         }
         await qc.invalidateQueries({
-          queryKey: ['firewall', 'group-rules', editingGroup],
+          queryKey: ['firewall', 'group-rules', targetConn, editingGroup],
         });
       } else if (editingRule) {
-        await firewallApi.updateRule(...scopeParams, editingRule.pos, rule);
+        await firewallApi.updateRule(
+          ...scopeParams,
+          editingRule.pos,
+          rule,
+          targetConn,
+        );
         await invalidateRules();
       } else {
-        await firewallApi.createRule(...scopeParams, rule);
+        await firewallApi.createRule(...scopeParams, rule, targetConn);
         await invalidateRules();
       }
       toast.success(editingRule ? t('firewall.ruleUpdated') : t('firewall.ruleAdded'));
@@ -303,10 +422,17 @@ export function Firewall() {
     try {
       const payload = toInput(rule, { enable: !rule.enable });
       if (group) {
-        await firewallApi.updateGroupRule(group, rule.pos, payload);
-        await qc.invalidateQueries({ queryKey: ['firewall', 'group-rules', group] });
+        await firewallApi.updateGroupRule(group, rule.pos, payload, targetConn);
+        await qc.invalidateQueries({
+          queryKey: ['firewall', 'group-rules', targetConn, group],
+        });
       } else {
-        await firewallApi.updateRule(...scopeParams, rule.pos, payload);
+        await firewallApi.updateRule(
+          ...scopeParams,
+          rule.pos,
+          payload,
+          targetConn,
+        );
         await invalidateRules();
       }
       toast.success(payload.enable ? t('firewall.ruleEnabled') : t('firewall.ruleDisabled'));
@@ -321,7 +447,7 @@ export function Firewall() {
     if (to < 0) return;
     setBusy(true);
     try {
-      await firewallApi.moveRule(...scopeParams, rule.pos, to);
+      await firewallApi.moveRule(...scopeParams, rule.pos, to, targetConn);
       await invalidateRules();
     } catch (err) {
       toast.error(t('firewall.moveFailed'), errorMessage(err));
@@ -335,23 +461,35 @@ export function Firewall() {
     setBusy(true);
     try {
       if (deleteTarget.kind === 'group') {
-        await firewallApi.deleteGroup(deleteTarget.name);
+        await firewallApi.deleteGroup(deleteTarget.name, targetConn);
         await groupsQuery.refetch();
         if (activeGroup === deleteTarget.name) setActiveGroup('');
       } else if (deleteTarget.kind === 'ipset') {
-        await firewallApi.deleteIpset(deleteTarget.name);
+        await firewallApi.deleteIpset(deleteTarget.name, targetConn);
         await ipsetsQuery.refetch();
         if (activeIpset === deleteTarget.name) setActiveIpset('');
       } else if (deleteTarget.kind === 'entry' && currentIpset) {
-        await firewallApi.deleteIpsetEntry(currentIpset.name, deleteTarget.name);
+        await firewallApi.deleteIpsetEntry(
+          currentIpset.name,
+          deleteTarget.name,
+          targetConn,
+        );
         await ipsetsQuery.refetch();
       } else if (deleteTarget.kind === 'group-rule') {
-        await firewallApi.deleteGroupRule(deleteTarget.name, deleteTarget.pos ?? 0);
+        await firewallApi.deleteGroupRule(
+          deleteTarget.name,
+          deleteTarget.pos ?? 0,
+          targetConn,
+        );
         await qc.invalidateQueries({
-          queryKey: ['firewall', 'group-rules', deleteTarget.name],
+          queryKey: ['firewall', 'group-rules', targetConn, deleteTarget.name],
         });
       } else {
-        await firewallApi.deleteRule(...scopeParams, deleteTarget.pos ?? 0);
+        await firewallApi.deleteRule(
+          ...scopeParams,
+          deleteTarget.pos ?? 0,
+          targetConn,
+        );
         await invalidateRules();
       }
       toast.success(t('firewall.deleted'));
@@ -366,7 +504,7 @@ export function Firewall() {
   const saveOptions = async (patch: FirewallOptions) => {
     setBusy(true);
     try {
-      await firewallApi.saveOptions(...scopeParams, patch);
+      await firewallApi.saveOptions(...scopeParams, patch, targetConn);
       await qc.invalidateQueries({ queryKey: ['firewall', 'options'] });
       toast.success(t('firewall.optionsSaved'));
     } catch (err) {
@@ -383,7 +521,11 @@ export function Firewall() {
     }
     setBusy(true);
     try {
-      await firewallApi.createGroup(groupDraft.name.trim(), groupDraft.comment.trim());
+      await firewallApi.createGroup(
+        groupDraft.name.trim(),
+        groupDraft.comment.trim(),
+        targetConn,
+      );
       setGroupDraft({ name: '', comment: '' });
       await groupsQuery.refetch();
       await refsQuery.refetch();
@@ -402,7 +544,11 @@ export function Firewall() {
     }
     setBusy(true);
     try {
-      await firewallApi.createIpset(ipsetDraft.name.trim(), ipsetDraft.comment.trim());
+      await firewallApi.createIpset(
+        ipsetDraft.name.trim(),
+        ipsetDraft.comment.trim(),
+        targetConn,
+      );
       setIpsetDraft({ name: '', comment: '' });
       await ipsetsQuery.refetch();
       await refsQuery.refetch();
@@ -421,11 +567,15 @@ export function Firewall() {
     }
     setBusy(true);
     try {
-      await firewallApi.createIpsetEntry(currentIpset.name, {
-        cidr: entryDraft.cidr.trim(),
-        comment: entryDraft.comment.trim(),
-        nomatch: entryDraft.nomask,
-      });
+      await firewallApi.createIpsetEntry(
+        currentIpset.name,
+        {
+          cidr: entryDraft.cidr.trim(),
+          comment: entryDraft.comment.trim(),
+          nomatch: entryDraft.nomask,
+        },
+        targetConn,
+      );
       setEntryDraft({ cidr: '', comment: '', nomask: false });
       await ipsetsQuery.refetch();
     } catch (err) {
@@ -762,11 +912,19 @@ export function Firewall() {
                     {scope === 'node' ? (
                       <div className="fw-target">
                         <Select
-                          value={node}
-                          onChange={(e) => setNode(e.target.value)}
+                          /* 选项值带上连接：同名节点可能出现在两套 PVE 上 */
+                          value={node ? nodeKeyOf({ node, connection_id: nodeConn }) : ''}
+                          onChange={(e) => {
+                            const hit = nodes.find(
+                              (item) => nodeKeyOf(item) === e.target.value,
+                            );
+                            if (!hit) return;
+                            setNode(hit.node);
+                            setNodeConn(hit.connection_id ?? '');
+                          }}
                           options={nodes.map((n) => ({
-                            label: `${n.node}（${n.status}）`,
-                            value: n.node,
+                            label: `${n.node}（${n.status}${n.connection_name ? ` · ${n.connection_name}` : ''}）`,
+                            value: nodeKeyOf(n),
                           }))}
                           placeholder={t('firewall.selectNodePlaceholder')}
                           aria-label={t('firewall.selectNodeAria')}
@@ -778,18 +936,32 @@ export function Firewall() {
                       <>
                         <div className="fw-target">
                           <Select
-                            value={vmid === null ? '' : String(vmid)}
+                            /* 值里带连接与节点：多套 PVE 上同 VMID 的机器不能再撞车 */
+                            value={
+                              vmid === null
+                                ? ''
+                                : guestKeyOf({
+                                    node,
+                                    vmid,
+                                    connection_id: vmConn,
+                                  })
+                            }
                             onChange={(e) => {
-                              const next = Number(e.target.value);
-                              const vm = guests.find((item) => item.vmid === next);
-                              setVmid(next);
-                              if (vm) setNode(vm.node);
+                              const vm = guests.find(
+                                (item) => guestKeyOf(item) === e.target.value,
+                              );
+                              if (!vm) return;
+                              setVmid(vm.vmid);
+                              setNode(vm.node);
+                              setVmConn(vm.connection_id ?? '');
                             }}
                             /* 清单已按作用域分开（虚拟机只列虚拟机、容器只列容器），
-                               这里不必再标类型 */
+                               这里不必再标类型；连接名用于区分同名节点 */
                             options={guests.map((vm) => ({
-                              label: `${vm.name}（${vm.node}/${vm.vmid}）`,
-                              value: String(vm.vmid),
+                              label: `${vm.name}（${vm.node}/${vm.vmid}${
+                                vm.connection_name ? ` · ${vm.connection_name}` : ''
+                              }）`,
+                              value: guestKeyOf(vm),
                             }))}
                             placeholder={
                               scope === 'ct'
@@ -801,6 +973,8 @@ export function Firewall() {
                                 ? t('firewall.selectCtAria')
                                 : t('firewall.selectVmAria')
                             }
+                            /* 几十上百台机器时逐个按键找太慢：按名称 / VMID 输入即筛 */
+                            searchable
                           />
                         </div>
                         <span className="fw-config-note">{t('firewall.ownerOnlyNote')}</span>
@@ -808,7 +982,22 @@ export function Firewall() {
                     ) : null}
 
                     {scope === 'cluster' ? (
-                      <span className="fw-config-note">{t('firewall.clusterNote')}</span>
+                      <>
+                        {/* 集群级对象（含安全组 / IP 集合）是每套 PVE 各自一份，
+                            无法由节点名推断，必须让用户看见「改的是哪一套」 */}
+                        {clusterOptions.length > 1 ? (
+                          <div className="fw-target">
+                            <Select
+                              value={clusterConn}
+                              onChange={(e) => setClusterConn(e.target.value)}
+                              options={clusterOptions}
+                              placeholder={t('firewall.clusterTargetPlaceholder')}
+                              aria-label={t('firewall.clusterTargetAria')}
+                            />
+                          </div>
+                        ) : null}
+                        <span className="fw-config-note">{t('firewall.clusterNote')}</span>
+                      </>
                     ) : null}
                   </div>
                 </div>

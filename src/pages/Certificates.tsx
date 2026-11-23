@@ -12,6 +12,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   certWorkflowRunsApi,
   certsApi,
+  connectionsApi,
   downloadCertificate,
   vmsApi,
 } from "../api/endpoints";
@@ -321,6 +322,7 @@ function blankSite(): Partial<CertSite> {
     ssh_host: "",
     ssh_password: "",
     ssh_key: "",
+    connection_id: "",
     agent_node: "",
     agent_vmid: "",
     auto_renew: true,
@@ -363,6 +365,7 @@ function buildSitePayload(form: Partial<CertSite>): Partial<CertSite> {
     ssh_auth: form.ssh_auth,
     ssh_password: form.ssh_password,
     ssh_key: form.ssh_key,
+    connection_id: form.connection_id ?? "",
     agent_node: form.agent_node,
     agent_vmid: form.agent_vmid,
   };
@@ -602,26 +605,59 @@ export function Certificates() {
     enabled: needsAgent,
   });
 
-  const agentValue =
-    form?.agent_node && form?.agent_vmid
-      ? `${form.agent_node}|${form.agent_vmid}`
-      : "";
+  /* 节点 / 机器所在的 PVE：证书最终要写进那台机器，节点名只在它所属的集群上
+     成立。多套集群都叫 pve1 时，只给 node 会让后端在「当前连接」上找 ——
+     agent 方式甚至会在错机器的客户机里执行命令。 */
+  const connectionsQuery = useQuery({
+    queryKey: ["connections"],
+    queryFn: connectionsApi.list,
+    staleTime: 300_000,
+    retry: false,
+    enabled: ["agent", "lxc", "pve"].includes(String(form?.deploy_method || "")),
+  });
+  const connectionOptions = useMemo(
+    () =>
+      (connectionsQuery.data ?? []).map((c) => ({
+        label: c.name || c.id,
+        value: c.id,
+      })),
+    [connectionsQuery.data],
+  );
+  const multiConnection = connectionOptions.length > 1;
+
   // Guest Agent 部署只能选运行中的虚拟机（虚拟机没开机时 Agent 无法工作）
   const agentOptions = useMemo(() => {
     const vms = (vmsQuery.data ?? [])
       .filter((vm) => isRunning(vm.status) && !vm.template)
       .map((vm) => ({
-        label: t('cert.agentOption', { name: vm.name, vmid: vm.vmid, node: vm.node }),
-        value: `${vm.node}|${vm.vmid}`,
+        label: `${t('cert.agentOption', { name: vm.name, vmid: vm.vmid, node: vm.node })}${
+          vm.connection_name ? ` · ${vm.connection_name}` : ''
+        }`,
+        // 值里带连接：两台 PVE 上同名的节点 + 同号机器是两台不同的机器
+        value: `${vm.connection_id ?? ''}|${vm.node}|${vm.vmid}`,
       }));
-    if (agentValue && !vms.some((o) => o.value === agentValue)) {
+    return vms;
+  }, [vmsQuery.data, t]);
+
+  const agentValue = useMemo(() => {
+    if (!form?.agent_node || !form?.agent_vmid) return "";
+    const identity = `${form.agent_node}|${form.agent_vmid}`;
+    const exact = `${form.connection_id ?? ''}|${identity}`;
+    if (agentOptions.some((o) => o.value === exact)) return exact;
+    /* 旧站点没存 connection_id：按 node+vmid 后缀认一次，显示上不至于变成
+       「这台机器不在运行」；用户重新选一次就会把连接补上。 */
+    return agentOptions.find((o) => o.value.endsWith(`|${identity}`))?.value ?? exact;
+  }, [form?.agent_node, form?.agent_vmid, form?.connection_id, agentOptions]);
+
+  const agentPickerOptions = useMemo(() => {
+    if (agentValue && !agentOptions.some((o) => o.value === agentValue)) {
       return [
         { label: t('cert.agentNotRunning', { value: agentValue }), value: agentValue },
-        ...vms,
+        ...agentOptions,
       ];
     }
-    return vms;
-  }, [vmsQuery.data, agentValue, t]);
+    return agentOptions;
+  }, [agentOptions, agentValue, t]);
 
   async function run(key: string, fn: () => Promise<string>, okTitle: string): Promise<boolean> {
     setBusy(key);
@@ -2562,12 +2598,33 @@ export function Certificates() {
                 label={t('cert.fieldAgentVm')}
                 value={agentValue}
                 placeholder={t('cert.agentVmPlaceholder')}
-                options={agentOptions}
+                options={agentPickerOptions}
                 hint={t('cert.agentVmHint')}
                 onChange={(e) => {
-                  const [node, vmid] = String(e.target.value).split("|");
-                  setForm({ ...form, agent_node: node || "", agent_vmid: vmid || "" });
+                  // 值形如「连接|节点|VMID」：选择机器时把连接一并记下来
+                  const [connectionId = "", node = "", vmid = ""] = String(
+                    e.target.value,
+                  ).split("|");
+                  setForm({
+                    ...form,
+                    connection_id: connectionId,
+                    agent_node: node || "",
+                    agent_vmid: vmid || "",
+                  });
                 }}
+              />
+            ) : null}
+            {multiConnection &&
+            ["agent", "lxc", "pve"].includes(String(form.deploy_method || "")) ? (
+              <Select
+                label={t('cert.fieldPveConnection')}
+                value={form.connection_id || ""}
+                options={[
+                  { label: t('cert.connectionAuto'), value: "" },
+                  ...connectionOptions,
+                ]}
+                hint={t('cert.pveConnectionHint')}
+                onChange={(e) => setForm({ ...form, connection_id: e.target.value })}
               />
             ) : null}
             {form.deploy_method === "lxc" ? (

@@ -9,7 +9,13 @@ import { PageShell } from "../components/Layout";
 import { Card, CardHeader } from "../components/ui/Card";
 import { Badge } from "../components/ui/Badge";
 import { Button, IconButton } from "../components/ui/Button";
-import { Field, Input, Switch, Textarea } from "../components/ui/Input";
+import {
+  Field,
+  Input,
+  SearchableSelect,
+  Switch,
+  Textarea,
+} from "../components/ui/Input";
 import { Notice } from "../components/ui/EmptyState";
 import { ConfirmDialog } from "../components/ui/ConfirmDialog";
 import {
@@ -2335,19 +2341,16 @@ export function Alerts() {
                       </select>
                     </td>
                     <td data-label={t("alerts.colTarget")}>
-                      <select
-                        className="select"
+                      {/* 规则目标可能是几十上百台机器里的一台：原生 select 只能
+                          逐项按键跳，这里换成可搜索下拉（按名称 / VMID 输入即筛） */}
+                      <SearchableSelect
+                        bare
                         value={r.target}
                         disabled={readonly}
                         aria-label={`${t("alerts.colTarget")} ${i + 1}`}
                         onChange={(e) => patch(index, { target: e.target.value })}
-                      >
-                        {targetSelectOptions(r).map((o) => (
-                          <option key={o.value} value={o.value}>
-                            {o.label}
-                          </option>
-                        ))}
-                      </select>
+                        options={targetSelectOptions(r)}
+                      />
                     </td>
                     <td data-label={t("alerts.colMetric")}>
                       <select

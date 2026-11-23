@@ -505,9 +505,16 @@ export async function upload<T>(
   url: string,
   formData: FormData,
   onProgress?: (percent: number) => void,
+  /* 上传同样要能硬指定连接（``X-PVE-Connection``）：目标节点可能在另一套 PVE 上，
+     而上传接口的 node 在 multipart 表单里，后端依赖看不到、也不会自动纠正。 */
+  config?: AxiosRequestConfig,
 ): Promise<T> {
   const res = await http.post<T>(url, formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
+    ...config,
+    headers: {
+      ...(config?.headers ?? {}),
+      'Content-Type': 'multipart/form-data',
+    },
     timeout: 0,
     onUploadProgress: (evt) => {
       if (!onProgress) return;

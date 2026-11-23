@@ -1598,10 +1598,11 @@ export function QuickDeployForm({
                     })}
               </dt>
               <dd className="deploy-summary-value deploy-summary-quota">
-                {/* 一行两段：左 = 额度读数（还能建几台），右 = 模板信息（按哪张
+                {/* 同一行两栏：左 = 额度读数（还能建几台），右 = 模板信息（按哪张
                     模板建）。额度读数右边原来空着半行，把模板放在那儿，正好
-                    补上那块空白；窄屏时模板整块折到下一行、贴右边缘，不与额度
-                    数字挤在同一截里。 */}
+                    补上那块空白。宽度不够时也不拆成两行：右栏按宽度逐级收起
+                    配置、规格，最后只留模板名（见 components.css 里
+                    .deploy-summary-quota 上的 @container 三档）。 */}
                 <span className="deploy-quota-main">
                   {!quota ? (
                     <span className="deploy-summary-loading">
@@ -1788,8 +1789,9 @@ export function QuickDeployForm({
  *
  * 显示规则：
  * · 名称 / 系统与选择器里的写法逐字一致（都来自 TemplatePickItem），不另拼一份；
- * · 「规格」是模板自带的核数 / 内存 / 磁盘，与下一行「单台」的计划规格是两回事，
- *   所以两者都标了来源（这块写「模板」，那行写「单台」）；
+ * · 虚拟机模板只报磁盘大小：核数与内存由规格决定（下一行「单台」），这里再报
+ *   一遍模板自带的数值，用户就得先分辨哪组数才作数；容器模板报压缩包大小，
+ *   它的 rootfs 同样由规格决定、模板本身没有「磁盘」；
  * · 「关键配置」只放模板自身的身份与落点：VMID、克隆方式、存储、节点。网络、
  *   登录这些字段属于这台机器，不在这里重复。
  */
@@ -1826,10 +1828,10 @@ function TemplateBrief({
 
   const specs: string[] = [];
   if (isVm) {
-    if (item.cores) specs.push(t('quickDeploy.specCores', { n: item.cores }));
-    const mem = normalizeSizeText(item.sizeText);
+    /* 只报模板磁盘。核数与内存不在这里报 —— 它们是模板当时那台机器的数值，
+        而这次创建用多少由规格决定（下一行「单台」写的就是它），两处都写
+        反而要用户自己去分辨哪组数才作数。 */
     const disk = normalizeSizeText(item.metaText);
-    if (mem !== '—') specs.push(t('quickDeploy.templateMem', { size: mem }));
     if (disk !== '—') specs.push(t('quickDeploy.templateDisk', { size: disk }));
   } else {
     /* 容器模板只报压缩包大小：rootfs 多大由规格决定，模板本身没有「磁盘」 */

@@ -197,7 +197,13 @@ export function SshSecurity() {
       : []),
     ...hosts
       .filter((row) => row.enabled)
-      .map((row) => ({ value: row.id, label: row.name || row.host })),
+      .map((row) => ({
+        value: row.id,
+        /* 受管主机名通常就是虚拟机名：带上 VMID，选择器就能按它搜索 */
+        label: `${row.name || row.host}${
+          row.vmid != null ? `（VMID ${row.vmid}）` : ''
+        }`,
+      })),
   ];
 
   useEffect(() => {
@@ -606,6 +612,7 @@ export function SshSecurity() {
             onChange={(event) => setScopeId(event.target.value)}
             options={scopeOptions}
             style={{ maxWidth: 280 }}
+            searchable
           />
           <span className="scope-meta">
             {fleet ? (

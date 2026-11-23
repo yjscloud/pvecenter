@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from . import crypto, defaults, store, vmconfig
-from .pve import ProxmoxError, get_client
+from .pve import ProxmoxError, all_connection_clients, client_for_connection, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,9 @@ DEFAULT_BOT: Dict[str, Any] = {
     "allow_write": True,
     "allow_create": True,
     "default_template_vmid": "",
+    # 创建走哪套 PVE：多连接部署里节点名 / VMID 各自独立，留空时按模板所处的
+    # 唯一连接推断（撞号会让机器人拒绝创建，而不是挑一条去建）
+    "default_connection_id": "",
     "default_node": "",
     "default_storage": "",
     "default_backup_storage": "",
@@ -414,6 +417,157 @@ async def find_vm(client: Any, keyword: str) -> Tuple[Optional[Dict[str, Any]], 
     return None, partial[:8]
 
 
+# ------------------------------------------------------------ 多连接寻址
+#: 匹配精度：3 = VMID 精确，2 = 名称精确，1 = 名称唯一模糊
+_MATCH_VMID, _MATCH_NAME, _MATCH_PARTIAL = 3, 2, 1
+
+
+def _connection_catalog() -> List[Tuple[Optional[Dict[str, Any]], Any]]:
+    """所有可用连接 ``(profile, client)``；没保存过连接时退回当前连接。
+
+    与面板的只读聚合用同一份清单（暂停接入的连接不进来）。
+    """
+    pairs = list(all_connection_clients())
+    if pairs:
+        return pairs
+    try:
+        return [(None, get_client())]
+    except ProxmoxError:
+        return []
+
+
+def connection_label(profile: Optional[Dict[str, Any]]) -> str:
+    """连接在聊天里怎么称呼：优先名字，其次 id。"""
+    if not profile:
+        return "默认连接"
+    return str(profile.get("name") or profile.get("id") or "默认连接")
+
+
+def connection_id_of(profile: Optional[Dict[str, Any]]) -> str:
+    return str((profile or {}).get("id") or "")
+
+
+def _match_quality(
+    vms: List[Dict[str, Any]], keyword: str
+) -> Tuple[int, Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """在一条连接的机器清单里按「VMID > 名称 > 唯一模糊」评估匹配精度。"""
+    if not keyword:
+        return 0, None, []
+    for vm in vms:
+        if str(vm.get("vmid")) == keyword:
+            return _MATCH_VMID, vm, []
+    for vm in vms:
+        if str(vm.get("name") or "").lower() == keyword:
+            return _MATCH_NAME, vm, []
+    partial = [vm for vm in vms if keyword in str(vm.get("name") or "").lower()]
+    if len(partial) == 1:
+        return _MATCH_PARTIAL, partial[0], []
+    return 0, None, partial[:8]
+
+
+def _split_connection_hint(
+    keyword: str, catalog: List[Tuple[Optional[Dict[str, Any]], Any]]
+) -> Tuple[Optional[str], str]:
+    """``office/100`` → (连接 id, "100")。
+
+    多套集群上都有 VMID 100 时，让用户多打一个前缀，比让机器人猜一条连接去
+    重启另一套集群上同号的机器安全得多。
+    """
+    text = str(keyword or "").strip()
+    if "/" not in text:
+        return None, text
+    head, rest = text.split("/", 1)
+    wanted = head.strip().lower()
+    if not wanted:
+        return None, text
+    for profile, _client in catalog:
+        if wanted in (connection_label(profile).lower(), connection_id_of(profile).lower()):
+            return connection_id_of(profile), rest.strip()
+    return None, text
+
+
+def _describe_target(
+    vm: Dict[str, Any], profile: Optional[Dict[str, Any]]
+) -> str:
+    return (
+        "「"
+        + connection_label(profile)
+        + "」"
+        + vm_name(vm)
+        + "（"
+        + str(vm.get("vmid"))
+        + "）"
+    )
+
+
+async def resolve_target(
+    keyword: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Any], Optional[str]]:
+    """跨连接找一台虚拟机，返回 ``(vm, client, 错误文案)``。
+
+    * 只有一台命中 → 直接返回，``vm`` 上补 ``connection_id`` / ``connection_name``，
+      调用方必须用返回的 ``client``（而不是 ``get_client()``），否则又回到「当前连接」；
+    * 多台同精度命中（比如两套集群都有 VMID 100）→ 报错并要求加连接名前缀，
+      **绝不默认第一条**：这是关机 / 回滚 / 备份这类写操作。
+    """
+    catalog = _connection_catalog()
+    if not catalog:
+        return None, None, "还没有配置任何 PVE 连接。"
+
+    hint, text = _split_connection_hint(keyword, catalog)
+    if hint is not None:
+        catalog = [
+            (profile, client)
+            for profile, client in catalog
+            if connection_id_of(profile) == hint
+        ] or catalog
+    if not text:
+        return None, None, "请提供虚拟机名称或 VMID。"
+
+    wanted = text.lower()
+    best: int = 0
+    winners: List[Tuple[Dict[str, Any], Any, Optional[Dict[str, Any]]]] = []
+    candidates: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
+
+    for profile, client in catalog:
+        try:
+            resources = await client.cluster_resources("vm") or []
+        except ProxmoxError:
+            # 单条连接读失败只影响它自己
+            continue
+        vms = [row for row in resources if row.get("type") == "qemu"]
+        quality, vm, partial = _match_quality(vms, wanted)
+        if vm is not None:
+            if quality > best:
+                best, winners = quality, [(vm, client, profile)]
+            elif quality == best:
+                winners.append((vm, client, profile))
+        else:
+            candidates.extend((row, profile) for row in partial)
+
+    if len(winners) == 1:
+        vm, client, profile = winners[0]
+        vm = dict(vm)
+        vm["connection_id"] = connection_id_of(profile)
+        vm["connection_name"] = connection_label(profile)
+        return vm, client, None
+    if len(winners) > 1:
+        names = "、".join(_describe_target(vm, profile) for vm, _c, profile in winners[:6])
+        return (
+            None,
+            None,
+            "匹配到多台虚拟机：" + names + "。请加连接名再试，例如「office/100」。",
+        )
+    if candidates:
+        names = "、".join(_describe_target(vm, profile) for vm, profile in candidates[:6])
+        return (
+            None,
+            None,
+            "匹配到多台虚拟机：" + names + "，请用 VMID 或「连接名/VMID」精确指定。",
+        )
+    return None, None, "没有找到「" + text + "」对应的虚拟机。"
+
+
 STATUS_LABEL = {
     "running": "运行中",
     "stopped": "已停止",
@@ -458,8 +612,13 @@ def _uptime_text(seconds: Any) -> str:
 
 
 def vm_line(vm: Dict[str, Any]) -> str:
-    """列表里的一行：状态图标 + 名称 + VMID + 实时占用。"""
-    parts = [status_icon(vm) + " **" + vm_name(vm) + "**", "VMID " + str(vm.get("vmid"))]
+    """列表里的一行：状态图标 + 名称 + VMID + 实时占用。
+
+    多连接聚合时名称前带上连接名 —— 两套集群都有 VMID 100 很常见。
+    """
+    prefix = str(vm.get("connection_name") or "")
+    title = ("「" + prefix + "」" if prefix else "") + vm_name(vm)
+    parts = [status_icon(vm) + " **" + title + "**", "VMID " + str(vm.get("vmid"))]
     if str(vm.get("status")) == "running":
         parts.append("CPU " + format(float(vm.get("cpu") or 0) * 100, ".1f") + "%")
         parts.append(
@@ -483,6 +642,8 @@ def vm_detail_pairs(vm: Dict[str, Any]) -> List[Tuple[str, str]]:
         ("VMID", str(vm.get("vmid"))),
         ("所在节点", str(vm.get("node") or "-")),
     ]
+    if vm.get("connection_name"):
+        pairs.append(("所属集群", str(vm.get("connection_name"))))
     if str(vm.get("status")) == "running":
         pairs.append(("CPU 使用率", format(float(vm.get("cpu") or 0) * 100, ".1f") + "%"))
         mem, maxmem = _gb(vm.get("mem")), _gb(vm.get("maxmem"))
@@ -568,10 +729,30 @@ def parse_command(text: str) -> Tuple[str, str]:
 
 
 async def op_list_card() -> Dict[str, Any]:
-    """虚拟机列表卡片：按运行状态分组，附实时占用。"""
-    client = get_client()
-    resources = await client.cluster_resources("vm")
-    vms = [r for r in resources if r.get("type") == "qemu" and not r.get("template")]
+    """虚拟机列表卡片：按运行状态分组，附实时占用。
+
+    多连接时**合并全部集群**：只列「当前连接」会让另一套集群的机器在聊天里
+    彻底不可见，用户只能以为它们不存在。
+    """
+    catalog = _connection_catalog()
+    if not catalog:
+        return result_card("未配置 PVE", "warn", ["还没有保存任何 PVE 连接。"])
+    scoped = len(catalog) > 1
+    vms: List[Dict[str, Any]] = []
+    for profile, client in catalog:
+        try:
+            resources = await client.cluster_resources("vm") or []
+        except ProxmoxError:
+            # 单条连接读失败只跳过它自己
+            continue
+        for row in resources:
+            if row.get("type") != "qemu" or row.get("template"):
+                continue
+            item = dict(row)
+            if scoped:
+                item["connection_name"] = connection_label(profile)
+            vms.append(item)
+    vms.sort(key=lambda v: (str(v.get("connection_name") or ""), v.get("vmid") or 0))
     running = sorted(
         [v for v in vms if str(v.get("status")) == "running"], key=lambda v: v.get("vmid") or 0
     )
@@ -608,35 +789,33 @@ async def op_list_card() -> Dict[str, Any]:
         + str(len(stopped))
         + " 台",
         elements,
-        "发送「状态 VMID」查看单台详情。",
+        "发送「状态 VMID」查看单台详情"
+        + ("；两套集群有同号机器时加连接名，如「状态 office/100」。" if scoped else "。"),
     )
 
 
 async def op_status_card(keyword: str) -> Dict[str, Any]:
-    """单台虚拟机详情卡片。"""
-    client = get_client()
-    vm, candidates = await find_vm(client, keyword)
-    if not vm:
-        if candidates:
-            names = "、".join(str(c.get("name") or c.get("vmid")) for c in candidates)
-            return result_card(
-                "匹配到多台虚拟机",
-                "warn",
-                ["关键词命中了多台：" + names, "请改用 VMID 精确指定。"],
-            )
+    """单台虚拟机详情卡片（跨连接查找，命中多台时要求加连接名）。"""
+    vm, _client, err = await resolve_target(keyword)
+    if vm is None:
         return result_card(
-            "未找到虚拟机", "warn", ["没有找到与「" + str(keyword) + "」匹配的虚拟机。"]
+            "未找到虚拟机" if err and err.startswith("没有找到") else "无法定位虚拟机",
+            "warn",
+            [err or "没有找到对应的虚拟机。"],
         )
     vmid = str(vm.get("vmid"))
     running = str(vm.get("status")) == "running"
+    conn = str(vm.get("connection_name") or "")
+    subject = (("「" + conn + "」") if conn else "") + vm_name(vm) + " · VMID " + vmid
+    target = ("「" + conn + "/" if conn else "「") + vmid + "」"
     return as_card(
         "info",
         "虚拟机详情",
-        vm_name(vm) + " · VMID " + vmid,
+        subject,
         [_fields_element(vm_detail_pairs(vm))],
-        "发送「关机 " + vmid + "」可关机（需确认）。"
+        "发送「关机 " + target + "」可关机（需确认）。"
         if running
-        else "发送「开机 " + vmid + "」可启动该虚拟机。",
+        else "发送「开机 " + target + "」可启动该虚拟机。",
     )
 
 
@@ -649,13 +828,11 @@ POWER_MAP = {
 
 async def op_power(action: str, keyword: str) -> Tuple[str, List[str]]:
     api_action, label, skip_reason = POWER_MAP[action]
-    client = get_client()
-    vm, candidates = await find_vm(client, keyword)
-    if not vm:
-        if candidates:
-            names = "、".join(str(c.get("name") or c.get("vmid")) for c in candidates)
-            return "warn", ["匹配到多台虚拟机：" + names, "请用 VMID 精确指定。"]
-        return "warn", ["没有找到「" + keyword + "」对应的虚拟机。"]
+    # 跨连接定位：返回的 client 才是这台机器所在的那台 PVE。命中多台（两套
+    # 集群都有 VMID 100）时宁可让它失败并要求加连接名 —— 这里最忌讳「猜一条」。
+    vm, client, err = await resolve_target(keyword)
+    if vm is None or client is None:
+        return "warn", [err or "没有找到对应的虚拟机。"]
     status = str(vm.get("status") or "")
     need_running = action in ("stop", "restart")
     if need_running and status != "running":
@@ -664,11 +841,14 @@ async def op_power(action: str, keyword: str) -> Tuple[str, List[str]]:
         return "warn", [str(vm.get("name")) + " " + skip_reason + "。"]
     node = str(vm.get("node") or "")
     await client.qemu_power(node, int(vm["vmid"]), api_action)
-    return "ok", [
+    lines = [
         "已下发**" + label + "**指令",
         "对象：" + str(vm.get("name")) + "（" + str(vm.get("vmid")) + "）",
         "节点：" + node,
     ]
+    if vm.get("connection_name"):
+        lines.append("集群：" + str(vm.get("connection_name")))
+    return "ok", lines
 
 
 async def op_create(
@@ -685,10 +865,32 @@ async def op_create(
     template_id = str(cfg.get("default_template_vmid") or "").strip()
     if not template_id:
         return "warn", ["尚未配置默认模板（模板 VMID），请先在面板里填写。"]
-    client = get_client()
-    template, _ = await find_vm(client, template_id)
-    if not template:
-        return "warn", ["模板 " + template_id + " 不存在。"]
+    catalog = _connection_catalog()
+    conn_hint = str(cfg.get("default_connection_id") or "").strip()
+    conn_name = ""
+    if conn_hint:
+        # 配置了默认集群就钉死它：模板 VMID 在每套 PVE 上各自独立
+        try:
+            client = client_for_connection(conn_hint)
+        except ProxmoxError as exc:
+            return "warn", ["默认 PVE 集群不可用：" + str(exc.message)]
+        template, _ = await find_vm(client, template_id)
+        template = dict(template) if template else None
+        conn_name = next(
+            (
+                connection_label(profile)
+                for profile, _c in catalog
+                if connection_id_of(profile) == conn_hint
+            ),
+            conn_hint,
+        )
+        if not template:
+            return "warn", ["模板 " + template_id + " 在默认集群里不存在。"]
+    else:
+        template, client, err = await resolve_target(template_id)
+        if template is None or client is None:
+            return "warn", [err or ("模板 " + template_id + " 不存在。")]
+        conn_name = str(template.get("connection_name") or "")
     if not int(template.get("template") or 0):
         return "warn", ["VMID " + template_id + " 不是模板，请用模板克隆。"]
     new_id = int(await client.nextid())
@@ -708,6 +910,8 @@ async def op_create(
         "新虚拟机：" + name + "（" + str(new_id) + "）",
         "来源模板：" + str(template.get("name")) + "（" + str(template.get("vmid")) + "）",
     ]
+    if conn_name:
+        lines.append("集群：" + conn_name)
     spec: Dict[str, Any] = {}
     if cpu:
         spec["cores"] = int(cpu)
@@ -1012,37 +1216,28 @@ async def send_test(cfg: Dict[str, Any], chat_id: str) -> Dict[str, Any]:
     return {"detail": "测试卡片已发送到 " + chat_id}
 
 
-async def _resolve(client: Any, keyword: str):
-    vm, candidates = await find_vm(client, keyword)
-    if vm:
-        return vm, None
-    if candidates:
-        names = "、".join(str(c.get("name") or c.get("vmid")) for c in candidates)
-        return None, "匹配到多台虚拟机：" + names + "，请用 VMID 精确指定。"
-    return None, "没有找到「" + keyword + "」对应的虚拟机。"
-
-
 async def op_snapshot(keyword: str, name: str) -> Tuple[str, List[str]]:
-    client = get_client()
-    vm, err = await _resolve(client, keyword)
-    if not vm:
-        return "warn", [err or ""]
+    vm, client, err = await resolve_target(keyword)
+    if vm is None or client is None:
+        return "warn", [err or "没有找到对应的虚拟机。"]
     snap = (name or "bot-" + time.strftime("%Y%m%d-%H%M%S")).strip()
     await client.qemu_snapshot_create(
         str(vm.get("node") or ""), int(vm["vmid"]), snap, description="由飞书机器人创建"
     )
-    return "ok", [
+    lines = [
         "已创建快照 **" + snap + "**",
         "对象：" + str(vm.get("name")) + "（" + str(vm.get("vmid")) + "）",
     ]
+    if vm.get("connection_name"):
+        lines.append("集群：" + str(vm.get("connection_name")))
+    return "ok", lines
 
 
 async def op_snap_card(keyword: str) -> Dict[str, Any]:
     """快照列表卡片。"""
-    client = get_client()
-    vm, err = await _resolve(client, keyword)
-    if not vm:
-        return result_card("未找到虚拟机", "warn", [err or ""])
+    vm, client, err = await resolve_target(keyword)
+    if vm is None or client is None:
+        return result_card("未找到虚拟机", "warn", [err or "没有找到对应的虚拟机。"])
     snaps = await client.qemu_snapshots(str(vm.get("node") or ""), int(vm["vmid"]))
     items = [s for s in snaps if str(s.get("name")) != "current"]
     lines: List[str] = []
@@ -1053,50 +1248,57 @@ async def op_snap_card(keyword: str) -> Dict[str, Any]:
         stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(when))) if when else "-"
         lines.append("· " + str(snap.get("name")) + " · " + stamp)
     vmid = str(vm.get("vmid"))
+    conn = str(vm.get("connection_name") or "")
     return as_card(
         "info",
         "快照列表",
         vm_name(vm) + " · VMID " + vmid + " · 共 " + str(len(items)) + " 个",
         [_text_element("\n".join(lines))],
-        "发送「回滚 " + vmid + " 快照名」可回滚到指定快照（需确认）。" if items else "",
+        "发送「回滚 " + (conn + "/" if conn else "") + vmid + " 快照名」可回滚到指定快照（需确认）。"
+        if items
+        else "",
     )
 
 
 async def op_rollback(keyword: str, snap: str) -> Tuple[str, List[str]]:
-    client = get_client()
-    vm, err = await _resolve(client, keyword)
-    if not vm:
-        return "warn", [err or ""]
+    vm, client, err = await resolve_target(keyword)
+    if vm is None or client is None:
+        return "warn", [err or "没有找到对应的虚拟机。"]
     if not snap:
         return "warn", ["请提供快照名，例如：回滚 web-01 before-upgrade"]
     snaps = await client.qemu_snapshots(str(vm.get("node") or ""), int(vm["vmid"]))
     if not any(str(s.get("name")) == snap for s in snaps):
         return "warn", ["快照 " + snap + " 不存在，发送「快照列表 " + keyword + "」查看现有快照。"]
     await client.qemu_snapshot_rollback(str(vm.get("node") or ""), int(vm["vmid"]), snap)
-    return "ok", [
+    lines = [
         "已回滚到快照 **" + snap + "**",
         "对象：" + str(vm.get("name")) + "（" + str(vm.get("vmid")) + "）",
         "回滚会丢弃快照之后的数据变更，请确认业务可接受。",
     ]
+    if vm.get("connection_name"):
+        lines.append("集群：" + str(vm.get("connection_name")))
+    return "ok", lines
 
 
 async def op_backup(cfg: Dict[str, Any], keyword: str, storage: str) -> Tuple[str, List[str]]:
-    client = get_client()
-    vm, err = await _resolve(client, keyword)
-    if not vm:
-        return "warn", [err or ""]
+    vm, client, err = await resolve_target(keyword)
+    if vm is None or client is None:
+        return "warn", [err or "没有找到对应的虚拟机。"]
     target = (storage or str(cfg.get("default_backup_storage") or "") or str(cfg.get("default_storage") or "")).strip()
     if not target:
         return "warn", ["未指定备份存储，请用「备份 名称或ID 存储名」，或先在面板里配置默认备份存储。"]
     await client.backup_create(
         str(vm.get("node") or ""), int(vm["vmid"]), target, mode="snapshot", compress="zstd"
     )
-    return "ok", [
+    lines = [
         "已提交**备份**任务",
         "对象：" + str(vm.get("name")) + "（" + str(vm.get("vmid")) + "）",
         "存储：" + target + " · 模式 snapshot · 压缩 zstd",
         "可在面板「任务队列」里查看进度。",
     ]
+    if vm.get("connection_name"):
+        lines.append("集群：" + str(vm.get("connection_name")))
+    return "ok", lines
 
 
 

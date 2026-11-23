@@ -412,6 +412,15 @@ function TemplateEditor({
 }
 
 /* -------------------------------------------------------------- 批量下发 */
+/** 目标的身份键：多套 PVE 上同名节点 + 同 VMID 是两台不同的机器 */
+function pickKeyOf(vm: {
+  node: string;
+  vmid: number;
+  connection_id?: string;
+}): string {
+  return `${vm.connection_id ?? ''}|${vm.node}|${vm.vmid}`;
+}
+
 function ApplyTemplateModal({
   template,
   vms,
@@ -421,7 +430,14 @@ function ApplyTemplateModal({
   setBusy,
 }: {
   template: FirewallTemplate;
-  vms: Array<{ node: string; vmid: number; name: string; type?: string }>;
+  vms: Array<{
+    node: string;
+    vmid: number;
+    name: string;
+    type?: string;
+    connection_id?: string;
+    connection_name?: string;
+  }>;
   busy: boolean;
   onClose: () => void;
   onDone: (result: FirewallApplyResult) => void;
@@ -429,7 +445,9 @@ function ApplyTemplateModal({
 }) {
   const t = useT();
   const toast = useToast();
-  const [selected, setSelected] = useState<Set<number>>(new Set());
+  /* 选中状态按「连接 + 节点 + VMID」记：只按 vmid 的话，两套 PVE 上同号机器
+     会一起被勾上 / 一起取消，下发也跟着错。 */
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [keyword, setKeyword] = useState('');
   const [replace, setReplace] = useState(true);
 
@@ -441,19 +459,25 @@ function ApplyTemplateModal({
     );
   });
 
-  const toggle = (vmid: number) => {
+  const toggle = (key: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(vmid)) next.delete(vmid);
-      else next.add(vmid);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   };
 
   const apply = async () => {
     const targets = vms
-      .filter((vm) => selected.has(vm.vmid))
-      .map((vm) => ({ node: vm.node, vmid: vm.vmid, type: vm.type ?? '' }));
+      .filter((vm) => selected.has(pickKeyOf(vm)))
+      .map((vm) => ({
+        node: vm.node,
+        vmid: vm.vmid,
+        type: vm.type ?? '',
+        /* 逐台带上所在的 PVE 连接：一次下发可能跨多套集群，后端据此逐台取客户端 */
+        connection_id: vm.connection_id ?? '',
+      }));
     if (targets.length === 0) {
       toast.warning(t('fwTpl.selectFirst'));
       return;
@@ -519,7 +543,7 @@ function ApplyTemplateModal({
             size="sm"
             variant="ghost"
             onClick={() =>
-              setSelected(new Set(visible.map((vm) => vm.vmid)))
+              setSelected(new Set(visible.map((vm) => pickKeyOf(vm))))
             }
           >
             {t('fwTpl.selectAll', { n: visible.length })}
@@ -531,16 +555,18 @@ function ApplyTemplateModal({
 
         <div className="fw-pick-list">
           {visible.map((vm) => (
-            <label key={`${vm.node}-${vm.vmid}`} className="fw-pick-row">
+            <label key={pickKeyOf(vm)} className="fw-pick-row">
               <input
                 type="checkbox"
-                checked={selected.has(vm.vmid)}
-                onChange={() => toggle(vm.vmid)}
+                checked={selected.has(pickKeyOf(vm))}
+                onChange={() => toggle(pickKeyOf(vm))}
               />
               <span className="fw-500">{vm.name}</span>
               <span className="mono fw-pick-meta">
-                {/* 标出类型：容器与虚拟机是两套写权限，选错了会被后端逐台拒绝 */}
+                {/* 标出类型：容器与虚拟机是两套写权限，选错了会被后端逐台拒绝；
+                    连接名用于区分两套 PVE 上的同名节点 */}
                 {vm.type === 'lxc' ? 'CT' : 'VM'} {vm.node}/{vm.vmid}
+                {vm.connection_name ? ` · ${vm.connection_name}` : ''}
               </span>
             </label>
           ))}

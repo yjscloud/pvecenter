@@ -328,3 +328,59 @@ def test_route_turns_unexpected_error_into_readable_message(monkeypatch):
     assert exc.status_code == 502
     assert "服务器内部错误" not in str(exc.detail)
     assert "未预期" in str(exc.detail)
+
+
+def test_status_route_maps_unresolved_node_to_actionable_message(monkeypatch):
+    """节点名解析失败 → 一句能照着做的中文，而不是 PVE 的英文原文。
+
+    多连接部署下 ``hostname lookup 'node02' failed`` 几乎总是「请求打错了 PVE」，
+    让用户看到原文只会以为是 DNS 坏了。这里点明连接归属与 /etc/hosts 两个方向。
+    """
+
+    async def _boom(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        raise ProxmoxError("hostname lookup 'node02' failed", 500)
+
+    monkeypatch.setattr(isolation_router.isolation, "status", _boom)
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(
+            isolation_router.quarantine_status(
+                node="node02",
+                vmid=107,
+                request=_request(),
+                user={"username": "alice"},
+            )
+        )
+
+    exc = caught.value
+    assert exc.status_code == 502
+    detail = str(exc.detail)
+    assert "node02" in detail
+    assert "/etc/hosts" in detail
+    # PVE 原文只进日志
+    assert "hostname lookup" not in detail
+
+
+def test_status_route_hides_raw_pve_error_behind_trace_id(monkeypatch):
+    """其它失败：502 + trace id，原文（可能带宿主机路径）不外泄。"""
+
+    async def _boom(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        raise ProxmoxError("storage '/var/lib/vz' is locked", 500)
+
+    monkeypatch.setattr(isolation_router.isolation, "status", _boom)
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(
+            isolation_router.quarantine_status(
+                node="pve",
+                vmid=107,
+                request=_request(),
+                user={"username": "alice"},
+            )
+        )
+
+    exc = caught.value
+    assert exc.status_code == 502
+    detail = str(exc.detail)
+    assert "trace:" in detail
+    assert "/var/lib/vz" not in detail

@@ -400,3 +400,37 @@ class TestProbeCaching:
 
         assert asyncio.run(_scenario()) == ["conn-a"] * 6
         assert len(calls) == 1, f"6 个并发请求探了 {len(calls)} 轮"
+
+class TestRouterWiring:
+    """按机器 / 节点寻址的路由必须挂上绑定依赖。
+
+    这条坑已经踩过三次（虚拟机详情、隔离、防火墙整组）：漏挂时请求落到「当前
+    连接」，另一台 PVE 会把节点名当主机名解析，报的却是 ``hostname lookup 'x'
+    failed``，看起来像 DNS 坏了。这里把当前需要绑定的路由钉住，新增路由时照着
+    ``vm_scope.bound_dependencies()`` 挂即可。
+    """
+
+    @staticmethod
+    def _dep_names(path: str) -> List[str]:
+        from app.main import app
+
+        for route in app.routes:
+            if getattr(route, "path", "") == path:
+                return [dep.call.__name__ for dep in route.dependant.dependencies]
+        raise AssertionError(f"路由未注册：{path}")
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/firewall/{scope}/rules",
+            "/api/vms/{node}/{vmid}/export",
+            "/api/vms/import/sources",
+            "/api/vms/import/progress",
+        ],
+    )
+    def test_routes_bind_connection(self, path: str) -> None:
+        names = self._dep_names(path)
+        assert "bind_vm_connection" in names, names
+        assert "bind_node_connection" in names, names
+        # 先 VM 级、再节点级：反了的话节点绑定写入硬指定，VM 级纠正就失效了
+        assert names.index("bind_vm_connection") < names.index("bind_node_connection")

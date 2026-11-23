@@ -207,6 +207,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await sshremote.init_table()
     # 受保护备份登记表（防删 / 防篡改核对）
     await backupguard.init_table()
+    # 节点备注的存量键（只有节点名）固定到升级时的当前连接，避免两套集群的
+    # 同名节点继续共用同一条备注（新键形如 <连接id>|<节点>）
+    await node_notes.migrate_legacy_keys()
     # 面板发起的隔离动作登记表：虚拟机列表靠它打「隔离」标签，应急响应页靠它
     # 列出「现在有哪些机器被隔离」（见 app.quarantine_store）
     await quarantine_store.init_table()

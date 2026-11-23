@@ -57,9 +57,11 @@ export function VmExportDialog({ open, vm, onClose }: VmExportDialogProps) {
   const node = vm?.node ?? '';
   const stopped = (vm?.status ?? '') === 'stopped';
 
+  /* 存储列表必须按这台机器所在的连接读：两套 PVE 有同名节点时，只传 node
+     会列出另一台的存储，选中的目标在导出时就对不上。 */
   const storagesQuery = useQuery({
-    queryKey: ['storages', 'list', node],
-    queryFn: () => storagesApi.list(node),
+    queryKey: ['storages', 'list', vm?.connection_id, node],
+    queryFn: () => storagesApi.list(node, vm?.connection_id),
     enabled: open && Boolean(node),
     staleTime: 60_000,
     retry: false,

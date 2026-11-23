@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS protected_backups (
+    connection       VARCHAR(64)  NOT NULL DEFAULT '',
     volid            VARCHAR(255) NOT NULL,
     node             VARCHAR(128) NOT NULL DEFAULT '',
     storage          VARCHAR(128) NOT NULL DEFAULT '',
@@ -47,15 +48,49 @@ CREATE TABLE IF NOT EXISTS protected_backups (
     state            VARCHAR(16)  NOT NULL DEFAULT 'ok',
     state_detail     VARCHAR(500) NOT NULL DEFAULT '',
     pve_protected    TINYINT      NOT NULL DEFAULT 0,
-    PRIMARY KEY (volid),
+    PRIMARY KEY (connection, volid),
     KEY idx_protected_state (state)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
+
+#: 主键的列顺序（迁移判断用）。
+_KEY_COLUMNS = ("connection", "volid")
 
 
 async def init_table() -> None:
     async with database.connect() as db:
         await db.executescript(SCHEMA)
+        # 旧库迁移：早期主键只有 ``volid``。而 volid 只含「存储名 + 文件名」，
+        # 两套 PVE 上同名存储、同号机器、备份时间落在同一秒时会是同一个字符串 ——
+        # 于是共用一条保护记录：is_protected 误判、核对状态互相覆盖。
+        # 补 connection 列后把主键换成复合键，旧记录一律归到「空连接」
+        # （= 当时用的是当前连接），行为与升级前一致。
+        await database.add_columns(
+            db,
+            "protected_backups",
+            [
+                (
+                    "connection",
+                    "ALTER TABLE protected_backups "
+                    "ADD COLUMN connection VARCHAR(64) NOT NULL DEFAULT ''",
+                )
+            ],
+        )
+        cursor = await db.execute(
+            "SELECT COLUMN_NAME FROM information_schema.key_column_usage"
+            " WHERE table_schema = DATABASE()"
+            " AND table_name = 'protected_backups'"
+            " AND constraint_name = 'PRIMARY'"
+            " ORDER BY ordinal_position"
+        )
+        rows = await cursor.fetchall()
+        key_columns = tuple(str(row["COLUMN_NAME"]) for row in rows)
+        if key_columns != _KEY_COLUMNS:
+            await db.execute(
+                "ALTER TABLE protected_backups DROP PRIMARY KEY,"
+                " ADD PRIMARY KEY (connection, volid)"
+            )
+        await db.commit()
 
 
 def meta_fingerprint(volid: str, size: Any, ctime: Any) -> str:
@@ -71,50 +106,77 @@ def _row(row: Any) -> Dict[str, Any]:
     if row is None:
         return {}
     return {
-        "volid": str(row[0]),
-        "node": row[1] or "",
-        "storage": row[2] or "",
-        "vmid": row[3] or "",
-        "size": int(row[4] or 0),
-        "ctime": int(row[5] or 0),
-        "meta_fingerprint": row[6] or "",
-        "note": row[7] or "",
-        "created": float(row[8] or 0),
-        "created_by": row[9] or "",
-        "last_seen": float(row[10] or 0),
-        "state": row[11] or "ok",
-        "state_detail": row[12] or "",
-        "pve_protected": bool(row[13]),
+        "connection": str(row[0] or ""),
+        "volid": str(row[1]),
+        "node": row[2] or "",
+        "storage": row[3] or "",
+        "vmid": row[4] or "",
+        "size": int(row[5] or 0),
+        "ctime": int(row[6] or 0),
+        "meta_fingerprint": row[7] or "",
+        "note": row[8] or "",
+        "created": float(row[9] or 0),
+        "created_by": row[10] or "",
+        "last_seen": float(row[11] or 0),
+        "state": row[12] or "ok",
+        "state_detail": row[13] or "",
+        "pve_protected": bool(row[14]),
     }
 
 
 _COLUMNS = (
-    "volid, node, storage, vmid, size, ctime, meta_fingerprint, note, created, "
-    "created_by, last_seen, state, state_detail, pve_protected"
+    "connection, volid, node, storage, vmid, size, ctime, meta_fingerprint, note, "
+    "created, created_by, last_seen, state, state_detail, pve_protected"
 )
 
 
-async def get_record(volid: str) -> Optional[Dict[str, Any]]:
-    async with database.connect() as db:
-        cursor = await db.execute(
-            f"SELECT {_COLUMNS} FROM protected_backups WHERE volid = ?", (volid,)
+async def get_record(
+    volid: str, connection_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """按卷读登记记录。
+
+    ``connection_id`` 为空 / ``None`` 时**不限定连接**：删除拦截走这条路，
+    volid 本身不含连接信息，漏判等于放行了受保护备份（宁严不漏）。需要精确
+    定位（解除保护、核对）时再显式传连接。
+    """
+    if connection_id:
+        sql = (
+            f"SELECT {_COLUMNS} FROM protected_backups"
+            " WHERE volid = ? AND connection = ?"
         )
+        params: tuple = (volid, connection_id)
+    else:
+        sql = (
+            f"SELECT {_COLUMNS} FROM protected_backups"
+            " WHERE volid = ? ORDER BY created DESC LIMIT 1"
+        )
+        params = (volid,)
+    async with database.connect() as db:
+        cursor = await db.execute(sql, params)
         row = await cursor.fetchone()
     return _row(row) if row else None
 
 
-async def list_records() -> List[Dict[str, Any]]:
+async def list_records(connection_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """全部受保护备份；``connection_id`` 非空时只列那一套集群。"""
     async with database.connect() as db:
-        cursor = await db.execute(
-            f"SELECT {_COLUMNS} FROM protected_backups ORDER BY created DESC"
-        )
+        if connection_id:
+            cursor = await db.execute(
+                f"SELECT {_COLUMNS} FROM protected_backups"
+                " WHERE connection = ? ORDER BY created DESC",
+                (connection_id,),
+            )
+        else:
+            cursor = await db.execute(
+                f"SELECT {_COLUMNS} FROM protected_backups ORDER BY created DESC"
+            )
         rows = await cursor.fetchall()
     return [_row(row) for row in rows]
 
 
-async def is_protected(volid: str) -> bool:
+async def is_protected(volid: str, connection_id: Optional[str] = None) -> bool:
     """面板层删除拦截用：登记过就算受保护（不看当前核对状态）。"""
-    return await get_record(volid) is not None
+    return await get_record(volid, connection_id) is not None
 
 
 async def protect(
@@ -125,20 +187,26 @@ async def protect(
     vmid: Optional[Any] = None,
     note: str = "",
     username: str = "",
+    connection_id: str = "",
 ) -> Dict[str, Any]:
     """登记为受保护备份，并尽力给 PVE 卷打上 ``protected`` 旗标。
 
     读一次 PVE 侧的大小与创建时间作为基线指纹；读不到（卷刚消失 / 权限不足）也照
     登记，只是状态标成 ``unknown`` —— 核对时会把差异报出来，比默默放过好。
+
+    ``connection_id`` 是这条备份所在的 PVE：与 volid 一起构成主键。两套集群上
+    同名存储 + 同号机器 + 同一秒的备份会得到同一个 volid，只按 volid 存会互相
+    覆盖（一处解除保护，另一处的防删保护也没了）。
     """
-    from .pve import ProxmoxError, get_client
+    from .pve import ProxmoxError, client_for_connection, get_client
 
     size = 0
     ctime = 0
     pve_protected = False
     detail = ""
+    client = None
     try:
-        client = get_client()
+        client = client_for_connection(connection_id) if connection_id else get_client()
         items = await client.storage_content(node, storage, content="backup")
         found = next((item for item in items if str(item.get("volid")) == volid), None)
         if found is None:
@@ -153,7 +221,7 @@ async def protect(
     except ProxmoxError as exc:
         detail = f"读取备份信息失败（仍登记，核对时再确认）：{exc}"
 
-    if not pve_protected:
+    if not pve_protected and client is not None:
         try:
             await client.storage_content_set_protected(node, storage, volid, True)
             pve_protected = True
@@ -161,6 +229,7 @@ async def protect(
             detail = (detail + "；" if detail else "") + f"PVE 未接受保护旗标：{exc}"
 
     record = {
+        "connection": str(connection_id or ""),
         "volid": volid,
         "node": node,
         "storage": storage,
@@ -181,11 +250,11 @@ async def protect(
             database.upsert_sql(
                 "protected_backups",
                 [
-                    "volid", "node", "storage", "vmid", "size", "ctime",
-                    "meta_fingerprint", "note", "created", "created_by",
+                    "connection", "volid", "node", "storage", "vmid", "size",
+                    "ctime", "meta_fingerprint", "note", "created", "created_by",
                     "last_seen", "state", "state_detail", "pve_protected",
                 ],
-                ["volid"],
+                ["connection", "volid"],
                 [
                     "node", "storage", "vmid", "size", "ctime", "meta_fingerprint",
                     "note", "created_by", "last_seen", "state", "state_detail",
@@ -193,11 +262,11 @@ async def protect(
                 ],
             ),
             (
-                record["volid"], record["node"], record["storage"], record["vmid"],
-                record["size"], record["ctime"], record["meta_fingerprint"],
-                record["note"], record["created"], record["created_by"],
-                record["last_seen"], record["state"], record["state_detail"],
-                1 if record["pve_protected"] else 0,
+                record["connection"], record["volid"], record["node"],
+                record["storage"], record["vmid"], record["size"], record["ctime"],
+                record["meta_fingerprint"], record["note"], record["created"],
+                record["created_by"], record["last_seen"], record["state"],
+                record["state_detail"], 1 if record["pve_protected"] else 0,
             ),
         )
         await db.commit()
@@ -212,23 +281,36 @@ async def protect(
     }
 
 
-async def unprotect(volid: str, *, release_pve_flag: bool = True) -> Dict[str, Any]:
-    """解除登记（并尽力解除 PVE 侧的保护旗标）。"""
-    from .pve import ProxmoxError, get_client
+async def unprotect(
+    volid: str,
+    *,
+    release_pve_flag: bool = True,
+    connection_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """解除登记（并尽力解除 PVE 侧的保护旗标）。
 
-    record = await get_record(volid)
+    ``connection_id`` 为空时按 volid 找到那条记录，再用**记录里的连接**精确
+    删除：老前端不带连接也能用；两套集群有同 volid 的记录时至少只动一条。
+    """
+    from .pve import ProxmoxError, client_for_connection, get_client
+
+    record = await get_record(volid, connection_id)
     if not record:
         return {"ok": False, "volid": volid, "detail": "该备份不在受保护清单里"}
+    conn = str(record.get("connection") or "")
     if release_pve_flag and record["pve_protected"]:
         try:
-            client = get_client()
+            client = client_for_connection(conn) if conn else get_client()
             await client.storage_content_set_protected(
                 record["node"], record["storage"], volid, False
             )
         except (ProxmoxError, Exception) as exc:  # noqa: BLE001
             logger.info("解除 PVE 保护旗标失败 %s：%s", volid, exc)
     async with database.connect() as db:
-        await db.execute("DELETE FROM protected_backups WHERE volid = ?", (volid,))
+        await db.execute(
+            "DELETE FROM protected_backups WHERE volid = ? AND connection = ?",
+            (volid, conn),
+        )
         await db.commit()
     return {"ok": True, "volid": volid, "detail": "已从受保护清单移除"}
 
@@ -236,25 +318,28 @@ async def unprotect(volid: str, *, release_pve_flag: bool = True) -> Dict[str, A
 async def reconcile() -> Dict[str, Any]:
     """把登记过的备份与 PVE 实际内容核对一遍，刷新状态。
 
-    按 ``(node, storage)`` 分组只拉一次存储内容，避免逐个卷去查。
+    按 ``(连接, node, storage)`` 分组只拉一次存储内容，避免逐个卷去查；
+    分组必须带连接 —— 同名节点 + 同名存储在两套 PVE 上是两份独立数据。
     """
-    from .pve import ProxmoxError, get_client
+    from .pve import ProxmoxError, client_for_connection, get_client
 
     records = await list_records()
     if not records:
         return {"checked": 0, "ok": 0, "missing": 0, "changed": 0, "unknown": 0, "items": []}
 
-    client = get_client()
     groups: Dict[Any, List[Dict[str, Any]]] = {}
     for record in records:
-        groups.setdefault((record["node"], record["storage"]), []).append(record)
+        groups.setdefault(
+            (record.get("connection") or "", record["node"], record["storage"]), []
+        ).append(record)
 
     items: List[Dict[str, Any]] = []
     now = time.time()
-    for (node, storage), group in groups.items():
+    for (conn_id, node, storage), group in groups.items():
         index: Dict[str, Dict[str, Any]] = {}
         error = ""
         try:
+            client = client_for_connection(conn_id) if conn_id else get_client()
             for entry in await client.storage_content(node, storage, content="backup"):
                 index[str(entry.get("volid"))] = entry
         except ProxmoxError as exc:
@@ -280,11 +365,18 @@ async def reconcile() -> Dict[str, Any]:
             async with database.connect() as db:
                 await db.execute(
                     "UPDATE protected_backups SET last_seen = ?, state = ?, state_detail = ? "
-                    "WHERE volid = ?",
-                    (now, state, detail[:500], volid),
+                    "WHERE volid = ? AND connection = ?",
+                    (now, state, detail[:500], volid, conn_id),
                 )
                 await db.commit()
-            items.append({"volid": volid, "state": state, "detail": detail})
+            items.append(
+                {
+                    "connection": conn_id,
+                    "volid": volid,
+                    "state": state,
+                    "detail": detail,
+                }
+            )
 
     counts = {key: sum(1 for item in items if item["state"] == key) for key in ("ok", "missing", "changed", "unknown")}
     return {"checked": len(items), **counts, "items": items}
@@ -351,7 +443,12 @@ async def evaluate(owner: Optional[str] = None) -> List[Dict[str, Any]]:
     去重 / 飞书邮件 / 恢复通知。
     """
     result = await reconcile()
-    records = {item["volid"]: item for item in result["items"]}
+    # 键带连接：两套集群的同一个 volid 是两条**独立**记录，按 volid 合并会让
+    # 一条恢复把另一条的告警也清掉。
+    records = {
+        f"{item.get('connection') or ''}|{item['volid']}": item
+        for item in result["items"]
+    }
     target_owner = owner or await store.first_admin_username() or ""
     if not target_owner:
         return []
@@ -374,10 +471,11 @@ async def evaluate(owner: Optional[str] = None) -> List[Dict[str, Any]]:
     still_alarming: set = set()
     fired: List[Dict[str, Any]] = []
 
-    for volid, record in records.items():
+    for record_key, record in records.items():
+        volid = str(record["volid"])
         if record["state"] not in ("missing", "changed"):
             continue
-        key = alerting.alarm_key(target_owner, "backup-protect", volid)
+        key = alerting.alarm_key(target_owner, "backup-protect", record_key)
         still_alarming.add(key)
         # prev 非空 = 上一轮就在告警中，这一轮只是重复提醒（不写新历史）
         prev = active.get(key) or {}
@@ -401,6 +499,7 @@ async def evaluate(owner: Optional[str] = None) -> List[Dict[str, Any]]:
             "rule_name": "受保护备份核对",
             "target_type": "host",
             "target": volid,
+            "connection": record.get("connection") or "",
             "metric": "backup_integrity",
             "value": 1.0 if record["state"] == "missing" else 0.5,
             "threshold": 0.0,
@@ -426,7 +525,7 @@ async def evaluate(owner: Optional[str] = None) -> List[Dict[str, Any]]:
         if key in still_alarming:
             continue
         volid = str(row.get("target") or "")
-        current = records.get(volid)
+        current = records.get(f"{row.get('connection') or ''}|{volid}")
         if current and current["state"] == "unknown":
             continue  # 读不到存储时不要误报「已恢复」
         if not await alerting.recovery_confirmed(key, row):

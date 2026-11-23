@@ -1874,6 +1874,16 @@
   box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
+/* 可搜索下拉（SearchableSelect）的菜单是 Portal 到 body 的浮层：坐标由 JS 按
+   输入框位置写进内联样式（fixed），这里只补 z-index —— 必须盖住 Modal
+   （--z-modal），否则弹窗里的下拉会被弹窗压住。 */
+.target-select-menu.is-floating {
+  position: fixed;
+  margin-top: 0;
+  z-index: calc(var(--z-modal) + 10);
+  background: var(--bg-elevated);
+}
+
 .target-select-menu {
   margin-top: 4px;
   max-height: 240px;
@@ -3088,10 +3098,15 @@
 }
 
 /* 额度占用条：一条 6px 的轨道，只表达「已用多少」。
-   颜色跟额度徽标同一套：正常品牌蓝、≥80% 琥珀、放不下时红色。 */
+   颜色跟额度徽标同一套：正常品牌蓝、≥80% 琥珀、放不下时红色。
+   宽度跟着这一栏走（cqi = 容器 .deploy-summary-quota 宽度的 1%）：宽档里
+   104px 打满，手机上收到 56px —— 固定 104px 时，窄格里的「本次 2 台」会被
+   挤到下一行，「创建后剩 N 台」再被挤到第三行。 */
 .deploy-quota-bar {
   flex: none;
+  /* 先给一个固定值：不认识 cqi 的浏览器丢掉下面那条声明，进度条也不会塌成 0 */
   width: 104px;
+  width: clamp(56px, 15cqi, 104px);
   height: 6px;
   border-radius: 999px;
   background: var(--border-muted);
@@ -3172,16 +3187,31 @@
   color: var(--text-muted);
 }
 
-/* ---- 额度行右侧的模板信息 ----
-   额度说完「还能建几台」，右边紧接着交代「按哪张模板建」。它做成这一行的右半
-   栏、贴住右边缘（margin-left: auto）：既不和额度数字抢注意力，右边缘又与下面
-   规格行的「合计」对齐 —— 两行合起来是一张对得齐的表。
+/* ---- 额度行：同一行左侧放读数（还能建几台），右侧放模板（按哪张模板建） ----
+   额度与模板是下单前一起确认的两件事，固定排在同一行、永不整块换行：读数
+   在左，竖线右侧是模板，模板右边缘与下面规格行的「合计」对齐 —— 两行合起来
+   是一张对得齐的表。
+
+   宽度不够时不靠换行解决，靠右栏**逐级降级**（见文末三档 @container）：
+   先收模板的配置（VMID / 克隆方式 / 节点），再收模板规格，最后只剩模板名
+   （省略号 + title 提示）。理由是这几项本来就有优先级 —— 名称必须有，
+   规格次之，落点再次；而换行换来的是一条半行宽的空白和第二行悬空的模块，
+   既多占高度，又让「哪一格属于哪一栏」重新变成要猜的事。
+
+   这一格自己作为宽度容器（container-type: inline-size）：判据是「这一格多宽」，
+   不是视口多宽 —— 这个表单只出现在上限 860px 的创建弹窗里，视口 1440 时这一格
+   也只有 700 出头，media query 会一路判成宽屏。
+
    不用白底描边的卡片那种画法：摘要本身就是一层浅底，里面再套一个白框会显得
-   像贴上去的贴纸，还把两行拆成两种视觉语言。一条竖分隔线足够说明「这一栏是
+   像贴上去的贴纸，还把两行拆成两种视觉语言。一条竖线足够说明「这一栏是
    另一件事」。 */
 .deploy-summary-quota {
-  justify-content: space-between;
+  display: flex;
+  /* nowrap：额度与模板永远同一行 —— 折行是这里唯一不能接受的排法 */
+  flex-wrap: nowrap;
+  align-items: center;
   gap: 6px 18px;
+  container-type: inline-size;
 }
 
 .deploy-quota-main {
@@ -3190,13 +3220,19 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
+  /* 读数不让位：被压缩时它会先把自己的项拆行（进度条 + 本次 N 台掉到
+     第二行），整行反而更高，而模板也没因此宽出多少。只在最窄一档才允许
+     它收缩（见 @container 420px） */
+  flex: 0 0 auto;
 }
 
 .deploy-tpl-brief {
   display: inline-flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
-  margin-left: auto;
+  /* 剩下的宽度全归模板：够宽时它撑满右半格（右边缘与「合计」共线），
+     不够宽时它原地收缩，再由下面的 @container 逐级减内容 */
+  flex: 1 1 auto;
   min-width: 0;
   max-width: 100%;
   padding: 2px 0 2px 12px;
@@ -3218,12 +3254,16 @@
   justify-content: center;
   width: 20px;
   height: 20px;
+  /* 与第一行（模板名）对齐，而不是与「名称 + 规格」两行的中点对齐：
+     中点是两行文字之间的缝，头像悬在缝上会让整块看起来是歪的 */
+  margin-top: 1px;
   border-radius: var(--radius-sm);
   background: var(--os-tint);
 }
 
 .deploy-tpl-body {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 1px;
   min-width: 0;
@@ -3282,13 +3322,16 @@
   white-space: nowrap;
 }
 
-/* 存储 / 节点名可能很长（`local-zfs-raid10` 这类）：这一组允许在词内折行，
-   宁可多占一行，也不让它顶破卡片、更不打省略号 —— 省掉的正是「按哪张模板、
-   落到哪」这个关键配置。 */
+/* 存储 / 节点名可能很长（`local-zfs-raid10` 这类）：只在「一个词自己就顶满
+   一整行」时才允许词内折行。
+   这里不能用 overflow-wrap: anywhere —— 它会把这一项的 min-content 算成
+   一个字符宽，于是整块可以被压成「V/M/I/D」那样一列竖着的字（窄栏里就会
+   出现这种情况）；break-word 不影响 min-content，宽度不够时先按项换行，
+   一项自己也放不下才在词内断。 */
 .deploy-tpl-config {
   min-width: 0;
   color: var(--text-muted);
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 /* 只有同一组内相邻的两项之间才补「·」：规格组与配置组之间已经有一道竖线，
@@ -3313,6 +3356,49 @@
   color: var(--text-muted);
 }
 
+/* ---- 右栏（模板）的自适应：三档降级，位置不动、行数不增 ----
+   断点按「这一格」的实际宽度给（cqi 容器就是 .deploy-summary-quota），每一档
+   都留出读数那一组（约 380px）加 18px 栏距之后，模板实际能拿到的宽度：
+
+   · ≥600px：模板拿到 200px 以上 —— 名称 + OS + 磁盘 + 配置全部显示
+     （配置组 VMID / 克隆方式 / 节点占六七十个字符，会自己折成两行）；
+   · <600px：先收配置组。VMID / 克隆方式 / 节点是「复制到哪儿」的补充说明，
+     模板名与它的磁盘大小才是「按哪张模板建」；
+   · <460px：只剩一百来像素 —— 磁盘也收掉，只留「模板 + 名称 + OS 家族」，
+     名称照旧省略号截断并保留 title；
+   · <420px：连头像都让位，名称独自撑住这一栏；读数这一组这时才允许收缩
+     （它的项内部换行，而不是整块跑到下一行）。 */
+@container (max-width: 600px) {
+  .deploy-tpl-config {
+    display: none;
+  }
+}
+
+@container (max-width: 460px) {
+  .deploy-tpl-meta {
+    display: none;
+  }
+}
+
+@container (max-width: 420px) {
+  .deploy-tpl-mark,
+  .deploy-tpl-os {
+    display: none;
+  }
+
+  /* 读数此时会折成两三行，模板只剩一行：让模板贴第一行顶部，而不是悬在
+     整块的中点 —— 中点落在两行读数之间，看起来像飘在外面 */
+  .deploy-tpl-brief {
+    align-self: flex-start;
+  }
+
+  /* 到最后这一档，读数自己就得折行了：这是唯一让读数让位的地方，
+     此时它没有宽度可让给模板了，再撑着只会把模板挤成一条竖线 */
+  .deploy-quota-main {
+    flex: 0 1 auto;
+  }
+}
+
 .deploy-actions {
   display: flex;
   align-items: center;
@@ -3322,17 +3408,14 @@
 
 /* 窄屏：只收窄两列之间的间距，不让标签和值上下分家 ——
    标签那列最多五个字，值仍有大半行可用；拆成上下排反而让「哪一行属于哪个标签」
-   变得要靠颜色去猜。 */
+   变得要靠颜色去猜。进度条宽度由 clamp() 跟着这一栏自己收（见 .deploy-quota-bar），
+   这里不再写死一个 72px 去和它抢。 */
 @media (max-width: 560px) {
   .deploy-summary-key {
     padding: 9px 10px 9px 11px;
   }
   .deploy-summary-value {
     padding: 9px 11px 9px 0;
-  }
-  /* 窄屏缩一档进度条，把宽度留给「创建后剩 N 台」这句结论 */
-  .deploy-quota-bar {
-    width: 72px;
   }
 }
 
@@ -11563,6 +11646,13 @@ button.pbs-task-row:focus-visible {
   --os-row-gap: 10px;
 }
 
+/* 虚拟机模板（is-tpl-vm）不渲染内存列，列模板跟着少一列。
+   不加这条的话表头与数据行用的是两套网格：表头少一格、数据行少一格，
+   但列宽是按列序号套的，后面的磁盘 / VMID 会整体左移一格去占内存列的位置。 */
+:where(.os-pick.is-tpl.is-tpl-vm) .os-pick-list {
+  --os-row-cols: 16px 18px minmax(120px, 1.6fr) minmax(90px, 1fr) 68px 76px;
+}
+
 /* 滑块比全局那条更实一点：这个列表是「挑东西」的地方，滚动条要像可拖的控件，
    悬停再加深一档，用户不用猜能不能抓。 */
 .os-pick-list::-webkit-scrollbar {
@@ -12016,6 +12106,10 @@ button.pbs-task-row:focus-visible {
     --os-row-cols: 16px 18px minmax(110px, 1fr) 76px 68px 76px;
   }
 
+  :where(.os-pick.is-tpl.is-tpl-vm) .os-pick-list {
+    --os-row-cols: 16px 18px minmax(110px, 1fr) 68px 76px;
+  }
+
   .os-pick-colhead .is-scene,
   .os-row-scene {
     display: none;
@@ -12031,6 +12125,11 @@ button.pbs-task-row:focus-visible {
     --os-row-cols: 16px 18px minmax(110px, 1fr) 76px 76px;
   }
 
+  /* 虚拟机模板在 720 这一档只剩「名称 + 行尾徽标」 */
+  :where(.os-pick.is-tpl.is-tpl-vm) .os-pick-list {
+    --os-row-cols: 16px 18px minmax(110px, 1fr) 76px;
+  }
+
   .os-pick-colhead .is-used,
   .os-row-used {
     display: none;
@@ -12040,6 +12139,11 @@ button.pbs-task-row:focus-visible {
 @media (max-width: 620px) {
   .os-pick-list {
     --os-row-cols: 16px 18px minmax(100px, 1fr) 76px;
+  }
+
+  /* 620 以下连行尾徽标也收起：虚拟机模板只剩「名称」，容器模板还留着大小 */
+  :where(.os-pick.is-tpl.is-tpl-vm) .os-pick-list {
+    --os-row-cols: 16px 18px minmax(100px, 1fr);
   }
 
   /* 版本列已经整列去掉，620 这一档改为收起行尾的 VMID 徽标 */

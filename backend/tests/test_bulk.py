@@ -47,6 +47,14 @@ class FakeClient:
         self.tags = tags
         self.calls: list = []
 
+    async def nodes(self):
+        """节点清单：迁移目标校验要用（见 app.migrateguard）。
+
+        与单机迁移一致的取舍：pve 是当前节点，pve2 是同一个集群里的另一台。
+        """
+        self.calls.append(("nodes",))
+        return [{"node": "pve", "status": "online"}, {"node": "pve2", "status": "online"}]
+
     async def get(self, path: str, **kwargs):
         self.calls.append(("GET", path))
         # 只有自己那种 guest 的路径命中，用来支撑 _detect_type
@@ -692,3 +700,22 @@ class TestRunBulk:
         )
         assert result["ok"] == 1
         assert ("qemu_migrate", "pve", 100, "pve2", False) in client.calls
+
+    def test_running_vm_offline_migrate_fails_with_actionable_reason(
+        self, monkeypatch
+    ) -> None:
+        """运行中的虚拟机 + 停机迁移：逐台给中文原因，别把 PVE 英文原文丢进清单。"""
+        client = FakeClient(status="running")
+        _install(monkeypatch, client)
+        result = run(
+            bulk.run_bulk(
+                _request(), _user(), _req("migrate", target_node="pve2", online=False)
+            )
+        )
+        assert result["ok"] == 0
+        error = result["results"][0]["error"]
+        assert "运行" in error
+        assert "在线迁移" in error
+        assert "without --online" not in error
+        # 一次注定失败的迁移不该发到 PVE
+        assert not any(c[0] == "qemu_migrate" for c in client.calls)

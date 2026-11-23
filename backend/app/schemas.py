@@ -989,7 +989,12 @@ class LxcMoveRequest(BaseModel):
 
 class LxcMigrateRequest(BaseModel):
     target_node: str
-    online: bool = True
+    #: 已废弃：PVE 的 LXC 迁移没有在线模式（``online=1`` 会被 PVE 直接拒绝）。
+    #: 保留字段只为识别老客户端 —— 传 True 时接口会明确回 400，而不是把 PVE 的
+    #: 英文原文透传出去，也不会静默降级成停机迁移（那会让人以为服务没中断）。
+    online: Optional[bool] = None
+    #: 迁移完成后在目标节点启动容器。PVE 侧对应 migrate 的 ``restart=1``；
+    #: 容器原本已停机时无意义（后端会忽略）。
     restart: bool = False
 
 
@@ -1030,6 +1035,9 @@ class SnapshotBulkDeleteItem(BaseModel):
     vmid: int
     type: str = "qemu"
     name: str
+    #: 这台机器所在的 PVE 连接。全局快照页合并了多套集群，同名节点 + 同号 VMID
+    #: 在两套 PVE 上都成立；不带连接就可能删掉另一台机器上同名的快照。
+    connection_id: str = ""
 
     @field_validator("type")
     @classmethod
@@ -1068,7 +1076,8 @@ class SnapshotBulkDelete(BaseModel):
             raise ValueError("单次最多删除 200 个快照，请分批执行")
         seen = set()
         for item in value:
-            key = (item.node, item.vmid, item.name)
+            # 连接进 key：两套集群可以有同节点 + 同 VMID + 同快照名的两条目标
+            key = (item.connection_id, item.node, item.vmid, item.name)
             if key in seen:
                 # 同一条点两次会让 PVE 收到两次删除，第二次必然报「快照不存在」
                 raise ValueError(f"目标重复：{item.node}/{item.vmid}/{item.name}")
@@ -1093,6 +1102,9 @@ class SnapshotBulkRestoreItem(BaseModel):
     vmid: int
     type: str = "qemu"
     name: str
+    #: 同 :class:`SnapshotBulkDeleteItem`：跨集群时必须带，否则回滚到另一台
+    #: 同名节点上的同名快照。
+    connection_id: str = ""
 
     @field_validator("type")
     @classmethod
@@ -1136,7 +1148,8 @@ class SnapshotBulkRestore(BaseModel):
         for item in value:
             # 同一台机器出现两条 = 两个目标快照，先回滚哪一个都不对：
             # 后一条会在前一条刚回滚完的链上执行，用户看到的结果无法预期。
-            key = (item.node, item.vmid, item.type)
+            # 连接进 key：两套集群可以有同节点 + 同 VMID 的两台不同机器。
+            key = (item.connection_id, item.node, item.vmid, item.type)
             if key in seen:
                 raise ValueError(
                     f"同一台机器只能指定一个快照：{item.node}/{item.vmid}"
@@ -1560,6 +1573,9 @@ class FirewallTarget(BaseModel):
     vmid: int
     # qemu / lxc；留空由面板查集群资源判断
     type: str = ""
+    # 这台机器所在的 PVE 连接：一次下发可能跨多套集群，节点名只在那台上有效。
+    # 老客户端不带时后端按归属表 / 探测补（见 routers/firewall.apply_template）。
+    connection_id: str = ""
 
 
 class FirewallApplyIn(BaseModel):

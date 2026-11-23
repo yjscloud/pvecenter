@@ -35,11 +35,19 @@ from ..pve import (
 )
 from ..schemas import VmExportRequest, VmImportRequest
 from ..task_scope import task_guest
-from ..vm_scope import bind_node_connection, resolve_node_connection
+from ..vm_scope import bind_node_connection, bound_dependencies, resolve_node_connection
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/vms", tags=["vmtransfer"])
+#: 导出接口的 ``{node}/{vmid}`` 是路径参数，导入的 ``node`` 在查询参数或请求体里。
+#: 挂在路由器上能一次覆盖前两类（导出走 VM 级定位，导入走节点级兜底）；
+#: **请求体里的 node**（``/import/inspect``、``/import``）依赖看不到，仍由处理函数
+#: 自己 ``bind_node_connection(payload.node)`` —— 这两处不能删。
+router = APIRouter(
+    prefix="/api/vms",
+    tags=["vmtransfer"],
+    dependencies=bound_dependencies(),
+)
 
 VM_VIEW = security.require_permission("vm.view")
 VM_CREATE = security.require_permission("vm.create")
@@ -87,7 +95,7 @@ async def import_sources(
     目录，不做隔离的话 A 用户能看见（并且一旦能删就能删掉）B 用户上传的镜像。
     管理员不受限制；没有归属记录的存量文件也只有管理员能看见。
     """
-    await bind_node_connection(node)
+    # 连接已由路由器级 ``bound_dependencies()`` 按 ``?node=`` 绑定
     client = get_client()
     try:
         storages = await vmtransfer.importable_storages(client, node)
@@ -131,7 +139,7 @@ async def delete_import_source(
     归属检查回 404 而不是 403 —— 403 等于告诉对方「确实有这么一个文件」，而
     import 目录里可能有别人的镜像。
     """
-    await bind_node_connection(node)
+    # 连接已由路由器级 ``bound_dependencies()`` 按 ``?node=`` 绑定
     ref = ownership.import_ref(_op_connection(), storage, volume)
     recorded = ""
     try:
@@ -387,7 +395,8 @@ async def start_export(
     只允许**关机**的虚拟机：导出是逐块读磁盘，跑着的机器拿不到一致的数据。
     产物落在所选 dir 存储的 dump 目录下，随后由前端轮询 + 流式下载取走。
     """
-    await bind_node_connection(node)
+    # 连接已由路由器级 ``bound_dependencies()`` 绑定：``{node}/{vmid}`` 是路径段，
+    # 因此走的是 VM 级定位（归属表 → 逐台探测），比只按节点名更准。
     # 对象级鉴权：导出会把**整块磁盘**读出来交给人。此前只校验 vm.backup
     # 权限点，普通的「备份员」角色把 vmid 换成别人的号段就能整盘外带；而且作业
     # 的 owner 记成发起人，后续 /exports/{id}/download 的 owner 校验反而会放行。
@@ -492,7 +501,7 @@ async def import_progress(
     注意这个百分比是按**磁盘标称容量**算的分母，所以稀疏盘会一路"虚低"到最后，
     随后瞬间跳到结束 —— 这是 PVE 的算法，不是我们能改的。
     """
-    await bind_node_connection(node)
+    # 连接已由路由器级 ``bound_dependencies()`` 按 ``?node=`` 绑定
     # 任务日志里带着导入源的路径与容量，不能凭一个 UPID 就读别人的。
     # 用「有归属就拦」的软校验：导入过程中新机器还没落归属，严格版会把发起人
     # 自己的轮询打成 404（这条接口正是用来轮询那个窗口的）。

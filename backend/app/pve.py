@@ -1126,14 +1126,20 @@ class ProxmoxClient:
         node: str,
         vmid: int,
         target_node: str,
-        online: bool = True,
         restart: bool = False,
     ) -> Any:
+        """LXC 迁移（只能是**停机**迁移）。
+
+        PVE 的 LXC 实现没有在线迁移：带 ``online=1`` 会被它直接拒绝，报
+        ``lxc live migration is currently not implemented``。所以这里固定
+        ``online=0``；``restart=1`` 表示「迁移完成后在目标节点启动」，是运行中的
+        容器唯一能缩短中断的做法（实际仍是 stop → migrate → start）。
+        """
         return await self.post(
             f"/nodes/{node}/lxc/{vmid}/migrate",
             data={
                 "target": target_node,
-                "online": 1 if online else 0,
+                "online": 0,
                 "restart": 1 if restart else 0,
             },
         )

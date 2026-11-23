@@ -35,6 +35,10 @@ export const enCore: Partial<Record<MessageKey, string>> = {
   'common.selectAll': 'Select all',
   'common.selectedCount': '{count} selected',
   'common.selectPlaceholder': 'Select…',
+  'common.selectSearchPlaceholder': 'Search by name or VMID…',
+  'common.selectSearchNoMatch': 'No match — try another keyword',
+  'common.selectSearchMore': '{n} more — keep typing to narrow down',
+  'common.selectSearchHint': 'Type to filter · ↑↓ to move · Enter to pick',
   'common.noOptions': 'No options',
   'common.listSeparator': ', ',
 

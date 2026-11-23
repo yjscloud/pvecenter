@@ -175,14 +175,40 @@ async def drop(conn_id: Any, node: Any, vmid: Any) -> None:
 
     按 ``连接 + VMID`` 删，不按节点：机器迁移过之后行还挂在旧节点下，只按当前
     节点删会留下孤儿行 —— 那是「解除隔离后标签还在」的来源。
+
+    按 ``连接 + VMID`` 删不到时再按 ``节点 + VMID`` **兜底一次**：存量错账里
+    隔离时记账用的是 A 连接、解除时是 B（或多连接作用域切换），主键对不上，
+    删除静默落空，机器网络已经恢复、清单里却永久留着一条。兜底只在「节点 +
+    VMID」恰好命中**一条**记录时生效 —— 多条说明同名节点上有同号的不同机器，
+    这时宁可留着让人工核对，也不能顺手删掉别人的隔离登记。
     """
     conn, host, number = key(conn_id, node, vmid)
     try:
         async with database.connect() as db:
-            await db.execute(
+            cursor = await db.execute(
                 "DELETE FROM quarantine_record WHERE conn_id = ? AND vmid = ?",
                 (conn, number),
             )
+            if host and number > 0 and getattr(cursor, "rowcount", 1) == 0:
+                rows = await (
+                    await db.execute(
+                        "SELECT conn_id FROM quarantine_record "
+                        "WHERE node = ? AND vmid = ?",
+                        (host, number),
+                    )
+                ).fetchall()
+                stale = {str(row[0] or "") for row in rows or []}
+                if len(stale) == 1:
+                    old_conn = stale.pop()
+                    logger.info(
+                        "隔离记录按（节点, VMID）兜底清除：%s/%s conn=%s（本次 conn=%s）",
+                        host, number, old_conn or "-", conn or "-",
+                    )
+                    await db.execute(
+                        "DELETE FROM quarantine_record "
+                        "WHERE conn_id = ? AND vmid = ?",
+                        (old_conn, number),
+                    )
             await db.commit()
     except Exception:  # noqa: BLE001
         logger.debug("删除隔离记录失败（%s/%s）", host, number, exc_info=True)

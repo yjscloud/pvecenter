@@ -713,8 +713,10 @@ export const clusterApi = {
    */
   nextId: (connectionId?: unknown) =>
     get<{ vmid: number }>('/cluster/nextid', scoped(connectionId)),
-  tasks: (params: { node?: string; limit?: number } = {}) =>
-    get<TaskInfo[]>('/cluster/tasks', { params }),
+  /* connectionId 可选：只查那一套集群的任务。同名节点在两套 PVE 上都存在时，
+     只传 node 会把两边同名的任务混在一起。 */
+  tasks: (params: { node?: string; limit?: number } = {}, connectionId?: unknown) =>
+    get<TaskInfo[]>('/cluster/tasks', { params, ...scoped(connectionId) }),
 };
 
 /* ---------------------------------------------------------------------------
@@ -997,6 +999,9 @@ export const storagesApi = {
     params: { node: string; storage: string; content: string },
     file: File,
     onProgress?: (percent: number) => void,
+    /* 存储行本身带着 connection_id：目标节点就在那台 PVE 上，必须硬指定，
+       否则上传会落到「当前连接」（节点名在别的集群里不存在） */
+    connectionId?: string,
   ) => {
     const fd = new FormData();
     fd.append('file', file);
@@ -1007,6 +1012,7 @@ export const storagesApi = {
       '/storages/upload',
       fd,
       onProgress,
+      scoped(connectionId),
     );
   },
 };
@@ -2558,35 +2564,49 @@ export const feishuApi = {
    防火墙（PVE 原生：集群 / 节点 / 虚拟机 + 安全组 / IP 集合 / 规则模板）
    --------------------------------------------------------------------------- */
 
-/** 作用域参数：集群级不需要 node/vmid，节点级要 node，虚拟机级要 node+vmid */
+/**
+ * 作用域参数：集群级不需要 node/vmid，节点级要 node，虚拟机级要 node+vmid。
+ *
+ * ``connectionId`` 是**硬指定**（``X-PVE-Connection``）：防火墙的寻址参数全是
+ * 查询参数，节点名 / VMID 只在机器真正所在的那台 PVE 上有效。不带就会落到
+ * 「顶栏作用域 / 兜底连接」，在另一套集群上读防火墙时 PVE 把节点名当主机名解析，
+ * 回 ``hostname lookup 'node02' failed``。集群级（``/firewall/cluster/*``、安全组、
+ * IP 集合）无法由 node/vmid 推断，更必须显式指定 —— 否则会静默读写错集群。
+ */
 function fwScope(
   scope: FirewallScope,
   node?: string,
   vmid?: number,
-): { params: Record<string, string | number> } {
+  connectionId?: string,
+): { params: Record<string, string | number> } & ReturnType<typeof scoped> {
   const params: Record<string, string | number> = {};
   if (scope !== 'cluster' && node) params.node = node;
   // vm 与 ct 都是「某台客户机」：都要带 vmid（后端按 scope 区分类型）
   if ((scope === 'vm' || scope === 'ct') && vmid !== undefined) params.vmid = vmid;
-  return { params };
+  return { params, ...scoped(connectionId) };
 }
 
 export const firewallApi = {
   /* ---- 规则 ----
-     统一参数顺序：(scope, node, vmid, ...载荷)，用途是让页面能直接
-     `fwApi.createRule(...scopeParams, rule)` 这样展开，不必每个调用点记两套顺序。 */
-  rules: (scope: FirewallScope, node?: string, vmid?: number) =>
-    get<FirewallRule[]>(`/firewall/${scope}/rules`, fwScope(scope, node, vmid)),
+     统一参数顺序：(scope, node, vmid, ...载荷, connectionId)，用途是让页面能直接
+     `fwApi.createRule(...scopeParams, rule, conn)` 这样展开，不必每个调用点记两套顺序。
+     **connectionId 永远是最后一个参数**。 */
+  rules: (scope: FirewallScope, node?: string, vmid?: number, connectionId?: string) =>
+    get<FirewallRule[]>(
+      `/firewall/${scope}/rules`,
+      fwScope(scope, node, vmid, connectionId),
+    ),
   createRule: (
     scope: FirewallScope,
     node: string | undefined,
     vmid: number | undefined,
     body: FirewallRuleInput,
+    connectionId?: string,
   ) =>
     post<{ ok: boolean }>(
       `/firewall/${scope}/rules`,
       body,
-      fwScope(scope, node, vmid),
+      fwScope(scope, node, vmid, connectionId),
     ),
   updateRule: (
     scope: FirewallScope,
@@ -2594,21 +2614,23 @@ export const firewallApi = {
     vmid: number | undefined,
     pos: number,
     body: FirewallRuleInput,
+    connectionId?: string,
   ) =>
     put<{ ok: boolean }>(
       `/firewall/${scope}/rules/${pos}`,
       body,
-      fwScope(scope, node, vmid),
+      fwScope(scope, node, vmid, connectionId),
     ),
   deleteRule: (
     scope: FirewallScope,
     node: string | undefined,
     vmid: number | undefined,
     pos: number,
+    connectionId?: string,
   ) =>
     del<{ ok: boolean }>(
       `/firewall/${scope}/rules/${pos}`,
-      fwScope(scope, node, vmid),
+      fwScope(scope, node, vmid, connectionId),
     ),
   /** 调整优先级：防火墙先匹配先生效 */
   moveRule: (
@@ -2617,68 +2639,126 @@ export const firewallApi = {
     vmid: number | undefined,
     pos: number,
     to: number,
+    connectionId?: string,
   ) =>
     post<{ ok: boolean }>(`/firewall/${scope}/rules/${pos}/move`, undefined, {
       params: { to, ...fwScope(scope, node, vmid).params },
+      ...scoped(connectionId),
     }),
 
   /* ---- 选项（开关 / 默认策略 / 日志级别）---- */
-  options: (scope: FirewallScope, node?: string, vmid?: number) =>
-    get<FirewallOptions>(`/firewall/${scope}/options`, fwScope(scope, node, vmid)),
+  options: (scope: FirewallScope, node?: string, vmid?: number, connectionId?: string) =>
+    get<FirewallOptions>(
+      `/firewall/${scope}/options`,
+      fwScope(scope, node, vmid, connectionId),
+    ),
   saveOptions: (
     scope: FirewallScope,
     node: string | undefined,
     vmid: number | undefined,
     body: FirewallOptions,
+    connectionId?: string,
   ) =>
     put<{ ok: boolean }>(
       `/firewall/${scope}/options`,
       body,
-      fwScope(scope, node, vmid),
+      fwScope(scope, node, vmid, connectionId),
     ),
 
-  /* ---- 编辑器用的引用清单 ---- */
-  refs: () => get<FirewallRefs>('/firewall/refs'),
+  /* ---- 编辑器用的引用清单（集群级：属于某一套 PVE）---- */
+  refs: (connectionId?: string) =>
+    get<FirewallRefs>('/firewall/refs', scoped(connectionId)),
 
-  /* ---- 安全组 ---- */
-  groups: () => get<FirewallGroup[]>('/firewall/groups'),
-  createGroup: (group: string, comment: string) =>
-    post<{ ok: boolean }>('/firewall/groups', { group, comment }),
-  deleteGroup: (group: string) =>
-    del<{ ok: boolean }>(`/firewall/groups/${group}`),
-  groupRules: (group: string) =>
-    get<FirewallRule[]>(`/firewall/groups/${group}/rules`),
-  createGroupRule: (group: string, body: FirewallRuleInput) =>
-    post<{ ok: boolean }>(`/firewall/groups/${group}/rules`, body),
-  updateGroupRule: (group: string, pos: number, body: FirewallRuleInput) =>
-    put<{ ok: boolean }>(`/firewall/groups/${group}/rules/${pos}`, body),
-  deleteGroupRule: (group: string, pos: number) =>
-    del<{ ok: boolean }>(`/firewall/groups/${group}/rules/${pos}`),
+  /* ---- 安全组（集群级）---- */
+  groups: (connectionId?: string) =>
+    get<FirewallGroup[]>('/firewall/groups', scoped(connectionId)),
+  createGroup: (group: string, comment: string, connectionId?: string) =>
+    post<{ ok: boolean }>(
+      '/firewall/groups',
+      { group, comment },
+      scoped(connectionId),
+    ),
+  deleteGroup: (group: string, connectionId?: string) =>
+    del<{ ok: boolean }>(`/firewall/groups/${group}`, scoped(connectionId)),
+  groupRules: (group: string, connectionId?: string) =>
+    get<FirewallRule[]>(
+      `/firewall/groups/${group}/rules`,
+      scoped(connectionId),
+    ),
+  createGroupRule: (
+    group: string,
+    body: FirewallRuleInput,
+    connectionId?: string,
+  ) =>
+    post<{ ok: boolean }>(
+      `/firewall/groups/${group}/rules`,
+      body,
+      scoped(connectionId),
+    ),
+  updateGroupRule: (
+    group: string,
+    pos: number,
+    body: FirewallRuleInput,
+    connectionId?: string,
+  ) =>
+    put<{ ok: boolean }>(
+      `/firewall/groups/${group}/rules/${pos}`,
+      body,
+      scoped(connectionId),
+    ),
+  deleteGroupRule: (group: string, pos: number, connectionId?: string) =>
+    del<{ ok: boolean }>(
+      `/firewall/groups/${group}/rules/${pos}`,
+      scoped(connectionId),
+    ),
 
-  /* ---- IP 集合 ---- */
-  ipsets: () => get<FirewallIpset[]>('/firewall/ipsets'),
-  createIpset: (name: string, comment: string) =>
-    post<{ ok: boolean }>('/firewall/ipsets', { name, comment }),
-  deleteIpset: (name: string) => del<{ ok: boolean }>(`/firewall/ipsets/${name}`),
+  /* ---- IP 集合（集群级）---- */
+  ipsets: (connectionId?: string) =>
+    get<FirewallIpset[]>('/firewall/ipsets', scoped(connectionId)),
+  createIpset: (name: string, comment: string, connectionId?: string) =>
+    post<{ ok: boolean }>(
+      '/firewall/ipsets',
+      { name, comment },
+      scoped(connectionId),
+    ),
+  deleteIpset: (name: string, connectionId?: string) =>
+    del<{ ok: boolean }>(`/firewall/ipsets/${name}`, scoped(connectionId)),
   createIpsetEntry: (
     name: string,
     body: { cidr: string; comment: string; nomatch: boolean },
-  ) => post<{ ok: boolean }>(`/firewall/ipsets/${name}/entries`, body),
-  deleteIpsetEntry: (name: string, cidr: string) =>
+    connectionId?: string,
+  ) =>
+    post<{ ok: boolean }>(
+      `/firewall/ipsets/${name}/entries`,
+      body,
+      scoped(connectionId),
+    ),
+  deleteIpsetEntry: (name: string, cidr: string, connectionId?: string) =>
     del<{ ok: boolean }>(
       `/firewall/ipsets/${name}/entries/${encodeURIComponent(cidr)}`,
+      scoped(connectionId),
     ),
 
-  /* ---- 规则模板 ---- */
+  /* ---- 规则模板（面板侧存储，与 PVE 连接无关）---- */
   templates: () => get<FirewallTemplate[]>('/firewall/templates'),
   saveTemplate: (body: FirewallTemplate) =>
     post<{ ok: boolean; template: FirewallTemplate }>('/firewall/templates', body),
   deleteTemplate: (id: string) =>
     del<{ ok: boolean }>(`/firewall/templates/${id}`),
-  /** 批量下发到多台虚拟机（需要二次确认） */
+  /**
+   * 批量下发到多台虚拟机（需要二次确认）。
+   *
+   * 目标里带 ``connection_id``：一次下发可能跨多套 PVE，后端逐台用它取客户端，
+   * 不再共用一个「当前连接」。
+   */
   applyTemplate: (
     id: string,
-    targets: Array<{ node: string; vmid: number; type?: string }>,
+    targets: Array<{
+      node: string;
+      vmid: number;
+      type?: string;
+      connection_id?: string;
+    }>,
     replace: boolean,
   ) =>
     post<FirewallApplyResult>(`/firewall/templates/${id}/apply`, {
@@ -2778,15 +2858,18 @@ export const vmReinstallApi = {
 /* ---- 虚拟机导入 / 导出（VMware 互操作）---- */
 export const vmTransferApi = {
   /** 可导入的文件 + 可作为导入源的存储 */
-  importSources: (node: string) =>
+  importSources: (node: string, connectionId?: string) =>
     get<{ storages: ImportStorage[]; sources: ImportSource[] }>('/vms/import/sources', {
       params: { node },
+      ...scoped(connectionId),
     }),
   /** 上传 OVA / OVF / VMDK / QCOW2 到存储的 import 内容 */
   uploadImport: (
     params: { node: string; storage: string },
     file: File,
     onProgress?: (percent: number) => void,
+    /* 目标节点可能属于另一套 PVE：node 在 multipart 里，后端依赖看不到它 */
+    connectionId?: string,
   ) => {
     const fd = new FormData();
     fd.append('node', params.node);
@@ -2796,6 +2879,7 @@ export const vmTransferApi = {
       '/vms/import/upload',
       fd,
       onProgress,
+      scoped(connectionId),
     );
   },
   /** 读 OVF/OVA 元数据（PVE 解析，面板只透传） */
@@ -2803,7 +2887,7 @@ export const vmTransferApi = {
     node: string;
     storage: string;
     volume: string;
-  }) => post<ImportMetadata>('/vms/import/inspect', body),
+  }, connectionId?: string) => post<ImportMetadata>('/vms/import/inspect', body, scoped(connectionId)),
   /** 按元数据建机（磁盘用 import-from 拉进来） */
   createImport: (body: {
     node: string;
@@ -2839,14 +2923,14 @@ export const vmTransferApi = {
     ssh_keys?: string;
     /** 导入完成后是否立即启动（前端在建机任务结束后调电源接口） */
     start?: boolean;
-  }) =>
+  }, connectionId?: string) =>
     post<{
       task: string;
       vmid: number;
       node: string;
       warnings: ImportWarning[];
       disks: Record<string, string>;
-    }>('/vms/import', body),
+    }>('/vms/import', body, scoped(connectionId)),
 
   /**
    * 删掉一个已上传的导入文件。参数走 query —— 有些代理会剥掉 DELETE 的请求体。
@@ -3005,8 +3089,11 @@ export const hostAuditApi = {
       undefined,
       hostId ? { params: { host_id: hostId } } : undefined,
     ),
-  vm: (node: string, vmid: number, hours = 24) =>
-    get<VmAuditResult>(`/host-audit/vm/${node}/${vmid}`, { params: { hours } }),
+  vm: (node: string, vmid: number, hours = 24, connectionId?: string) =>
+    get<VmAuditResult>(`/host-audit/vm/${node}/${vmid}`, {
+      params: { hours },
+      ...scoped(connectionId),
+    }),
   actions: () => get<Record<string, string>>('/host-audit/actions'),
 };
 
@@ -3187,15 +3274,40 @@ export const isolationApi = {
   /** 面板登记过的隔离清单（最近的排前面）—— 刷新页面后仍能看到的那些 */
   list: () =>
     get<{ items: QuarantineRecord[]; count: number }>('/isolation'),
-  /** 当前隔离状态（断了几张网卡、是否保护、有哪些取证快照） */
-  status: (node: string, vmid: number) =>
-    get<QuarantineStatus>(`/vms/${node}/${vmid}/quarantine`),
+  /**
+   * 当前隔离状态（断了几张网卡、是否保护、有哪些取证快照）。
+   *
+   * ``connectionId`` 是**硬指定**：隔离接口和虚拟机详情同属
+   * ``/vms/{node}/{vmid}/...`` 的单机语义，节点名只在那台 PVE 上有效。不带就会
+   * 落到「顶栏作用域 / 当前连接」，在另一套集群上做隔离时 PVE 会把节点名当主机名
+   * 去解析（``hostname lookup 'node02' failed``）。
+   */
+  status: (node: string, vmid: number, connectionId?: string) =>
+    get<QuarantineStatus>(`/vms/${node}/${vmid}/quarantine`, scoped(connectionId)),
   /** 一键隔离（需 vm.isolate + 二次确认） */
-  quarantine: (node: string, vmid: number, body: QuarantineInput) =>
-    post<QuarantineResult>(`/vms/${node}/${vmid}/quarantine`, body),
+  quarantine: (
+    node: string,
+    vmid: number,
+    body: QuarantineInput,
+    connectionId?: string,
+  ) =>
+    post<QuarantineResult>(
+      `/vms/${node}/${vmid}/quarantine`,
+      body,
+      scoped(connectionId),
+    ),
   /** 解除隔离 */
-  release: (node: string, vmid: number, body: QuarantineReleaseInput) =>
-    post<QuarantineResult>(`/vms/${node}/${vmid}/quarantine/release`, body),
+  release: (
+    node: string,
+    vmid: number,
+    body: QuarantineReleaseInput,
+    connectionId?: string,
+  ) =>
+    post<QuarantineResult>(
+      `/vms/${node}/${vmid}/quarantine/release`,
+      body,
+      scoped(connectionId),
+    ),
 };
 
 /* ---------------------------------------------------------------------------
@@ -3211,10 +3323,15 @@ export const protectedBackupsApi = {
     volid: string;
     vmid?: number | null;
     note?: string;
-  }) => post<{ ok: boolean; detail: string }>('/backups/protected', body),
-  unprotect: (volid: string) =>
+  }, connectionId?: string) => post<{ ok: boolean; detail: string }>(
+    '/backups/protected',
+    body,
+    scoped(connectionId),
+  ),
+  /* connectionId：同一 volid 在两套集群上都存在时用它精确到那一条 */
+  unprotect: (volid: string, connectionId?: string) =>
     del<{ ok: boolean; detail: string }>('/backups/protected', {
-      params: { volid },
+      params: { volid, ...(connectionId ? { connection_id: connectionId } : {}) },
     }),
   verify: (push = true) =>
     post<ProtectedVerifyResult>('/backups/protected/verify', {}, { params: { push } }),

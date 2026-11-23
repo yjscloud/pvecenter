@@ -251,6 +251,11 @@ async def list_connections(
             "template.view",
             "pbs.view",
             "task.view",
+            # 防火墙页要先知道「改的是哪套集群」：集群作用域无法由 node/vmid
+            # 推断，只能靠前端把连接硬指定下发（见 routers/firewall.py 的依赖）。
+            # 这里只回 id + name，不泄露地址与凭据。
+            "firewall.view",
+            "ct.firewall.view",
         )
     ),
 ) -> List[Dict[str, Any]]:

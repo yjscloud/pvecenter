@@ -993,7 +993,11 @@ function NodeCard({ node, onOpen }: { node: NodeInfo; onOpen: () => void }) {
               {offline ? t('nodes.offline') : formatUptimeShort(node.uptime)}
             </span>
           </span>
-          <NodeNoteField node={node.node} canEdit={canEditNote} />
+          <NodeNoteField
+            node={node.node}
+            connectionId={node.connection_id}
+            canEdit={canEditNote}
+          />
           {canScope ? (
             <Button
               size="sm"

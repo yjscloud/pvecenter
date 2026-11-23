@@ -49,7 +49,10 @@ import type { BulkResponse, Snapshot } from '../api/types';
  * 当成「还在删」藏着）。
  */
 function snapshotKey(s: Snapshot): string {
-  return `${s.node}|${s.vmid}|${s.vm_type === 'lxc' ? 'lxc' : 'qemu'}|${s.name}`;
+  /* 连接进 key：两套集群可以有同节点、同 VMID、同快照名的一行 */
+  return `${s.connection_id ?? ''}|${s.node}|${s.vmid}|${
+    s.vm_type === 'lxc' ? 'lxc' : 'qemu'
+  }|${s.name}`;
 }
 
 export function Snapshots() {
@@ -286,6 +289,8 @@ export function Snapshots() {
           // 容器与虚拟机是两套后端端点与权限点，类型必须带
           type: s.vm_type === 'lxc' ? 'lxc' : 'qemu',
           name: s.name,
+          // 全局视图合并了多套集群：不带连接会删到另一台同名节点上的同名快照
+          connection_id: s.connection_id,
         })),
       );
       setBulkResult(result);
@@ -385,7 +390,12 @@ export function Snapshots() {
               // 容器快照要跳到容器页：虚拟机页拿不到 /lxc 的配置
               navigate(
                 guestPath(
-                  { node: s.node, vmid: s.vmid, type: s.vm_type },
+                  {
+                    node: s.node,
+                    vmid: s.vmid,
+                    type: s.vm_type,
+                    connection_id: s.connection_id,
+                  },
                   { tab: 'snapshots' },
                 ),
               );

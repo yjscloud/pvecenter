@@ -182,6 +182,8 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'vmMore.migrateOnline': 'Online migration',
   'vmMore.migrateOnlineHint':
     'The virtual machine keeps running; shared storage is required, a local-disk machine must be shut down first',
+  'vmMore.migrateOfflineRunningWarn':
+    'This VM is running, so it cannot be migrated offline. Enable “online migration”, or shut the VM down first',
   'vmMore.migrateNoTarget':
     'There is no other online node in this cluster, so there is nothing to migrate to.',
   'vmMore.migrateStart': 'Start migration',
@@ -1768,11 +1770,16 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'lxcMore.assignOwner': 'Assign owner',
   'lxcMore.migrate': 'Migrate to another node',
   'lxcMore.migrateTitle': 'Migrate to another node',
-  'lxcMore.migrateOnlineHint':
-    'The container keeps running; requires shared storage — containers on local storage must be stopped first',
-  'lxcMore.migrateRestart': 'Restart on source node on failure',
-  'lxcMore.migrateRestartHint':
-    'Bring the container back up on the source node if the live migration fails, so services are not left hanging',
+  /* LXC has no live migration — never promise "keeps running" here */
+  'lxcMore.migrateDowntime':
+    'LXC has no live migration: the container stops while it moves, so expect brief downtime',
+  'lxcMore.migrateStartAfter': 'Start after migration',
+  'lxcMore.migrateRestartRequired':
+    'A running container must start on the target node: LXC has no live migration, so PVE only accepts “start after migration”',
+  'lxcMore.migrateStopFirstHint':
+    'To keep the container stopped after the move, stop it first and then migrate',
+  'lxcMore.migrateStopped':
+    'The container is stopped and stays stopped after the move',
   'lxcMore.migrateTask': 'Migrate “{name}”',
   'lxcMore.deleteCt': 'Delete container',
   'lxcDetail.tfHour': 'Hour',
@@ -2432,6 +2439,8 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'guestList.migrate.targetLabel': 'Target node',
   'guestList.migrate.targetPlaceholder': 'Pick a target node',
   'guestList.migrate.online': 'Live migration (no downtime; needs shared storage or local disk migration support)',
+  'guestList.migrate.offlineRunningWarn':
+    'This VM is running, so it cannot be migrated offline. Enable “live migration”, or shut the VM down first',
   'guestList.snap.title': 'New snapshot',
   'guestList.snap.task': 'Create snapshot “{name}”',
   'guestList.snap.nameLabel': 'Snapshot name',
@@ -2456,6 +2465,10 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'guestList.bulkDialog.tagReplaceHint': 'Replace the existing tags with these',
   'guestList.bulkDialog.onlineMigrate': 'Live migration',
   'guestList.bulkDialog.onlineMigrateHint': 'No downtime; needs shared storage or local disk migration support',
+  'guestList.bulkDialog.offlineRunningWarn':
+    'With live migration off, every running VM in this batch is rejected — offline migration requires the VM to be shut down',
+  'guestList.bulkDialog.ctRestartNotice':
+    'Running containers start again on the target node; stopped containers stay stopped after the move',
   'guestList.bulkDialog.migrateWarnTitle': 'Machines already on the target node will fail',
   'guestList.bulkDialog.migrateWarnDesc': 'The backend does not filter for you: PVE errors out for machines already on the target node, and the result list names them.',
   'guestList.bulkDialog.balloonLabel': 'Minimum memory to keep (MB)',

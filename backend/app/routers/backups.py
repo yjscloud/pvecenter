@@ -51,7 +51,7 @@ from ..pve import (
     requested_connection,
     set_request_connection,
 )
-from ..vm_scope import resolve_node_connection
+from ..vm_scope import bind_node_connection, resolve_node_connection
 from ..schemas import (
     BackupCreate,
     BackupJobCreate,
@@ -411,8 +411,13 @@ def _protected_record_owner(
     """
     vmid = record.get("vmid") or _vmid_from_volid(str(record.get("volid") or ""))
     if vmid is not None and str(vmid) != "":
+        # 记录自己的连接优先：两套集群有同名节点 + 同号 VMID 时，按「当前作用域」
+        # 去查归属会把这条备份算到另一台机器的所有者头上。
         owner = ownership.vm_owner_from(
-            vm_owners, record.get("node") or "", vmid, connection_id
+            vm_owners,
+            record.get("node") or "",
+            vmid,
+            record.get("connection") or connection_id,
         )
         if owner:
             return owner
@@ -625,6 +630,11 @@ async def list_backups(
     user: Dict[str, Any] = Depends(security.require_any_permission("vm.backup", "ct.backup")),
 ) -> List[Dict[str, Any]]:
     """List backup archives across the cluster (or one node/storage/VM)."""
+    # 指定了节点就必须查那台 PVE：节点名在每套集群上都是本地的，落到「当前
+    # 连接」时另一台会把它当主机名解析（``hostname lookup 'node02' failed``）。
+    # 不指定节点的是集群视图，仍然走当前连接 / 顶栏作用域。
+    if node:
+        await bind_node_connection(node)
     client = get_client()
     scope = security.visible_owner(user)
     # 无创建者标记的存量备份按虚拟机归属回落，一次取全量归属表
@@ -1019,6 +1029,10 @@ async def delete_backup(
     # 备份删掉就没了（不像虚拟机还有快照兜底）：要求二次确认身份
     _step_up: Dict[str, Any] = Depends(security.require_step_up()),
 ) -> Dict[str, Any]:
+    # 先绑定连接：``assert_backup_access`` 会用 ``get_client()`` 去读存储内容，
+    # 落错 PVE 时那台会把节点名当主机名解析（读不到 → 归属判不出来），随后
+    # 真正要删的也是这台 PVE 上的卷。与 /backups/download 同一口径。
+    await bind_node_connection(node)
     await assert_backup_access(user, node, storage, volid)
     # 受保护备份禁止在此删除：勒索软件常见手法就是「先删备份再加密」，所以即便
     # 拿到了管理员会话，也必须先在「备份防护」里解除保护（两次明确操作）。
@@ -1293,6 +1307,9 @@ async def protect_backup(
         vmid=payload.vmid,
         note=payload.note,
         username=str(user.get("username") or ""),
+        # 备份卷在哪套 PVE 上，保护记录就归哪套：volid 不含连接信息，
+        # 两套集群的同名存储 + 同号机器 + 同秒备份会撞成同一个字符串。
+        connection_id=_connection_scope(),
     )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("detail") or "登记失败")
@@ -1307,18 +1324,23 @@ async def protect_backup(
 async def unprotect_backup(
     request: Request,
     volid: str = Query(...),
+    # 记录所属连接：两套集群有同一个 volid 时用它精确到那一条；
+    # 留空 = 按 volid 找（兼容不带该参数的老前端）。
+    connection_id: str = Query(""),
     user: Dict[str, Any] = Depends(security.require_any_permission("vm.backup", "ct.backup")),
     # 解除保护意味着备份重新可删：同样要二次确认
     _step_up: Dict[str, Any] = Depends(security.require_step_up()),
 ) -> Dict[str, Any]:
     # 原先只凭一个 volid 就能解除任意备份的防删保护 —— 这是整套备份防护的
     # 总开关，必须先确认这条记录属于当前用户
-    record = await backupguard.get_record(volid)
+    record = await backupguard.get_record(volid, connection_id or None)
     if not record:
         raise HTTPException(status_code=404, detail="该备份不在受保护清单里")
     await assert_protected_access(user, record)
 
-    result = await backupguard.unprotect(volid)
+    result = await backupguard.unprotect(
+        volid, connection_id=str(record.get("connection") or "")
+    )
     if not result.get("ok"):
         raise HTTPException(status_code=404, detail=result.get("detail") or "不存在")
     await security.audit(request, user, "backup.unprotect", target=volid)

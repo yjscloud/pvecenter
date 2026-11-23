@@ -86,6 +86,9 @@ export function VmImportWizard({ open, onClose, onCreated }: VmImportWizardProps
 
   const [step, setStep] = useState(0);
   const [node, setNode] = useState('');
+  /* 目标节点所在的 PVE 连接：节点名在每套 PVE 上都是本地的，只传 node 时
+     两套集群同名节点会列出 / 写入另一台主机的存储。 */
+  const [conn, setConn] = useState('');
   const [sourceStorage, setSourceStorage] = useState('');
   const [volume, setVolume] = useState('');
   const [meta, setMeta] = useState<ImportMetadata | null>(null);
@@ -133,8 +136,8 @@ export function VmImportWizard({ open, onClose, onCreated }: VmImportWizardProps
      分不清「在跑」和「卡死」。 */
   const [importUpid, setImportUpid] = useState('');
   const progressQuery = useQuery({
-    queryKey: ['vm-import', 'progress', importUpid],
-    queryFn: () => vmTransferApi.importProgress(importUpid, node),
+    queryKey: ['vm-import', 'progress', conn, importUpid],
+    queryFn: () => vmTransferApi.importProgress(importUpid, node, conn),
     enabled: Boolean(importUpid) && busy,
     /* **不跟**「数据刷新间隔」：这里盯的是一次导入的进度条，
        该由这个过程本身决定节奏（3 秒），不是「多久刷一次数据」 */
@@ -211,19 +214,21 @@ export function VmImportWizard({ open, onClose, onCreated }: VmImportWizardProps
   const nodes = nodesQuery.data ?? [];
 
   useEffect(() => {
-    if (open && !node && nodes.length) setNode(nodes[0].node);
+    if (!open || node || !nodes.length) return;
+    setNode(nodes[0].node);
+    setConn(nodes[0].connection_id ?? '');
   }, [open, node, nodes]);
 
   const sourcesQuery = useQuery({
-    queryKey: ['vm-import', 'sources', node],
-    queryFn: () => vmTransferApi.importSources(node),
+    queryKey: ['vm-import', 'sources', conn, node],
+    queryFn: () => vmTransferApi.importSources(node, conn),
     enabled: open && Boolean(node),
     retry: false,
   });
 
   const storagesQuery = useQuery({
-    queryKey: ['storages', 'list', node],
-    queryFn: () => storagesApi.list(node),
+    queryKey: ['storages', 'list', conn, node],
+    queryFn: () => storagesApi.list(node, conn),
     enabled: open && Boolean(node),
     staleTime: 60_000,
     retry: false,
@@ -369,6 +374,7 @@ export function VmImportWizard({ open, onClose, onCreated }: VmImportWizardProps
           { node, storage: sourceStorage },
           item,
           setProgress,
+          conn,
         );
         if (DESCRIPTOR_RE.test(item.name) || !selected) selected = res.volume;
       }
@@ -399,7 +405,7 @@ export function VmImportWizard({ open, onClose, onCreated }: VmImportWizardProps
         node,
         storage: sourceStorage,
         volume,
-      });
+      }, conn);
       setMeta(data);
       const args = data.create_args ?? {};
       // 裸磁盘镜像（PVE 解析不了，面板也不编）没有任何机器配置：给一套能开机的
@@ -439,11 +445,11 @@ export function VmImportWizard({ open, onClose, onCreated }: VmImportWizardProps
     if (!target) return;
     setDeleting(true);
     try {
-      await vmTransferApi.deleteImportSource(node, target.storage, target.volume);
+      await vmTransferApi.deleteImportSource(node, target.storage, target.volume, conn);
       toast.success(t('vmImport.deleteSourceDone'));
       if (volume === target.volume) setVolume('');
       setCleanupFile(null);
-      void qc.invalidateQueries({ queryKey: ['vm-import', 'sources', node] });
+      void qc.invalidateQueries({ queryKey: ['vm-import', 'sources', conn, node] });
     } catch (err) {
       toast.error(t('vmImport.deleteSourceFailed'), errorMessage(err));
     } finally {
@@ -489,7 +495,7 @@ export function VmImportWizard({ open, onClose, onCreated }: VmImportWizardProps
           ci_password: ciPassword,
             ssh_keys: sshKeys.trim(),
             start: startAfter,
-          })
+          }, conn)
           .then((r) => {
             createdVmid = r.vmid;
             setImportUpid(r.task);
@@ -584,14 +590,19 @@ export function VmImportWizard({ open, onClose, onCreated }: VmImportWizardProps
           <div className="field-row">
             <Field label={t('vmImport.node')}>
               <Select
-                value={node}
+                value={`${conn}::${node}`}
                 onChange={(e) => {
-                  setNode(e.target.value);
+                  const raw = e.target.value;
+                  const at = raw.indexOf('::');
+                  setConn(at < 0 ? '' : raw.slice(0, at));
+                  setNode(at < 0 ? raw : raw.slice(at + 2));
                   setVolume('');
                 }}
                 options={nodes.map((item) => ({
-                  label: item.node,
-                  value: item.node,
+                  label: item.connection_name
+                    ? `${item.node}（${item.connection_name}）`
+                    : item.node,
+                  value: `${item.connection_id ?? ''}::${item.node}`,
                 }))}
               />
             </Field>

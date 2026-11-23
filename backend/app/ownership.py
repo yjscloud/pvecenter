@@ -24,6 +24,13 @@
 2. 作废按用户分档的读缓存与额度读数（否则 10–60 秒内新旧主人看到的都是旧账）；
 3. 返回变更前的归属，供审计记录 ``previous``。
 
+另有一类**位置**变更：机器在同一个集群里换节点（迁移）。ref 的第二段是节点名，
+迁移之后整条记录就指向了一个不存在的位置 —— 普通用户在列表里看不到它、详情页
+404、快照也跟着失联。走 :func:`move_guest` 把记录跟到新节点（人不变）。
+读取侧还有一层兜底（:func:`get_owner_for` / :func:`vm_owner_from`）：VMID 在一条
+连接内唯一，所以「同连接 + 同 VMID、节点不同」只可能是同一台机器换了位置 ——
+迁移任务还在跑、记录尚未搬完的那段时间里，靠它不至于把人挡在门外。
+
 逐个路由自己 upsert 一行，就是这些不一致的来源 —— 新增入口请复用上面的函数。
 """
 from __future__ import annotations
@@ -107,6 +114,19 @@ def vm_ref(connection_id: str, node: str, vmid: Any) -> str:
 def snapshot_ref(connection_id: str, node: str, vmid: Any, name: str) -> str:
     """快照的归属标识：在所属虚拟机 ref 后追加 ``/快照名``。"""
     return f"{vm_ref(connection_id, node, vmid)}/{name}"
+
+
+def _guest_ref_parts(ref: Any) -> Optional[Tuple[str, str, str]]:
+    """``<连接>:<节点>:<vmid>[/快照名]`` → ``(连接, 节点, vmid)``。
+
+    拆不出来（不是客户机 ref）返回 ``None``。连接 id、节点名与 VMID 都不含
+    ``:``，所以从右侧切两刀是安全的；快照名可能带 ``/``，先按第一个 ``/`` 截掉。
+    """
+    guest = str(ref or "").split("/", 1)[0]
+    parts = guest.rsplit(":", 2)
+    if len(parts) != 3 or not parts[1] or not parts[2]:
+        return None
+    return parts[0], parts[1], parts[2]
 
 
 async def set_owner(kind: str, ref: str, username: str) -> None:
@@ -469,6 +489,101 @@ async def transfer_guest(
     }
 
 
+async def move_guest(
+    connection_id: str,
+    old_node: str,
+    new_node: str,
+    vmid: Any,
+    *,
+    notify: bool = True,
+) -> Dict[str, int]:
+    """迁移（同集群换节点）之后把这台客户机的归属记录搬到新节点。
+
+    为什么必须搬：ref 的第二段是节点名。不搬的话，迁移一完成这台机器在归属表里
+    就「查无此人」—— 普通用户的列表里它直接消失（列表是按 ``<连接>:<当前节点>:<vmid>``
+    精确比对的），详情页 404，它名下的快照标记也跟着失联。**人没变，只是位置变了**，
+    所以这里既不改 ``username`` 也不改 ``created``（``created`` 还参与额度告警的
+    宽限窗口，见 :func:`last_created`）。
+
+    按**身份**（连接 + VMID）而不是按「旧节点」匹配：VMID 在一条连接内唯一，
+    「同连接 + 同 VMID、节点不同」只可能是同一台机器换了位置。这样上一次迁移留下的
+    过期位置（升级前迁过、没搬记录）也能一并纠正，不会越积越多。
+
+    冲突处理：新位置上已经有一条同名记录时，保留它、删掉旧位置那条 —— 两者描述的是
+    同一台机器，留一行就够；保留新位置那条是因为它更贴近机器**现在**所在的地方。
+
+    返回搬动的条数，供审计留痕。失败让调用方决定（迁移已经提交给 PVE，搬账失败
+    不该把迁移报成失败，见 ``migrateguard.carry_ownership``）。
+    """
+    old = str(old_node or "").strip()
+    new = str(new_node or "").strip()
+    number = str(vmid if vmid is not None else "").strip()
+    counts = {"guests_moved": 0, "snapshots_moved": 0, "dropped": 0}
+    if not new or not number or old == new:
+        return counts
+    conn = str(connection_id or "")
+    moved = 0
+    dropped = 0
+    # 客户机本体 + 它名下的快照标记；两类客户机都看（容器在升级前记在 KIND_VM 下）
+    kinds = (KIND_VM, KIND_CT, KIND_SNAPSHOT)
+    marks = ", ".join("?" for _ in kinds)
+    async with database.connect() as db:
+        # 只把「VMID 对得上」的行取回来：ref 的节点段是未知的，所以是后缀匹配
+        # （服务端扫、只传回几条），不把整张归属表搬进进程 —— 批量迁移时那是一笔
+        # 随机器数线性增长的搬运。
+        cursor = await db.execute(
+            f"SELECT kind, ref FROM resource_owner WHERE kind IN ({marks}) "
+            "AND (ref LIKE ? OR ref LIKE ?)",
+            (*kinds, f"%:{number}", f"%:{number}/%"),
+        )
+        rows = await cursor.fetchall()
+
+        doomed: List[Tuple[str, str]] = []
+        for kind, ref in rows:
+            kind = str(kind)
+            text = str(ref or "")
+            parts = _guest_ref_parts(text)
+            if parts is None or parts[1] == new or parts[2] != number:
+                continue
+            if parts[0] not in (conn, "-", ""):
+                continue
+            # 快照行是 ``<客户机 ref>/快照名``：整段前缀跟着换，快照名原样保留
+            suffix = text.partition("/")[2]
+            target = f"{parts[0]}:{new}:{number}" + (f"/{suffix}" if suffix else "")
+            clash = await db.execute(
+                "SELECT ref FROM resource_owner WHERE kind = ? AND ref = ?",
+                (kind, target),
+            )
+            if await clash.fetchone():
+                doomed.append((kind, text))
+                dropped += 1
+                continue
+            await db.execute(
+                "UPDATE resource_owner SET ref = ? WHERE kind = ? AND ref = ?",
+                (target, kind, text),
+            )
+            moved += 1
+            if kind == KIND_SNAPSHOT:
+                counts["snapshots_moved"] += 1
+            else:
+                counts["guests_moved"] += 1
+        for kind, ref in doomed:
+            await db.execute(
+                "DELETE FROM resource_owner WHERE kind = ? AND ref = ?", (kind, ref)
+            )
+        await db.commit()
+
+    counts["dropped"] = dropped
+    if moved or dropped:
+        logger.info(
+            "迁移归属跟随：VMID %s（原节点 %s）→ %s（搬动 %d 条，去重 %d 条）",
+            number, old or "?", new, moved, dropped,
+        )
+        if notify:
+            await invalidate_caches()
+    return counts
+
+
 async def transfer_host(host_id: str, username: str) -> Dict[str, Any]:
     """指派 / 收回一台受管主机，返回变更详情（``{"previous", "owner"}``）。
 
@@ -585,6 +700,58 @@ async def find_refs_by_vm(
     return found
 
 
+async def find_owner_by_vmid(
+    kind: str, connection_id: str, vmid: Any
+) -> Optional[str]:
+    """按「连接 + VMID」找归属，**忽略节点**；找不到或有歧义返回 ``None``。
+
+    为什么需要它：ref 的第二段是节点名，而节点是会变的 —— 机器在同一个集群里
+    迁移之后，记录还挂在旧节点下。VMID 在一条连接（= 一个 PVE 集群）内唯一，
+    所以「同连接 + 同 VMID、节点不同」只可能是同一台机器换了位置
+    （与 ``guest_created`` / ``vm_meta`` / ``quarantine_store`` 同一套推断）。
+
+    查询用 **前缀 LIKE**（``<连接>:%:<vmid>``）而不是把整张表捞回来：走的是
+    ``(kind, ref)`` 主键的范围扫描，只碰这条连接的记录。跨连接绝不认领 ——
+    两套 PVE 各有一台 100 号机器是常态，按 VMID 全局匹配会把别人的机器判给你。
+
+    命中多条且归属人不同时无法判定（历史遗留的重复行），返回 ``None``：
+    与 :func:`vm_owner_from` 同一取舍 —— 宁可回落到「无归属」，也不猜一个人出来。
+    """
+    number = str(vmid if vmid is not None else "").strip()
+    if not number:
+        return None
+    kinds: List[str] = [kind]
+    if kind == KIND_CT:
+        # 升级前容器的归属记在 KIND_VM 下（见 migrate_guest_kinds）
+        kinds.append(KIND_VM)
+    marks = ", ".join("?" for _ in kinds)
+    conn = str(connection_id or "")
+    prefixes = [f"{conn or '-'}:"]
+    if conn:
+        # 单连接时代写下的记录前缀是 "-"，与「当前连接」同义
+        prefixes.append("-:")
+
+    found: List[str] = []
+    async with database.connect() as db:
+        for prefix in prefixes:
+            cursor = await db.execute(
+                f"SELECT ref, username FROM resource_owner "
+                f"WHERE kind IN ({marks}) AND ref LIKE ?",
+                (*kinds, f"{prefix}%:{number}"),
+            )
+            for ref, username in await cursor.fetchall():
+                parts = _guest_ref_parts(ref)
+                if parts is None or parts[2] != number:
+                    continue
+                if parts[0] not in (conn, "-", ""):
+                    continue
+                found.append(str(username or ""))
+    unique = {name for name in found if name}
+    if len(unique) > 1:
+        return None
+    return next(iter(unique), None)
+
+
 async def owners_map(kind: str) -> Dict[str, str]:
     """一次取出某个类别的全部归属，避免列表接口逐条查库。"""
     async with database.connect() as db:
@@ -645,11 +812,24 @@ async def guest_owners_map() -> Dict[str, str]:
 
 
 async def get_owner_for(kind: str, ref: str) -> Optional[str]:
-    """:func:`get_owner` 的客户机版本：容器会回看升级前的 ``KIND_VM`` 记录。"""
+    """:func:`get_owner` 的客户机版本。
+
+    两层兜底，都是为了让「机器还在、归属没变」时不要把人挡在门外：
+
+    1. 容器会回看升级前的 ``KIND_VM`` 记录；
+    2. 精确 ref 查不到时按「连接 + VMID」再找一次 —— 机器迁移过（同集群换节点）
+       之后记录仍挂在旧节点下，只按新节点拼 ref 就是「查无此人」。
+    """
     owner = await get_owner(kind, ref)
     if owner is None and kind == KIND_CT:
         owner = await get_owner(KIND_VM, ref)
-    return owner
+    if owner is not None:
+        return owner
+    parts = _guest_ref_parts(ref)
+    if parts is None:
+        return None
+    connection_id, _node, vmid = parts
+    return await find_owner_by_vmid(kind, connection_id, vmid)
 
 
 async def list_owned(kind: str, username: str) -> List[str]:
@@ -709,26 +889,66 @@ def vm_owner_from(
             if owner is not None:
                 return str(owner or "") or None
 
-    usernames: List[str] = []
-    for ref, username in vm_owners.items():
-        text = str(ref)
-        if node:
-            if not text.endswith(f":{node}:{vmid}"):
+    def _collect(node_scoped: bool) -> List[str]:
+        names: List[str] = []
+        for ref, username in vm_owners.items():
+            text = str(ref)
+            if node_scoped and node:
+                if not text.endswith(f":{node}:{vmid}"):
+                    continue
+            elif not text.endswith(f":{vmid}"):
                 continue
             # 连接已知时只认同一连接（或旧版本的 “-” 前缀）的记录：否则 B 连接上
             # 的同号机器会把 A 连接的归属认领走，隔离就漏了。
             if cid != "-" and text.rsplit(":", 2)[0] not in (cid, "-"):
                 continue
-        else:
-            if not text.endswith(f":{vmid}") or text.rsplit(":", 2)[0] != cid:
-                continue
-        usernames.append(str(username or ""))
+            names.append(str(username or ""))
+        return names
+
+    usernames = _collect(True)
+    if not usernames and node:
+        # 迁移过的机器：归属行还挂在旧节点下，按当前节点怎么都匹配不上。
+        # VMID 在一条连接内唯一，所以「同连接、同 VMID、节点不同」只可能是同一台
+        # 机器换了位置 —— 此时忽略节点按 VMID 认领（仍然锁定连接，不跨主机）。
+        usernames = _collect(False)
     if not usernames:
         return None
     unique = {u for u in usernames if u}
     if len(unique) > 1:
         return None
     return usernames[0]
+
+
+def identity_index(owners: Dict[str, str]) -> Dict[Tuple[str, str], str]:
+    """把 ``owners``（``ref -> 用户名``）重建成 ``{(连接, VMID): 用户名}`` 的索引。
+
+    用途：列表接口已经为整张表建好了 ``ref -> 用户`` 的字典，逐行按精确 ref 取
+    归属时，**迁移过的机器**会取不到（记录还挂在旧节点下）。VMID 在一条连接内
+    唯一，所以「同连接 + 同 VMID、节点不同」只可能是同一台机器换了位置
+    （与 :func:`vm_owner_from` 同一套推断）。
+
+    **有歧义的键不收录**：同一个 ``(连接, VMID)`` 出现两个不同归属人时（历史脏
+    数据 / 重复行），宁可回落到「无归属」（严格隔离下即仅管理员可见），也不猜一个
+    人出来 —— 猜错就是把别人的机器交出去。
+
+    ``-`` 前缀（旧版本记录时未指定连接）照样按 ``-`` 收录，调用方查不到时再回落到
+    它（与 :func:`vm_owner_from` 的 ``-`` 兼容口径一致）。
+    """
+    index: Dict[Tuple[str, str], str] = {}
+    conflicts: set = set()
+    for ref, username in owners.items():
+        parts = _guest_ref_parts(ref)
+        if parts is None:
+            continue
+        key = (parts[0], parts[2])
+        name = str(username or "")
+        if key in index and index[key] != name:
+            conflicts.add(key)
+            continue
+        index[key] = name
+    for key in conflicts:
+        index.pop(key, None)
+    return index
 
 
 # ------------------------------------------------------------------ 存量迁移

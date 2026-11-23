@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query
 
@@ -115,6 +116,10 @@ async def _search_vms(
         vmid = vm.get("vmid")
         # 容器与虚拟机是两套详情页，跳错就是 404
         link = f"/{'lxc' if is_lxc else 'vms'}/{node}/{vmid}"
+        # 带上连接：详情页据此把页面级连接设成这台机器所在的那条，
+        # 否则同名节点 / 同号 VMID 会读到另一套集群的数据。
+        if vm.get("connection_id"):
+            link += f"?connection={quote(str(vm['connection_id']), safe='')}"
         badge = "模板" if vm.get("template") else ("容器" if is_lxc else "虚拟机")
         found.append(
             _item(

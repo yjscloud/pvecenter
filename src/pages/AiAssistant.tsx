@@ -612,12 +612,20 @@ export function AiAssistant() {
     () => [
       // 占位项必须在：没有匹配项时原生 select 会显示第一台，等于骗用户已经选好了
       { label: t('ai.selectTargetPlaceholder'), value: '' },
-      ...hostCards.map((host) => ({
-        label: `${host.name || host.id} · ${
-          vmByHostId.has(host.id) ? t('ai.targetBoth') : t('ai.targetHostOnly')
-        }`,
-        value: host.id,
-      })),
+      ...hostCards.map((host) => {
+        /* VMID 拼进 label 是为了能按编号搜：机器名可能长得差不多，用户手里
+           常常只有 PVE 界面上那个编号（SearchableSelect 只匹配 label 文本）。 */
+        const vmidTag =
+          host.vmid != null
+            ? `（VMID ${host.vmid}${host.node ? ` · ${host.node}` : ''}）`
+            : '';
+        return {
+          label: `${host.name || host.id}${vmidTag} · ${
+            vmByHostId.has(host.id) ? t('ai.targetBoth') : t('ai.targetHostOnly')
+          }`,
+          value: host.id,
+        };
+      }),
     ],
     [hostCards, vmByHostId, t],
   );
@@ -1693,6 +1701,7 @@ export function AiAssistant() {
                       }}
                       options={targetOptions}
                       disabled={busy || hostCards.length === 0}
+                      searchable
                     />
                   </Field>
                   {/* 排查因题而异：读个负载用快模型就够，真定位故障才值得上强

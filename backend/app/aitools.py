@@ -1682,6 +1682,9 @@ async def _internal_metrics(
             continue
         series.append(
             {
+                # 多套 PVE 上同名节点 + 同号机器是两台机器：不给连接标识，
+                # 模型会把两条曲线当成同一台的两次读数
+                "connection_id": item.get("connection_id"),
                 "node": item.get("node"),
                 "vmid": item.get("vmid"),
                 "name": item.get("name"),

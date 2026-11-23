@@ -35,6 +35,7 @@ import { Field, Input, Select, Switch } from './ui/Input';
 import { Notice } from './ui/EmptyState';
 import { OwnerAssignDialog } from './OwnerAssignDialog';
 import { formatBytes } from '../utils/format';
+import { migrationTargetNodes } from '../utils/clusterNodes';
 import {
   IconCopy,
   IconLayers,
@@ -204,6 +205,7 @@ export function LxcMoreMenu({
       />
       <MigrateMiniDialog
         ct={dialog === 'migrate' ? ct : null}
+        connectionId={connectionId}
         onClose={() => setDialog(null)}
         onDone={() => {
           setDialog(null);
@@ -424,35 +426,45 @@ function CloneMiniDialog({
 
 function MigrateMiniDialog({
   ct,
+  connectionId,
   onClose,
   onDone,
 }: {
   ct: LxcDetail | null;
+  /** 这台容器所属的 PVE 连接（详情页从 ?connection= 读出） */
+  connectionId?: string;
   onClose: () => void;
   onDone: () => void;
 }) {
   const t = useT();
   const runner = useTaskRunner();
   const [target, setTarget] = useState('');
-  const [online, setOnline] = useState(true);
-  const [restart, setRestart] = useState(false);
+  /* LXC 没有在线迁移：只能停机迁。开关决定迁完要不要在目标节点自动拉起，
+     不叫「在线」—— 免得用户以为服务不会中断。 */
+  const [startAfter, setStartAfter] = useState(true);
   const [busy, setBusy] = useState(false);
+  const running = Boolean(ct?.status.startsWith('run'));
 
+  /* 节点清单按**这台容器所属的连接**查：`/nodes` 在多套 PVE 下是合并返回的，
+     而迁移只能在同一个集群里换节点（见 utils/clusterNodes）。 */
   const nodesQuery = useQuery({
-    queryKey: ['nodes'],
-    queryFn: nodesApi.list,
+    queryKey: ['nodes', connectionId ?? ''],
+    queryFn: () => nodesApi.list(connectionId || undefined),
     enabled: Boolean(ct),
     staleTime: 60_000,
     retry: false,
   });
-  /* 排除当前节点：PVE 的 migrate 目标是另一台节点 */
-  const targets = (nodesQuery.data ?? []).filter((item) => item.node !== ct?.node);
+  /* 同集群、且不是当前节点：PVE 的 migrate 目标是另一台节点 */
+  const targets = migrationTargetNodes(
+    nodesQuery.data,
+    ct ? { node: ct.node, connection_id: connectionId } : null,
+  );
 
   useEffect(() => {
     if (!ct) return;
     setTarget('');
-    setOnline(ct.status.startsWith('run'));
-    setRestart(false);
+    /* 运行中的容器默认「迁完自动拉起」：这是损失最小的做法（仍然是停机迁移） */
+    setStartAfter(ct.status.startsWith('run'));
     setBusy(false);
   }, [ct?.node, ct?.vmid]);
 
@@ -463,13 +475,15 @@ function MigrateMiniDialog({
       await runner.run(
         lxcApi.migrate(ct.node, ct.vmid, {
           target_node: target,
-          online,
-          restart,
+          /* 运行中的容器必须带 restart：PVE 没有 LXC 在线迁移，运行中的容器
+             只能用 --restart 迁移（不带给的是英文报错）。开关此时是锁定的。 */
+          restart: running ? true : startAfter,
         }),
         {
           title: t('lxcMore.migrateTask', { name: ct.name || ct.vmid }),
           node: ct.node,
-          invalidate: [['lxc'], ['nodes']],
+          /* 归属记录随容器搬到了新节点（后端 move_guest），台数 / 额度读数一起作废 */
+          invalidate: [['lxc'], ['nodes'], ['cluster'], ['quota'], ['guests']],
         },
       );
       onDone();
@@ -518,21 +532,24 @@ function MigrateMiniDialog({
                 options={targets.map((item) => ({ label: item.node, value: item.node }))}
               />
             </Field>
-            <Switch
-              checked={online}
-              onChange={setOnline}
-              label={t('vmMore.migrateOnline')}
-              hint={t('lxcMore.migrateOnlineHint')}
-            />
-            {/* 在线迁移失败时 PVE 可以自动把容器在原节点拉起来，别让服务悬着 */}
-            {online ? (
-              <Switch
-                checked={restart}
-                onChange={setRestart}
-                label={t('lxcMore.migrateRestart')}
-                hint={t('lxcMore.migrateRestartHint')}
-              />
-            ) : null}
+            {/* 先把代价说清楚：LXC 迁移必然停机，没有「在线」这个选项 */}
+            <Notice tone="info">{t('lxcMore.migrateDowntime')}</Notice>
+            {running ? (
+              <>
+                {/* 运行中的容器做不到「迁移后保持停机」：PVE 只接受 --restart，
+                    关掉开关就是一句英文报错，所以这里锁定为开 */}
+                <Switch
+                  checked
+                  onChange={setStartAfter}
+                  disabled
+                  label={t('lxcMore.migrateStartAfter')}
+                  hint={t('lxcMore.migrateRestartRequired')}
+                />
+                <Notice tone="info">{t('lxcMore.migrateStopFirstHint')}</Notice>
+              </>
+            ) : (
+              <Notice tone="info">{t('lxcMore.migrateStopped')}</Notice>
+            )}
           </>
         ) : (
           <Notice tone="warning">{t('vmMore.migrateNoTarget')}</Notice>

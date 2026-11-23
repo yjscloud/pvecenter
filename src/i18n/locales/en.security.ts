@@ -842,6 +842,8 @@ export const enSecurity: Partial<Record<MessageKey, string>> = {
   'firewall.selectCtAria': 'Select a container',
   'firewall.ownerOnlyNote': 'Regular users only see the machines they own',
   'firewall.clusterNote': 'Cluster-wide: the rules apply to every host',
+  'firewall.clusterTargetPlaceholder': 'Select the target PVE cluster',
+  'firewall.clusterTargetAria': 'Select which PVE cluster to manage (each PVE has its own cluster firewall)',
   'firewall.clusterReadonly': 'Cluster-wide rules affect every host and require the firewall.cluster permission: you can view them but not modify them.',
   'firewall.optionsError': 'Cannot read the firewall settings',
   'firewall.enableLabel': 'Firewall',

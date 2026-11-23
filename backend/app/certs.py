@@ -63,7 +63,7 @@ from .certproviders import (
     label as provider_label,
 )
 from .certproviders.base import STATUS_EXPIRED
-from .pve import ProxmoxError, get_client
+from .pve import ProxmoxError, client_for_connection, get_client
 from .tencent_ssl import (
     STATUS_FAILED,
     STATUS_ISSUED,
@@ -192,7 +192,9 @@ DEFAULT_TARGET: Dict[str, Any] = {
     "ssh_password": "",
     "ssh_key": "",
     "ssh_host_key": "",
-    # Guest Agent / LXC
+    # Guest Agent / LXC / PVE 节点：这三个通道都要经 PVE 接口执行，
+    # 节点名只在它所属的那台 PVE 上成立（多连接部署里同名节点很常见）
+    "connection_id": "",
     "agent_node": "",
     "agent_vmid": "",
     # --- 云负载均衡 / CDN ---
@@ -239,6 +241,8 @@ DEFAULT_SITE: Dict[str, Any] = {
     "ssh_key": "",
     "ssh_host_key": "",  # 首次连接后记录的主机指纹（TOFU）
     # --- PVE 虚拟机 Guest Agent 部署 ---
+    # 站点级字段只用于兼容单目标入参；真正的连接记在 targets 里
+    "connection_id": "",
     "agent_node": "",
     "agent_vmid": "",
     "auto_renew": True,
@@ -416,6 +420,7 @@ def _legacy_target(site: Dict[str, Any]) -> Dict[str, Any]:
         "ssh_password",
         "ssh_key",
         "ssh_host_key",
+        "connection_id",
         "agent_node",
         "agent_vmid",
     ):
@@ -587,6 +592,11 @@ def _normalise_target(
         target[key] = value
     target["ssh_host_key"] = str(item.get("ssh_host_key", target.get("ssh_host_key")) or "").strip()
 
+    # 部署到哪台 PVE：空串 = 当前连接（旧站点的行为），新数据由前端按选中的
+    # 机器 / 节点带上。少了它，节点名会在「当前连接」那台上被当主机名解析。
+    target["connection_id"] = str(
+        item.get("connection_id", target.get("connection_id")) or ""
+    ).strip()
     target["agent_node"] = str(item.get("agent_node", target.get("agent_node")) or "").strip()
     if method == "pve":
         # pve 方式复用 agent_node 存节点名；VMID 与它无关，切换方式后清掉旧值
@@ -1622,6 +1632,37 @@ async def load_sites() -> List[Dict[str, Any]]:
 async def save_sites(sites: List[Dict[str, Any]]) -> None:
     async with _SITES_LOCK:
         await _write_sites(sites)
+
+
+async def migrate_site_connections() -> int:
+    """把存量站点固定到升级时的「当前连接」。
+
+    早期站点的 target 没有 ``connection_id``，部署时按「当前连接」走 —— 默认
+    连接一换，证书就悄悄部署到另一台机器上（同名节点 + 同号 VMID 时甚至是
+    无关机器）。升级时把当时那条连接写死，之后再换默认连接也不会漂。
+    返回改动过的站点数。
+    """
+    sites = await load_sites()
+    active = str(store.get_active_connection_id() or "")
+    if not active or not sites:
+        return 0
+    changed = 0
+    for site in sites:
+        touched = False
+        for target in site.get("targets") or []:
+            if str(target.get("connection_id") or ""):
+                continue
+            target["connection_id"] = active
+            touched = True
+        # 站点级字段只用于兼容单目标入参，同步补上：旧结构再次合成 target 时才不会丢
+        if not str(site.get("connection_id") or ""):
+            site["connection_id"] = active
+            touched = True
+        if touched:
+            changed += 1
+    if changed:
+        await save_sites(sites)
+    return changed
 
 
 def visible_sites(sites: List[Dict[str, Any]], owner: Optional[str]) -> List[Dict[str, Any]]:
@@ -2716,10 +2757,29 @@ async def _agent_rollback(
     return ok
 
 
+def _client_for_site(site: Dict[str, Any]):
+    """站点该用哪条 PVE 连接。
+
+    空值表示站点没有指定（单连接部署 / 升级前的存量站点）：沿用当前连接，
+    与旧行为一致。指定了就用那一条 —— 同名的节点 + 同号的 VMID 在两套集群上
+    都成立，落到错的连接就是往另一台无关机器里写文件。
+    """
+    conn_id = str(site.get("connection_id") or "")
+    return client_for_connection(conn_id) if conn_id else get_client()
+
+
 async def _push_guest_agent(
     site: Dict[str, Any], bundle: Dict[str, Any]
 ) -> Tuple[str, str]:
-    client = get_client()
+    # 站点的目标是哪台 PVE 就用它：``agent_exec`` 会在客户机里执行命令（mkdir /
+    # 写证书 / 私钥）。落到「当前连接」时，同名的节点 + 同号的 VMID 可能是另一套
+    # 集群里**完全无关的一台机器** —— 那就不是「报个错」而是写错机器。
+    try:
+        client = _client_for_site(site)
+    except ProxmoxError as exc:
+        # 连接被删 / id 过期：按部署失败记账（站点状态里能看到原因），
+        # 而不是让整个部署请求 500
+        raise CertError(str(exc)) from exc
     node = str(site.get("agent_node") or "")
     vmid = int(str(site.get("agent_vmid") or "0"))
     directory = str(site.get("deploy_dir") or "")
@@ -3006,7 +3066,8 @@ async def _push_pve_node(
     if not node:
         raise CertError(i18n.tr("PVE 节点部署需要填写节点名称"))
     try:
-        client = get_client()
+        # 与 Agent 通道同理：证书落到 /etc/pve/local/，必须就是那台节点的 PVE
+        client = _client_for_site(site)
     except ProxmoxError as exc:
         # 作用域指定的连接不存在 / 已被删除时，get_client 抛的是 ProxmoxError；
         # 统一转成 CertError，部署结果里才会记「失败」而不是整个请求 500。

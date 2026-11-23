@@ -377,8 +377,14 @@ async def purge_old(now: Optional[float] = None) -> int:
 
 
 # --------------------------------------------------------------------- 查询
-def _series_key(node: str, vmid: int) -> Tuple[str, int]:
-    return (node, vmid)
+def _series_key(connection_id: str, node: str, vmid: int) -> Tuple[str, str, int]:
+    """一条序列的身份：**连接 + 节点 + VMID**。
+
+    节点名在每套 PVE 上都是本地的，两台都叫 ``pve1`` 的节点、两台都有 vmid 100
+    的机器在多连接部署里很常见。只按 ``(node, vmid)`` 分组会把它们揉成一条曲线
+    （读数被平均、上限被取大），看起来像机器在「忽快忽慢」。
+    """
+    return (connection_id, node, vmid)
 
 
 async def query(
@@ -389,6 +395,7 @@ async def query(
     step: int,
     node: Optional[str] = None,
     vmid: Optional[int] = None,
+    connection_id: Optional[str] = None,
     owned_refs: Optional[Sequence[str]] = None,
     max_series: int = DEFAULT_MAX_SERIES,
 ) -> Dict[str, Any]:
@@ -400,6 +407,11 @@ async def query(
 
     ``owned_refs`` 为 ``None`` 表示不做归属过滤（管理员）；空列表表示该用户
     名下没有任何虚拟机，直接返回空（严格隔离：没有归属记录的资源不可见）。
+
+    ``connection_id`` 为 ``None`` 表示不限连接（多套 PVE 一起看）；空串表示
+    **默认连接**（落库时用 ``"-"`` 标记）；其它值就是那条连接。序列本身一律按
+    「连接 + 节点 + VMID」拆分 —— 同名节点上的同号机器是两台不同的机器，混成
+    一条曲线会把读数悄悄平均掉。
     """
     if scope not in SCOPES:
         raise ValueError(f"未知作用域：{scope}")
@@ -410,6 +422,10 @@ async def query(
     if node:
         where.append("node = ?")
         params.append(node)
+    if connection_id is not None:
+        # None = 不限；空串 = 默认连接（与落库口径一致）
+        where.append("connection_id = ?")
+        params.append(str(connection_id).strip() or DEFAULT_CONNECTION)
     if vmid is not None:
         where.append("vmid = ?")
         params.append(int(vmid))
@@ -447,7 +463,8 @@ async def query(
     sql = (
         # name / guest_type 用 MAX() 包起来而不是进 GROUP BY：一旦窗口内改过名，
         # 按 name 分组会让同一个桶裂成两行、序列里出现重复的时间点。
-        "SELECT node, vmid,"
+        # connection_id 必须进 GROUP BY：两台 PVE 的同名节点 + 同号机器是两台机器。
+        "SELECT connection_id, node, vmid,"
         "       MAX(name) AS name, MAX(guest_type) AS guest_type,"
         "       FLOOR(ts / ?) * ? AS bucket,"
         "       AVG(cpu) AS cpu, MAX(maxcpu) AS maxcpu,"
@@ -459,8 +476,8 @@ async def query(
         "       AVG(CASE WHEN status = ? THEN 1 ELSE 0 END) AS up_ratio,"
         "       COUNT(*) AS samples "
         "FROM metrics_history WHERE " + " AND ".join(where) + " "
-        "GROUP BY node, vmid, bucket "
-        "ORDER BY node, vmid, bucket "
+        "GROUP BY connection_id, node, vmid, bucket "
+        "ORDER BY connection_id, node, vmid, bucket "
         "LIMIT ?"
     )
     query_params: List[Any] = [step, step, UP_STATUS[scope]]
@@ -476,20 +493,24 @@ async def query(
     if truncated:
         rows = rows[:_QUERY_ROW_LIMIT]
 
-    series: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    series: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     for row in rows:
+        stored_cid = str(row["connection_id"] or "") or DEFAULT_CONNECTION
         node_name = str(row["node"] or "")
         row_vmid = int(row["vmid"] or 0)
-        entry = series.get(_series_key(node_name, row_vmid))
+        key = _series_key(stored_cid, node_name, row_vmid)
+        entry = series.get(key)
         if entry is None:
             entry = {
+                # 空串对外表示「默认连接」（与 X-PVE-Connection 的空值同义）
+                "connection_id": "" if stored_cid == DEFAULT_CONNECTION else stored_cid,
                 "node": node_name,
                 "vmid": row_vmid if scope == SCOPE_GUEST else None,
                 "name": str(row["name"] or ""),
                 "guest_type": str(row["guest_type"] or "") or None,
                 "points": [],
             }
-            series[_series_key(node_name, row_vmid)] = entry
+            series[key] = entry
         entry["points"].append(
             {
                 "ts": int(row["bucket"]),
@@ -511,7 +532,11 @@ async def query(
 
     ordered = sorted(
         series.values(),
-        key=lambda s: (s["node"], s["vmid"] if s["vmid"] is not None else 0),
+        key=lambda s: (
+            s["connection_id"],
+            s["node"],
+            s["vmid"] if s["vmid"] is not None else 0,
+        ),
     )
     truncated = truncated or len(ordered) > max_series
 

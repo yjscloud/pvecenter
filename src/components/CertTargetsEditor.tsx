@@ -7,10 +7,13 @@
    状态（见后端 certs.deploy_site）。
    ========================================================================== */
 
+import { useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "./ui/Button";
 import { Input, Select } from "./ui/Input";
 import { IconPlus, IconTrash } from "./Icons";
 import { useT } from "../i18n";
+import { connectionsApi } from "../api/endpoints";
 import type { CertTarget } from "../api/types";
 
 interface Props {
@@ -41,6 +44,25 @@ function isCloudMethod(method?: string): boolean {
 
 export function CertTargetsEditor({ targets, methods, disabled, onChange }: Props) {
   const t = useT();
+
+  /* 部署目标所在的 PVE 连接：节点名在每套 PVE 上都是本地的。选了连接之后，
+     后端才不会把 node 当成「当前连接」上的主机名去解析（agent 方式甚至会
+     在客户机里执行命令，落错机器就是写错机器）。 */
+  const connectionsQuery = useQuery({
+    queryKey: ["connections"],
+    queryFn: connectionsApi.list,
+    staleTime: 300_000,
+    retry: false,
+  });
+  const connectionOptions = useMemo(
+    () =>
+      (connectionsQuery.data ?? []).map((c) => ({
+        label: c.name || c.id,
+        value: c.id,
+      })),
+    [connectionsQuery.data],
+  );
+  const multiConnection = connectionOptions.length > 1;
 
   const update = (index: number, patch: Partial<CertTarget>) => {
     onChange(targets.map((item, i) => (i === index ? { ...item, ...patch } : item)));
@@ -117,15 +139,30 @@ export function CertTargetsEditor({ targets, methods, disabled, onChange }: Prop
                 />
               </>
             ) : target.method === "pve" ? (
-              <Input
-                label={t('cert.fieldNode')}
-                value={target.agent_node || ""}
-                placeholder="pve1"
-                className="mono"
-                disabled={disabled}
-                hint={t('cert.pveNodeHint')}
-                onChange={(e) => update(index, { agent_node: e.target.value })}
-              />
+              <>
+                {multiConnection ? (
+                  <Select
+                    label={t('cert.fieldPveConnection')}
+                    value={target.connection_id || ""}
+                    disabled={disabled}
+                    options={[
+                      { label: t('cert.connectionAuto'), value: "" },
+                      ...connectionOptions,
+                    ]}
+                    hint={t('cert.pveConnectionHint')}
+                    onChange={(e) => update(index, { connection_id: e.target.value })}
+                  />
+                ) : null}
+                <Input
+                  label={t('cert.fieldNode')}
+                  value={target.agent_node || ""}
+                  placeholder="pve1"
+                  className="mono"
+                  disabled={disabled}
+                  hint={t('cert.pveNodeHint')}
+                  onChange={(e) => update(index, { agent_node: e.target.value })}
+                />
+              </>
             ) : null}
 
             {target.method === "tencent_clb" ? (
@@ -220,6 +257,19 @@ export function CertTargetsEditor({ targets, methods, disabled, onChange }: Prop
 
             {target.method === "agent" || target.method === "lxc" ? (
               <>
+                {multiConnection ? (
+                  <Select
+                    label={t('cert.fieldPveConnection')}
+                    value={target.connection_id || ""}
+                    disabled={disabled}
+                    options={[
+                      { label: t('cert.connectionAuto'), value: "" },
+                      ...connectionOptions,
+                    ]}
+                    hint={t('cert.pveConnectionHint')}
+                    onChange={(e) => update(index, { connection_id: e.target.value })}
+                  />
+                ) : null}
                 <Input
                   label={t('cert.fieldNode')}
                   value={target.agent_node || ""}

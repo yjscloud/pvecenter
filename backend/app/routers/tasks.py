@@ -12,7 +12,7 @@ from .. import guestguard, i18n, security, store
 from ..formatters import normalize_task
 from ..pve import ProxmoxError, get_client, node_from_upid
 from ..task_scope import build_scope
-from ..vm_scope import bind_task_connection
+from ..vm_scope import bind_node_connection, bind_task_connection
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ def _raise(exc: ProxmoxError) -> None:
 # WebSocket 推送三条出口共用同一套规则，避免只收紧其中一条（安全审计 M-1）。
 
 
-@router.get("/tasks")
+@router.get("/tasks", dependencies=[Depends(bind_node_connection)])
 async def list_tasks(
     node: Optional[str] = None,
     limit: int = Query(default=100, ge=1, le=1000),

@@ -300,8 +300,10 @@ export function VmDetail() {
 
   /* ---- 最近任务 ---- */
   const tasksQuery = useQuery({
-    queryKey: ['cluster', 'tasks', node, 20],
-    queryFn: () => clusterApi.tasks({ node, limit: 20 }),
+    /* 带上连接：两套 PVE 有同名节点时，只按 node 过滤会把另一台的任务混进来。
+       连接来自详情页 URL 上的 ?connection=（见 pageConnection）。 */
+    queryKey: ['cluster', 'tasks', pageConnection, node, 20],
+    queryFn: () => clusterApi.tasks({ node, limit: 20 }, pageConnection),
     enabled: validParams,
     refetchInterval: refresh,
     retry: false,

@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Depends, Request
 
@@ -156,7 +156,7 @@ def _known_connection_ids() -> set:
     return ids
 
 
-async def bind_node_connection(node: str) -> None:
+async def bind_node_connection(node: Optional[str] = None) -> None:
     """请求没显式指定连接时，按节点名把这次请求绑到正确的那条 PVE 连接上。
 
     多连接部署里前端常常只发来节点名（详情页、存储页、备份下载链接…）：
@@ -166,10 +166,14 @@ async def bind_node_connection(node: str) -> None:
 
     只看**硬指定**（``X-PVE-Connection``）：顶栏的集群作用域是「我默认在看哪一套」，
     不该拦住这次纠正 —— 否则作用域是 A 时点开 B 的节点，请求会打到 A 上。
+
+    ``node`` 有默认值是为了能直接挂成路由器级依赖：集群级接口（防火墙的
+    ``/firewall/cluster/*``、安全组 / IP 集合）根本没有节点参数，FastAPI 会把
+    这个形参当成**必填查询参数**，整组接口直接 422。
     """
     from . import pve
 
-    if pve.bound_connection():
+    if not node or pve.bound_connection():
         return
     try:
         cid = await resolve_node_connection(node)
@@ -308,3 +312,21 @@ async def bind_task_connection(
     )
     if conn_id:
         set_request_connection(conn_id)
+
+
+def bound_dependencies() -> List[Any]:
+    """「按机器 / 节点寻址」的接口的标准接线（路由器级依赖）。
+
+    **顺序不能反**：先 VM 级（最精确，能区分不同 PVE 上的同名节点 + 同 VMID），
+    再节点级兜底。反过来写的话，节点绑定先写入硬指定，VM 级纠正会被
+    ``bound_connection()`` 挡住，同名节点场景就定位到错的那台。
+
+    之所以要有这个函数：这条 bug（防火墙整组接口没挂绑定 → ``hostname lookup
+    'node02' failed``）已经出现过三次（虚拟机、隔离、防火墙）。新接口统一写成::
+
+        router = APIRouter(prefix="/api", dependencies=bound_dependencies())
+
+    依赖的形参是 ``node`` / ``vmid``，路径段或查询参数都能取到；两者都没有的
+    集群级接口两个依赖都是空转，不会变成「必填参数」。
+    """
+    return [Depends(bind_vm_connection), Depends(bind_node_connection)]
