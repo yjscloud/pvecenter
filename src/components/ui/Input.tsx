@@ -331,7 +331,7 @@ const SEARCH_VIEW_PAD = 8;
 /** 菜单的高度上限（与 .target-select-menu 的 max-height 一致）与下限 */
 const SEARCH_MENU_MAX_HEIGHT = 240;
 const SEARCH_MENU_MIN_HEIGHT = 120;
-/** 菜单的最小宽度：窄列 / 表格单元格里也要放得下「名称（vmid · 节点 · 状态）」 */
+/** bare（表格单元格）形态下菜单的最小宽度：单元格太窄时也要放得下机器名 */
 const SEARCH_MENU_MIN_WIDTH = 240;
 
 /** 浮层菜单的 fixed 坐标：给了 top 就是向下展开，给了 bottom 就是向上展开 */
@@ -488,10 +488,12 @@ export function SearchableSelect({
     const below = window.innerHeight - rect.bottom - SEARCH_MENU_GAP - SEARCH_VIEW_PAD;
     const above = rect.top - SEARCH_MENU_GAP - SEARCH_VIEW_PAD;
     const up = below < SEARCH_MENU_MIN_HEIGHT && above > below;
-    /* 表格单元格里的下拉往往只有几十像素宽，菜单跟它等宽会把机器名截得只剩
-       几个字：给一个最小宽度，再夹回视口内 */
+    /* 宽度默认跟输入框严格对齐：菜单比触发它的框宽，就会盖住并排的下一块内容
+       （SSH 安全「作用域」那种一行三张卡的地方尤其明显）。只有表格单元格里的
+       bare 形态例外 —— 那里输入框往往只有几十像素，等宽会把机器名截得只剩
+       几个字，给一个最小宽度，再夹回视口内。 */
     const width = Math.min(
-      Math.max(rect.width, SEARCH_MENU_MIN_WIDTH),
+      Math.max(rect.width, bare ? SEARCH_MENU_MIN_WIDTH : 0),
       window.innerWidth - SEARCH_VIEW_PAD * 2,
     );
     const next: SearchMenuBox = {
@@ -509,7 +511,7 @@ export function SearchableSelect({
         : { top: rect.bottom + SEARCH_MENU_GAP }),
     };
     setMenuBox((prev) => (sameBox(prev, next) ? prev : next));
-  }, []);
+  }, [bare]);
 
   /* layout 阶段就量好位置：不然菜单会先在屏幕左上角画一帧再跳到输入框下 */
   useLayoutEffect(() => {
@@ -664,6 +666,8 @@ export function SearchableSelect({
                       id={`${listId}-${index}`}
                       role="option"
                       aria-selected={selected}
+                      /* 菜单与输入框等宽，长名字会被省略号截掉：悬停看全称 */
+                      title={item.label}
                       className={`target-select-option ${
                         index === active ? 'is-active' : ''
                       } ${selected ? 'is-selected' : ''}`}
