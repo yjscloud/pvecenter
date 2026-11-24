@@ -43,7 +43,7 @@
 | `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | `127.0.0.1` / `3306` / 空 | MySQL 连接，库名必填 |
 | `DB_POOL_SIZE` | `8` | 连接池上限 |
 
-面板只支持 MySQL，建库后表结构启动时自动创建：
+面板只认 MySQL 协议，MySQL 8 和 MariaDB 都能跑（裸机脚本装的就是 MariaDB），建库后表结构启动时自动创建：
 
 ```sql
 CREATE DATABASE pvecenter_panel CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;

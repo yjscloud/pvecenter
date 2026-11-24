@@ -70,13 +70,6 @@ environments and the upkeep; not tipping changes nothing about support.
 
 ## Screenshots
 
-<!--
-Placeholder list (each shows up once the file is in docs/screenshots/):
-vm-list.png / vm-create.png / lxc-list.png / template-pipeline.png / firewall.png /
-ssh-security.png / security-baseline.png / ai-assistant.png / monitoring.png /
-backup.png / console.png / audit-log.png / certificates.png / users-rbac.png
--->
-
 <table>
   <tr>
     <td width="50%"><a href="docs/screenshots/dashboard.png"><img src="docs/screenshots/dashboard.png" alt="pvecenter overview: cluster status, CPU / memory / storage use, nodes and resource distribution"></a><br><sub><b>Dashboard</b> · cluster status / resource use / distribution</sub></td>
@@ -103,7 +96,7 @@ backup.png / console.png / audit-log.png / certificates.png / users-rbac.png
 | **AI assistant** | attributes findings from inspection data, read-only command allowlist, write commands approved one by one |
 | **Day to day** | background jobs, task queue, in-app notifications, a `Ctrl / ⌘ + K` command palette, one-click updates, branding and nav switches |
 
-Short version: most of what the PVE web UI does, plus cross-cluster aggregation, batch operations, and the permission and audit layer PVE never had. Details and limits for each area are in the [feature guide](docs/features.md) (Chinese).
+Short version: most of what the PVE web UI does, plus cross-cluster aggregation, batch operations, and the permission and audit layer PVE never had. Details and limits for each area are in the [feature guide](docs/features.en.md) (English outline; the full page is Chinese).
 
 ---
 
@@ -115,9 +108,17 @@ Short version: most of what the PVE web UI does, plus cross-cluster aggregation,
 |---|---|---|
 | Proxmox VE | 8.x / 9.x | tested on 8.4 and 9; both run the same code |
 | Python | 3.11+ | 3.9 / 3.10 are rejected at startup |
-| MySQL | 8 | MySQL only; tables are created on first start |
-| Node.js | 22.22+ | only needed to build the frontend; `deploy.sh` installs it |
+| Database | MySQL 8.0+ or MariaDB | standard MySQL protocol; the bare-metal script installs MariaDB (10.11 on Debian 12) and the Docker image defaults to `mysql:8.0`; tables are created on first start |
+| Node.js | 22.22+ | automatic: `deploy.sh` installs it; only needed up front if you build the frontend by hand |
 | Docker + Compose | v2 | only for the container route |
+
+The panel itself is light, but give it its own VM rather than sharing the PVE host: `deploy.sh` installs MariaDB and a systemd service on that machine, and the baseline checks and SSH login audit read that machine's own logs, so on a PVE node those readings describe PVE itself. Ubuntu, Debian, CentOS and TencentOS are supported, as are RHEL / Rocky / Alma / openEuler and Alpine; Debian 12+ and Ubuntu 24.04+ ship Python 3.11 already, older releases need 3.11 installed first.
+
+| Resource | Starting point | Notes |
+|---|---|---|
+| CPU | 2 cores | 1 core works, but frontend builds and batch operations get noticeably slower |
+| RAM | 2 GB | the frontend build (`npm run build`) is the peak; 1 GB machines often stall there. The Docker image does not build |
+| Disk | 3 GB | source, dependencies, virtualenv and built assets come to about 1 GB; the rest is logs, metrics history and the database |
 
 ### Bare metal
 
@@ -143,14 +144,16 @@ curl http://127.0.0.1:8080/api/health
 
 ### Docker
 
-No Python / Node / MySQL on the host? Docker is enough:
+No Python / Node / database on the host? Docker is enough:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/yjscloud/pvecenter/main/docker-compose.yml
+export ADMIN_PASSWORD="$(openssl rand -base64 18)"
+echo "login password: $ADMIN_PASSWORD"
 docker compose up -d
 ```
 
-Open `http://your-server-ip:8080`. Default account `admin`, password `pvecenter@2026`. Change it: all three passwords live in `docker-compose.yml` under `★ 改这里`.
+Open `http://your-server-ip:8080`, account `admin`, password the one just generated and printed (the backend refuses to start with fewer than 12 characters). The database and DB-admin passwords live in `docker-compose.yml` under `★ 改这里`; change those too before exposing the port.
 
 ### Connect a PVE host
 
@@ -172,16 +175,17 @@ The link can be limited to a number of uses: 1 by default, or 5, 10, unlimited. 
 
 ## Documentation
 
-The detailed docs are written in Chinese for now; this page is the English entry point.
+The detailed docs are written in Chinese for now; this page is the English entry point, and the feature guide has an English heading-level outline.
 
 | I want to… | Read |
 |---|---|
 | Install it, change the port, use Docker | [Deployment](docs/deployment.md) |
 | Put the panel on the public internet | [Hardening](docs/hardening.md) |
 | Look up an `.env` variable | [Configuration](docs/configuration.md) |
-| Understand what a feature does | [Features](docs/features.md) |
+| Understand what a feature does | [Features (English outline)](docs/features.en.md) |
 | Fix an empty list, a PVE connection error, a black console | [Troubleshooting](docs/troubleshooting.md) |
 | Work on the code, run the tests | [Layout and tests](docs/development.md) |
+| Send a pull request | [Contributing](CONTRIBUTING.md) |
 | See what is planned | [Roadmap](docs/roadmap.md) |
 | PBS, frp real IP, alert mail, data ownership | [All docs](docs/README.md) |
 

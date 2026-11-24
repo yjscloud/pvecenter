@@ -2,7 +2,7 @@
 
 按页面讲每个功能能做什么、边界在哪。只想看有哪些功能，[README](../README.md#核心功能) 里有张简表。
 
-> 返回 [README](../README.md) · 相关：[部署](deployment.md) · [配置项](configuration.md)
+> 返回 [README](../README.md) · 相关：[部署](deployment.md) · [配置项](configuration.md) · [English outline](features.en.md)
 
 ## 虚拟机管理（QEMU / KVM）
 

@@ -26,7 +26,7 @@
 
 **pvecenter** 是一个开源自托管的 **Proxmox VE（PVE）Web 管理面板**。一套界面管 QEMU 虚拟机、LXC 容器、cloud-init 模板、存储与网络、快照备份、内网穿透、VNC 控制台、证书和账号权限，还能同时接管多台 PVE。装成 systemd 服务或用 Docker 跑，机器重启后自己起来。
 
-面板自己不做虚拟化，底下仍然是 Proxmox。它把散在 API、命令行和各台节点上的操作收进一个界面，顺手补了多用户、配额、审计这些 PVE 本身不提供的东西。
+一句话概括：PVE 负责虚拟化，pvecenter 负责它上面那层运营：多台集群收进一个视图、批量下发，再加上账号、配额、证书和审计。每项的细节和边界在 [功能说明](docs/features.md)。
 
 > Self-hosted **Proxmox VE (PVE) web UI** for QEMU VMs, LXC containers, cloud-init templates,
 > networking, firewalls, backups, monitoring, certificates and RBAC.
@@ -67,13 +67,6 @@ pvecenter 由个人维护。它帮你省下时间的话，欢迎自愿赞赏，�
 
 ## 界面预览
 
-<!--
-截图占位清单（放入 docs/screenshots/ 后自动显示）：
-vm-list.png / vm-create.png / lxc-list.png / template-pipeline.png / firewall.png /
-ssh-security.png / security-baseline.png / ai-assistant.png / monitoring.png /
-backup.png / console.png / audit-log.png / certificates.png / users-rbac.png
--->
-
 <table>
   <tr>
     <td width="50%"><a href="docs/screenshots/dashboard.png"><img src="docs/screenshots/dashboard.png" alt="pvecenter 运行总览：集群状态、CPU / 内存 / 存储占用、节点与资源分布"></a><br><sub><b>运行总览</b> · 集群状态 / 资源占用 / 资源分布</sub></td>
@@ -100,7 +93,7 @@ backup.png / console.png / audit-log.png / certificates.png / users-rbac.png
 | **AI 助手** | 拿巡检数据做归因，只读命令白名单，写操作逐条审批 |
 | **日常** | 后台作业、任务队列、站内通知、`Ctrl / ⌘ + K` 命令面板、一键更新、站点品牌与入口开关 |
 
-一句话概括：PVE 网页上能做的大多数事这里都能做，外加跨集群聚合、批量操作，以及 PVE 本身没有的权限与审计。每项的细节和边界在 [功能说明](docs/features.md)。
+上面每个模块的具体范围、参数和已知边界，[功能说明](docs/features.md) 里逐条写了。
 
 ---
 
@@ -112,9 +105,17 @@ backup.png / console.png / audit-log.png / certificates.png / users-rbac.png
 |---|---|---|
 | Proxmox VE | 8.x / 9.x | 8.4 与 9 实测通过，两版走同一套代码 |
 | Python | 3.11+ | 3.9 / 3.10 启动时会被拒绝 |
-| MySQL | 8 | 只支持 MySQL，建库后表结构自动创建 |
-| Node.js | 22.22+ | 只在构建前端时需要，`deploy.sh` 会自己装 |
+| 数据库 | MySQL 8.0+ 或 MariaDB | 走标准 MySQL 协议；裸机脚本默认装 MariaDB（Debian 12 是 10.11），Docker 镜像默认 `mysql:8.0`，建库后表结构自动创建 |
+| Node.js | 22.22+ | 自动：`deploy.sh` 自己装，只有手工构建前端时才需要预装 |
 | Docker + Compose | v2 | 只用容器方式时需要 |
+
+面板本身很轻，但建议单独开一台虚拟机来跑，别和 PVE 挤在同一台：`deploy.sh` 会在这台机器上装 MariaDB、加 systemd 服务，安全基线和 SSH 登录审计读的也是这台机器的日志，混在 PVE 节点上，这些读数说的就是 PVE 自己。系统支持 Ubuntu、Debian、CentOS、TencentOS，RHEL / Rocky / Alma / openEuler 与 Alpine 也能装；Debian 12+ 和 Ubuntu 24.04+ 自带 Python 3.11，更老的版本得先补一个 3.11 再跑脚本。
+
+| 资源 | 起步 | 说明 |
+|---|---|---|
+| CPU | 2 核 | 1 核也能跑，前端构建和批量下发会明显变慢 |
+| 内存 | 2 GB | 前端构建（`npm run build`）是内存峰值，1 GB 的机器常卡在这一步；用 Docker 镜像不构建 |
+| 磁盘 | 3 GB | 源码、依赖、虚拟环境与前端产物合计约 1 GB，其余留给日志、指标历史和数据库 |
 
 ### 裸机安装
 
@@ -140,14 +141,16 @@ curl http://127.0.0.1:8080/api/health
 
 ### Docker 安装
 
-不想在宿主机装 Python / Node / MySQL 就用容器，宿主机只要有 Docker：
+不想在宿主机装 Python / Node / 数据库就用容器，宿主机只要有 Docker：
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/yjscloud/pvecenter/main/docker-compose.yml
+export ADMIN_PASSWORD="$(openssl rand -base64 18)"
+echo "登录口令：$ADMIN_PASSWORD"
 docker compose up -d
 ```
 
-打开 `http://你的服务器IP:8080`，默认账号 `admin`，口令 `pvecenter@2026`。这个口令得改，三个口令都在 `docker-compose.yml` 里，搜 `★ 改这里`。
+打开 `http://你的服务器IP:8080`，账号 `admin`，口令就是上面生成并打印出来的那个（短于 12 位后端会拒绝启动）。连库口令和数据库管理员口令在 `docker-compose.yml` 里，搜 `★ 改这里`，公网部署前一并换掉。
 
 ### 接入 PVE
 
@@ -177,6 +180,7 @@ docker compose up -d
 | 某个功能怎么用、边界在哪 | [功能说明](docs/features.md) |
 | 列表全空 / 连不上 PVE / 控制台黑屏 | [排查问题](docs/troubleshooting.md) |
 | 接手代码、跑测试 | [目录结构与测试](docs/development.md) |
+| 想提 PR、问代码约定 | [贡献指南](CONTRIBUTING.md) |
 | 后面打算做什么 | [路线图](docs/roadmap.md) |
 | PBS、frp 真实 IP、告警邮件、数据归属 | [专题文档](docs/README.md) |
 

@@ -71,28 +71,26 @@ sudo ./deploy.sh --port 9000 --mysql-root-password '<root 口令>' \
 
 ## Docker 部署
 
-不想在宿主机装 Python / Node / MySQL 就用容器，宿主机只要有 Docker：
+不想在宿主机装 Python / Node / 数据库就用容器，宿主机只要有 Docker：
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/yjscloud/pvecenter/main/docker-compose.yml
+export ADMIN_PASSWORD="$(openssl rand -base64 18)"
+echo "登录口令：$ADMIN_PASSWORD"
 docker compose up -d
 ```
 
-打开 `http://你的服务器IP:8080`，账号 `admin`，口令 `pvecenter@2026`。这个口令得改。
+打开 `http://你的服务器IP:8080`，账号 `admin`，口令就是上面生成并打印的那个。口令短于 12 位、或属于 `admin123` 这类弱口令时，首次建号会直接拒绝启动，而不是建出一个弱口令管理员。
 
-三个口令都在 `docker-compose.yml` 里，搜 `★ 改这里`。口令行长这样：
-
-```yaml
-ADMIN_PASSWORD: ${ADMIN_PASSWORD:-pvecenter@2026}
-```
-
-`:-` 是 compose 的「取默认值」记号：`.env` 或环境变量给了就用那个，没给才用后面这段。`-`、`$`、`{`、`}` 都只是语法，真正的口令是 `pvecenter@2026`，改的时候只动它：
+三个口令都在 `docker-compose.yml` 里，搜 `★ 改这里`。每一行长这样：
 
 ```yaml
-ADMIN_PASSWORD: ${ADMIN_PASSWORD:-MyPassw0rd2026}
+ADMIN_PASSWORD: ${ADMIN_PASSWORD:-你的口令}
 ```
 
-要改的是 `ADMIN_PASSWORD`（面板登录）、`DB_PASSWORD`（连库）、`MYSQL_ROOT_PASSWORD`（MySQL 管理员）。也可以不碰这个文件，在同目录放个 `.env`，等号后直接写口令，优先级更高。
+`:-` 是 compose 的「取默认值」记号：`.env` 或环境变量给了就用那个，没给才用 `:-` 后面那段。改的时候只动 `:-` 后面、`}` 前面那一截，`$`、`{`、`}` 都只是语法。不设也能起，那时用的是文件里那段默认值，别让它留在公网可达的实例上。
+
+要改的是 `ADMIN_PASSWORD`（面板登录）、`DB_PASSWORD`（连库）、`MYSQL_ROOT_PASSWORD`（数据库管理员）。也可以不碰这个文件，在同目录放个 `.env`，等号后直接写口令，优先级更高。
 
 两个坑先说在前面：
 
