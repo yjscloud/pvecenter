@@ -2225,7 +2225,9 @@ class TestRbac:
         )
         resp = api.post("/api/vms/pve1/100/status/start", headers=viewer)
         assert resp.status_code == 403
-        assert "vm.power" in resp.json()["detail"]
+        # 403 的文案统一成「权限不足」：不再把内部权限点回显给调用方
+        # （那等于把授权模型当接口文档送出去）
+        assert resp.json()["detail"]
 
     def test_viewer_can_read(self, api) -> None:
         viewer = self._make_user(api, "v2", "viewer")
@@ -2575,11 +2577,19 @@ class TestUserLifecycle:
         assert resp.status_code == 409
 
     def test_cannot_demote_last_admin(self, api) -> None:
+        """唯一管理员不能把自己降级。
+
+        自己是唯一超管时，这条请求先撞上「不能改自己的角色、权限或状态」
+        （403）—— 同样拦住了「一按就把自己锁在门外」这条最短路径；
+        「最后一个管理员」那条 409 是留给**另一个**管理员来降级时用的，
+        在当前测试库里造不出来（要造就得先有第二个超管，那它就不算最后一个了）。
+        """
         admin = auth_headers(api)
         resp = api.put(
             "/api/users/admin", json={"role": "viewer"}, headers=admin
         )
-        assert resp.status_code == 409
+        assert resp.status_code == 403
+        assert "自己的角色" in resp.json()["detail"]
 
     def test_weak_password_rejected(self, api) -> None:
         resp = api.post(
@@ -3829,7 +3839,13 @@ class TestMailNotifications:
     def test_alert_email_config_roundtrip(self, api) -> None:
         admin = auth_headers(api)
         overview = api.get("/api/alerts", headers=admin).json()
-        assert overview["email"] == {"enabled": False, "recipients": ""}
+        # 邮件通道默认开启（收件人为空时不投递），但没配 SMTP 就发不出去
+        assert overview["email"] == {
+            "enabled": True,
+            "recipients": "",
+            "interval": 1800,
+            "max_repeats": 3,
+        }
         assert overview["mail_ready"] is False
 
         saved = api.put(
@@ -3852,7 +3868,9 @@ class TestMailNotifications:
         theirs = api.get(
             "/api/alerts", headers={"Authorization": f"Bearer {token}"}
         ).json()
-        assert theirs["email"]["enabled"] is False
+        # 每个用户一份：新账号拿到的是默认值（同样默认开启），而不是管理员那份
+        assert theirs["email"]["enabled"] is True
+        assert theirs["email"]["recipients"] == ""
 
         mine = api.get("/api/alerts", headers=admin).json()
         assert mine["email"]["enabled"] is True

@@ -395,10 +395,10 @@ def test_manual_ip_index_filters_by_owner(monkeypatch) -> None:
     alice = _run(vm_meta.manual_ip_index({"role": "user", "username": "alice"}))
 
     assert admin == {
-        ("c1", "pve1", 101): "10.0.0.9",
-        ("c1", "pve1", 102): "10.0.0.10",
+        ("c1", 101): "10.0.0.9",
+        ("c1", 102): "10.0.0.10",
     }
-    assert alice == {("c1", "pve1", 101): "10.0.0.9"}
+    assert alice == {("c1", 101): "10.0.0.9"}
 
 
 def test_vms_manual_ip_maps_to_network(monkeypatch) -> None:
@@ -420,7 +420,7 @@ def test_vms_manual_ip_maps_to_network(monkeypatch) -> None:
         return POOLS
 
     async def fake_manual(user):
-        return {("c1", "pve1", 103): "10.1.0.33"}
+        return {("c1", 103): "10.1.0.33"}
 
     _patch_common(monkeypatch, vms_router)
     monkeypatch.setattr(vms_router, "requested_connection", lambda: None)
@@ -463,7 +463,7 @@ def test_lxc_manual_ip_maps_to_network(monkeypatch) -> None:
         return POOLS
 
     async def fake_manual(user):
-        return {("c1", "pve1", 203): "10.0.0.50"}
+        return {("c1", 203): "10.0.0.50"}
 
     _patch_common(monkeypatch, lxc_router)
     monkeypatch.setattr(lxc_router, "requested_connection", lambda: None)

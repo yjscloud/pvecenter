@@ -299,7 +299,9 @@ class TestBuildVmConfig:
     def test_imported_cloud_image_boots_from_its_disk(self) -> None:
         """导入云镜像时没有安装介质，系统盘就是导入进来的那块。"""
         config = vmconfig.build_vm_config(
-            self._request(), vmid=101, import_disk=True
+            self._request(cloud_image="local:iso/noble.img"),
+            vmid=101,
+            import_disk=True,
         )
         assert config["boot"] == "order=scsi0"
 
@@ -460,16 +462,23 @@ class TestBuildVmConfig:
         )
         assert config["scsi0"] == "local:8,format=qcow2"
 
-    def test_import_disk_mode_skips_disk_allocation(self) -> None:
-        # The template pipeline imports the disk separately, so no scsi0 here.
+    def test_import_disk_mode_uses_import_from(self) -> None:
+        """导入模式不按 size 分盘，改写 ``import-from``（0 = 大小交给源镜像）。
+
+        PVE 9.2 移除了 ``POST .../importdisk``（实测 501），所以建机时只能走
+        配置阶段的 ``<存储>:0,import-from=<镜像>``，磁盘不再是「事后单独导入」。
+        """
         config = vmconfig.build_vm_config(
             self._request(
-                disks=[DiskSpec(storage="local-lvm", size=32, interface="scsi0")]
+                disks=[DiskSpec(storage="local-lvm", size=32, interface="scsi0")],
+                cloud_image="local:iso/noble.img",
             ),
             vmid=101,
             import_disk=True,
         )
-        assert "scsi0" not in config
+        assert config["scsi0"] == (
+            "local-lvm:0,import-from=local:iso/noble.img,discard=on"
+        )
         assert config["boot"] == "order=scsi0"
 
     def test_invalid_ostype_is_normalized(self) -> None:
@@ -663,11 +672,12 @@ class TestAdvancedHardware:
                 numa=True,
                 efi_disk=EfiDiskSpec(storage="local-lvm"),
                 tpm=TpmSpec(storage="local-lvm"),
+                cloud_image="local:iso/noble.img",
             ),
             vmid=101,
             import_disk=True,
         )
-        assert "scsi0" not in config
+        assert config["scsi0"].startswith("local-lvm:0,import-from=")
         assert config["numa"] == 1
         assert config["efidisk0"].startswith("local-lvm:1")
         assert config["tpmstate0"].startswith("local-lvm:4")

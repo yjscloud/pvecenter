@@ -35,7 +35,30 @@ sys.path.insert(0, str(BACKEND_DIR))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
 from app import scheduler, store, update  # noqa: E402
+from app.config import settings  # noqa: E402
+
+from conftest import connect  # noqa: E402
 from test_api_routes import api, auth_headers  # noqa: E402,F401
+
+
+def _set_setting(key: str, value: str) -> None:
+    """直接写 ``settings`` 表。
+
+    不能用 ``asyncio.run(store.set_setting(...))``：``api`` fixture 里的应用跑在
+    自己的事件循环上，连接池绑在那个循环；在新循环里取用同一个池会抛
+    「Future attached to a different loop」。
+    """
+    conn = connect(settings.db_name)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO settings (`key`, `value`) VALUES (%s, %s)"
+                " ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+                (key, value),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------ 道具
@@ -368,7 +391,9 @@ class TestUpdateScript:
         """
         assert update.service_id("pvecenter.service") == "pvecenter"
         assert update.service_id("pvecenter") == "pvecenter"
-        assert update.service_id("") == ""
+        # 空串 = 自动探测当前单元名。测试机上探测到的名字各不相同（CI 里是
+        # runner 的单元名），所以只断言「与 service_name() 一致、且不带后缀」。
+        assert update.service_id("") == update.service_name().removesuffix(".service")
         # 已经带后缀的旧状态也不能拼出两层
         text = update._script_text(
             _dep(service="pvecenter.service"), "v0.1.5", Path("/tmp/x.log")
@@ -856,21 +881,19 @@ class TestUpdateApi:
         验证提醒真的发出去、且只发一次。
         """
         headers = auth_headers(api)
-        asyncio.run(
-            store.set_setting(
-                "update_state",
-                json.dumps(
-                    {
-                        "latest": {"tag": "v0.9.9", "version": "0.9.9"},
-                        "last_update": {
-                            "tag": "v0.9.9",
-                            "ok": True,
-                            "at": 1760000000,
-                            "log": "/tmp/update-x.log",
-                        },
-                    }
-                ),
-            )
+        _set_setting(
+            "update_state",
+            json.dumps(
+                {
+                    "latest": {"tag": "v0.9.9", "version": "0.9.9"},
+                    "last_update": {
+                        "tag": "v0.9.9",
+                        "ok": True,
+                        "at": 1760000000,
+                        "log": "/tmp/update-x.log",
+                    },
+                }
+            ),
         )
         body = api.get("/api/update/status", headers=headers).json()
         assert body["last_update"]["notified"] is True

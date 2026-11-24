@@ -57,6 +57,23 @@ def log_file(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------- 时间戳解析
+@pytest.fixture(autouse=True)
+def _import_local_host(request):
+    """本机管控默认是关的（容器里读不到宿主机日志，也不该默认打开）。
+
+    这四个模块的接口用例测的都是「已把面板本机纳入管控」之后的行为，
+    所以只要用例用了 ``api``（真正的 TestClient），就先把开关打开。
+    """
+    if "api" not in request.fixturenames:
+        return
+    api = request.getfixturevalue("api")
+    resp = api.post("/api/ssh/local", headers=auth_headers(api))
+    assert resp.status_code == 200, resp.text
+    # 登录会顺手种下会话 cookie；后面的用例可能要断言「未登录」被拒，
+    # 所以这里把 cookie 清掉，认证只走各用例自己带的 Authorization 头。
+    api.cookies.clear()
+
+
 class TestTimestamp:
     def test_iso_with_offset(self) -> None:
         ts = sshguard.parse_timestamp("2026-09-25T07:24:42.504199+08:00 kvm-web sshd[1]: x")

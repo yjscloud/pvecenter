@@ -20,8 +20,29 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 from app import maintenance  # noqa: E402
 from app.config import settings  # noqa: E402
 
+from conftest import connect  # noqa: E402
+
 ADMIN = {"username": "admin", "password": settings.admin_password}
 USER = {"username": "maint-user", "password": "Unit-Test-Pa55word"}
+
+
+def _open_registration() -> None:
+    """把注册方式写成「开放」。
+
+    注册默认是关的，而 ``/api/auth/register`` 的校验顺序是
+    「注册方式 → 维护模式 → 限流 → 人机校验」—— 注册关着时请求根本走不到
+    维护模式那条分支，断言 503 就会变成「自助注册已关闭」的 400。
+    """
+    conn = connect(settings.db_name)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO settings (`key`, `value`) VALUES ('registration_mode', 'open')"
+                " ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)"
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _csrf(client: TestClient) -> Dict[str, str]:
@@ -137,6 +158,7 @@ def test_signed_in_user_is_pushed_out(api: TestClient) -> None:
 def test_register_is_closed(api: TestClient) -> None:
     """自助注册也属于对外服务，维护期间一并停掉。"""
     admin = _login_admin(api)
+    _open_registration()
     _toggle(api, admin, True)
 
     resp = api.post(
