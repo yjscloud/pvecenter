@@ -1091,6 +1091,43 @@ async def proxmox_error_handler(request: Request, exc: ProxmoxError) -> JSONResp
     )
 
 
+@app.exception_handler(ownership.OwnershipClaimError)
+async def ownership_claim_error_handler(
+    request: Request, exc: ownership.OwnershipClaimError
+) -> JSONResponse:
+    """机器已经建好、但归属没记上：必须明说，不能静默成功也不能只给通用 500。
+
+    严格隔离下「没有归属记录 = 不存在」：用户会看到机器在 PVE 里、面板里却找不到，
+    而清理任务也不敢碰它。这里把 ref（含节点与 VMID）写进日志，响应用户能看懂的话。
+    """
+    trace_id = secrets.token_hex(8)
+    logger.error(
+        "归属登记失败 trace_id=%s %s %s kind=%s ref=%s user=%s err=%s",
+        trace_id,
+        request.method,
+        request.url.path,
+        exc.kind,
+        exc.ref,
+        exc.username,
+        exc.cause,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": i18n.pick(
+                "资源已经创建，但归属登记失败（重试后仍未成功）。请稍后重试，"
+                "或把这条信息提供给管理员补记归属。",
+                "The resource was created but its ownership record could not be "
+                "saved after retries. Please retry later or ask an administrator "
+                "to re-assign ownership.",
+            ),
+            "code": "ownership_claim_failed",
+            "trace_id": trace_id,
+        },
+        headers={"X-Trace-Id": trace_id},
+    )
+
+
 @app.exception_handler(Exception)
 async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """未捕获异常：日志留全栈，响应只留通用文案 + trace id。

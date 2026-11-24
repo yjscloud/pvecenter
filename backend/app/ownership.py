@@ -35,6 +35,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -144,6 +145,59 @@ async def set_owner(kind: str, ref: str, username: str) -> None:
             (kind, ref, username, int(time.time())),
         )
         await db.commit()
+
+
+class OwnershipClaimError(RuntimeError):
+    """归属写不进去（数据库抖动 / 连接池耗尽），且重试已用尽。"""
+
+    def __init__(self, kind: str, ref: str, username: str, cause: BaseException):
+        super().__init__(f"归属登记失败 kind={kind} ref={ref} user={username}: {cause}")
+        self.kind = kind
+        self.ref = ref
+        self.username = username
+        self.cause = cause
+
+
+#: 归属写入的退避（秒）。克隆 / 建机 / 转模板都是「PVE 那边已经成功」之后
+#: 才写归属：这里多试几次就能吸收掉常见的短抖动，代价是失败时最多等 3 秒。
+_CLAIM_BACKOFF = (0.2, 0.5, 1.0, 1.5)
+
+
+async def claim(kind: str, ref: str, username: str) -> None:
+    """写归属的**可重试**版本，供「资源已经建出来了」的路径使用。
+
+    为什么不能直接 ``set_owner``：克隆走完 PVE 调用之后机器已经存在，此时一次
+    数据库抖动就会留下一台**无主机器** —— 归配额不算、普通用户看不见（严格隔离）、
+    清理任务也不敢删，只能人工补。重试用尽后抛 :class:`OwnershipClaimError`，
+    让调用方明确告诉用户「机器建好了，归属没记上，请联系管理员」，而不是静默
+    返回成功。
+    """
+    if not ref or not username:
+        return
+    last: Optional[BaseException] = None
+    for delay in (0.0, *_CLAIM_BACKOFF):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            await set_owner(kind, ref, username)
+            return
+        except Exception as exc:  # noqa: BLE001 - 驱动层异常类型不稳定
+            last = exc
+            logger.warning(
+                "归属登记失败，准备重试 kind=%s ref=%s user=%s err=%s",
+                kind,
+                ref,
+                username,
+                exc,
+            )
+    logger.error(
+        "归属登记最终失败（机器已创建但无主） kind=%s ref=%s user=%s err=%s",
+        kind,
+        ref,
+        username,
+        last,
+    )
+    raise OwnershipClaimError(kind, ref, username, last or RuntimeError("unknown"))
 
 
 async def last_created(username: str) -> int:

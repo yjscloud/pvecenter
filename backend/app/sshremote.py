@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import socket
 import threading
 import time
@@ -1713,8 +1714,10 @@ async def write_file_sync(row: Dict[str, Any], path: str, content: str) -> Tuple
             fallback_error = str(exc)
     finally:
         client.close()
-    # 退回：把内容交给远程的 tee（内容由面板生成，不含用户输入）
-    command = f"{_sudo_prefix(row)}tee {path} > /dev/null"
+    # 退回：把内容交给远程的 tee。内容由面板生成；**路径必须转义** —— 它来自
+    # ``/etc/fail2ban/jail.d/panel-<jail>.local``，一旦 jail 里混进 ``;`` / ``$()``，
+    # 未加引号的路径就是一条以 sudo 执行的注入点。
+    command = f"{_sudo_prefix(row)}tee {shlex.quote(path)} > /dev/null"
     client, _ = _connect(row)
     try:
         _, stdout, stderr = client.exec_command(command, timeout=DEFAULT_TIMEOUT)
@@ -1969,6 +1972,12 @@ async def remote_fail2ban_action(
 async def remote_write_jail(
     row: Dict[str, Any], jail: str, maxretry: int, findtime: int, bantime: int
 ) -> Dict[str, Any]:
+    # jail 名会进两个地方：配置文件里的 ``[jail]`` 段名，和
+    # ``/etc/fail2ban/jail.d/panel-<jail>.local`` 这个**远端路径**。不校验就等于
+    # 让请求体决定写哪个文件、写什么内容（换行可以往片段里塞任意配置，``;`` /
+    # ``$()`` 可以借着 sudo tee 在受管主机上执行命令）。
+    if not sshguard.JAIL_NAME_RE.match(jail or ""):
+        raise ValueError("jail 名称不合法")
     policy = await sshguard.load_policy()
     content = sshguard.render_jail_config(
         jail, maxretry, findtime, bantime, policy.get("ignore_ips", "")

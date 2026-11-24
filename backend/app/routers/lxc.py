@@ -664,7 +664,7 @@ async def _create_lxc_core(
         },
     )
 
-    await ownership.set_owner(
+    await ownership.claim(
         ownership.KIND_CT,
         ownership.vm_ref(_op_connection(), payload.node, vmid),
         str(user.get("username") or ""),
@@ -1506,7 +1506,7 @@ async def clone_container(
             pass
 
     target_node = payload.target_node or node
-    await ownership.set_owner(
+    await ownership.claim(
         ownership.KIND_CT,
         ownership.vm_ref(_op_connection(), target_node, payload.newid),
         str(user.get("username") or ""),
@@ -1650,7 +1650,7 @@ async def create_container_snapshot(
         _raise(exc)
 
     task = result if isinstance(result, str) else (result or {}).get("task", "")
-    await ownership.set_owner(
+    await ownership.claim(
         ownership.KIND_SNAPSHOT,
         ownership.snapshot_ref(_op_connection(), node, vmid, payload.name),
         str(user.get("username") or ""),

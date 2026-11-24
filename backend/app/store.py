@@ -7,6 +7,7 @@ Password hashing is delegated to ``passlib`` (bcrypt).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
@@ -359,19 +360,36 @@ async def _warn_weak_admin_password() -> None:
     password_hash = str(row["password_hash"] or "")
     if not password_hash.startswith("$2"):  # 非 bcrypt（外部登录等）无从校验
         return
-    for candidate in sorted(WEAK_ADMIN_PASSWORDS):
-        try:
-            if pwd_context.verify(candidate, password_hash):
-                logger.warning(
-                    "管理员 %s 的登录口令仍是弱默认值（%s 一类）。面板已在公网 8080/443 "
-                    "可访问，请登录后立刻在「设置」里改掉口令，并把 backend/.env 的 "
-                    "ADMIN_PASSWORD 换成随机值（它只影响全新安装时的首次建号）。",
-                    row["username"],
-                    candidate,
-                )
-                return
-        except (TypeError, ValueError):
-            return
+    # 每次 bcrypt 校验 ~200ms，串行查 7 个候选就是 1.5s —— 这是启动路径上最大的
+    # 一笔开销（实测 init_db 1.51s 里它占 1.50s）。bcrypt 计算期间会释放 GIL，所以
+    # 丢到线程池里并发跑，耗时从「候选数 × 单次」降到「约 单次 × 候选数/核数」。
+    # 顺序只影响日志里报哪个候选，matches 保序，取第一个命中即可。
+    candidates = sorted(WEAK_ADMIN_PASSWORDS)
+    matches = await asyncio.gather(
+        *(
+            asyncio.to_thread(_matches_password, candidate, password_hash)
+            for candidate in candidates
+        )
+    )
+    for candidate, matched in zip(candidates, matches):
+        if not matched:
+            continue
+        logger.warning(
+            "管理员 %s 的登录口令仍是弱默认值（%s 一类）。面板已在公网 8080/443 "
+            "可访问，请登录后立刻在「设置」里改掉口令，并把 backend/.env 的 "
+            "ADMIN_PASSWORD 换成随机值（它只影响全新安装时的首次建号）。",
+            row["username"],
+            candidate,
+        )
+        return
+
+
+def _matches_password(candidate: str, password_hash: str) -> bool:
+    """``candidate`` 是否是 ``password_hash`` 的明文（bcrypt 校验，可在线程里跑）。"""
+    try:
+        return bool(pwd_context.verify(candidate, password_hash))
+    except (TypeError, ValueError):
+        return False
 
 
 def _row_to_user(row: database.Row) -> Dict[str, Any]:

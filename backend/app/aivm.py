@@ -189,6 +189,20 @@ OPS_READ_ONLY = re.compile(
     re.IGNORECASE,
 )
 
+#: 命中上面的只读前缀还不够：同一条命令换个子命令就是在改系统状态
+#: （``ip link set`` / ``iptables -F`` / ``nft flush``）。这些必须在放行前再挡一次，
+#: 否则「只读免审批」等于把这些写操作也免掉了。
+OPS_READ_ONLY_DENY = re.compile(
+    r"\bip6?\s+(?:link|addr|address|route|rule|neigh)\s+"
+    r"(?:set|add|del|delete|flush|change|replace|up|down)\b"
+    r"|\bip6?tables\b[^|]*?\s-(?:A|D|I|F|X|P|N|E|R)\b"
+    r"|\bnft\b[^|]*?\b(?:add|delete|flush|insert|replace)\b"
+    r"|\b(?:apt|apt-get|dnf|yum)\s+(?:install|remove|purge|upgrade|update)\b"
+    r"|\bdpkg\s+--(?:configure|remove|purge)\b"
+    r"|\bsysctl\s+-w\b",
+    re.IGNORECASE,
+)
+
 #: 无论授权怎么写，这些路径一律不给碰（与 aitools 同源，再补几条客户机特有的）
 FORBIDDEN_HINTS = tuple(aitools.FORBIDDEN_HINTS) + (
     "/root",
@@ -1462,19 +1476,32 @@ def _ops_command_risk(lease: Dict[str, Any], command: str) -> int:
         if any(
             lowered.startswith(cmd.strip())
             for cmd in WINDOWS_COMMANDS
-        ) and not any(token in command for token in ("&", ">", "<", "%", "`", "$(")):
+        ) and not any(
+            token in command
+            for token in ("&", ">", "<", "%", "`", "$(", "\n", "\r")
+        ):
             return RISK_READ
         return RISK_CONFIG
-    if any(token in command for token in (";", "&&", "||", "`", "$(")):
-        # 复合命令里任何一段都可能在改状态，而且拼装方式千变万化 —— 按变更处理
+    # 复合命令里任何一段都可能在改状态，而且拼装方式千变万化 —— 按变更处理。
+    # 换行 / 重定向 / 单个 & 同样是分隔符（``docker ps \\n rm -rf /`` 曾被当成只读），
+    # 判断只读之前必须先全部挡掉。
+    if any(
+        token in command
+        for token in (";", "&", "&&", "||", "`", "$(", ">", "<", "\\", "\n", "\r")
+    ):
         return RISK_CONFIG
     try:
         aitools.validate_command(command)
         return RISK_READ
     except aitools.ToolError:
         pass
-    # 管道不在这里放行：`docker ps | xargs rm` 的开头看着人畜无害
-    if "|" not in command and OPS_READ_ONLY.match(command):
+    # 管道不在这里放行：`docker ps | xargs rm` 的开头看着人畜无害。
+    # 前缀命中还要再排掉「同一条命令换子命令就变成写」的形态（见 OPS_READ_ONLY_DENY）。
+    if (
+        "|" not in command
+        and OPS_READ_ONLY.match(command)
+        and not OPS_READ_ONLY_DENY.search(command)
+    ):
         return RISK_READ
     if OPS_MUTATING.search(command):
         return RISK_CONFIG

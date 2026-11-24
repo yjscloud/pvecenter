@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 
 from . import ownership, security, store
-from .pve import requested_connection
+from .pve import ProxmoxError, get_client, requested_connection
 
 #: 拒绝时统一的响应体。存在性泄露的最小化：既不说存在，也不说为什么。
 NOT_FOUND_DETAIL = "资源不存在"
@@ -141,3 +141,49 @@ async def require_import_object(
         recorded = ""
     if recorded != str((user or {}).get("username") or ""):
         raise HTTPException(status_code=404, detail="导入文件不存在，可能已被删除")
+
+
+async def require_storage_volume(
+    user: Dict[str, Any],
+    node: str,
+    volid: str,
+    *,
+    connection: Optional[str] = None,
+) -> None:
+    """要求 ``user`` 有权把存储卷 ``volid`` 当**源**使用（建模板 / 建机 / 导入）。
+
+    存储卷同样是「对象」：``local-lvm:vm-105-disk-0`` 是别人的系统盘，
+    ``local:import/x.ova`` 是别人上传的镜像。只校验权限点等于把「读取任意卷」
+    借给调用方 —— 把别人的盘填进 ``import-from``，PVE 会原样复制成请求者的新盘，
+    一次「从镜像建模板」就把别人的数据带走了。
+
+    ``volid`` 必须能在该存储的 content 列表里**精确命中**；命中不了按不存在处理，
+    ``../`` / ``?`` 这类注入形态也在这里自然被挡掉。共享只读类型（iso / vztmpl）
+    不查归属，其余按卷的 ``vmid`` / ``import`` 归属判定。
+    """
+    storage, sep, volume = str(volid or "").partition(":")
+    if not sep or not storage or not volume:
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+    try:
+        items = await get_client().storage_content(node, storage) or []
+    except ProxmoxError:  # noqa: BLE001 - 存储不存在 / 读不到，一律按不存在处理
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from None
+    item = next(
+        (i for i in items if str(i.get("volid") or "") == str(volid)), None
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+    if security.is_admin(user):
+        return
+
+    ctype = str(item.get("content") or "")
+    if ctype == "import" or volume.startswith("import/"):
+        await require_import_object(user, storage, volume, connection=connection)
+    elif item.get("vmid") is not None:
+        kind = ownership.KIND_CT if ctype == "rootdir" else ownership.KIND_VM
+        await require_guest_object(
+            user, node, int(item["vmid"]), kind, connection=connection
+        )
+    elif ctype == "backup" or "vzdump" in volume:
+        # 备份归档不能当镜像源，直接按不存在处理（也免得把别人的备份卷标出来）
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)

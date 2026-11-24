@@ -507,18 +507,24 @@ export function Templates() {
             >
               {t('templates.clone')}
             </Button>
-            <IconButton
-              label={t('templates.viewDetail')}
-              onClick={() =>
-                navigate(
-                  tpl.guest_type === 'lxc'
-                    ? `/lxc/${tpl.node}/${tpl.vmid}`
-                    : `/vms/${tpl.node}/${tpl.vmid}`,
-                )
-              }
-            >
-              <IconEye size={15} />
-            </IconButton>
+            {/* 模板详情 = 那台模板虚拟机自己的页面（控制台 / 电源 / 配置）。
+                模板机通常归 root 或管理员，普通用户点进去只会被归属校验挡成
+                404（"该虚拟机接口暂不可用"）。模板对普通用户唯一有意义的动作是
+                克隆，所以这个入口只留给有 template.manage 的账号。 */}
+            {canManage ? (
+              <IconButton
+                label={t('templates.viewDetail')}
+                onClick={() =>
+                  navigate(
+                    tpl.guest_type === 'lxc'
+                      ? `/lxc/${tpl.node}/${tpl.vmid}`
+                      : `/vms/${tpl.node}/${tpl.vmid}`,
+                  )
+                }
+              >
+                <IconEye size={15} />
+              </IconButton>
+            ) : null}
             <IconButton
               label={t('templates.deleteAria', { name: tpl.name })}
               variant="danger"
@@ -1241,9 +1247,12 @@ function TemplateCard({
           {t('templates.clone')}
         </Button>
         <span className="tpl-card-foot-actions">
-          <IconButton label={t('templates.viewDetail')} onClick={onOpen}>
-            <IconEye size={15} />
-          </IconButton>
+          {/* 同上：模板详情是模板虚拟机自身页面，普通用户点开只会 404 */}
+          {canManage ? (
+            <IconButton label={t('templates.viewDetail')} onClick={onOpen}>
+              <IconEye size={15} />
+            </IconButton>
+          ) : null}
           <IconButton
             label={t('templates.deleteAria', { name: template.name })}
             variant="danger"

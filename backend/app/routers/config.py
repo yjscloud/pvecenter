@@ -35,6 +35,7 @@ from .. import (
     specs,
     ssrfguard,
     store,
+    throttle,
     ui,
 )
 from ..config import settings
@@ -356,40 +357,29 @@ def _same_cluster(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     return bool(key) and key == str(b.get("cluster_key") or "").strip()
 
 
-#: TLS 握手里的「证书不被信任」几种措辞：OpenSSL / Python 版本不同，文案也不同。
-_TLS_VERIFY_MARKERS = (
-    "certificate_verify_failed",
-    "certificate verify failed",
-    "unable to get local issuer",
-    "self-signed certificate",
-    "self signed certificate",
-)
+def _connect_failure_detail(payload: ConnectionRegisterIn) -> str:
+    """传输层失败的**唯一**文案：只随「调用方有没有带证书」变化。
 
-
-def _is_tls_verify_error(message: str) -> bool:
-    low = (message or "").lower()
-    return any(marker in low for marker in _TLS_VERIFY_MARKERS)
-
-
-def _tls_hint(payload: ConnectionRegisterIn) -> str:
-    """自签证书校验失败时给一句能直接照做的说明。
-
-    这条路上有个很常见的死循环：面板开了 ``PVE_VERIFY_SSL``，PVE 又是出厂自签，
-    于是脚本永远注册不上，而原始报错只有一句 ``unable to get local issuer
-    certificate`` —— 看不出这是「证书没钉扎」还是「面板连不上」。
+    以前这里会把 TLS 原文回显出来（排障方便），代价是匿名的持码者能靠回显区分
+    「端口拒绝连接 / 超时 / 不是一个 TLS 服务 / 证书不被信任」—— 这正是端口
+    扫描器需要的读数。现在所有传输层失败共用同一句话，唯一的分支是调用方自己
+    就知道的信息（有没有带 PEM），不再随错误类型分化。
     """
     if payload.ca_cert:
         # 已经钉扎还失败：要么 PEM 里缺签发者（节点证书是 CA 签的，不是自签），
         # 要么证书换过了（pvecm updatecerts / 换节点证书）
         return (
-            "。带的证书和节点当前用的对不上（PEM 缺签发者，或证书换过？）—— "
-            "重跑接入命令会重新取整条证书链；实在不行在面板里把这条连接的"
-            "「证书 PEM」清空后重试"
+            "连接失败：无法与目标建立可信连接。带的证书和目标当前用的对不上"
+            "（PEM 缺签发者，或证书换过？）—— 重跑接入命令会重新取整条证书链；"
+            "也可以在面板里把这条连接的「证书 PEM」清空后重试"
         )
     return (
-        "。PVE 的 pveproxy 出厂是自签证书，面板校验不过才连不上：重跑接入命令即可，"
-        "脚本会把本机证书带上来做钉扎；确实取不到证书时可加 PVE_ONBOARD_INSECURE=1 "
-        "跳过校验，或在面板里给这条连接填「证书 PEM」"
+        "连接失败：无法与目标建立可信连接。请依次核对："
+        "①地址与端口（PVE 默认 8006，必须 HTTPS）；"
+        "②证书校验 —— pveproxy 出厂是自签证书，重跑接入命令会把本机证书带上来做钉扎，"
+        "确实取不到证书时可加 PVE_ONBOARD_INSECURE=1 临时跳过校验，"
+        "或在面板里给这条连接填「证书 PEM」；"
+        "③面板到目标的网络与防火墙"
     )
 
 
@@ -444,15 +434,22 @@ async def _probe_registration(
         # 回显。这条链路允许持码者指定 ``host:port``，差异化回显就是「端口扫描器」
         # 的另一半（另一半是退码，见 connregister.record_failure）。
         #
-        # TLS 一类是例外：它只说明「这个端口不是 TLS」，对扫描器没有额外价值，
-        # 而排障时非看原文不可（CERTIFICATE_VERIFY_FAILED 与协议不匹配的处理
-        # 方式完全不同），所以保留原文并接上能直接照做的下一步。
+        # 传输层（拒绝连接 / 超时 / 不是 TLS / 证书不信任）**统一同一句话**，
+        # 原文只进服务端日志：只要能区分，持码者就拿到了一个端口存活的读数。
+        # 唯一保留差异的是 401/403 —— 那说明对面确实是 PVE 且给了应答，且是
+        # 接入能否成功的必要条件（否则用户不知道该改令牌还是改地址）。
         code, text = ssrfguard.classify_failure(exc)
-        if code == "not_tls" or _is_tls_verify_error(exc.message):
-            raw = " ".join(str(exc.message or "").split())[:200]
-            detail = f"连接失败：{raw}" + _tls_hint(payload)
-        else:
+        logger.info(
+            "注册探活失败 host=%s port=%s code=%s detail=%s",
+            payload.host,
+            payload.port,
+            code,
+            " ".join(str(exc.message or "").split())[:300],
+        )
+        if code in ("auth_failed", "forbidden"):
             detail = f"连接失败：{text}"
+        else:
+            detail = _connect_failure_detail(payload)
         raise HTTPException(status_code=400, detail=detail) from exc
     finally:
         await client.aclose()
@@ -798,6 +795,16 @@ async def onboard_script(
     return PlainTextResponse(body, headers=headers)
 
 
+#: 匿名注册接口的按 IP 限速（次 / 窗口秒）。
+#:
+#: 这是面板上**唯一不需要登录、又会让服务端主动去连调用方指定 ``host:port``**
+#: 的入口。注册码的免费退码已经封顶（``connregister.record_failure``），但一张
+#: 「不限次数」的码（``max_uses=0``）仍然可以按 3 次/10 分钟的速度一直探内网 ——
+#: 限速是最后一道，让扫描速度不再取决于码的类型。正常接入一次只调一两次。
+REGISTER_IP_LIMIT = 10
+REGISTER_IP_WINDOW = 600
+
+
 @router.post("/connections/register")
 async def register_connection(
     payload: ConnectionRegisterIn,
@@ -813,6 +820,23 @@ async def register_connection(
     HTTP 200 表示请求本身成立，具体结果看 ``status``；只有「同地址不同集群」
     这种真冲突才回 409。
     """
+    # 0) 匿名限速：先按来源 IP 计数，再谈注册码。计在「码之前」是有意的 ——
+    #    连「码无效」的请求也占额度，否则换着乱填的码就能绕过（反正会被 403，
+    #    但探活发生在码校验之后，这里挡的是那之前的所有请求）。
+    ip = security.client_ip(request) or "unknown"
+    allowed, retry_after = await throttle.allow(
+        f"connreg:ip:{ip}", REGISTER_IP_LIMIT, REGISTER_IP_WINDOW
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"注册请求过于频繁（{REGISTER_IP_WINDOW // 60} 分钟内最多 "
+                f"{REGISTER_IP_LIMIT} 次），请 {retry_after} 秒后再试"
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+
     # 1) 原子占用一次额度（并发下由 used_count<max_uses 判定，超出即失败）
     used_by = f"{payload.node_name or '-'}@{security.client_ip(request)}"
     code_row = await connregister.consume(payload.code, used_by=used_by)

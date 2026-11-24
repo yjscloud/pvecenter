@@ -17,6 +17,7 @@ from ..pve import (
     all_connection_clients,
     api_path,
     bound_connection,
+    check_location,
     connection_label,
     get_client,
     requested_connection,
@@ -416,23 +417,18 @@ _GUEST_CONTENT_TYPES = ("images", "rootdir", "backup", "import")
 #: 否则一旦请求被打到别的 PVE 接口（用户表 / 任务列表），那些条目会被原样透传。
 _SHARED_CONTENT_TYPES = ("iso", "vztmpl", "snippets")
 
-#: 节点名 / 存储名。它们会拼进 PVE API 路径（``pve.api_path`` 已逐段编码，
-#: 这里是第二道）：只接受 PVE 实际会出现的字符集。
-_NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$")
-_STORAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-
-
 def _check_location(node: str, storage: str) -> None:
     """校验 ``node`` / ``storage`` 的形状，不合法直接 400。
 
     这两个值来自查询参数，最终会出现在 PVE API 路径上。``api_path`` 会做编码，
     但「看起来就不像节点名」的值应该在入口就拒掉，而不是让它变成一个 404 或
-    一条被编码成怪物的请求。
+    一条被编码成怪物的请求。字符集定义在 ``pve`` 里，上传等直接拼 URL 的
+    调用方共用同一份。
     """
-    if not _NODE_RE.match(str(node or "")):
-        raise HTTPException(status_code=400, detail="节点名不合法")
-    if not _STORAGE_RE.match(str(storage or "")):
-        raise HTTPException(status_code=400, detail="存储名不合法")
+    try:
+        check_location(node, storage)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 async def _scope_storage_content(
@@ -634,6 +630,9 @@ async def upload_to_storage(
     # 看不到它：不补这一次，请求固定落到「当前连接」，在另一套集群的节点上
     # 上传就会收到 ``hostname lookup 'node02' failed``（甚至传进同名的另一台）。
     await bind_node_connection(node)
+    # 这条路径**绕过 client 直接拼 URL** 做流式转发：node / storage 不做形状校验
+    # 的话，``..`` 经 httpx 点段归一化就变成另一条 PVE API（root 令牌）。
+    _check_location(node, storage)
     client = get_client()
     http = await client._http()
 

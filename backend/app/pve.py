@@ -50,6 +50,59 @@ def api_path(*segments: Any) -> str:
         parts.append(quote(text.strip("/"), safe=""))
     return "/" + "/".join(parts)
 
+
+#: PVE 节点名 / 存储名的字符集。这两个值来自请求参数并出现在 API 路径上：
+#: ``api_path`` 会编码，但**绕过它直接拼 URL 的调用方**（上传是流式转发的）
+#: 仍需在入口拒掉「一看就不像名字」的值 —— ``..`` 经 httpx 归一化后就是另一条
+#: API 路径，而面板手里是集群 root 令牌。
+NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$")
+STORAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _reject_unsafe_path(method: str, path: str) -> None:
+    """出口兜底：任何一层忘了走 ``api_path``，也不许把 ``..`` / 控制字符送进 URL。
+
+    ``api_path`` 只保证**经过它**的段被编码；``pve.py`` 里仍有大量按段拼好的
+    路径。httpx 会按 RFC 3986 做点段归一化，``/nodes/../access/users`` 于是变成
+    另一条 PVE API —— 而面板手里是集群 root 令牌。这里在真正发请求前再判一次，
+    代价只有一次 ``split``。
+    """
+    if not path.startswith("/"):
+        raise ProxmoxError(
+            "PVE API 路径必须以 / 开头",
+            status_code=400,
+            endpoint=f"{method} {path}",
+            code="pve_bad_path",
+        )
+    for seg in path.split("/"):
+        bad = (
+            seg in (".", "..")
+            or any(ord(ch) < 0x20 for ch in seg)
+            or "?" in seg
+            or "#" in seg
+            or "%2e" in seg.lower()  # %2E%2E 同样会被对端解码成 ..
+        )
+        if bad:
+            raise ProxmoxError(
+                "PVE API 路径包含非法片段",
+                status_code=400,
+                endpoint=f"{method} {path}",
+                code="pve_bad_path",
+            )
+
+
+def check_location(node: Any, storage: Any) -> None:
+    """校验 ``node`` / ``storage`` 的形状；不合法抛 :class:`ValueError`。
+
+    只做形状判断（是不是「节点名 / 存储名」该有的样子），不查它是否真实存在：
+    存在性由各调用方按自己的权限口径处理。
+    """
+    if not NODE_NAME_RE.match(str(node or "")):
+        raise ValueError("节点名不合法")
+    if not STORAGE_NAME_RE.match(str(storage or "")):
+        raise ValueError("存储名不合法")
+
+
 logger = logging.getLogger(__name__)
 
 # UPID format: UPID:<node>:<pid>:<pstart>:<starttime>:<type>:<id>:<user>:<comment>
@@ -350,6 +403,8 @@ class ProxmoxClient:
         ``path`` must start with ``/`` and be relative to ``/api2/json``.
         Set ``raw=True`` to get the full envelope instead of just ``data``.
         """
+        # 统一出口再兜一次：不允许 ``..`` / 控制字符 / 查询片段混进路径。
+        _reject_unsafe_path(method, path)
         if not self.conn.configured:
             raise ProxmoxError(
                 "Proxmox connection is not configured. "
@@ -480,7 +535,7 @@ class ProxmoxClient:
     async def tasks(self, node: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         """List recent tasks. PVE exposes tasks per-node, so we fan out."""
         if node:
-            items = await self.get(f"/nodes/{node}/tasks", params={"limit": limit})
+            items = await self.get(api_path("nodes", node, "tasks"), params={"limit": limit})
             return items or []
 
         result: List[Dict[str, Any]] = []
@@ -489,7 +544,7 @@ class ProxmoxClient:
             if not name:
                 continue
             try:
-                items = await self.get(f"/nodes/{name}/tasks", params={"limit": limit})
+                items = await self.get(api_path("nodes", name, "tasks"), params={"limit": limit})
                 result.extend(items or [])
             except ProxmoxError:
                 # A node may be offline; skip it rather than failing the page.
@@ -502,7 +557,7 @@ class ProxmoxClient:
         node = node or node_from_upid(upid)
         if not node:
             raise ProxmoxError(f"Cannot determine node from UPID: {upid}", 400)
-        return await self.get(f"/nodes/{node}/tasks/{upid}/status")
+        return await self.get(api_path("nodes", node, "tasks", upid, "status"))
 
     async def task_log(
         self, upid: str, node: Optional[str] = None, start: int = 0, limit: int = 500
@@ -511,7 +566,7 @@ class ProxmoxClient:
         if not node:
             raise ProxmoxError(f"Cannot determine node from UPID: {upid}", 400)
         lines = await self.get(
-            f"/nodes/{node}/tasks/{upid}/log",
+            api_path("nodes", node, "tasks", upid, "log"),
             params={"start": start, "limit": limit},
         )
         return lines or []
@@ -546,22 +601,22 @@ class ProxmoxClient:
 
     # ----------------------------------------------------------- node info
     async def node_status(self, node: str) -> Dict[str, Any]:
-        return await self.get(f"/nodes/{node}/status")
+        return await self.get(api_path("nodes", node, "status"))
 
     async def node_rrddata(self, node: str, timeframe: str = "hour") -> List[Dict[str, Any]]:
         data = await self.get(
-            f"/nodes/{node}/rrddata", params={"timeframe": timeframe}
+            api_path("nodes", node, "rrddata"), params={"timeframe": timeframe}
         )
         return data or []
 
     async def node_network(self, node: str) -> List[Dict[str, Any]]:
-        data = await self.get(f"/nodes/{node}/network")
+        data = await self.get(api_path("nodes", node, "network"))
         return data or []
 
     # ---------------------------------------------------- node certificates
     async def node_certificates(self, node: str) -> List[Dict[str, Any]]:
         """当前节点上生效的证书（默认 / 自定义 / ACME）。"""
-        data = await self.get(f"/nodes/{quote(node, safe='')}/certificates/info")
+        data = await self.get(api_path("nodes", node, "certificates", "info"))
         return data or []
 
     async def upload_node_certificate(
@@ -580,7 +635,7 @@ class ProxmoxClient:
         * ``restart=1`` —— 由 pveproxy 自己重载证书，不需要再执行 systemctl。
         """
         return await self.post(
-            f"/nodes/{quote(node, safe='')}/certificates/custom",
+            api_path("nodes", node, "certificates", "custom"),
             data={
                 "certificates": certificates,
                 "key": key,
@@ -685,7 +740,7 @@ class ProxmoxClient:
             if checksum_algorithm:
                 data["checksum-algorithm"] = checksum_algorithm
         return await self.post(
-            f"/nodes/{node}/storage/{storage}/download-url", data=data
+            api_path("nodes", node, "storage", storage, "download-url"), data=data
         )
 
     async def storage_content_set_protected(
@@ -704,7 +759,7 @@ class ProxmoxClient:
 
     # ---------------------------------------------------------------- qemu
     async def qemu_list(self, node: str) -> List[Dict[str, Any]]:
-        data = await self.get(f"/nodes/{node}/qemu")
+        data = await self.get(api_path("nodes", node, "qemu"))
         return data or []
 
     async def qemu_all(self) -> List[Dict[str, Any]]:
@@ -719,37 +774,37 @@ class ProxmoxClient:
         都不带）。列表只提供 ``vmid`` / ``name`` / 资源用量；系统类型要读每台机器
         的 ``config`` —— 编排与缓存见 :mod:`app.guestostype`。
         """
-        return await self.get(f"/nodes/{node}/{kind}") or []
+        return await self.get(api_path("nodes", node, kind)) or []
 
     async def qemu_config(self, node: str, vmid: int) -> Dict[str, Any]:
-        return await self.get(f"/nodes/{node}/qemu/{vmid}/config")
+        return await self.get(api_path("nodes", node, "qemu", vmid, "config"))
 
     async def qemu_status(self, node: str, vmid: int) -> Dict[str, Any]:
-        return await self.get(f"/nodes/{node}/qemu/{vmid}/status/current")
+        return await self.get(api_path("nodes", node, "qemu", vmid, "status", "current"))
 
     async def qemu_pending(self, node: str, vmid: int) -> List[Dict[str, Any]]:
-        data = await self.get(f"/nodes/{node}/qemu/{vmid}/pending")
+        data = await self.get(api_path("nodes", node, "qemu", vmid, "pending"))
         return data or []
 
     async def qemu_vm_rrddata(
         self, node: str, vmid: int, timeframe: str = "hour"
     ) -> List[Dict[str, Any]]:
         data = await self.get(
-            f"/nodes/{node}/qemu/{vmid}/rrddata", params={"timeframe": timeframe}
+            api_path("nodes", node, "qemu", vmid, "rrddata"), params={"timeframe": timeframe}
         )
         return data or []
 
     async def qemu_set_config(
         self, node: str, vmid: int, config: Dict[str, Any]
     ) -> Any:
-        return await self.post(f"/nodes/{node}/qemu/{vmid}/config", data=config)
+        return await self.post(api_path("nodes", node, "qemu", vmid, "config"), data=config)
 
     async def qemu_create(self, node: str, config: Dict[str, Any]) -> Any:
-        return await self.post(f"/nodes/{node}/qemu", data=config)
+        return await self.post(api_path("nodes", node, "qemu"), data=config)
 
     async def qemu_destroy(self, node: str, vmid: int, purge: bool = True) -> Any:
         return await self.delete(
-            f"/nodes/{node}/qemu/{vmid}", params={"purge": 1 if purge else 0}
+            api_path("nodes", node, "qemu", vmid), params={"purge": 1 if purge else 0}
         )
 
     async def qemu_clone(
@@ -775,10 +830,10 @@ class ProxmoxClient:
             payload["target"] = target_node
         if description:
             payload["description"] = description
-        return await self.post(f"/nodes/{node}/qemu/{vmid}/clone", data=payload)
+        return await self.post(api_path("nodes", node, "qemu", vmid, "clone"), data=payload)
 
     async def qemu_to_template(self, node: str, vmid: int) -> Any:
-        return await self.post(f"/nodes/{node}/qemu/{vmid}/template")
+        return await self.post(api_path("nodes", node, "qemu", vmid, "template"))
 
     # 注意：这里刻意**没有** qemu_importdisk。PVE 9.2 已经移除了
     # ``POST /nodes/{node}/qemu/{vmid}/importdisk``（实测返回 501），
@@ -787,14 +842,14 @@ class ProxmoxClient:
 
     async def qemu_resize(self, node: str, vmid: int, disk: str, size: str) -> Any:
         return await self.put(
-            f"/nodes/{node}/qemu/{vmid}/resize", data={"disk": disk, "size": size}
+            api_path("nodes", node, "qemu", vmid, "resize"), data={"disk": disk, "size": size}
         )
 
     async def qemu_move_disk(
         self, node: str, vmid: int, disk: str, storage: str, delete_source: bool = True
     ) -> Any:
         return await self.post(
-            f"/nodes/{node}/qemu/{vmid}/move_disk",
+            api_path("nodes", node, "qemu", vmid, "move_disk"),
             data={
                 "disk": disk,
                 "storage": storage,
@@ -806,7 +861,7 @@ class ProxmoxClient:
         self, node: str, vmid: int, target_node: str, online: bool = True
     ) -> Any:
         return await self.post(
-            f"/nodes/{node}/qemu/{vmid}/migrate",
+            api_path("nodes", node, "qemu", vmid, "migrate"),
             data={"target": target_node, "online": 1 if online else 0},
         )
 
@@ -826,19 +881,19 @@ class ProxmoxClient:
         if action == "shutdown" and force_stop:
             payload["forceStop"] = 1
         return await self.post(
-            f"/nodes/{node}/qemu/{vmid}/status/{action}", data=payload
+            api_path("nodes", node, "qemu", vmid, "status", action), data=payload
         )
 
     # ------------------------------------------------------------- snapshots
     async def qemu_snapshots(self, node: str, vmid: int) -> List[Dict[str, Any]]:
-        data = await self.get(f"/nodes/{node}/qemu/{vmid}/snapshot")
+        data = await self.get(api_path("nodes", node, "qemu", vmid, "snapshot"))
         return data or []
 
     async def qemu_snapshot_create(
         self, node: str, vmid: int, name: str, description: str = "", vmstate: bool = False
     ) -> Any:
         return await self.post(
-            f"/nodes/{node}/qemu/{vmid}/snapshot",
+            api_path("nodes", node, "qemu", vmid, "snapshot"),
             data={
                 "snapname": name,
                 "description": description,
@@ -847,14 +902,14 @@ class ProxmoxClient:
         )
 
     async def qemu_snapshot_rollback(self, node: str, vmid: int, name: str) -> Any:
-        return await self.post(f"/nodes/{node}/qemu/{vmid}/snapshot/{name}/rollback")
+        return await self.post(api_path("nodes", node, "qemu", vmid, "snapshot", name, "rollback"))
 
     async def qemu_snapshot_delete(self, node: str, vmid: int, name: str) -> Any:
-        return await self.delete(f"/nodes/{node}/qemu/{vmid}/snapshot/{name}")
+        return await self.delete(api_path("nodes", node, "qemu", vmid, "snapshot", name))
 
     # ------------------------------------------------------------ cloud-init
     async def qemu_cloudinit(self, node: str, vmid: int) -> Dict[str, Any]:
-        return await self.get(f"/nodes/{node}/qemu/{vmid}/cloudinit")
+        return await self.get(api_path("nodes", node, "qemu", vmid, "cloudinit"))
 
     async def qemu_cloudinit_regen(self, node: str, vmid: int) -> Any:
         """重新生成 config drive（GUI 上的「Regenerate Image」）。
@@ -865,7 +920,7 @@ class ProxmoxClient:
         生成，重启后口令不会变 —— 这正是「改了 cloud-init 密码但登不进去」的常见
         原因。
         """
-        return await self.put(f"/nodes/{node}/qemu/{vmid}/cloudinit")
+        return await self.put(api_path("nodes", node, "qemu", vmid, "cloudinit"))
 
     # ------------------------------------------------------- agent (optional)
     async def qemu_agent_network(self, node: str, vmid: int) -> List[Dict[str, Any]]:
@@ -879,7 +934,7 @@ class ProxmoxClient:
         因此照常显示），而直接当数组遍历的地方会**静默拿到空**（列表页的 IP 列就是
         这么对 DHCP 机器一直空着的）。
         """
-        data = await self.get(f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces")
+        data = await self.get(api_path("nodes", node, "qemu", vmid, "agent", "network-get-interfaces"))
         if isinstance(data, dict):
             result = data.get("result")
             return result if isinstance(result, list) else []
@@ -896,14 +951,14 @@ class ProxmoxClient:
         客户机没装 / 没起 qemu-guest-agent 时 PVE 会报 500/595，调用方按「本轮
         没有数据」处理，不要当成 0%。
         """
-        data = await self.get(f"/nodes/{node}/qemu/{vmid}/agent/get-fsinfo")
+        data = await self.get(api_path("nodes", node, "qemu", vmid, "agent", "get-fsinfo"))
         if isinstance(data, dict):
             result = data.get("result")
             return result if isinstance(result, list) else []
         return data if isinstance(data, list) else []
 
     async def qemu_agent_ping(self, node: str, vmid: int) -> Dict[str, Any]:
-        data = await self.post(f"/nodes/{node}/qemu/{vmid}/agent/ping")
+        data = await self.post(api_path("nodes", node, "qemu", vmid, "agent", "ping"))
         return data or {}
 
     async def qemu_agent_set_password(
@@ -919,7 +974,7 @@ class ProxmoxClient:
         要求口令至少 5 位 —— 不足会被 PVE 直接拒掉，根本到不了客户机。
         """
         return await self.post(
-            f"/nodes/{node}/qemu/{vmid}/agent/set-user-password",
+            api_path("nodes", node, "qemu", vmid, "agent", "set-user-password"),
             data={"username": username, "password": password},
         )
 
@@ -938,7 +993,7 @@ class ProxmoxClient:
         schema``。输出是默认捕获的，不需要显式要求。
         """
         data = await self.post(
-            f"/nodes/{node}/qemu/{vmid}/agent/exec",
+            api_path("nodes", node, "qemu", vmid, "agent", "exec"),
             data={"command": command},
         )
         return data or {}
@@ -954,7 +1009,7 @@ class ProxmoxClient:
         其中 ``out-data`` 实测是**明文**（见 :func:`formatters.decode_agent_output`）。
         """
         data = await self.get(
-            f"/nodes/{node}/qemu/{vmid}/agent/exec-status", params={"pid": pid}
+            api_path("nodes", node, "qemu", vmid, "agent", "exec-status"), params={"pid": pid}
         )
         return data or {}
 
@@ -962,7 +1017,7 @@ class ProxmoxClient:
         self, node: str, vmid: int, path: str, mode: str = "wb"
     ) -> Any:
         data = await self.post(
-            f"/nodes/{node}/qemu/{vmid}/agent/file-open",
+            api_path("nodes", node, "qemu", vmid, "agent", "file-open"),
             data={"file": path, "mode": mode},
         )
         return (data or {}).get("handle")
@@ -972,13 +1027,13 @@ class ProxmoxClient:
     ) -> Any:
         """写入 base64 编码的 ``buf``。"""
         return await self.post(
-            f"/nodes/{node}/qemu/{vmid}/agent/file-write",
+            api_path("nodes", node, "qemu", vmid, "agent", "file-write"),
             data={"handle": handle, "buf": buf},
         )
 
     async def qemu_agent_file_close(self, node: str, vmid: int, handle: Any) -> None:
         await self.post(
-            f"/nodes/{node}/qemu/{vmid}/agent/file-close", data={"handle": handle}
+            api_path("nodes", node, "qemu", vmid, "agent", "file-close"), data={"handle": handle}
         )
 
     # ------------------------------------------------------------------ lxc
@@ -989,7 +1044,7 @@ class ProxmoxClient:
     #   * 快照没有 vmstate；
     #   * 克隆只能全量（PVE 不支持容器的链接克隆）。
     async def lxc_list(self, node: str) -> List[Dict[str, Any]]:
-        data = await self.get(f"/nodes/{node}/lxc")
+        data = await self.get(api_path("nodes", node, "lxc"))
         return data or []
 
     async def lxc_all(self) -> List[Dict[str, Any]]:
@@ -998,10 +1053,10 @@ class ProxmoxClient:
         return [r for r in resources if r.get("type") == "lxc"]
 
     async def lxc_config(self, node: str, vmid: int) -> Dict[str, Any]:
-        return await self.get(f"/nodes/{node}/lxc/{vmid}/config")
+        return await self.get(api_path("nodes", node, "lxc", vmid, "config"))
 
     async def lxc_status(self, node: str, vmid: int) -> Dict[str, Any]:
-        return await self.get(f"/nodes/{node}/lxc/{vmid}/status/current")
+        return await self.get(api_path("nodes", node, "lxc", vmid, "status", "current"))
 
     async def lxc_interfaces(self, node: str, vmid: int) -> List[Dict[str, Any]]:
         """容器内网卡的**实际**地址（``{name, hwaddr, inet, inet6}``）。
@@ -1011,18 +1066,18 @@ class ProxmoxClient:
         已停止的容器 PVE 会直接报错，调用方（见 :mod:`app.guestip`）把它当
         「拿不到」处理即可。
         """
-        data = await self.get(f"/nodes/{node}/lxc/{vmid}/interfaces")
+        data = await self.get(api_path("nodes", node, "lxc", vmid, "interfaces"))
         return data or []
 
     async def lxc_pending(self, node: str, vmid: int) -> List[Dict[str, Any]]:
-        data = await self.get(f"/nodes/{node}/lxc/{vmid}/pending")
+        data = await self.get(api_path("nodes", node, "lxc", vmid, "pending"))
         return data or []
 
     async def lxc_vm_rrddata(
         self, node: str, vmid: int, timeframe: str = "hour"
     ) -> List[Dict[str, Any]]:
         data = await self.get(
-            f"/nodes/{node}/lxc/{vmid}/rrddata", params={"timeframe": timeframe}
+            api_path("nodes", node, "lxc", vmid, "rrddata"), params={"timeframe": timeframe}
         )
         return data or []
 
@@ -1041,10 +1096,10 @@ class ProxmoxClient:
         热更新），没有 UPID 可等。调用方（routers/lxc.py、bulk.py）本来就按
         「task 可能为空」处理，所以不需要补一个假任务。
         """
-        return await self.put(f"/nodes/{node}/lxc/{vmid}/config", data=config)
+        return await self.put(api_path("nodes", node, "lxc", vmid, "config"), data=config)
 
     async def lxc_create(self, node: str, config: Dict[str, Any]) -> Any:
-        return await self.post(f"/nodes/{node}/lxc", data=config)
+        return await self.post(api_path("nodes", node, "lxc"), data=config)
 
     async def lxc_destroy(
         self, node: str, vmid: int, purge: bool = True, force: bool = False
@@ -1052,7 +1107,7 @@ class ProxmoxClient:
         payload: Dict[str, Any] = {"purge": 1 if purge else 0}
         if force:
             payload["force"] = 1
-        return await self.delete(f"/nodes/{node}/lxc/{vmid}", params=payload)
+        return await self.delete(api_path("nodes", node, "lxc", vmid), params=payload)
 
     async def lxc_to_template(self, node: str, vmid: int) -> Any:
         """容器转模板，等价于 ``pct template <vmid>``（见 pct(1)）。
@@ -1061,7 +1116,7 @@ class ProxmoxClient:
         成「不存在」—— 面板以前就是这么断定容器不能转模板的，而 pct(1) 里
         明明白白有这条命令。
         """
-        return await self.post(f"/nodes/{node}/lxc/{vmid}/template")
+        return await self.post(api_path("nodes", node, "lxc", vmid, "template"))
 
     async def lxc_clone(
         self,
@@ -1083,7 +1138,7 @@ class ProxmoxClient:
             payload["target"] = target_node
         if description:
             payload["description"] = description
-        return await self.post(f"/nodes/{node}/lxc/{vmid}/clone", data=payload)
+        return await self.post(api_path("nodes", node, "lxc", vmid, "clone"), data=payload)
 
     async def lxc_power(
         self,
@@ -1100,11 +1155,11 @@ class ProxmoxClient:
         if action == "shutdown" and force_stop:
             payload["forceStop"] = 1
         return await self.post(
-            f"/nodes/{node}/lxc/{vmid}/status/{action}", data=payload
+            api_path("nodes", node, "lxc", vmid, "status", action), data=payload
         )
 
     async def lxc_snapshots(self, node: str, vmid: int) -> List[Dict[str, Any]]:
-        data = await self.get(f"/nodes/{node}/lxc/{vmid}/snapshot")
+        data = await self.get(api_path("nodes", node, "lxc", vmid, "snapshot"))
         return data or []
 
     async def lxc_snapshot_create(
@@ -1115,26 +1170,26 @@ class ProxmoxClient:
         if description:
             payload["description"] = description
         return await self.post(
-            f"/nodes/{node}/lxc/{vmid}/snapshot", data=payload
+            api_path("nodes", node, "lxc", vmid, "snapshot"), data=payload
         )
 
     async def lxc_snapshot_rollback(self, node: str, vmid: int, name: str) -> Any:
-        return await self.post(f"/nodes/{node}/lxc/{vmid}/snapshot/{name}/rollback")
+        return await self.post(api_path("nodes", node, "lxc", vmid, "snapshot", name, "rollback"))
 
     async def lxc_snapshot_delete(self, node: str, vmid: int, name: str) -> Any:
-        return await self.delete(f"/nodes/{node}/lxc/{vmid}/snapshot/{name}")
+        return await self.delete(api_path("nodes", node, "lxc", vmid, "snapshot", name))
 
     async def lxc_resize(self, node: str, vmid: int, disk: str, size: str) -> Any:
         """扩容 rootfs / mpN。``size`` 支持绝对值（20G）与增量（+10G）。"""
         return await self.put(
-            f"/nodes/{node}/lxc/{vmid}/resize", data={"disk": disk, "size": size}
+            api_path("nodes", node, "lxc", vmid, "resize"), data={"disk": disk, "size": size}
         )
 
     async def lxc_move_volume(
         self, node: str, vmid: int, volume: str, storage: str, delete_source: bool = True
     ) -> Any:
         return await self.post(
-            f"/nodes/{node}/lxc/{vmid}/move_volume",
+            api_path("nodes", node, "lxc", vmid, "move_volume"),
             data={
                 "volume": volume,
                 "storage": storage,
@@ -1157,7 +1212,7 @@ class ProxmoxClient:
         容器唯一能缩短中断的做法（实际仍是 stop → migrate → start）。
         """
         return await self.post(
-            f"/nodes/{node}/lxc/{vmid}/migrate",
+            api_path("nodes", node, "lxc", vmid, "migrate"),
             data={
                 "target": target_node,
                 "online": 0,
@@ -1237,7 +1292,7 @@ class ProxmoxClient:
             payload["vmid"] = vmid
         if notes:
             payload["notes-template"] = notes
-        return await self.post(f"/nodes/{node}/vzdump", data=payload)
+        return await self.post(api_path("nodes", node, "vzdump"), data=payload)
 
     async def backup_restore(
         self,
@@ -1264,9 +1319,9 @@ class ProxmoxClient:
             # rootfs 全部报 unknown setting。
             payload["ostemplate"] = archive
             payload["restore"] = 1
-            return await self.post(f"/nodes/{node}/lxc", data=payload)
+            return await self.post(api_path("nodes", node, "lxc"), data=payload)
         payload["archive"] = archive
-        return await self.post(f"/nodes/{node}/qemu", data=payload)
+        return await self.post(api_path("nodes", node, "qemu"), data=payload)
 
     async def backup_jobs(self) -> List[Dict[str, Any]]:
         data = await self.get("/cluster/backup")
@@ -1283,19 +1338,19 @@ class ProxmoxClient:
 
     # ------------------------------------------------------------ networking
     async def network_create(self, node: str, payload: Dict[str, Any]) -> Any:
-        return await self.post(f"/nodes/{node}/network", data=payload)
+        return await self.post(api_path("nodes", node, "network"), data=payload)
 
     async def network_update(self, node: str, iface: str, payload: Dict[str, Any]) -> Any:
-        return await self.put(f"/nodes/{node}/network/{iface}", data=payload)
+        return await self.put(api_path("nodes", node, "network", iface), data=payload)
 
     async def network_delete(self, node: str, iface: str) -> Any:
-        return await self.delete(f"/nodes/{node}/network/{iface}")
+        return await self.delete(api_path("nodes", node, "network", iface))
 
     async def network_reload(self, node: str) -> Any:
-        return await self.put(f"/nodes/{node}/network")
+        return await self.put(api_path("nodes", node, "network"))
 
     async def network_revert(self, node: str) -> Any:
-        return await self.delete(f"/nodes/{node}/network")
+        return await self.delete(api_path("nodes", node, "network"))
 
     # ------------------------------------------------------------------ pools
     async def pools(self) -> List[Dict[str, Any]]:

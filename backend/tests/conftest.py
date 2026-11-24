@@ -32,6 +32,11 @@ os.environ["FORCE_HTTPS"] = "0"
 # 二次确认（step-up）会拦下删虚拟机、建账号等写操作：端到端用例只验证业务
 # 逻辑，默认关掉；它本身的实现由 tests/test_hardening.py::TestStepUp 专门覆盖。
 os.environ["STEP_UP_REQUIRED"] = "0"
+# 本机证书部署目录有白名单（见 app.certs.local_deploy_dir）：生产默认只放开
+# /etc、/var/www 这类位置，避免拿到 cert.manage 就能往 /root/.ssh 写文件。
+# 用例普遍把证书部署进 tmp_path（/tmp/...），这里**只在测试进程里**把系统临时
+# 目录追加进允许根，生产默认值不受影响。
+os.environ.setdefault("PC_CERT_DEPLOY_ROOTS", tempfile.gettempdir())
 
 from app import database  # noqa: E402
 from app.config import settings  # noqa: E402

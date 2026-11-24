@@ -45,8 +45,15 @@ function readErrorCode(headers: unknown): string {
 export class ApiError extends Error {
   status: number;
   detail: string;
-  /** 后端未实现（501）*/
+  /** 后端未实现（501），以及老后端没有这条路由时的 404 */
   notImplemented: boolean;
+  /**
+   * 资源不存在 / 不属于当前用户（404）。
+   *
+   * 与 `notImplemented` 刻意分开：404 在新的后端上主要来自归属校验，
+   * 页面要提示「不存在或无权访问」，而不是「接口暂不可用」。
+   */
+  notFound: boolean;
   /** 认证失败 */
   unauthorized: boolean;
   /** 服务不可用（网络层错误 / 5xx）*/
@@ -75,6 +82,7 @@ export class ApiError extends Error {
     this.payload = payload;
     this.code = code ?? '';
     this.notImplemented = status === 501 || status === 404;
+    this.notFound = status === 404;
     this.unauthorized = status === 401 || status === 403;
     this.unavailable = status === 0 || status >= 500;
     /* 428 有两种：没配连接（该去添加）和没配控制台账号（该去补账号）。
@@ -537,6 +545,16 @@ export async function upload<T>(
  */
 export function isNotImplemented(err: unknown): boolean {
   return err instanceof ApiError && err.notImplemented;
+}
+
+/**
+ * 判断是否为「资源不存在或不属于你」（404）。
+ *
+ * 调用方要在 `isNotImplemented` **之前**判它：404 目前两者都会命中，
+ * 先判这里才能把「无权访问」和「接口不可用」两种提示分开。
+ */
+export function isNotFound(err: unknown): boolean {
+  return err instanceof ApiError && err.notFound;
 }
 
 /**

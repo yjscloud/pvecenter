@@ -922,11 +922,13 @@ def validate_params(tool: Dict[str, Any], raw: Any) -> Dict[str, str]:
 #
 # 约束与模块开头那四条一脉相承，只是从「模板 + 参数」放宽到「白名单命令」：
 #
-# 1. **不给任意 shell**：先做结构检查（禁 ``;`` / ``&&`` / ``||`` / 重定向 /
+# 1. **不给任意 shell**：先做结构检查（禁 ``;`` / ``&`` / ``&&`` / ``||`` / 重定向 /
 #    命令替换），再按 ``|`` 分段，每段的首个可执行文件必须在 READONLY_COMMANDS 里；
 # 2. **逐命令限制子命令**：``systemctl`` 只认查询类子命令，``ip`` 不许 set / add / del，
 #    ``find`` 不许 ``-exec``，``awk`` 不许 ``system(``；
-# 3. **仍然不用 sudo**：即使受管主机配了免密 sudo，模型也拿不到 root。
+# 3. **白名单里不许有执行器**：``env`` / ``xargs`` / ``sh`` / ``timeout`` 这类命令
+#    后面跟什么就执行什么（见 ``_FORBIDDEN_EXE``），「只读」会立刻变成「任意命令」；
+# 4. **仍然不用 sudo**：即使受管主机配了免密 sudo，模型也拿不到 root。
 #
 # 这是一道**防误伤的门槛，不是安全沙箱**：命令由模型生成、用户已授权、全程记入
 # 审计（工具调用明细）。要更硬的隔离，应当用专用只读账号 + ``authorized_keys`` 的
@@ -938,7 +940,7 @@ READONLY_COMMANDS = frozenset(
         "pidstat", "lscpu", "lsblk", "lsmod", "lspci", "lsusb", "nproc", "sensors",
         "smartctl",
         # 文件与文本（只读）
-        "cat", "head", "tail", "ls", "stat", "file", "wc", "sort", "uniq", "grep",
+        "cat", "head", "tail", "ls", "stat", "file", "wc", "sort", "grep",
         "egrep", "fgrep", "cut", "tr", "awk", "find", "which", "whereis",
         # 日志与服务
         "journalctl", "dmesg", "systemctl", "hostnamectl",
@@ -948,13 +950,30 @@ READONLY_COMMANDS = frozenset(
         "iptables", "ip6tables", "nft", "ufw", "fail2ban-client",
         # 系统与账号信息
         "uname", "hostname", "date", "timedatectl", "who", "w", "last", "lastb",
-        "id", "groups", "mount", "findmnt", "swapon", "lsof", "getconf", "env",
-        "printenv",
+        "id", "groups", "findmnt", "lsof", "getconf", "printenv",
     }
 )
 
-# 出现即整条拒绝：多命令、命令替换、输入输出重定向（重定向会改文件）
-_SHELL_METACHARS = (";", "&&", "||", "`", "$(", "${", ">", "<", "\n", "\r")
+# 名字看着无害、实际是「执行器」的命令：它们后面跟什么就执行什么，一旦放进白名单，
+# 「只读」就成了「任意命令免审批」。白名单里**永远不该出现**这些，这里再拦一次是
+# 为了防止以后有人顺手加回去（``env rm -rf /`` 曾经就是能过校验的）。
+_FORBIDDEN_EXE = frozenset(
+    {
+        "env", "sudo", "doas", "su", "sh", "bash", "dash", "zsh", "fish", "ksh",
+        "xargs", "nohup", "nice", "ionice", "timeout", "watch", "setsid", "script",
+        "busybox", "perl", "ruby", "python", "python2", "python3", "node", "php",
+        "tar", "rsync", "tee", "dd", "cp", "mv", "install", "chmod", "chown",
+    }
+)
+
+# 允许用绝对路径调用的目录：``/tmp/x/cat`` 这种「文件名是 cat」的可执行文件不能算数。
+_TRUSTED_BIN_DIRS = (
+    "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/",
+    "/usr/local/bin/", "/usr/local/sbin/",
+)
+
+# 出现即整条拒绝：多命令、命令替换、输入输出重定向（重定向会改文件）、后台执行
+_SHELL_METACHARS = (";", "&&", "||", "&", "`", "$(", "${", ">", "<", "\\", "\n", "\r")
 
 # 子命令白名单：第一个非选项参数必须是其中之一（没给子命令时至少要有个 -- 开关）
 _SUBCOMMAND_ALLOW: Dict[str, tuple] = {
@@ -973,15 +992,32 @@ _TOKEN_DENY: Dict[str, tuple] = {
     "ip": ("set", "add", "del", "delete", "flush", "change", "replace", "up", "down"),
     "iptables": ("-A", "-D", "-I", "-F", "-X", "-P", "-N", "-E", "-R"),
     "ip6tables": ("-A", "-D", "-I", "-F", "-X", "-P", "-N", "-E", "-R"),
-    "mount": ("-o", "-a", "--all"),
-    "swapon": ("-a", "--all"),
     "smartctl": ("-t", "--test", "-s", "--set", "-X"),
+    # 以下几条本身是「查询命令」，但同一个开关就能改系统状态：白名单里留着它们
+    # 是为了 ``date`` / ``hostnamectl`` 这类裸调用，具体写入口必须堵死。
+    "date": ("-s", "--set"),
+    # sort 的 -o 直接写文件，--compress-program 会**执行**指定的程序
+    "sort": ("-o", "--output", "--compress-program"),
+    "hostnamectl": (
+        "set-hostname", "set-icon-name", "set-chassis", "set-deployment",
+        "set-location", "set-static-hostname", "set-transient-hostname",
+    ),
+    "timedatectl": ("set-time", "set-timezone", "set-ntp", "set-local-rtc"),
+    "dmesg": ("-C", "--clear", "-c", "--read-clear", "-n", "--console-level"),
+    "journalctl": (
+        "--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush",
+        "--sync", "--relinquish-var", "--setup-keys",
+    ),
+    # ethtool 的 -s/-K/-G 等都是改网卡参数；-S 是统计信息（大小写敏感，不受影响）
+    "ethtool": (
+        "-s", "--change", "-K", "-G", "-A", "-C", "-L", "-N", "-E", "-f",
+    ),
 }
 
 # 子串黑名单：参数本身是一段脚本 / 表达式，只能按内容匹配
 _SUBSTR_DENY: Dict[str, tuple] = {
-    "awk": ("system(", "exec(", "print >", "printf >"),
-    "find": ("-exec", "-delete", "-fprint", "-fls"),
+    "awk": ("system(", "exec(", "print >", "printf >", "print |", "printf |", "close("),
+    "find": ("-exec", "-delete", "-fprint", "-fls", "-ok", "-okdir"),
 }
 
 MAX_COMMAND_LENGTH = 500
@@ -991,7 +1027,15 @@ def _segment_ok(argv: List[str]) -> bool:
     """单段管道是否只读：可执行文件在白名单内，且子命令 / 参数都合规。"""
     if not argv:
         return False
-    exe = argv[0].rsplit("/", 1)[-1]
+    raw = argv[0]
+    if "/" in raw:
+        # 只认系统目录里的同名程序：``/tmp/evil/cat`` 不能因为 basename 是 cat 就放行
+        if not raw.startswith(_TRUSTED_BIN_DIRS):
+            return False
+    exe = raw.rsplit("/", 1)[-1]
+    # 白名单是「只读」的保证，不是「能执行什么」的集合：执行器类命令一律拒绝
+    if exe in _FORBIDDEN_EXE:
+        return False
     if exe not in READONLY_COMMANDS:
         return False
     rest = argv[1:]

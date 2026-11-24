@@ -3719,8 +3719,13 @@ class TestMailNotifications:
 
     def test_registration_notifies_admins(self, api, outbox) -> None:
         admin = auth_headers(api)
-        # 管理员收件人留空时回退到「填了邮箱的管理员」
-        api.put("/api/auth/me", json={"email": "boss@example.com"}, headers=admin)
+        # 管理员收件人留空时回退到「填了邮箱的管理员」。改邮箱要验当前口令
+        # （PVE-AUTH-001），少了它这里会 400，后面的收件人断言就无从谈起。
+        api.put(
+            "/api/auth/me",
+            json={"email": "boss@example.com", "current_password": ADMIN["password"]},
+            headers=admin,
+        )
         api.put(
             "/api/config/mail",
             json={
@@ -4663,7 +4668,13 @@ class TestSelfServiceProfile:
 
         resp = api.put(
             "/api/auth/me",
-            json={"email": "bob@example.com", "role": "admin", "enabled": False},
+            json={
+                "email": "bob@example.com",
+                # 改邮箱要验当前口令（PVE-AUTH-001）；role / enabled 仍必须被忽略
+                "current_password": self.PASSWORD,
+                "role": "admin",
+                "enabled": False,
+            },
             headers=bob,
         )
         assert resp.status_code == 200, resp.text

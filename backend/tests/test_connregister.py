@@ -854,10 +854,41 @@ class TestRegisterTlsHint:
         resp = _register(client, port, issued["code"])
         assert resp.status_code == 400
         detail = resp.json()["detail"]
-        # 原文保留（排障要看），后面跟上能直接照做的下一步
-        assert "CERTIFICATE_VERIFY_FAILED" in detail
+        # 能直接照做的下一步还在……
+        assert "8006" in detail
         assert "钉扎" in detail
         assert "PVE_ONBOARD_INSECURE" in detail
+        # ……但不再回显 TLS 原文：匿名的持码者不该借回显判断端口是不是 TLS
+        assert "CERTIFICATE_VERIFY_FAILED" not in detail
+        assert "ssl" not in detail.lower()
+
+    def test_transport_failures_are_indistinguishable(
+        self, onboard, monkeypatch
+    ) -> None:
+        """拒绝连接 / 超时 / 不是 TLS：对外必须是同一句话。
+
+        这条接口允许不登录（凭注册码）就让面板去连任意 ``host:port``，文案一旦
+        随错误类型变化，就等于给了一个免费端口扫描器。
+        """
+        client, port = onboard
+        issued = _issue(client, auth_headers(client))
+
+        details = []
+        for message in (
+            "Cannot reach Proxmox at https://10.0.0.5:443: [SSL] record layer failure",
+            "Cannot reach Proxmox at https://10.0.0.6:22: No route to host",
+            "Cannot reach Proxmox at https://10.0.0.7:8006: timed out",
+        ):
+            async def _raise(*args: Any, _msg: str = message, **kwargs: Any) -> Any:
+                raise pve_module.ProxmoxError(_msg)
+
+            monkeypatch.setattr(pve_module.ProxmoxClient, "version", _raise)
+            resp = _register(client, port, issued["code"])
+            assert resp.status_code == 400
+            details.append(resp.json()["detail"])
+
+        assert len(set(details)) == 1, details
+        assert "10.0.0" not in details[0]
 
     def test_unparsable_ca_cert_is_400_not_500(self, onboard) -> None:
         """坏 PEM 必须是 400 + 人话，不能是裸 500。

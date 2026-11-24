@@ -34,6 +34,13 @@ async def _with_pool(coro):
 
 
 def _run(coro):
+    # _with_pool 只在自己的 loop 里关池，复用不到「上一个 asyncio.run 留下的池」。
+    # 但本文件之外的用例可能已经把 _mysql_pool 建在别的 loop 上；不清掉的话
+    # 本次 asyncio.run 会拿到一个绑在已关闭 loop 上的池 —— future different loop /
+    # Event loop is closed，尤其并行分片打乱用例顺序时必现。
+    from app import database
+
+    database._mysql_pool = None
     return asyncio.run(_with_pool(coro))
 
 

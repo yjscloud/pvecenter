@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from .. import guestguard, ownership, quota, security, sshremote, store, vmtransfer
 from ..pve import (
     ProxmoxError,
+    check_location,
     get_client,
     requested_connection,
     set_request_connection,
@@ -189,6 +190,13 @@ async def upload_import_file(
     大 OVA 动辄几十 GB，中间不能在面板里落盘。
     """
     await bind_node_connection(node)
+    # 下面直接拼 PVE 的 URL 做流式转发（不经过 client 的 api_path 编码）：
+    # node / storage 必须先是「像样的节点名 / 存储名」，否则 ``..`` 会把请求
+    # 改写成另一条 PVE API —— 面板手里是集群 root 令牌。
+    try:
+        check_location(node, storage)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     client = get_client()
     filename = str(file.filename or "").strip()
     # 目录型存储的宿主路径（best effort）：OVF 只能靠 scp 放进 import 目录，
@@ -237,7 +245,7 @@ async def upload_import_file(
     # sources 列表里看不到自己刚上传的文件（下一步的过滤会滤掉它），别人也照样
     # 看得见、删得掉。归属记不上不该让上传失败 —— 文件确实已经在 PVE 上了。
     try:
-        await ownership.set_owner(
+        await ownership.claim(
             ownership.KIND_IMPORT,
             ownership.import_ref(_op_connection(), storage, f"import/{filename}"),
             str(user.get("username") or ""),
@@ -361,7 +369,7 @@ async def create_imported_vm(
     # 连接 id 必须与列表侧拼 ref 时用的**完全一致**（vm_ref 的前缀对不上等于没写），
     # 所以用与 vms._op_connection 相同的解析：先看本次请求指定的连接，再退到当前
     # 活跃的那条。
-    await ownership.set_owner(
+    await ownership.claim(
         ownership.KIND_VM,
         ownership.vm_ref(
             requested_connection() or str(store.get_active_connection_id() or ""),

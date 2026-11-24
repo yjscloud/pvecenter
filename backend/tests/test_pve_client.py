@@ -19,7 +19,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
@@ -88,6 +88,10 @@ class MockPveHandler(BaseHTTPRequestHandler):
     def _handle(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        # 真实 PVE 的语义是「先按 / 切段，再对每段做 URL 解码」：``api_path`` 现在
+        # 把节点 / 存储 / 卷 ID / UPID 逐段编码（``%3A``、``%40``），mock 要是按
+        # 原始串匹配就会把它们当成未知路径。这里按同样的顺序解码后再路由。
+        route_path = "/".join(unquote(seg) for seg in path.split("/"))
         query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         body = self._read_body() if method in ("POST", "PUT") else {}
 
@@ -97,7 +101,7 @@ class MockPveHandler(BaseHTTPRequestHandler):
             self._send(401, {"data": None, "errors": {"auth": "no valid ticket"}})
             return
 
-        handler = self._route(method, path, query, body)
+        handler = self._route(method, route_path, query, body)
         if handler is None:
             self._send(
                 501, {"data": None, "errors": {"x": f"unhandled {method} {path}"}}

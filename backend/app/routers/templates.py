@@ -550,6 +550,11 @@ async def list_cloud_images(
     )
 
     images: List[Dict[str, Any]] = []
+    # 导入目录是所有人共用的一格：不清洗就相当于把别人上传的文件名（以及「这台
+    # 面板上有谁在传什么镜像」）列给每个用户看。真正的写入口由
+    # ``guestguard.require_storage_volume`` 挡住，这里只是不再列出别人的文件。
+    scope = security.visible_owner(user)
+    import_owners: Optional[Dict[str, str]] = None
     for (name, content), items in zip(plans, results):
         if isinstance(items, BaseException) or items is None:
             continue
@@ -557,6 +562,19 @@ async def list_cloud_images(
             volid = str(item.get("volid") or "")
             if not volid.lower().endswith(CLOUD_IMAGE_EXT):
                 continue
+            volume = volid.split(":", 1)[-1] if ":" in volid else volid
+            if (
+                scope is not None
+                and not security.is_region_admin(user)
+                and (content == "import" or volume.startswith("import/"))
+            ):
+                if import_owners is None:
+                    import_owners = await ownership.owners_map(ownership.KIND_IMPORT)
+                ref = ownership.import_ref(
+                    guestguard.call_connection(), name, volume
+                )
+                if import_owners.get(ref) != scope:
+                    continue
             images.append(
                 {
                     "volid": volid,
@@ -587,6 +605,10 @@ async def build_template_from_image(
     # ``node`` 在请求体里，路由级依赖看不到它：不补这一次，请求会固定落到
     # 「当前连接」，在另一套集群的节点上建模板就变成 hostname lookup 失败。
     await bind_node_connection(payload.node)
+    # 源镜像是「别人的数据」：``image`` 是请求体里的卷 ID，PVE 会按 ``import-from``
+    # 把它整块复制成新盘。只校验 ``template.manage`` 的话，任何普通用户都能把别人的
+    # 磁盘卷（或别人上传的 import 镜像）做成自己的模板，再克隆出来读内容。
+    await guestguard.require_storage_volume(user, payload.node, payload.image)
     # 建模板也是一台新机器（模板同样计入用量），走同一套额度校验。
     # ``disk_size`` 可能为空 —— 那样磁盘由镜像自身决定，这一项就不查。
     await quota.enforce_create(
@@ -961,7 +983,7 @@ async def clone_template(
 
     # 记录归属：虚拟机列表对普通用户按归属过滤，漏记会让「自己刚建好的机器」
     # 在列表里查无此机。
-    await ownership.set_owner(
+    await ownership.claim(
         ownership.KIND_VM,
         ownership.vm_ref(_op_connection(), target_node, newid),
         str(user.get("username") or ""),

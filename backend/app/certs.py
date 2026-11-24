@@ -102,9 +102,28 @@ RELOAD_TIMEOUT = 30
 CN_TZ = timezone(timedelta(hours=8))
 
 DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
-FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+#: ``.`` / ``..`` 单独成文件名时等于「目录本身 / 上一级目录」，必须排除
+FILENAME_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")
 # 部署目录：绝对路径，禁止 .. 与 shell 元字符（路径会被拼进远程命令）
 DEPLOY_DIR_RE = re.compile(r"^/[A-Za-z0-9._/@+-]*(/[A-Za-z0-9._@+-]+)*$")
+
+#: 本机目录部署允许的根目录。部署证书本质上是「以面板进程身份写文件」，而进程
+#: 通常是 root：只校验「绝对路径 + 字符集」等于把根目录写权限借给任何拿到
+#: ``cert.manage`` 的人（``/root/.ssh``、``/etc/sudoers.d`` 都是合法输入）。
+#: 默认只放开放证书的地方；确有别的路径需求时用 PC_CERT_DEPLOY_ROOTS 追加
+#: （冒号分隔），而不是靠改代码。
+LOCAL_DEPLOY_ROOTS = ("/etc", "/usr/local/etc", "/var/www", "/srv", "/opt")
+_LOCAL_DEPLOY_ROOTS_ENV = "PC_CERT_DEPLOY_ROOTS"
+
+#: 即使落在上面的根目录里，这些位置也不许写：认证、提权与开机自启相关。
+LOCAL_DEPLOY_DENY = (
+    "/etc/passwd", "/etc/shadow", "/etc/gshadow", "/etc/group",
+    "/etc/sudoers", "/etc/sudoers.d", "/etc/ssh", "/etc/pam.d",
+    "/etc/security", "/etc/systemd", "/etc/init.d", "/etc/rc.local",
+    "/etc/crontab", "/etc/cron.d", "/etc/cron.daily", "/etc/cron.hourly",
+    "/etc/cron.weekly", "/etc/cron.monthly", "/etc/ld.so.conf.d",
+    "/etc/ld.so.preload", "/etc/profile.d", "/etc/fstab",
+)
 
 # PVE 节点证书：走 ``/nodes/{node}/certificates/custom`` 上传，PVE 会把证书
 # 落盘为 ``/etc/pve/local/pveproxy-ssl.pem`` / ``.key``（面板不直接写该目录）。
@@ -2295,6 +2314,66 @@ def _rollback(snap: List[Tuple[Path, int, Any]]) -> bool:
     return ok
 
 
+def _deploy_roots() -> List[str]:
+    """本机部署允许的根目录（默认值 + 环境变量追加）。"""
+    roots = list(LOCAL_DEPLOY_ROOTS)
+    for item in os.environ.get(_LOCAL_DEPLOY_ROOTS_ENV, "").split(":"):
+        text = item.strip()
+        if text.startswith("/"):
+            roots.append(text)
+    out: List[str] = []
+    for root in roots:
+        norm = os.path.normpath(root)
+        if norm not in out:
+            out.append(norm)
+    return out
+
+
+def _within(path: str, root: str) -> bool:
+    """``path`` 是否等于 ``root`` 或位于其下（按路径分段，不按字符串前缀）。"""
+    base = root.rstrip("/") or "/"
+    return path == base or path.startswith(base.rstrip("/") + "/")
+
+
+def local_deploy_dir(raw: Any) -> Path:
+    """把 ``deploy_dir`` 解析成**本机**可写的目标目录；越界直接抛 :class:`CertError`。
+
+    这是证书部署唯一写本机文件系统的入口，必须在写盘前（而不是在保存配置时）
+    判定：模板、历史数据、旧版本落库的值都绕过了保存期校验。
+
+    三道检查：字符集与 ``.``/``..``（拼进远程命令的老问题）→ ``resolve()`` 后
+    是否仍在允许的根目录内（同时挡掉符号链接逃逸）→ 是否落在禁止写入的系统路径。
+    """
+    text = str(raw or "").strip()
+    if not text or not text.startswith("/"):
+        raise CertError("部署目录必须是绝对路径，例如 /etc/nginx/ssl")
+    if not DEPLOY_DIR_RE.match(text.rstrip("/") or "/") or any(
+        part in (".", "..") for part in text.split("/")
+    ):
+        raise CertError("部署目录只能包含字母、数字与 . _ - @ + /，且不能包含 . 或 .. 路径片段")
+    try:
+        # resolve() 会把符号链接展开：``/var/www/ssl -> /root`` 这类跳板在这里失效
+        target = Path(text).resolve()
+    except OSError as exc:
+        raise CertError("部署目录无法解析：" + str(exc)) from exc
+    resolved = str(target)
+    if resolved == "/":
+        raise CertError("部署目录不能是根目录")
+    for denied in LOCAL_DEPLOY_DENY:
+        if _within(resolved, denied):
+            raise CertError("不允许写系统配置/认证相关目录：" + resolved)
+    roots = _deploy_roots()
+    if not any(_within(resolved, root) for root in roots):
+        raise CertError(
+            "本机部署目录必须在以下目录之内："
+            + "、".join(roots)
+            + "（确有需要可用 "
+            + _LOCAL_DEPLOY_ROOTS_ENV
+            + " 追加）"
+        )
+    return target
+
+
 def _preflight_local(
     site: Dict[str, Any], target_dir: Path, files: List[Tuple[Path, int]]
 ) -> None:
@@ -2323,7 +2402,9 @@ def _preflight_local(
 
 
 async def _push_local(site: Dict[str, Any], bundle: Dict[str, Any]) -> Tuple[str, str]:
-    target_dir = Path(str(site.get("deploy_dir")))
+    # 目录可能在保存时是合法的、之后被换成符号链接；也可能来自模板或旧版本数据。
+    # 写盘前一律重新解析 + 白名单校验（见 local_deploy_dir）。
+    target_dir = local_deploy_dir(site.get("deploy_dir"))
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:

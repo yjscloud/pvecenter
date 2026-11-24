@@ -1613,7 +1613,7 @@ async def _create_vm_core(
     # 受管主机登记：两者互不依赖，并发写。后者此刻只写一条记录、指纹留空 ——
     # 机器还在 cloud-init 阶段，等后台巡检连上后自动采纳（见 adopt_panel_hosts）。
     tail: List[Any] = [
-        ownership.set_owner(
+        ownership.claim(
             ownership.KIND_VM,
             ownership.vm_ref(_op_connection(), payload.node, vmid),
             str(user.get("username") or ""),
@@ -2020,7 +2020,7 @@ async def _create_from_clone(
             source="clone",
             username=str(user.get("username") or ""),
         ),
-        ownership.set_owner(
+        ownership.claim(
             ownership.KIND_VM,
             ownership.vm_ref(_op_connection(), target_node, vmid),
             str(user.get("username") or ""),
@@ -2821,7 +2821,7 @@ async def clone_vm(
     # 归属：克隆体一出场就得记上。没记录的机器在面板里是「无主」—— 既不计入
     # 任何人的配额（反复克隆即可绕过上限），又能被任何持 template.clone 的用户
     # 整机克隆走。容器克隆一直有这一步（lxc.py 的 clone_container），虚拟机侧漏了。
-    await ownership.set_owner(
+    await ownership.claim(
         ownership.KIND_VM,
         ownership.vm_ref(_op_connection(), target_node, payload.newid),
         str(user.get("username") or ""),
@@ -3008,7 +3008,7 @@ async def create_snapshot(
         _raise(exc)
 
     task = result if isinstance(result, str) else (result or {}).get("task", "")
-    await ownership.set_owner(
+    await ownership.claim(
         ownership.KIND_SNAPSHOT,
         ownership.snapshot_ref(_op_connection(), node, vmid, payload.name),
         str(user.get("username") or ""),

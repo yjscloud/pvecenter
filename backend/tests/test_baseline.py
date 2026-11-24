@@ -23,7 +23,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
-from app import baseline, reportcache, sshremote  # noqa: E402
+from app import baseline, localhost, reportcache, sshremote  # noqa: E402
 from app.config import settings  # noqa: E402
 from conftest import connect  # noqa: E402
 from test_api_routes import api, auth_headers, user_with_permissions  # noqa: E402,F401
@@ -448,6 +448,14 @@ class TestHostRowShaping:
 
     def test_targets_never_leaks_credentials(self, monkeypatch) -> None:
         self._stub_hosts(monkeypatch)
+
+        # 「本机在不在清单里」读的是 settings（用户有没有显式导入本机）。用例顺序
+        # 一变（前面清过库 / 没导过本机），hosts[0] 就不再是 local —— 这条断言
+        # 会变成「看别处跑过什么」。这里把开关钉死，只验证 targets 的输出形状。
+        async def _local_enabled() -> bool:
+            return True
+
+        monkeypatch.setattr(localhost, "enabled", _local_enabled)
         hosts = asyncio.run(baseline.targets())
         assert hosts[0]["id"] == "local"
         assert hosts[1]["id"] == "h1"

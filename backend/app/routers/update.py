@@ -73,7 +73,10 @@ async def save_settings(
         if repo != await update.get_repo():
             # 换仓库 = 换「面板去哪里取代码」：必须确认是本人操作
             security.check_step_up(request, user)
-            await update.set_repo(repo)
+            try:
+                await update.set_repo(repo)
+            except update.UpdateError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             changed["repo"] = repo
     if payload.auto_check is not None:
         await update.set_auto_check(bool(payload.auto_check))

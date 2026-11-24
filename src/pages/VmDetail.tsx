@@ -19,7 +19,7 @@ import {
   storagesApi,
   vmsApi,
 } from '../api/endpoints';
-import { setPageConnection, isNotImplemented } from '../api/client';
+import { setPageConnection, isNotImplemented, isNotFound } from '../api/client';
 import { PveQueryError } from '../components/SetupRequired';
 import { usePveReady } from '../hooks/usePveStatus';
 import { useRefreshInterval } from '../hooks/useRefreshInterval';
@@ -540,7 +540,10 @@ export function VmDetail() {
   }
 
   if (vmQuery.isError || !vm) {
-    const notImpl = isNotImplemented(vmQuery.error);
+    /* 404 要先于 isNotImplemented 判：ApiError 目前把 404 也算进
+       notImplemented，直接沿用会把「机器不属于你」显示成「接口暂不可用」。 */
+    const notFound = isNotFound(vmQuery.error);
+    const notImpl = !notFound && isNotImplemented(vmQuery.error);
     return (
       <div className="page">
         <Breadcrumb
@@ -550,7 +553,14 @@ export function VmDetail() {
           ]}
         />
         <PveQueryError
-          title={notImpl ? t('vmDetail.notAvailable') : t('vmDetail.loadFailed')}
+          title={
+            notFound
+              ? t('vmDetail.notFoundTitle')
+              : notImpl
+                ? t('vmDetail.notAvailable')
+                : t('vmDetail.loadFailed')
+          }
+          message={notFound ? t('vmDetail.notFoundMessage') : undefined}
           error={vmQuery.error}
           notImplemented={notImpl}
           onRetry={() => void vmQuery.refetch()}

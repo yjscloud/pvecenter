@@ -26,6 +26,7 @@ from .. import (
     throttle,
     totp,
     trusteddevices,
+    validators,
 )
 from ..config import settings
 from ..schemas import (
@@ -873,7 +874,7 @@ async def send_register_email_code(
         raise HTTPException(status_code=400, detail=detail)
 
     email = (payload.email or "").strip()
-    if not email or "@" not in email:
+    if not validators.is_email(email):
         raise HTTPException(status_code=400, detail="请填写正确的邮箱")
     if len(email) > 255:
         raise HTTPException(status_code=400, detail="邮箱长度不能超过 255 个字符")
@@ -1031,7 +1032,7 @@ async def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]
         raise HTTPException(
             status_code=400, detail="请填写邮箱，审批结果会发送到该邮箱"
         )
-    if "@" not in email:
+    if not validators.is_email(email):
         raise HTTPException(status_code=400, detail="邮箱格式不正确")
     if len(email) > 255:
         raise HTTPException(status_code=400, detail="邮箱长度不能超过 255 个字符")
@@ -1813,7 +1814,7 @@ async def update_me(
     email = (payload.email or "").strip()
     if len(email) > 255:
         raise HTTPException(status_code=400, detail="邮箱长度不能超过 255 个字符")
-    if email and "@" not in email:
+    if email and not validators.is_email(email):
         raise HTTPException(status_code=400, detail="邮箱格式不正确")
 
     record = await store.get_user(user["username"])

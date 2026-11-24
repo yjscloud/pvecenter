@@ -2052,7 +2052,12 @@ class SshHostIn(BaseModel):
 class SshJailPolicyIn(BaseModel):
     """自定义 fail2ban 封禁策略：写面板托管的 jail 片段并 reload。"""
 
-    jail: str = Field(min_length=1, max_length=32)
+    jail: str = Field(
+        min_length=1,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+        description="fail2ban jail 名（会拼进远端路径与配置段名）",
+    )
     maxretry: int = Field(default=5, ge=1, le=100)
     findtime: int = Field(default=600, ge=60, le=86400, description="统计窗口（秒）")
     bantime: int = Field(default=3600, ge=60, le=31536000, description="封禁时长（秒）")
@@ -2061,6 +2066,8 @@ class SshJailPolicyIn(BaseModel):
 class SshTargetIn(BaseModel):
     """对某个 jail 里的某个 IP 做操作。"""
 
+    # jail / ip 的字符白名单在业务层校验（sshguard.JAIL_NAME_RE / IP_RE），
+    # 那里同时覆盖本机与远端两条路径，且返回 400 带字段名。
     jail: str = Field(min_length=1, max_length=32)
     ip: str = Field(min_length=3, max_length=45)
 

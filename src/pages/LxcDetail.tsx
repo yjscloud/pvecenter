@@ -17,7 +17,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react
 import { useNavigate, useParams, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { lxcApi, storagesApi } from '../api/endpoints';
-import { setPageConnection } from '../api/client';
+import { setPageConnection, isNotFound } from '../api/client';
 import { guestPower } from '../api/guests';
 import { PveQueryError } from '../components/SetupRequired';
 import { usePveReady } from '../hooks/usePveStatus';
@@ -617,6 +617,7 @@ export function LxcDetail() {
     );
   }
   if (ctQuery.isError || !ct) {
+    const notFound = isNotFound(ctQuery.error);
     return (
       <div className="page">
         <Breadcrumb
@@ -626,7 +627,10 @@ export function LxcDetail() {
           ]}
         />
         <PveQueryError
-          title={t('lxcDetail.loadFailed')}
+          title={
+            notFound ? t('lxcDetail.notFoundTitle') : t('lxcDetail.loadFailed')
+          }
+          message={notFound ? t('lxcDetail.notFoundMessage') : undefined}
           error={ctQuery.error}
           onRetry={() => void ctQuery.refetch()}
         />

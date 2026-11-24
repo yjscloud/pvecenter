@@ -69,6 +69,11 @@ LOG_DIR = ROOT / "logs"
 #: 虽然来源是 GitHub 的 tag，但「上游返回什么就原样拼进脚本」是典型的注入口子。
 _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$")
 
+#: 仓库 slug（``owner/name``）。它同样会被拼进一段以 root 执行的 shell 脚本
+#: （``SRC_URL="https://github.com/<repo>/..."``），所以字符集必须与 tag 一样收死：
+#: 只要允许引号 / ``$()`` / 反引号，改一次「发布仓库」就等于拿到面板宿主机的 root。
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
 #: 源码包安装（从 Releases 下载 tar.gz 解开的，没有 .git）的标志文件。三个都在，
 #: 才认为这是一个结构完整的安装 —— 与 deploy.sh 自己的前置检查同一套标准。
 ARCHIVE_FILES = ("deploy.sh", "package.json", "backend/requirements.txt")
@@ -149,7 +154,7 @@ async def fetch_latest(
     ``transport`` 只为测试而留（注入 ``httpx.MockTransport``），生产走默认。
     """
     slug = str(repo or DEFAULT_REPO).strip() or DEFAULT_REPO
-    if not re.match(r"^[\w.-]+/[\w.-]+$", slug):
+    if not _REPO_RE.match(slug):
         raise UpdateError(i18n.pick("仓库地址不合法，应形如 owner/name", "Invalid repository, expected owner/name"))
     url = f"https://api.github.com/repos/{slug}/releases/latest"
     headers = {
@@ -221,7 +226,17 @@ async def get_repo() -> str:
 
 
 async def set_repo(repo: str) -> None:
-    await store.set_setting(REPO_KEY, str(repo or DEFAULT_REPO).strip())
+    """保存「面板去哪里取代码」。落库前必须校验：这个值会进 root 脚本。"""
+    slug = str(repo or DEFAULT_REPO).strip() or DEFAULT_REPO
+    if not _REPO_RE.match(slug):
+        raise UpdateError(
+            i18n.pick(
+                "仓库地址不合法，应形如 owner/name（只允许字母、数字、. _ -）",
+                "Invalid repository, expected owner/name "
+                "(letters, digits and . _ - only)",
+            )
+        )
+    await store.set_setting(REPO_KEY, slug)
 
 
 async def auto_check() -> bool:
@@ -1117,10 +1132,19 @@ async def apply_update(tag: str, *, allow_dirty: bool = False) -> Dict[str, Any]
     log = LOG_DIR / f"update-{stamp}.log"
     script = LOG_DIR / f"update-{stamp}.sh"
     outcome = LOG_DIR / f"update-{stamp}.result"
+    # repo 只给「源码包安装」用（下载 tar.gz 的地址就是它）。存量数据可能是在
+    # 加校验之前写进去的，这里再判一次：脚本一旦落盘就是以 root 执行的。
+    repo = await get_repo()
+    if not _REPO_RE.match(repo):
+        raise UpdateError(
+            i18n.pick(
+                f"发布仓库设置不合法：{repo}，请先在设置里改回 owner/name",
+                f"Invalid release repository setting: {repo}; set it back to owner/name",
+            )
+        )
     try:
-        # repo 只给「源码包安装」用（下载 tar.gz 的地址就是它）
         script.write_text(
-            _script_text(dep, target, log, outcome, await get_repo()), encoding="utf-8"
+            _script_text(dep, target, log, outcome, repo), encoding="utf-8"
         )
         script.chmod(0o700)
     except OSError as exc:
