@@ -15,6 +15,7 @@ from ..pve import (
     ProxmoxClient,
     ProxmoxError,
     all_connection_clients,
+    api_path,
     bound_connection,
     connection_label,
     get_client,
@@ -411,6 +412,27 @@ _CONTENT_TTL = 20.0
 #: 归属于某台客户机的内容类型：普通用户只能看自己名下机器的那几条。
 #: ISO / vztmpl / snippets 是共享基础设施，不参与归属过滤（否则连安装镜像都选不到）。
 _GUEST_CONTENT_TYPES = ("images", "rootdir", "backup", "import")
+#: 不参与归属过滤的**已知**共享类型。必须是白名单：认不出的条目一律丢弃，
+#: 否则一旦请求被打到别的 PVE 接口（用户表 / 任务列表），那些条目会被原样透传。
+_SHARED_CONTENT_TYPES = ("iso", "vztmpl", "snippets")
+
+#: 节点名 / 存储名。它们会拼进 PVE API 路径（``pve.api_path`` 已逐段编码，
+#: 这里是第二道）：只接受 PVE 实际会出现的字符集。
+_NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$")
+_STORAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _check_location(node: str, storage: str) -> None:
+    """校验 ``node`` / ``storage`` 的形状，不合法直接 400。
+
+    这两个值来自查询参数，最终会出现在 PVE API 路径上。``api_path`` 会做编码，
+    但「看起来就不像节点名」的值应该在入口就拒掉，而不是让它变成一个 404 或
+    一条被编码成怪物的请求。
+    """
+    if not _NODE_RE.match(str(node or "")):
+        raise HTTPException(status_code=400, detail="节点名不合法")
+    if not _STORAGE_RE.match(str(storage or "")):
+        raise HTTPException(status_code=400, detail="存储名不合法")
 
 
 async def _scope_storage_content(
@@ -457,7 +479,11 @@ async def _scope_storage_content(
 
         vmid = item.get("vmid")
         if ctype not in _GUEST_CONTENT_TYPES and vmid is None:
-            out.append(item)
+            # 只放行已知的共享类型；认不出的条目丢掉。这一条是「参数被当成路径」
+            # 的兜底：越权请求打到 /access/users 之类的接口时，返回的条目没有
+            # content 字段，不该被当作共享资源原样透传给普通用户。
+            if ctype in _SHARED_CONTENT_TYPES:
+                out.append(item)
             continue
         if vmid is None:
             # 明确是客户机内容却拿不到 vmid：无法判定归属，严格隔离
@@ -477,6 +503,7 @@ async def storage_content(
     vmid: Optional[int] = None,
     user: Dict[str, Any] = Depends(security.require_permission("storage.view")),
 ) -> List[Dict[str, Any]]:
+    _check_location(node, storage)
     client = get_client()
     # 连接作用域必须进 key：两台 PVE 上完全可能有同名节点 + 同名存储
     cache_key = (
@@ -537,14 +564,41 @@ async def delete_storage_content(
     Parameters are query strings rather than a JSON body because some proxies
     strip request bodies from DELETE requests.
     """
-    # 备份归档也走这个通用删除入口（备份页前端即如此），先做备份级用户隔离
-    await assert_backup_access(
-        user, node, storage, volid, strict_missing=False
-    )
+    _check_location(node, storage)
     client = get_client()
+
+    # 先确认这个卷真的存在：既拿到 content / vmid 用于归属判定，也避免「卷不存在
+    # 也照发 DELETE」。注入形态（volid 里带 ../ 或 ?）在这里必然 404，请求根本
+    # 发不出去 —— 这是除了路径编码之外的第二道。
+    try:
+        items = await client.storage_content(node, storage) or []
+    except ProxmoxError as exc:
+        _raise(exc)
+    item = next(
+        (i for i in items if str(i.get("volid") or "") == volid), None
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="该卷不存在")
+
+    ctype = str(item.get("content") or "")
+    volume = volid.split(":", 1)[-1] if ":" in volid else volid
+    if ctype == "backup" or "vzdump" in volid:
+        # 备份归档：严格归属（找不到卷 / 无归属 = 拒绝），改派后备份跟着机器走
+        await assert_backup_access(
+            user, node, storage, volid, strict_missing=True
+        )
+    elif ctype == "import" or volume.startswith("import/"):
+        await guestguard.require_import_object(user, storage, volume)
+    elif item.get("vmid") is not None:
+        # 磁盘卷：按所属客户机的归属判定（rootdir = 容器，其余按虚拟机）
+        kind = "ct" if ctype == "rootdir" else "vm"
+        await guestguard.require_guest_object(
+            user, node, int(item["vmid"]), kind
+        )
+
     try:
         await client.delete(
-            f"/nodes/{node}/storage/{storage}/content/{volid}"
+            api_path("nodes", node, "storage", storage, "content", volid)
         )
     except ProxmoxError as exc:
         await security.audit(

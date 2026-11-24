@@ -440,9 +440,19 @@ async def _probe_registration(
             ),
         ) from exc
     except ProxmoxError as exc:
-        detail = f"连接失败：{exc.message}"
-        if _is_tls_verify_error(exc.message):
-            detail += _tls_hint(payload)
+        # 失败原因走 ssrfguard 的固定文案：上游正文、内部地址与请求路径一律不
+        # 回显。这条链路允许持码者指定 ``host:port``，差异化回显就是「端口扫描器」
+        # 的另一半（另一半是退码，见 connregister.record_failure）。
+        #
+        # TLS 一类是例外：它只说明「这个端口不是 TLS」，对扫描器没有额外价值，
+        # 而排障时非看原文不可（CERTIFICATE_VERIFY_FAILED 与协议不匹配的处理
+        # 方式完全不同），所以保留原文并接上能直接照做的下一步。
+        code, text = ssrfguard.classify_failure(exc)
+        if code == "not_tls" or _is_tls_verify_error(exc.message):
+            raw = " ".join(str(exc.message or "").split())[:200]
+            detail = f"连接失败：{raw}" + _tls_hint(payload)
+        else:
+            detail = f"连接失败：{text}"
         raise HTTPException(status_code=400, detail=detail) from exc
     finally:
         await client.aclose()
@@ -844,8 +854,18 @@ async def register_connection(
     try:
         probe = await _probe_registration(payload)
     except Exception:  # noqa: BLE001 - 任何失败都要把码退回，让人改完参数直接重跑
-        await connregister.release(code_id)
+        # 退码有上限：同一张码 10 分钟内最多免费失败 3 次，超出就真扣一次额度。
+        # 否则持码者可以不断更换 host:port 让面板去连，把这张「一次性接入许可」
+        # 变成不用登录的内网扫描额度。
+        if await connregister.record_failure(code_id):
+            await connregister.release(code_id)
+        else:
+            logger.warning(
+                "注册码 %s 探活失败次数过多，本次不再退回额度", code_id
+            )
         raise
+
+    await connregister.reset_failures(code_id)
 
     region = str(code_row.get("region") or payload.region or "").strip()
 

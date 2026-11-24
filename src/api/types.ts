@@ -405,6 +405,9 @@ export interface SliderTracePoint {
 /** 自助修改个人信息（当前仅邮箱可改） */
 export interface ProfileUpdateInput {
   email: string;
+  /** 改邮箱等于改「找回密码」的收件地址，需再验证一次身份；邮箱没变可不传 */
+  current_password?: string;
+  totp_code?: string;
 }
 
 /** 自助修改密码：需提供当前密码；开了两步验证还要带动态码 */

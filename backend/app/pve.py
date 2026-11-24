@@ -30,6 +30,26 @@ from . import reqmetrics
 from .backup_volid import archive_guest_type
 from .config import settings
 
+
+def api_path(*segments: Any) -> str:
+    """把路径段拼成 PVE API 路径，**逐段编码**。
+
+    为什么要这个函数：``node`` / ``storage`` / ``volid`` 这类名字来自请求参数，
+    历史上是直接 f-string 拼进 URL 的。PVE 的路由会把 ``..``（httpx 会做 RFC 3986
+    点段归一化）和 ``?`` 当成路径 / 查询串处理，于是「只读的存储内容接口」
+    可以被改写成任意 PVE API 调用 —— 而面板手里是集群 root 令牌。
+
+    传进来的每一段都按「不透明名字」处理（``/`` 也会被编码成 ``%2F``），
+    静态路径也当段传：``api_path("nodes", node, "storage", storage, "content")``。
+    """
+    parts: List[str] = []
+    for seg in segments:
+        text = str(seg if seg is not None else "").strip()
+        if not text:
+            continue
+        parts.append(quote(text.strip("/"), safe=""))
+    return "/" + "/".join(parts)
+
 logger = logging.getLogger(__name__)
 
 # UPID format: UPID:<node>:<pid>:<pstart>:<starttime>:<type>:<id>:<user>:<comment>
@@ -611,7 +631,7 @@ class ProxmoxClient:
     # -------------------------------------------------------------- storage
     async def storages(self, node: Optional[str] = None) -> List[Dict[str, Any]]:
         if node:
-            data = await self.get(f"/nodes/{node}/storage")
+            data = await self.get(api_path("nodes", node, "storage"))
             for item in data or []:
                 item.setdefault("node", node)
             return data or []
@@ -630,8 +650,9 @@ class ProxmoxClient:
             params["content"] = content
         if vmid:
             params["vmid"] = vmid
+        # 段内编码：node/storage 是请求参数，不能当作路径的一部分直接拼
         data = await self.get(
-            f"/nodes/{node}/storage/{storage}/content", params=params
+            api_path("nodes", node, "storage", storage, "content"), params=params
         )
         return data or []
 
@@ -677,7 +698,7 @@ class ProxmoxClient:
         Lock 这类存储侧能力。旧版本 PVE 可能不支持该字段，调用方要容忍失败。
         """
         await self.put(
-            f"/nodes/{node}/storage/{storage}/content/{volume}",
+            api_path("nodes", node, "storage", storage, "content", volume),
             data={"protected": 1 if protected else 0},
         )
 

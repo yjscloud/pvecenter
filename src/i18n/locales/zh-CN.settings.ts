@@ -250,6 +250,10 @@ export const zhSettings = {
   'profile.permsOverride': '已由管理员单独指定权限（不随角色变化）',
   'profile.fieldEmail': '邮箱',
   'profile.fieldEmailHint': '可选，用于接收通知；留空表示不设置',
+  'profile.fieldEmailPwd': '当前密码',
+  'profile.fieldEmailPwdHint':
+    '修改邮箱会改变「找回密码」的收件地址，因此需要验证当前密码；开了两步验证还要输入动态码。',
+  'profile.emailPwdRequired': '修改邮箱前请输入当前密码',
   'profile.saveChanges': '保存修改',
   'profile.revert': '还原',
   'profile.saved': '已保存',

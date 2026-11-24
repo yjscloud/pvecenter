@@ -256,7 +256,7 @@ class TestTokenModule:
 
         # 本人（或管理员传 None）才删得掉
         assert _run(apitokens.purge(int(created["id"]), username="admin")) is True
-        assert _exec("SELECT id FROM api_tokens WHERE id = %s", (created["id"],)) == []
+        assert not _exec("SELECT id FROM api_tokens WHERE id = %s", (created["id"],))
 
     def test_last_used_is_written_but_throttled(self, db) -> None:
         created = _run(apitokens.create("admin", name="采集"))

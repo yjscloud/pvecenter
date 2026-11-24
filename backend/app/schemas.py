@@ -1776,9 +1776,16 @@ class ApprovalRequest(BaseModel):
 
 
 class ProfileUpdate(BaseModel):
-    """自助修改个人信息（仅邮箱；用户名与角色由管理员维护）。"""
+    """自助修改个人信息（仅邮箱；用户名与角色由管理员维护）。
+
+    改邮箱等于改「找回密码的收件地址」，所以真正变更时要带当前口令（开了两步
+    验证还要动态码）—— 否则一枚被捡到的 token 就能把账号的找回入口换成自己的。
+    邮箱没变时这两项可以不传。
+    """
 
     email: str = ""
+    current_password: str = ""
+    totp_code: str = ""
 
 
 class StepUpRequest(BaseModel):

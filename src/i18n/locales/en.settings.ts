@@ -267,6 +267,10 @@ export const enSettings: Partial<Record<MessageKey, string>> = {
   'profile.permsOverride': 'Permissions were assigned individually by an administrator (they do not follow the role)',
   'profile.fieldEmail': 'Email',
   'profile.fieldEmailHint': 'Optional; used to receive notifications. Leave blank for none',
+  'profile.fieldEmailPwd': 'Current password',
+  'profile.fieldEmailPwdHint':
+    'Changing your email changes where password-reset links go, so it needs your current password — plus a two-factor code if enabled.',
+  'profile.emailPwdRequired': 'Enter your current password to change the email',
   'profile.saveChanges': 'Save changes',
   'profile.revert': 'Revert',
   'profile.saved': 'Saved',

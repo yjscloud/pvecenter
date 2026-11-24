@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS connection_register_codes (
     used_by       VARCHAR(191) NOT NULL DEFAULT '',
     connection_id VARCHAR(40)  NOT NULL DEFAULT '',
     revoked       TINYINT      NOT NULL DEFAULT 0,
+    fail_count    INT          NOT NULL DEFAULT 0,
+    fail_at       BIGINT       NOT NULL DEFAULT 0,
     PRIMARY KEY (id),
     UNIQUE KEY uk_conn_reg_hash (code_hash),
     KEY idx_conn_reg_created (created)
@@ -98,6 +100,18 @@ async def init_table() -> None:
             await db.execute(
                 "ALTER TABLE connection_register_codes"
                 " ADD COLUMN read_only TINYINT NOT NULL DEFAULT 0"
+            )
+        # 失败计数：探活失败仍然退码（运维打错 IP 不必重签），但不能无限退 ——
+        # 否则一张码就是「任意 host:port 探测」的免费额度，见 record_failure。
+        if "fail_count" not in columns:
+            await db.execute(
+                "ALTER TABLE connection_register_codes"
+                " ADD COLUMN fail_count INT NOT NULL DEFAULT 0"
+            )
+        if "fail_at" not in columns:
+            await db.execute(
+                "ALTER TABLE connection_register_codes"
+                " ADD COLUMN fail_at BIGINT NOT NULL DEFAULT 0"
             )
         await db.execute(
             "UPDATE connection_register_codes SET used_count=1"
@@ -314,6 +328,65 @@ async def release(code_id: str) -> None:
             await db.commit()
     except Exception:  # noqa: BLE001
         logger.warning("退回注册码失败", exc_info=True)
+
+
+#: 同一张码在窗口期内最多「免费失败」几次。
+#:
+#: 探活失败退码是运维体验上的必要让步（打错一个 IP 不该让码少一次），但它同时
+#: 把「一张码只能探一次」收窄成了「一张码可以无限探」：每次换个 ``host:port``，
+#: 面板就会去连一次，而失败原因（拒绝 / 超时 / TLS / 协议错）本身有区分度。
+#: 因此退码要给个上限，越过之后这次就真扣一次额度。
+REFUND_FAILURE_LIMIT = 3
+#: 失败计数的统计窗口（秒）：窗口外的失败从头计数。
+FAILURE_WINDOW_SECONDS = 600
+
+
+async def record_failure(code_id: str) -> bool:
+    """记一次探活失败，返回「这次是否还该把额度退回去」。
+
+    窗口期（``FAILURE_WINDOW_SECONDS``）内失败次数不超过 ``REFUND_FAILURE_LIMIT``
+    时退码；超过就不再退 —— 持码者每多探一个目标都要消耗一次真实额度。
+    """
+    if not code_id:
+        return True
+    now = int(time.time())
+    window_start = now - FAILURE_WINDOW_SECONDS
+    try:
+        async with database.connect() as db:
+            await db.execute(
+                "UPDATE connection_register_codes"
+                " SET fail_count = CASE WHEN fail_at>=? THEN fail_count+1 ELSE 1 END,"
+                "     fail_at = ?"
+                " WHERE id=?",
+                (window_start, now, str(code_id)),
+            )
+            cursor = await db.execute(
+                "SELECT fail_count FROM connection_register_codes WHERE id=?",
+                (str(code_id),),
+            )
+            row = await cursor.fetchone()
+            await db.commit()
+        count = int((_row(row) or {}).get("fail_count") or 0)
+        return count <= REFUND_FAILURE_LIMIT
+    except Exception:  # noqa: BLE001 - 记不上就按「不退了」处理，宁可扣一次额度
+        logger.warning("记录注册码失败次数失败", exc_info=True)
+        return False
+
+
+async def reset_failures(code_id: str) -> None:
+    """接入成功后清零失败计数，下次接入重新获得免费重试额度。"""
+    if not code_id:
+        return
+    try:
+        async with database.connect() as db:
+            await db.execute(
+                "UPDATE connection_register_codes SET fail_count=0, fail_at=0"
+                " WHERE id=?",
+                (str(code_id),),
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("清零注册码失败次数失败", exc_info=True)
 
 
 async def bind_connection(code_id: str, connection_id: str) -> None:

@@ -106,6 +106,9 @@ export function Profile() {
   const [email, setEmail] = useState(user?.email ?? '');
   const [savingProfile, setSavingProfile] = useState(false);
   const [profileError, setProfileError] = useState<string | undefined>();
+  /* 改邮箱要二次验证：邮箱是找回密码的收件地址，只凭一枚会话令牌不算数 */
+  const [emailPwd, setEmailPwd] = useState('');
+  const [emailTotp, setEmailTotp] = useState('');
 
   const savedEmail = user?.email ?? '';
   const emailDirty = email.trim() !== savedEmail;
@@ -183,13 +186,30 @@ export function Profile() {
       setProfileError(invalid);
       return;
     }
+    /* 只有真的改了邮箱才要口令：单纯点保存不该被拦 */
+    if (emailDirty) {
+      if (!emailPwd) {
+        setProfileError(t('profile.emailPwdRequired'));
+        return;
+      }
+      if (user?.totp_enabled && !emailTotp.trim()) {
+        setProfileError(t('profile.totpRequired'));
+        return;
+      }
+    }
     setProfileError(undefined);
     setSavingProfile(true);
     try {
-      const updated = await authApi.updateProfile({ email: email.trim() });
+      const updated = await authApi.updateProfile({
+        email: email.trim(),
+        current_password: emailDirty ? emailPwd : undefined,
+        totp_code: emailDirty && user?.totp_enabled ? emailTotp.trim() : undefined,
+      });
       // 后端返回的是权威值：用它覆盖本地状态与缓存，避免界面与库不一致
       await refresh().catch(() => undefined);
       setEmail(updated.email ?? email.trim());
+      setEmailPwd('');
+      setEmailTotp('');
       toast.success(t('profile.saved'), t('profile.savedDetail'));
     } catch (err) {
       setProfileError(errorMessage(err));
@@ -555,6 +575,41 @@ export function Profile() {
               />
             </Field>
 
+            {/* 改邮箱等于改「找回密码」的收件地址：只凭会话令牌不够，要再验证
+                一次身份。邮箱没变时不显示，避免日常保存也被表单拦住。 */}
+            {emailDirty ? (
+              <>
+                <Field
+                  label={t('profile.fieldEmailPwd')}
+                  hint={t('profile.fieldEmailPwdHint')}
+                >
+                  <Input
+                    type="password"
+                    value={emailPwd}
+                    onChange={(e) => {
+                      setEmailPwd(e.target.value);
+                      if (profileError) setProfileError(undefined);
+                    }}
+                    autoComplete="current-password"
+                  />
+                </Field>
+                {user?.totp_enabled ? (
+                  <Field label={t('profile.fieldTotp')}>
+                    <Input
+                      value={emailTotp}
+                      onChange={(e) => {
+                        setEmailTotp(e.target.value);
+                        if (profileError) setProfileError(undefined);
+                      }}
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      placeholder="123456"
+                    />
+                  </Field>
+                ) : null}
+              </>
+            ) : null}
+
             <div className="form-row">
               <Button
                 variant="primary"
@@ -569,6 +624,8 @@ export function Profile() {
                 variant="ghost"
                 onClick={() => {
                   setEmail(savedEmail);
+                  setEmailPwd('');
+                  setEmailTotp('');
                   setProfileError(undefined);
                 }}
                 disabled={!emailDirty || savingProfile}

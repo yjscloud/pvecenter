@@ -1816,6 +1816,44 @@ async def update_me(
     if email and "@" not in email:
         raise HTTPException(status_code=400, detail="邮箱格式不正确")
 
+    record = await store.get_user(user["username"])
+    if not record:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    # 邮箱是「找回密码」的收件地址：改它等于把账号的找回入口交出去。所以真正
+    # 变更时必须再验证一次身份 —— 只凭一枚可能被捡到的 token 不算数。
+    # 与「改密码 / 关两步验证」同档：当前口令（+ 开了 2FA 时的动态码）。
+    changed = (record.get("email") or "").strip().lower() != email.lower()
+    if changed:
+        if not security.verify_password(
+            payload.current_password or "", record["password_hash"]
+        ):
+            await security.audit(
+                request,
+                user,
+                "auth.profile_update",
+                target=user["username"],
+                result="failed",
+                detail="修改邮箱时当前密码不正确",
+            )
+            raise HTTPException(
+                status_code=400, detail="修改邮箱需要输入当前密码"
+            )
+        if record.get("totp_enabled"):
+            if not payload.totp_code:
+                raise HTTPException(status_code=400, detail="请输入两步验证动态码")
+            ok, _ = await totp.verify_login_code(record, payload.totp_code)
+            if not ok:
+                await security.audit(
+                    request,
+                    user,
+                    "auth.profile_update",
+                    target=user["username"],
+                    result="failed",
+                    detail="修改邮箱时两步验证码不正确",
+                )
+                raise HTTPException(status_code=400, detail="两步验证码不正确")
+
     updated = await store.update_user(user["username"], email=email) or {}
     await security.audit(
         request,

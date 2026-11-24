@@ -25,6 +25,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
+from app import diskspec  # noqa: E402
 from app.routers import templates as templates_router  # noqa: E402
 
 
@@ -59,7 +60,7 @@ def _storage(name, *, shared, content="vztmpl"):
 def _list(client, monkeypatch, profile=None):
     """跑一次端点，客户端换成假的（依赖注入的参数直接给 user）。"""
     monkeypatch.setattr(
-        templates_router, "all_connection_clients", lambda: [(profile, client)]
+        templates_router, "collection_targets", lambda: [(profile, client)]
     )
     return asyncio.run(templates_router.list_ct_system_templates(user={}))
 
@@ -142,7 +143,7 @@ class TestSharedStorageIsDeduplicated:
         first = _FakeClient(["node01"], shared_storages, volumes)
         monkeypatch.setattr(
             templates_router,
-            "all_connection_clients",
+            "collection_targets",
             lambda: [
                 (_profile("conn-1", "PVE 1"), first),
                 (_profile("conn-2", "PVE 2"), _FakeClient(["node01"], shared_storages, volumes)),
@@ -234,6 +235,8 @@ class TestResponseShape:
             # name 是 volid 的最后一段：卡片标题、搜索都用它
             "name": "rocky-9-default.tar.xz",
             "size": 100_000_000,
+            # 解包后所需根盘（前端据此提示「建议至少 N G」）
+            "min_rootfs_gb": diskspec.estimate_rootfs_gb(100_000_000),
             "ctime": None,
             "shared": False,
             "connection_id": "conn-1",
@@ -270,17 +273,20 @@ class TestResponseShape:
         assert [r["name"] for r in rows] == ["alpha.tar.zst", "zebra.tar.zst"]
 
     def test_no_connection_configured_yet(self, monkeypatch) -> None:
-        """面板还没配连接：all_connection_clients 返回空，端点也不能炸。"""
-        monkeypatch.setattr(templates_router, "all_connection_clients", lambda: [])
-        monkeypatch.setattr(
-            templates_router,
-            "get_client",
-            lambda: _FakeClient(
-                ["node01"],
-                {"node01": [_storage("local", shared=False)]},
-                {"local": ["rocky-9.tar.xz"]},
-            ),
+        """面板还没配连接：退回兜底客户端（None, client），端点也不能炸。
+
+        「没有保存过连接」时由 :func:`pve.collection_targets` 负责回退，所以这里
+        直接给出它回退后的结果，而不是把目标列表清空。
+        """
+        fallback = _FakeClient(
+            ["node01"],
+            {"node01": [_storage("local", shared=False)]},
+            {"local": ["rocky-9.tar.xz"]},
         )
+        monkeypatch.setattr(
+            templates_router, "collection_targets", lambda: [(None, fallback)]
+        )
+        monkeypatch.setattr(templates_router, "get_client", lambda: fallback)
 
         rows = asyncio.run(templates_router.list_ct_system_templates(user={}))
 
