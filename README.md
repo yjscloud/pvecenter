@@ -1,7 +1,5 @@
 <div align="center">
-<h1>pvecenter</h1>
-<p><b>Proxmox VE 8.x / 9.x 管理面板</b><br>
-<sub>虚拟机 · 容器 · 模板 · 网络 · 备份 · 证书 · 权限，一个界面管完</sub></p>
+<p><img src="docs/screenshots/banner.png" alt="pvecenter —— Proxmox VE 8.x / 9.x 管理面板" width="880"></p>
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/yjscloud/pvecenter?color=blue" alt="License"></a>
   <a href="../../releases"><img src="https://img.shields.io/github/v/release/yjscloud/pvecenter?sort=semver&color=success&label=release" alt="Release"></a>
@@ -14,7 +12,7 @@
   <img src="https://img.shields.io/badge/Proxmox%20VE-8.x%20%2F%209.x-e57000" alt="Proxmox VE">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776ab" alt="Python">
   <img src="https://img.shields.io/badge/React-19-61dafb" alt="React">
-  <img src="https://img.shields.io/badge/MySQL-8-4479A1" alt="MySQL">
+  <img src="https://img.shields.io/badge/Database-MySQL%20%2F%20MariaDB-4479A1" alt="数据库：MySQL / MariaDB">
   <img src="https://img.shields.io/badge/Docker-compose-2496ED" alt="Docker">
 </p>
 <p>
@@ -26,17 +24,17 @@
 
 **pvecenter** 是一个开源自托管的 **Proxmox VE（PVE）Web 管理面板**。一套界面管 QEMU 虚拟机、LXC 容器、cloud-init 模板、存储与网络、快照备份、内网穿透、VNC 控制台、证书和账号权限，还能同时接管多台 PVE。装成 systemd 服务或用 Docker 跑，机器重启后自己起来。
 
-一句话概括：PVE 负责虚拟化，pvecenter 负责它上面那层运营：多台集群收进一个视图、批量下发，再加上账号、配额、证书和审计。每项的细节和边界在 [功能说明](docs/features.md)。
+一句话概括：PVE 负责虚拟化，pvecenter 负责它上面那层运营：多台集群收进一个视图、批量下发，再加上账号、配额、证书和审计。
 
-> Self-hosted **Proxmox VE (PVE) web UI** for QEMU VMs, LXC containers, cloud-init templates,
-> networking, firewalls, backups, monitoring, certificates and RBAC.
+适合家庭实验室（homelab）、小团队，以及要把 PVE 开放给多人用的场景。
+
+**在线演示**：<https://pvecenter.yjscloud.com>。不预置账号，登录页点「注册」自己开一个，管理员审批通过后就能进；急着看就扫码找我。
+
+> Self-hosted **Proxmox VE (PVE) web UI** for QEMU VMs, LXC containers, cloud-init templates, networking, firewalls, backups, monitoring, certificates and RBAC.
 >
-> 适合家庭实验室（homelab）、小团队，以及要把 PVE 开放给多人用的场景。
+> 关键词：Proxmox VE 管理面板 · PVE 面板 · PVE Web UI · LXC 容器管理 · QEMU / KVM · cloud-init 模板 · 自托管虚拟化平台 · Proxmox alternative UI · homelab · self-hosted
 
-> 关键词：Proxmox VE 管理面板 · PVE 面板 · PVE Web UI · LXC 容器管理 · QEMU / KVM ·
-> cloud-init 模板 · 自托管虚拟化平台 · Proxmox alternative UI · homelab · self-hosted
-
-**在线演示**：<https://pvecenter.yjscloud.com>
+---
 
 ## 目录
 
@@ -48,8 +46,7 @@
 
 ## 联系与支持
 
-遇到问题、想提建议，或者需要部署协助，扫码加微信；也可以到
-[Issues](https://github.com/yjscloud/pvecenter/issues) 留言。部分功能还没经过充分测试，遇到问题直接说。
+遇到问题、想提建议，或者需要部署协助，扫码加微信；也可以到 [Issues](https://github.com/yjscloud/pvecenter/issues) 留言。部分功能还没经过充分测试，遇到问题直接说。
 
 pvecenter 由个人维护。它帮你省下时间的话，欢迎自愿赞赏，用于服务器、测试环境和后续维护；不赞赏也完全不影响使用和技术支持。
 
@@ -93,11 +90,15 @@ pvecenter 由个人维护。它帮你省下时间的话，欢迎自愿赞赏，�
 | **AI 助手** | 拿巡检数据做归因，只读命令白名单，写操作逐条审批 |
 | **日常** | 后台作业、任务队列、站内通知、`Ctrl / ⌘ + K` 命令面板、一键更新、站点品牌与入口开关 |
 
+有几块只读不写：集群仲裁、HA、Ceph、SDN 能看状态，配置仍回 PVE 做；PBS 的 prune / GC / verify 留在 PBS 控制台；PVE 节点自身的安装和升级也不碰。
+
 上面每个模块的具体范围、参数和已知边界，[功能说明](docs/features.md) 里逐条写了。
 
 ---
 
 ## 快速开始
+
+两种装法，二选一：裸机跑 `deploy.sh`，或者只用 Docker 起容器。
 
 ### 环境要求
 
@@ -109,13 +110,17 @@ pvecenter 由个人维护。它帮你省下时间的话，欢迎自愿赞赏，�
 | Node.js | 22.22+ | 自动：`deploy.sh` 自己装，只有手工构建前端时才需要预装 |
 | Docker + Compose | v2 | 只用容器方式时需要 |
 
-面板本身很轻，但建议单独开一台虚拟机来跑，别和 PVE 挤在同一台：`deploy.sh` 会在这台机器上装 MariaDB、加 systemd 服务，安全基线和 SSH 登录审计读的也是这台机器的日志，混在 PVE 节点上，这些读数说的就是 PVE 自己。系统支持 Ubuntu、Debian、CentOS、TencentOS，RHEL / Rocky / Alma / openEuler 与 Alpine 也能装；Debian 12+ 和 Ubuntu 24.04+ 自带 Python 3.11，更老的版本得先补一个 3.11 再跑脚本。
+面板自己很轻，2 核 2 GB 的机器就够：
 
 | 资源 | 起步 | 说明 |
 |---|---|---|
 | CPU | 2 核 | 1 核也能跑，前端构建和批量下发会明显变慢 |
 | 内存 | 2 GB | 前端构建（`npm run build`）是内存峰值，1 GB 的机器常卡在这一步；用 Docker 镜像不构建 |
 | 磁盘 | 3 GB | 源码、依赖、虚拟环境与前端产物合计约 1 GB，其余留给日志、指标历史和数据库 |
+
+**装在哪**：别装进 PVE 宿主机的 root 系统。常见做法是在 PVE 上单开一台小 VM：`deploy.sh` 会在这台 VM 里装 MariaDB、加 systemd 服务，安全基线和 SSH 审计读的也是它的日志；装进宿主机，这些读数就成了 PVE 节点自己的，出了事分不清是哪一层。
+
+**系统**：Linux + systemd。Debian 12+、Ubuntu 24.04+、RHEL 9 系（Rocky 9 / Alma 9 / TencentOS 4 / openEuler）和 Fedora 能直接装，仓库里有 Python 3.11，缺的依赖 `deploy.sh` 自己补。RHEL 8 / CentOS 8、Ubuntu 20.04 / 22.04、Debian 11 也能跑，先装好 Python 3.11 就行；脚本会自己试一次，试不出来就把该敲的命令列给你。
 
 ### 裸机安装
 
@@ -125,13 +130,15 @@ cd pvecenter
 sudo ./deploy.sh
 ```
 
-一次装完依赖、前端产物、数据库和 systemd 服务，全程不提问。最后一屏打印面板地址和初始口令，口令只显示这一次。重复执行不会弄坏已有配置，想指定端口或库名就直接传参：
+一次装完依赖、前端产物、数据库和 systemd 服务，全程不提问。最后一屏打印面板地址和初始口令，口令只显示这一次。重复执行不会弄坏已有配置。
+
+想换端口或库名，直接传参：
 
 ```bash
 sudo ./deploy.sh --port 9000 --db-name pvecenter_panel
 ```
 
-完整参数用 `./deploy.sh --help` 看，端口、HTTPS、反代和服务管理的细节在 [部署指南](docs/deployment.md)。
+完整参数用 `./deploy.sh --help` 看。端口、HTTPS、反代和服务管理的细节在 [部署指南](docs/deployment.md)。
 
 装完确认服务起来了：
 
@@ -141,7 +148,7 @@ curl http://127.0.0.1:8080/api/health
 
 ### Docker 安装
 
-不想在宿主机装 Python / Node / 数据库就用容器，宿主机只要有 Docker：
+不想在服务器装 Python / Node / 数据库就用容器，只要服务器有 Docker：
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/yjscloud/pvecenter/main/docker-compose.yml
@@ -150,11 +157,13 @@ echo "登录口令：$ADMIN_PASSWORD"
 docker compose up -d
 ```
 
-打开 `http://你的服务器IP:8080`，账号 `admin`，口令就是上面生成并打印出来的那个（短于 12 位后端会拒绝启动）。连库口令和数据库管理员口令在 `docker-compose.yml` 里，搜 `★ 改这里`，公网部署前一并换掉。
+打开 `http://你的服务器IP:8080`，账号 `admin`，口令就是上面生成并打印出来的那个（短于 12 位后端会拒绝启动）。
+
+这个口令只在库里还没有管理员时用来建号；已经跑过的实例，重跑上面的命令不会改现有口令，请登录后在「个人中心 → 修改密码」改。连库口令和数据库管理员口令在 `docker-compose.yml` 里，搜 `★ 改这里`，公网部署前一并换掉。
 
 ### 接入 PVE
 
-登录进去第一件事是把 PVE 接进来。不想手动建账号、发 Token、填表单，就走批量接入：
+登录进去第一件事是把 PVE 接进来。不想手动建账号、发 Token、填表单，就走批量接入。
 
 **打开面板 → 集群节点 → 连接配置 → 批量接入**，面板会生成一条命令。复制到 PVE 节点上以 root 执行，建账号、建令牌、注册到面板、结果自检都由脚本完成，失败自动回滚并说明原因。
 
@@ -171,6 +180,8 @@ docker compose up -d
 ---
 
 ## 文档
+
+按你现在要干的事选，不用从头读。
 
 | 我想…… | 看这里 |
 |---|---|
@@ -190,6 +201,6 @@ docker compose up -d
 
 ## 许可证
 
-本项目以 [Apache-2.0](LICENSE) 许可发布。
+本项目以 [Apache-2.0](LICENSE) 许可发布。改代码、提 PR 之前，先看一眼 [贡献指南](CONTRIBUTING.md)。
 
 如果这个项目对你有帮助，点一个 Star 是最直接的支持。
