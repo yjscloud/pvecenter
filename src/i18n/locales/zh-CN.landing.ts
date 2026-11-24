@@ -82,7 +82,7 @@ export const zhLanding = {
   'landing.security.resultDenied': '已拦截',
   'landing.security.resultFailed': '失败',
   'landing.start.title': '四步开始用',
-  'landing.start.desc': '从部署到拥有第一台自动化交付的虚拟机，通常不超过半小时。命令就是下面这三行，复制即可。',
+  'landing.start.desc': '从部署到拥有第一台自动化交付的虚拟机，通常不超过半小时。命令就是下面这几行，复制即可。',
 
   /* ------------------------------------------------------ 官网：架构 / 场景 */
   'landing.architecture.title': '一套面板，管住多套集群',

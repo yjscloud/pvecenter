@@ -5,14 +5,16 @@ import asyncio
 import json
 import logging
 import platform
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
+from html import escape
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
@@ -1436,6 +1438,151 @@ async def robots_txt() -> PlainTextResponse:
 DIST_DIR = BASE_DIR.parent / "dist"
 
 
+# ------------------------------------------------------- 入口页品牌注入
+# 品牌名存在 settings 表里，index.html 却是构建产物：不做处理的话，浏览器先
+# 渲染写死的「pvecenter」，等 React 起来、/api/config/site 回来才换成真实站点
+# 名 —— 标签页肉眼可见地闪一下，图标同理（先空着，再弹出自定义 Logo）。
+#
+# 这里在返回入口页时把标题 / 描述 / 图标替换掉，首帧就是对的。只做字符串替换、
+# 不改构建流程：dist/index.html 仍是普通静态文件，被 CDN 或独立静态服务器直接
+# 托管时退化成写死的兜底值，不会把占位符泄漏给用户。
+
+_HTML_TITLE_RE = re.compile(r"<title>.*?</title>", re.S)
+_HTML_DESC_RE = re.compile(r'(<meta\s+name="description"\s+content=")[^"]*(")', re.S)
+_HTML_ICON_RE = re.compile(r'<link\s+rel="icon"[^>]*>', re.S)
+_HTML_LANG_RE = re.compile(r'<html\s+lang="[^"]*"', re.S)
+
+# 站点信息也塞进 <meta>，前端首帧就用它做 React Query 的 placeholderData：
+# 否则侧边栏 / 登录页的品牌名还是会先显示兜底的「pvecenter」，接口回来才换。
+_HTML_META_RE = {
+    key: re.compile(rf'(<meta\s+name="{key}"\s+content=")[^"]*(")', re.S)
+    for key in ("site-name", "site-subtitle", "site-logo")
+}
+
+# 站点信息缓存 15 秒：入口页一被请求就要用到它，每个请求都查库（一次读三行 KV）
+# 不划算；改名后最多 15 秒生效，比进程内缓存一辈子安全。
+_BRAND_TTL = 15.0
+_brand_cache: Dict[str, Any] = {
+    "at": -1e9,
+    "rev": -1,
+    "name": "pvecenter",
+    "subtitle": "",
+    "logo": None,
+}
+
+# index.html 正文按 mtime 缓存：升级后文件变了要重读，没变就别反复读盘
+_index_cache: Dict[str, Any] = {"mtime": -1.0, "text": ""}
+
+
+def _index_template() -> str:
+    path = DIST_DIR / "index.html"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return ""
+    if _index_cache["mtime"] != mtime:
+        _index_cache["text"] = path.read_text(encoding="utf-8")
+        _index_cache["mtime"] = mtime
+    return str(_index_cache["text"])
+
+
+_BRAND_FAIL_TTL = 3.0
+
+
+async def _site_branding() -> Tuple[str, str, Optional[str]]:
+    """站点名 / 副标题 / logo 地址；读库失败时沿用上一次成功的值，绝不让首页 500。"""
+    now = time.monotonic()
+    fresh = now - float(_brand_cache["at"]) < _BRAND_TTL
+    # 改名 / 换 logo 会让 revision 立刻变化，不必等缓存过期
+    if fresh and _brand_cache["rev"] == site.brand_revision:
+        return (
+            str(_brand_cache.get("name") or "pvecenter"),
+            str(_brand_cache.get("subtitle") or ""),
+            _brand_cache.get("logo"),
+        )
+
+    try:
+        info = await site.get_site_info()
+    except Exception:  # noqa: BLE001 —— 品牌信息读不到不影响页面本身
+        logger.warning("读取站点信息失败，入口页沿用上一次的品牌", exc_info=True)
+        # 只压 3 秒：数据库抖一下不能让标题错一整轮缓存周期
+        _brand_cache["at"] = now - (_BRAND_TTL - _BRAND_FAIL_TTL)
+        return (
+            str(_brand_cache.get("name") or "pvecenter"),
+            str(_brand_cache.get("subtitle") or ""),
+            _brand_cache.get("logo"),
+        )
+
+    name = str(info.get("name") or "pvecenter")
+    subtitle = str(info.get("subtitle") or "")
+    logo = info.get("logo_url") or None
+    _brand_cache.update(
+        at=now, rev=site.brand_revision, name=name, subtitle=subtitle, logo=logo
+    )
+    return name, subtitle, logo
+
+
+def _request_lang(request: Request) -> str:
+    """从 Accept-Language 猜标题语言，和前端 detectLang 的默认行为对齐。"""
+    header = request.headers.get("accept-language") or ""
+    first = header.split(",")[0].split(";")[0].strip().lower()
+    return "en" if first.startswith("en") else "zh"
+
+
+def _render_index(
+    lang: str, name: str, logo: Optional[str], subtitle: str = ""
+) -> str:
+    """把入口页 HTML 里的标题 / 描述 / 语言 / 图标 / 站点信息换成当前站点值。"""
+    text = _index_template()
+    if not text:
+        return ""
+
+    title = f"{name} — Proxmox VE {'management panel' if lang == 'en' else '管理面板'}"
+    desc = f"{name} - Proxmox VE {'cluster management panel' if lang == 'en' else '集群管理面板'}"
+
+    text = _HTML_TITLE_RE.sub(lambda _m: f"<title>{escape(title)}</title>", text, count=1)
+    text = _HTML_DESC_RE.sub(
+        lambda m: f"{m.group(1)}{escape(desc)}{m.group(2)}", text, count=1
+    )
+    text = _HTML_LANG_RE.sub(
+        '<html lang="en"' if lang == "en" else '<html lang="zh-CN"', text, count=1
+    )
+    if logo:
+        # 整个标签重写：自定义 Logo 可能是 PNG / ICO / SVG，保留构建时的
+        # type="image/svg+xml" 会声明错类型，交给浏览器按内容嗅探更稳。
+        tag = f'<link rel="icon" href="{escape(logo)}">'
+        if _HTML_ICON_RE.search(text):
+            text = _HTML_ICON_RE.sub(lambda _m: tag, text, count=1)
+        else:
+            # 旧版本的构建产物里没有 icon 声明，补一个，省得升级后还要等重新构建
+            text = re.sub(r"</head>", f"  {tag}\n  </head>", text, count=1)
+
+    # 站点信息供前端做 initialData（转义后放进属性，避免站点名里的引号破坏 HTML）
+    metas = {
+        "site-name": name,
+        "site-subtitle": subtitle,
+        "site-logo": logo or "",
+    }
+    missing = []
+    for key, value in metas.items():
+        pattern = _HTML_META_RE[key]
+        if pattern.search(text):
+            text = pattern.sub(
+                lambda m, v=escape(value): f"{m.group(1)}{v}{m.group(2)}",
+                text,
+                count=1,
+            )
+        else:
+            # 升级后 dist/ 还是旧构建产物（没有 site-* 声明）——直接补上，
+            # 不必等用户重新 npm run build 才能拿到首帧品牌。
+            missing.append(f'  <meta name="{key}" content="{escape(value)}">')
+    if missing:
+        text = re.sub(
+            r"</head>", "\n".join(missing) + "\n  </head>", text, count=1
+        )
+    return text
+
+
 def _looks_like_static_file(path: str) -> bool:
     """路径是否在要一个**静态文件**（而不是前端路由）。
 
@@ -1466,7 +1613,7 @@ if (DIST_DIR / "index.html").is_file():
         )
 
     @app.get("/{full_path:path}", include_in_schema=False)
-    async def spa(full_path: str) -> FileResponse:
+    async def spa(full_path: str, request: Request) -> Response:
         """返回 dist/ 中的静态文件；其余路径回退到 index.html（前端路由）。
 
         但「像静态文件」的路径不能回退：``/robots.txt`` 之类没命中真实文件时
@@ -1485,9 +1632,15 @@ if (DIST_DIR / "index.html").is_file():
         # 入口页**不能**被缓存：它引用的是一串带 hash 的 assets，index.html 一旦
         # 被浏览器或代理存住，用户就一直跑旧版本 —— 前端明明重新构建过，页面上
         # 还是旧行为，看起来就像「修复没生效」。
-        return FileResponse(
-            DIST_DIR / "index.html", headers={"Cache-Control": "no-store"}
-        )
+        name, subtitle, logo = await _site_branding()
+        page = _render_index(_request_lang(request), name, logo, subtitle)
+        if not page:
+            # 模板读不出来（权限 / 编码异常）就退回原文件，不能给个空页
+            logger.warning("入口页模板不可读，回退到原始 index.html")
+            return FileResponse(
+                DIST_DIR / "index.html", headers={"Cache-Control": "no-store"}
+            )
+        return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
 else:
 

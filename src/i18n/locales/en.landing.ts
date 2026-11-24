@@ -86,7 +86,7 @@ export const enLanding: Partial<Record<MessageKey, string>> = {
   'landing.security.resultDenied': 'denied',
   'landing.security.resultFailed': 'failed',
   'landing.start.title': 'Four steps to get going',
-  'landing.start.desc': 'From deployment to your first automatically provisioned VM usually takes under half an hour. The commands are the three lines below — copy and go.',
+  'landing.start.desc': 'From deployment to your first automatically provisioned VM usually takes under half an hour. The commands are the lines below — copy and go.',
 
   /* -------------------------------------------- Landing: architecture / scenarios */
   'landing.architecture.title': 'One panel for several clusters',

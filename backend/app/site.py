@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 SITE_INFO_KEY = "site_info"
 
+# 品牌信息变更计数：入口页的标题 / 图标注入在 main.py 里做了十几秒缓存，
+# 改名或换 logo 时递增它，让下一个请求立刻拿到新值，不用等缓存过期。
+brand_revision = 0
+
 # 内置默认值：数据库里没存过 site_info（或记录损坏）时回落到这里
 DEFAULT_NAME = "pvecenter"
 DEFAULT_SUBTITLE = "Proxmox 管理面板"
@@ -213,6 +217,8 @@ async def save_logo(data: bytes, declared_mime: str = "") -> Dict[str, Any]:
         "updated_at": int(time.time()),
     }
     await store.set_setting(LOGO_KEY, json.dumps(meta, ensure_ascii=False))
+    global brand_revision
+    brand_revision += 1
     logger.info("站点 logo 已更新：%s（%d 字节，%s）", filename, len(data), mime)
     return meta
 
@@ -221,6 +227,8 @@ async def delete_logo() -> None:
     """移除自定义 logo，前端回落到内置图标。"""
     await _purge_logo_files()
     await store.delete_setting(LOGO_KEY)
+    global brand_revision
+    brand_revision += 1
 
 
 # ------------------------------------------------------------- 登录页背景图
@@ -374,5 +382,7 @@ async def set_site_info(
         "links": _clean_links(links),
     }
     await store.set_setting(SITE_INFO_KEY, json.dumps(payload, ensure_ascii=False))
+    global brand_revision
+    brand_revision += 1
     # 返回完整信息，保证与前端的 SiteInfo 结构一致（含 logo_url）
     return await get_site_info()

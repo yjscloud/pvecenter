@@ -1066,8 +1066,8 @@ export const STEPS: { title: Bi; desc: Bi }[] = [
   {
     title: ['部署面板', 'Deploy the panel'],
     desc: [
-      '后端拉起来即可，前端由后端同源托管，一个端口对外。',
-      'Just start the backend — it serves the frontend from the same origin, one port to the outside.',
+      'clone 下来跑一句 deploy.sh：依赖、前端产物、数据库与 systemd 服务一次装好，默认一个 8080 端口对外。',
+      'Clone it and run deploy.sh once — dependencies, frontend build, database and a systemd unit are all set up, exposed on a single port 8080.',
     ],
   },
   {
@@ -1094,18 +1094,21 @@ export const STEPS: { title: Bi; desc: Bi }[] = [
 ];
 
 /**
- * 部署命令示例。注释行随语言变，命令本身不变 —— 用 same() 标出来，
- * 免得读代码的人以为漏翻了。
+ * 部署命令示例：与 README「裸机安装」/ docs/deployment.md 一致的三条命令。
+ * deploy.sh 自己装 Python 依赖、构建前端产物、装 MariaDB、注册 systemd 服务，
+ * 所以不需要先手工 npm run build，也不再给 start-prod.sh（那只是前台调试跑法）。
+ * 注释行随语言变，命令本身不变 —— 用 same() 标出来，免得读代码的人以为漏翻了。
  */
 export const DEPLOY_LINES: Bi[] = [
   [
-    '# 构建前端产物，后端会同源托管 dist/ 与 /api',
-    '# Build the frontend; the backend serves dist/ and /api from the same origin',
+    '# 一次装完依赖、前端产物、数据库与 systemd 服务',
+    '# Installs deps, builds the frontend, creates the DB and a systemd service',
   ],
-  same('npm run build'),
+  same('git clone https://github.com/yjscloud/pvecenter.git'),
+  same('cd pvecenter'),
   [
-    './start-prod.sh          # 监听 0.0.0.0:8080',
-    './start-prod.sh          # listens on 0.0.0.0:8080',
+    'sudo ./deploy.sh        # 默认 8080 端口，末尾打印地址与口令',
+    'sudo ./deploy.sh        # port 8080 by default; prints URL + password',
   ],
 ];
 

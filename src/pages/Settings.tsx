@@ -1055,6 +1055,8 @@ function SiteInfoSection() {
   });
 
   useEffect(() => {
+    /* 表单只认接口返回的完整数据：useSiteInfo 里那份入口页注入的品牌信息是
+       placeholderData，不进缓存，这里拿到的 query.data 一定来自 /config/site。 */
     if (!query.data || loadedRef.current) return;
     loadedRef.current = true;
     setForm(query.data);

@@ -13,7 +13,17 @@
       content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <meta name="theme-color" content="#f3f6f9" />
+    <!-- 下面几行的标题 / 描述 / 图标 / 站点信息会被后端在返回入口页时替换成
+         「设置 → 站点信息」里的真实值（见 backend/app/main.py 的 _render_index）。
+         这里写的是单跑 Vite（npm run dev）时的兜底值，构建产物也能直接静态托管。
+
+         site-* 三个 meta 是给前端首帧用的：useSiteInfo() 把它们当作 React Query
+         的 initialData，否则侧边栏 / 登录页的品牌名会先闪一下兜底的 pvecenter。 -->
     <meta name="description" content="pvecenter - Proxmox VE 集群管理面板" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="site-name" content="pvecenter" />
+    <meta name="site-subtitle" content="" />
+    <meta name="site-logo" content="" />
     <title>pvecenter — Proxmox VE 管理面板</title>
   </head>
   <body>
