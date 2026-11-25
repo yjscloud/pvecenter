@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import posixpath
 import re
 import shlex
 import time
@@ -1117,6 +1118,65 @@ _WRITE_FORBIDDEN = (
     ("放开根目录权限（chmod -R 777 /）", "Open up root permissions (chmod -R 777 /)", re.compile(r"\bchmod\s+-R\s+777\s+/(\s|$)")),
 )
 
+#: 出现即视为「不可回滚」的可执行文件（按 argv[0] 的 basename 判定）。
+_DESTRUCTIVE_EXE = frozenset(
+    {
+        "mkfs", "mke2fs", "wipefs", "fdisk", "parted", "sgdisk",
+        "shutdown", "poweroff", "halt", "reboot",
+    }
+)
+
+#: 删除类命令的目标里出现这些形态就等同于「删根」。
+_ROOT_TARGETS = frozenset({"/", "/*", "/.", "/.."})
+
+
+def is_destructive_command(command: Any) -> bool:
+    """按 **argv** 判断一条命令是否包含不可回滚的操作。
+
+    正则黑名单锚在字面形态上，``rm -rf "/"``、``/bin/rm -rf /``、
+    ``systemctl --no-block reboot`` 都能绕过去（PVE-AI-002）。这里先把命令按
+    shell 词法切开，再逐个 token 判断：可执行文件取 basename（因此绝对路径一样
+    命中），删除目标做路径归一化（因此引号与多余斜杠不影响判定）。
+    """
+    try:
+        tokens = shlex.split(str(command or ""))
+    except ValueError:
+        return False
+    names = [posixpath.basename(token).lower() for token in tokens]
+    for index, name in enumerate(names):
+        rest = tokens[index + 1:]
+        if name in ("rm", "rmdir"):
+            flags = [arg for arg in rest if arg.startswith("-")]
+            targets = [arg for arg in rest if not arg.startswith("-")]
+            wild = any(
+                posixpath.normpath(target.rstrip("*") or "/") in _ROOT_TARGETS
+                or target in _ROOT_TARGETS
+                for target in targets
+            )
+            recursive = any(
+                "recursive" in flag.lower() or "r" in flag[1:].lower()
+                for flag in flags
+            )
+            if wild and recursive:
+                return True
+            if any("no-preserve-root" in flag for flag in flags):
+                return True
+        elif name in _DESTRUCTIVE_EXE or name.startswith("mkfs."):
+            return True
+        elif name == "dd":
+            if any("of=/dev/" in arg for arg in rest):
+                return True
+        elif name == "systemctl":
+            if any(arg in ("reboot", "poweroff", "halt", "kexec") for arg in rest):
+                return True
+        elif name == "init" and rest[:1] == ["0"]:
+            return True
+        elif name == "chmod" and any("777" in arg for arg in rest):
+            if any(posixpath.normpath(arg) == "/" for arg in rest):
+                return True
+    return False
+
+
 MAX_WRITE_COMMAND_LENGTH = 1000
 
 
@@ -1133,6 +1193,14 @@ def validate_write_command(command: Any) -> str:
         raise ToolError(i18n.pick("命令过长", "Command is too long"))
     if "\n" in text or "\r" in text:
         raise ToolError(i18n.pick("命令不能包含换行", "The command must be a single line"))
+    if is_destructive_command(text):
+        raise ToolError(
+            i18n.pick(
+                "这类命令不允许执行（可能毁坏系统或断开连接），请改用平台自带的操作入口",
+                "This kind of command is not allowed (it may destroy the system or drop the "
+                "connection); use the platform's own action instead",
+            )
+        )
     for _label_zh, _label_en, pattern in _WRITE_FORBIDDEN:
         if pattern.search(text):
             raise ToolError(

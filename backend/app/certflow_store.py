@@ -85,8 +85,34 @@ CREATE TABLE IF NOT EXISTS cert_flow_step (
     error     TEXT,
     ms        INT         NOT NULL DEFAULT 0,
     at_ms     INT         NOT NULL DEFAULT 0,
+    -- 子步骤归属：签发里的下单 / 等待 / 下载、部署里的每个目标都挂在顶层步骤下。
+    -- 空串 = 顶层步骤，site["last_run"] 的投影只取这些行。
+    parent_id VARCHAR(64) NOT NULL DEFAULT '',
+    -- 界面用的可读标题（步骤名与文案表解耦，加步骤不必改前端词条）
+    title     VARCHAR(128) NOT NULL DEFAULT '',
+    -- 第几次尝试：自动重试用同一个 node_id，靠它区分
+    attempt   INT         NOT NULL DEFAULT 0,
+    -- waiting 状态的下次检查时间（epoch 秒）
+    next_at   BIGINT      NOT NULL DEFAULT 0,
+    level     VARCHAR(16) NOT NULL DEFAULT 'info',
     PRIMARY KEY (id),
-    KEY idx_cert_flow_step_run (run_id, seq)
+    KEY idx_cert_flow_step_run (run_id, seq),
+    KEY idx_cert_flow_step_node (run_id, node_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 步骤内的操作日志：一行一条（「下单成功，ID xxx」「目标 A 写入 2 个文件 3.8KB」）。
+-- 与 cert_deploy_log 的分工：那张表是**跨运行**的业务日志（页面「操作日志」），
+-- 这张表只服务于运行详情里的「这一步内部做了什么」，随运行一起被清理。
+CREATE TABLE IF NOT EXISTS cert_flow_step_log (
+    id      BIGINT      NOT NULL AUTO_INCREMENT,
+    run_id  VARCHAR(48) NOT NULL,
+    node_id VARCHAR(64) NOT NULL DEFAULT '',
+    seq     INT         NOT NULL DEFAULT 0,
+    ts      BIGINT      NOT NULL DEFAULT 0,
+    level   VARCHAR(16) NOT NULL DEFAULT 'info',
+    text    TEXT,
+    PRIMARY KEY (id),
+    KEY idx_cert_flow_step_log_run (run_id, node_id, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS cert_flow_artifact (
@@ -107,10 +133,10 @@ CREATE TABLE IF NOT EXISTS cert_flow_artifact (
 
 #: 运行记录的保留条数。每次 tick 每个站点最多一条，保留 500 条够回看几个月，
 #: 又不至于把 MySQL 撑成日志仓库；超出部分在写完新记录后顺带删掉。
-KEEP_RUNS = 500
+KEEP_RUNS = 30
 #: 每多少次运行做一轮清理（进程内计数，多 worker 各自计数不影响正确性，
 #: 最坏情况是清得勤一点）。
-PRUNE_EVERY = 200
+PRUNE_EVERY = 20
 
 _finishes = 0
 
@@ -118,6 +144,29 @@ _finishes = 0
 async def init_table() -> None:
     async with database.connect() as db:
         await db.executescript(SCHEMA)
+        # 旧库补列：子步骤 / 等待 / 标题是这次「每步都看得见」改造新增的。
+        # ``add_columns`` 对重复 / 并发执行是幂等的（见 database.add_columns）。
+        await database.add_columns(
+            db,
+            "cert_flow_step",
+            (
+                ("parent_id", "ALTER TABLE cert_flow_step ADD COLUMN parent_id VARCHAR(64) NOT NULL DEFAULT ''"),
+                ("title", "ALTER TABLE cert_flow_step ADD COLUMN title VARCHAR(128) NOT NULL DEFAULT ''"),
+                ("attempt", "ALTER TABLE cert_flow_step ADD COLUMN attempt INT NOT NULL DEFAULT 0"),
+                ("next_at", "ALTER TABLE cert_flow_step ADD COLUMN next_at BIGINT NOT NULL DEFAULT 0"),
+                ("level", "ALTER TABLE cert_flow_step ADD COLUMN level VARCHAR(16) NOT NULL DEFAULT 'info'"),
+            ),
+        )
+        cursor = await db.execute(
+            "SELECT COUNT(*) AS n FROM information_schema.statistics"
+            " WHERE table_schema = DATABASE() AND table_name = 'cert_flow_step'"
+            " AND index_name = 'idx_cert_flow_step_node'"
+        )
+        row = await cursor.fetchone()
+        if row and int(row["n"] or 0) == 0:
+            await db.execute(
+                "CREATE INDEX idx_cert_flow_step_node ON cert_flow_step (run_id, node_id)"
+            )
         await db.commit()
 
 
@@ -214,6 +263,8 @@ class SqlSink:
         # 步骤序号自己数：Runner 可能在运行结束后才回放 steps，用 len(run.steps)
         # 会让每一条都拿到同一个序号。
         self._seq: Dict[str, int] = {}
+        # 步骤日志的序号：键是 run_id|node_id，保证同一节点内严格递增。
+        self._logs: Dict[str, int] = {}
 
     async def start(self, run: Run) -> None:
         try:
@@ -244,29 +295,76 @@ class SqlSink:
             logger.debug("写入证书流水运行记录失败", exc_info=True)
 
     async def step(self, run: Run, step: RunStep) -> None:
+        """写一步。**按 (run_id, node_id) 更新已有行**，不是每次都插一条。
+
+        子步骤会先以 ``running`` 出现、结束时再更新成 ``ok`` / ``failed`` /
+        ``waiting``；同一目标重试时也复用同一个 node_id（靠 ``attempt`` 区分），
+        页面因此不会出现一串重复的「目标 A」。
+        """
         try:
-            seq = self._seq.get(run.id, 0) + 1
-            self._seq[run.id] = seq
+            async with database.connect() as db:
+                cursor = await db.execute(
+                    "SELECT id FROM cert_flow_step WHERE run_id = ? AND node_id = ?"
+                    " ORDER BY id DESC LIMIT 1",
+                    (run.id, step.node_id),
+                )
+                row = await cursor.fetchone()
+                values = (
+                    step.node_type,
+                    step.status,
+                    step.detail,
+                    step.error,
+                    int(step.ms),
+                    int(step.at),
+                    step.parent_id,
+                    step.title,
+                    int(step.attempt),
+                    int(step.next_at),
+                    step.level,
+                )
+                if row:
+                    await db.execute(
+                        "UPDATE cert_flow_step SET node_type=?, status=?, detail=?,"
+                        " error=?, ms=?, at_ms=?, parent_id=?, title=?, attempt=?,"
+                        " next_at=?, level=? WHERE id=?",
+                        values + (int(row["id"]),),
+                    )
+                else:
+                    seq = self._seq.get(run.id, 0) + 1
+                    self._seq[run.id] = seq
+                    await db.execute(
+                        "INSERT INTO cert_flow_step"
+                        " (node_type, status, detail, error, ms, at_ms, parent_id,"
+                        "  title, attempt, next_at, level, run_id, seq, node_id)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        values + (run.id, seq, step.node_id),
+                    )
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("写入证书流水步骤失败", exc_info=True)
+
+    async def log(self, run: Run, node_id: str, text: str, level: str = "info") -> None:
+        """追加一行步骤日志（见 cert_flow_step_log 的注释）。"""
+        try:
+            key = run.id + "|" + node_id
+            seq = self._logs.get(key, 0) + 1
+            self._logs[key] = seq
             async with database.connect() as db:
                 await db.execute(
-                    "INSERT INTO cert_flow_step"
-                    " (run_id, seq, node_id, node_type, status, detail, error, ms, at_ms)"
-                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cert_flow_step_log"
+                    " (run_id, node_id, seq, ts, level, text) VALUES (?,?,?,?,?,?)",
                     (
                         run.id,
+                        str(node_id or "")[:64],
                         seq,
-                        step.node_id,
-                        step.node_type,
-                        step.status,
-                        step.detail,
-                        step.error,
-                        int(step.ms),
-                        int(step.at),
+                        _now(),
+                        str(level or "info")[:16],
+                        str(text or "")[:2000],
                     ),
                 )
                 await db.commit()
         except Exception:  # noqa: BLE001
-            logger.debug("写入证书流水步骤失败", exc_info=True)
+            logger.debug("写入证书流水步骤日志失败", exc_info=True)
 
     async def finish(self, run: Run) -> None:
         try:
@@ -348,6 +446,12 @@ async def get_run(run_id: str, include_payload: bool = False) -> Optional[Dict[s
             "SELECT * FROM cert_flow_step WHERE run_id = ? ORDER BY seq", (run_id,)
         )
         steps = [dict(r) for r in await cursor.fetchall()]
+        # 步骤日志：既按步骤挂到 step["step_logs"]（前端渲染子步骤时直接用），
+        # 也整体返回一份，便于「按顺序滚一遍」。两条查询都很小（一次运行十几行）。
+        cursor = await db.execute(
+            "SELECT * FROM cert_flow_step_log WHERE run_id = ? ORDER BY id", (run_id,)
+        )
+        step_logs = [dict(r) for r in await cursor.fetchall()]
         columns = "id, run_id, node_id, kind, checksum, size, meta_json, encoding, created_at"
         if include_payload:
             columns += ", payload"
@@ -363,29 +467,83 @@ async def get_run(run_id: str, include_payload: bool = False) -> Optional[Dict[s
             except Exception:  # noqa: BLE001
                 record["meta"] = {}
             artifacts.append(record)
-    head["steps"] = steps
+    by_node: Dict[str, List[Dict[str, Any]]] = {}
+    for item in step_logs:
+        by_node.setdefault(str(item.get("node_id") or ""), []).append(item)
+    for step in steps:
+        step["step_logs"] = by_node.get(str(step.get("node_id") or ""), [])
+
+    # 子步骤是在父步骤**执行过程中**写的，落库序号比父步骤小；直接按 seq 排会
+    # 出现「目标一、目标二、部署」这种倒挂。这里重排成「父步骤 → 它的子步骤」，
+    # 父步骤之间仍按 seq 保持流程顺序。
+    parents = [item for item in steps if not str(item.get("parent_id") or "")]
+    children: Dict[str, List[Dict[str, Any]]] = {}
+    for item in steps:
+        parent_id = str(item.get("parent_id") or "")
+        if parent_id:
+            children.setdefault(parent_id, []).append(item)
+    ordered: List[Dict[str, Any]] = []
+    for parent in parents:
+        ordered.append(parent)
+        ordered.extend(children.pop(str(parent.get("node_id") or ""), []))
+    for orphan in children.values():  # 父步骤被裁掉 / 数据不完整时也别丢
+        ordered.extend(orphan)
+
+    head["steps"] = ordered
+    head["step_logs"] = step_logs
     head["artifacts"] = artifacts
     return head
 
 
+async def drop_run(run_id: str) -> None:
+    """丢掉一条运行记录（连同步骤 / 日志 / 产物）。
+
+    「这次检查什么都没做」（decision=none）的运行不占历史：主作业 6 小时一轮，
+    一天 4 条纯检查记录会把真正有动作的运行刷到翻页。SqlSink 已经写过了，
+    这里按 id 撤销 —— 比让 Runner 预判 decision 简单（decision 只有 decide
+    节点执行后才知道）。失败只记日志，历史里多一条无害。
+    """
+    rid = str(run_id or "")
+    if not rid:
+        return
+    try:
+        async with database.connect() as db:
+            await db.execute("DELETE FROM cert_flow_step WHERE run_id = ?", (rid,))
+            await db.execute("DELETE FROM cert_flow_step_log WHERE run_id = ?", (rid,))
+            await db.execute("DELETE FROM cert_flow_artifact WHERE run_id = ?", (rid,))
+            await db.execute("DELETE FROM cert_flow_run WHERE id = ?", (rid,))
+            await db.commit()
+    except Exception:  # noqa: BLE001 - 降噪失败不影响主流程
+        logger.debug("撤销空运行记录失败（%s）", rid, exc_info=True)
+
+
 async def prune(keep: int = KEEP_RUNS) -> int:
-    """只保留最近 ``keep`` 条运行，连同步骤与产物一起清掉。
+    """每个站点只保留最近 ``keep`` 条运行，连同步骤与产物一起清掉。
+
+    按站点而不是全局保留：全局上限会让「跑得勤的站点」把别的站点历史挤掉，
+    而用户看的是单个站点的运行日志 —— 每个站点都该有自己的最近 N 条。
 
     先查出要删的 id 再逐表删：MySQL 不允许在子查询里引用正在删除的同一张表，
     这个写法绕开了那条限制，也让每次删除的行数可控。
     """
-    keep = max(20, int(keep))
+    keep = max(10, int(keep))
     async with database.connect() as db:
-        # 表大小由本函数自身维持在 keep 附近，所以一次取回 id 是可控的；
-        # 用 LIMIT ... OFFSET 反而在 offset 上做无用扫描。
-        cursor = await db.execute(
-            "SELECT id FROM cert_flow_run ORDER BY started_at DESC", ()
-        )
-        stale = [str(r["id"]) for r in (await cursor.fetchall())[keep:]]
+        cursor = await db.execute("SELECT DISTINCT site_id FROM cert_flow_run")
+        sites = [str(row["site_id"] or "") for row in (await cursor.fetchall()) or []]
+        stale: List[str] = []
+        for sid in sites:
+            cursor = await db.execute(
+                "SELECT id FROM cert_flow_run WHERE site_id = ? ORDER BY started_at DESC",
+                (sid,),
+            )
+            stale.extend(str(row["id"]) for row in (await cursor.fetchall())[keep:])
         if not stale:
             return 0
         marks = ",".join("?" for _ in stale)
         await db.execute(f"DELETE FROM cert_flow_step WHERE run_id IN ({marks})", tuple(stale))
+        await db.execute(
+            f"DELETE FROM cert_flow_step_log WHERE run_id IN ({marks})", tuple(stale)
+        )
         await db.execute(
             f"DELETE FROM cert_flow_artifact WHERE run_id IN ({marks})", tuple(stale)
         )

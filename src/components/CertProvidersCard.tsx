@@ -159,7 +159,8 @@ export function CertProvidersCard({
                 ? provider.fields.find((field) => field.key === provider.identity_key)
                 : provider.fields.find((field) => !field.secret && /(^|_)id$/.test(field.key));
               const renew = provider.values?.renew_before_days;
-              const test = tests[provider.kind];
+              /* 本次打开页面后的结果优先，其次读服务端持久化的上一次自检 */
+              const test = tests[provider.kind] ?? provider.last_test ?? null;
               const count = counts[provider.kind] ?? 0;
               const failed = !!test && !test.ok;
               const badgeTone = failed ? "is-failed" : "is-ready";
@@ -167,7 +168,11 @@ export function CertProvidersCard({
                 ? t("cert.providerTestFailedShort")
                 : t("cert.providerAvailable");
               return (
-                <div className="cert-provider-row" key={provider.kind}>
+                <div
+                  className="cert-provider-row"
+                  key={provider.kind}
+                  data-state={failed ? "failed" : "ready"}
+                >
                   <div className="cert-provider-main">
                     <div className="cert-provider-head">
                       <span className="cert-provider-name">
@@ -182,21 +187,21 @@ export function CertProvidersCard({
                         {badgeText}
                       </span>
                       {count > 0 ? (
-                        <span className="cert-provider-count fs-xs text-muted">
+                        <span className="cert-provider-count fs-xs">
                           {t("cert.providerCertCount", { n: count })}
                         </span>
                       ) : null}
                     </div>
                     <div className="cert-provider-meta">
-                      <span className="cert-provider-id mono fs-xs text-muted">
+                      <span className="cert-provider-id mono fs-xs">
                         {idField ? maskId(String(provider.values?.[idField.key] ?? "")) : ""}
                       </span>
                       {renew != null ? (
-                        <span className="fs-xs text-muted">
+                        <span className="fs-xs">
                           {t("cert.renewDaysShort", { n: Number(renew) })}
                         </span>
                       ) : null}
-                      <span className="fs-xs text-muted">
+                      <span className="fs-xs">
                         {test
                           ? t("cert.providerLastTest", { time: formatRelative(test.at) })
                           : t("cert.providerNeverTested")}
@@ -219,7 +224,11 @@ export function CertProvidersCard({
                         disabled={!canManage}
                         onClick={() => void onTest(provider.kind)}
                       >
-                        {t("cert.testConnection")}
+                        {t(
+                          provider.kind === "acme"
+                            ? "cert.verifyConfig"
+                            : "cert.testConnection",
+                        )}
                       </Button>
                     )}
                     <Button
@@ -253,14 +262,18 @@ export function CertProvidersCard({
             <div className="cert-provider-section-title">{t("cert.providerPendingTitle")}</div>
             {pending.map((provider) => (
               <div className="cert-provider-pending-row" key={provider.kind}>
-                <span className="cert-provider-name">
-                  {t(provider.label_key as MessageKey) || provider.label}
-                </span>
-                <span className="fs-xs text-muted cert-provider-tagline">
-                  {provider.tagline_key
-                    ? t(provider.tagline_key as MessageKey)
-                    : provider.tagline || t("cert.providerUnconfiguredHint")}
-                </span>
+                {/* 与已配置卡片同构：左边名称 + 一行说明，右边动作。
+                    三列 grid 会把说明推到卡片中间，读起来像「两个不相关的字段」。 */}
+                <div className="cert-provider-pending-main">
+                  <span className="cert-provider-name">
+                    {t(provider.label_key as MessageKey) || provider.label}
+                  </span>
+                  <span className="fs-xs cert-provider-tagline">
+                    {provider.tagline_key
+                      ? t(provider.tagline_key as MessageKey)
+                      : provider.tagline || t("cert.providerUnconfiguredHint")}
+                  </span>
+                </div>
                 <Button
                   variant="secondary"
                   size="sm"
@@ -283,7 +296,28 @@ export function CertProvidersCard({
   const note =
     providers.length === 0 ? null : (
       <div className="cert-provider-note">
-        <span className="cert-provider-note-summary">{summary}</span>
+        <div className="cert-provider-note-main">
+          <span className="cert-provider-note-summary">{summary}</span>
+          {/* 进度只是把「已配置几条」可视化：读屏器读一次 summary 就够 */}
+          <span
+            className="cert-provider-progress"
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={providers.length}
+            aria-valuenow={configured.length}
+            aria-label={summary}
+          >
+            <span
+              style={{
+                width: `${
+                  providers.length
+                    ? Math.round((configured.length / providers.length) * 100)
+                    : 0
+                }%`,
+              }}
+            />
+          </span>
+        </div>
         {canManage ? (
           <span className="cert-provider-crednote">{t("cert.providerCredNote")}</span>
         ) : (

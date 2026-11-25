@@ -25,7 +25,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
-from app import certflow, certs  # noqa: E402
+from app import certflow, certnotify, certs  # noqa: E402
 from app.certpipeline import STEP_FAILED, STEP_OK, STEP_SKIPPED, Context, Pipeline, Step  # noqa: E402
 from app.tencent_ssl import STATUS_ISSUED  # noqa: E402
 
@@ -355,9 +355,187 @@ def test_manual_run_attributes_inner_logs(monkeypatch) -> None:
     site = _site()
     _run(certs.run_manual(site, "deploy", job))
 
-    written = sink[0]["params"]
+    # 手动动作现在也会先写运行头（cert_flow_run），所以不能再取 sink[0]：
+    # 按 SQL 找 cert_deploy_log 那一行。
+    written = next(
+        item["params"] for item in sink if "cert_deploy_log" in item["sql"]
+    )
     assert written[8] == site["last_run_id"]
     assert written[9] == "deploy"
+
+
+def test_manual_run_writes_run_header_and_child_steps(monkeypatch) -> None:
+    """手动动作也要进运行表：运行头 + 顶层步骤 + 子步骤（P1-a 的验收点）。"""
+    sink: List[Dict[str, Any]] = []
+    _patch_db(monkeypatch, sink)
+
+    async def job():
+        await certflow.emit_step(
+            "deploy:t1", title="目标一", detail="已写入", parent=""
+        )
+        return {"detail": "ok"}
+
+    async def fake_update(site) -> None:
+        return None
+
+    monkeypatch.setattr(certs, "update_site", fake_update)
+
+    site = _site()
+    _run(certs.run_manual(site, "deploy", job))
+
+    headers = [item for item in sink if "INSERT INTO cert_flow_run" in item["sql"]]
+    assert headers and headers[0]["params"][5] == "cert-manual"
+    step_inserts = [
+        item for item in sink if item["sql"].startswith("INSERT INTO cert_flow_step ")
+    ]
+    assert step_inserts, "手动动作的步骤必须落库"
+    # 子步骤挂在顶层步骤下：parent_id == 运行里的顶层节点 id
+    child = next(item["params"] for item in step_inserts if item["params"][13] == "deploy:t1")
+    assert child[6] == "deploy"
+
+
+# ---------------------------------------------------------- 部署子步骤 / 通知
+_UPLOAD_SITE_KW = {
+    "ca": "upload",
+    "cert_id": "c1",
+    "acme_pem": "-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----",
+    "acme_key": "-----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----",
+}
+
+
+def test_deploy_emits_one_child_step_per_target(monkeypatch) -> None:
+    """每个部署目标都是一条子步骤：三个目标挂了一个，能直接看到是哪个。"""
+    sink: List[Dict[str, Any]] = []
+    _patch_db(monkeypatch, sink)
+
+    async def fake_push(view, bundle):
+        return ("写入 2 个文件", "")
+
+    async def fake_update(site) -> None:
+        return None
+
+    monkeypatch.setattr(certs, "_push_target", fake_push)
+    monkeypatch.setattr(certs, "update_site", fake_update)
+
+    site = _site(
+        **_UPLOAD_SITE_KW,
+        targets=[
+            {"id": "primary", "method": "local", "deploy_dir": "/tmp/a"},
+            {"id": "t2", "method": "local", "deploy_dir": "/tmp/b"},
+        ],
+    )
+    _run(
+        certs.run_manual(
+            site, "deploy", lambda: certs.deploy_site(site, None, action="deploy")
+        )
+    )
+
+    child_nodes = {
+        item["params"][13]
+        for item in sink
+        if item["sql"].startswith("INSERT INTO cert_flow_step ") and item["params"][6]
+    }
+    assert {"deploy:primary", "deploy:t2"} <= child_nodes
+    # 部署后还会申报一条「线上校验」子步骤：没配监控地址时是 skipped
+    assert "verify" in child_nodes
+
+
+def test_deploy_success_and_partial_send_notifications(monkeypatch) -> None:
+    """成功 / 部分失败都要发通知：这是「部署成功也要有消息」的验收点。"""
+    sink: List[Dict[str, Any]] = []
+    _patch_db(monkeypatch, sink)
+    events: List[str] = []
+
+    async def fake_push(view, bundle):
+        if str(view.get("deploy_dir")) == "/tmp/bad":
+            raise certs.CertError("目标不可达")
+        return ("写入 2 个文件", "")
+
+    async def fake_notify(owner, site, event, *a, **kw):
+        events.append(event)
+        return True
+
+    async def fake_update(site) -> None:
+        return None
+
+    monkeypatch.setattr(certs, "_push_target", fake_push)
+    monkeypatch.setattr(certs, "update_site", fake_update)
+    monkeypatch.setattr(certs.certnotify, "notify", fake_notify)
+
+    good = _site(
+        **_UPLOAD_SITE_KW,
+        targets=[{"id": "primary", "method": "local", "deploy_dir": "/tmp/a"}],
+    )
+    _run(certs.deploy_site(good, None, action="deploy"))
+    assert events[-1] == certnotify.EVENT_DEPLOY_OK
+
+    mixed = _site(
+        **_UPLOAD_SITE_KW,
+        targets=[
+            {"id": "primary", "method": "local", "deploy_dir": "/tmp/a"},
+            {"id": "t2", "method": "local", "deploy_dir": "/tmp/bad"},
+        ],
+    )
+    _run(certs.deploy_site(mixed, None, action="deploy"))
+    assert events[-1] == certnotify.EVENT_DEPLOY_PARTIAL
+
+
+def test_pending_sync_schedules_short_poll(monkeypatch) -> None:
+    """CA 还在签发时要排短轮询：页面上的倒计时与补跑作业都靠这个时间。"""
+    site = _site(pending_cert_id="p1", cert_status=0)
+
+    async def fake_sync(site, provider=None):
+        return site
+
+    monkeypatch.setattr(certs, "sync_site_cert", fake_sync)
+
+    ctx = Context(site=site)
+    _run(certs._step_sync(ctx))
+    assert site["next_attempt_at"] >= certs.now_ts() + certs.CA_POLL_SECONDS - 5
+
+
+# --------------------------------------------------------------------- 重跑
+def test_retry_run_refuses_steps_that_need_input(monkeypatch) -> None:
+    async def fake_get_run(run_id, include_payload=False):
+        return {
+            "id": run_id,
+            "site_id": "site-1",
+            "steps": [{"node_id": "import", "status": "failed", "parent_id": ""}],
+        }
+
+    async def fake_get_site(site_id, owner=None):
+        return _site()
+
+    monkeypatch.setattr(certs.certflow_store, "get_run", fake_get_run)
+    monkeypatch.setattr(certs, "get_site", fake_get_site)
+
+    with pytest.raises(certs.CertError):
+        _run(certs.retry_run("run_1"))
+
+
+def test_retry_run_dispatches_failed_deploy(monkeypatch) -> None:
+    async def fake_get_run(run_id, include_payload=False):
+        return {
+            "id": run_id,
+            "site_id": "site-1",
+            "steps": [
+                {"node_id": "deploy", "status": "failed", "parent_id": ""},
+                {"node_id": "deploy:t2", "status": "failed", "parent_id": "deploy"},
+            ],
+        }
+
+    async def fake_get_site(site_id, owner=None):
+        return _site()
+
+    async def fake_run_manual(site, node_id, job, **kw):
+        return {"detail": "ok"}
+
+    monkeypatch.setattr(certs.certflow_store, "get_run", fake_get_run)
+    monkeypatch.setattr(certs, "get_site", fake_get_site)
+    monkeypatch.setattr(certs, "run_manual", fake_run_manual)
+
+    out = _run(certs.retry_run("run_1"))
+    assert out["step"] == "deploy"
 
 
 # ------------------------------------------------------------------------ 读取

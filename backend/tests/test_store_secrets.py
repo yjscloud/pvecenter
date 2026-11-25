@@ -21,7 +21,7 @@ from typing import Any, Dict, List
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
-from app import database, store  # noqa: E402
+from app import crypto, database, store  # noqa: E402
 from app.config import settings  # noqa: E402
 from conftest import connect  # noqa: E402
 
@@ -57,7 +57,12 @@ def _raw_setting(key: str) -> str:
 def _assert_ciphertext(raw: str, *plaintexts: str) -> None:
     for plain in plaintexts:
         assert plain not in raw, f"明文 {plain} 泄露到了 settings 表"
-    assert "enc:v1:" in raw, "密钥字段没有被加密"
+    # 新写入一律 enc:v2:，v1 只保留读取；这里只断言「里面确实是本模块的密文」，
+    # 不绑定具体版本（升级格式不该让这条用例跟着改）。raw 是整段 JSON，
+    # 所以按子串判断而不是 is_encrypted()。
+    assert (
+        crypto.PREFIX in raw or crypto.PREFIX_V2 in raw
+    ), "密钥字段没有被加密"
 
 
 class TestConnectionSecretsAtRest:

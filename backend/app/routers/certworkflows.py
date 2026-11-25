@@ -15,10 +15,10 @@ import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
-from .. import certworkflow, certworkflow_store, i18n, security
+from .. import certs, certworkflow, certworkflow_run, certworkflow_store, i18n, security
 
 router = APIRouter(prefix="/api/cert-workflows", tags=["cert-workflows"])
 
@@ -237,12 +237,42 @@ async def update_workflow(
 @router.delete("/{workflow_id}")
 async def delete_workflow(
     workflow_id: str,
+    request: Request,
     user: Dict[str, Any] = Depends(CERT_MANAGE),
 ) -> Dict[str, Any]:
-    removed = await certworkflow_store.delete(_owner(user), workflow_id)
+    """删除工作流定义，并妥善处理它的引用。
+
+    * 还有待审批 / 进行中的实例时**拒绝**（409）：直接删会让这些实例永远卡在
+      半路，用户看到的是「审批卡住」而不是「工作流没了」。先把它们推进或取消；
+    * 删掉定义后，解绑引用了它的站点（否则证书页仍显示「已绑定」），并清理
+      它的历史审批实例（``workflow_name`` 是快照，留着也点不开）。
+    """
+    owner = _owner(user)
+    active = await certworkflow_run.count_active(owner, workflow_id)
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=i18n.pick(
+                f"该工作流还有 {active} 个待审批 / 进行中的实例，"
+                "请先处理或取消这些实例，再删除工作流",
+                f"This workflow still has {active} pending or running run(s). "
+                "Finish or cancel them before deleting the workflow.",
+            ),
+        )
+    removed = await certworkflow_store.delete(owner, workflow_id)
     if not removed:
         raise HTTPException(status_code=404, detail=i18n.t("workflow.error.not_found"))
-    return {"removed": True}
+    detached = await certs.detach_workflow(owner, workflow_id)
+    runs = await certworkflow_run.delete_for_workflow(owner, workflow_id)
+    await security.audit(
+        request,
+        user,
+        "cert.workflow.delete",
+        workflow_id,
+        "success",
+        f"删除证书工作流（解绑站点 {detached}，清理实例 {runs}）",
+    )
+    return {"removed": True, "detached_sites": detached, "removed_runs": runs}
 
 
 @router.get("/{workflow_id}/export")

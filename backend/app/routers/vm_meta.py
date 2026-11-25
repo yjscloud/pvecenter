@@ -100,11 +100,15 @@ async def _load() -> Dict[str, Dict[str, Any]]:
                 tpl_vmid = int(tpl.get("vmid") or 0)
             except (TypeError, ValueError):
                 tpl_vmid = 0
-            if tpl_node and tpl_vmid:
+            tpl_name = str(tpl.get("name") or "").strip()
+            # 容器的「来源模板」可以是一个**模板文件**（vztmpl），没有 VMID 也
+            # 没有节点 —— 名字就是唯一标识（`ubuntu-24.04-...tar.zst`）。
+            # 只认「节点 + VMID」会把这类记录整个丢掉，列表就少了模板名。
+            if (tpl_node and tpl_vmid) or tpl_name:
                 template = {
                     "node": tpl_node,
                     "vmid": tpl_vmid,
-                    "name": str(tpl.get("name") or "").strip(),
+                    "name": tpl_name,
                 }
         # 系统信息快照（隔离 / 解除隔离 / 开机时采集，见 app.guest_osinfo）。
         # 只做展示与恢复用，空字段一律丢掉。
@@ -269,6 +273,82 @@ async def drop_os(connection_id: Optional[str], node: str, vmid: int) -> None:
     重装后运维多半还要靠它定位机器，所以只清 ``os`` 与 ``template``。
     """
     await _drop(connection_id, node, vmid, keep_ip=True)
+
+
+async def set_template(
+    connection_id: Optional[str],
+    node: str,
+    vmid: int,
+    template: Optional[Dict[str, Any]],
+    *,
+    by: str = "",
+) -> None:
+    """把「来源模板」关联写到某台机器上（克隆体继承用）。
+
+    只动 ``template`` 一个字段，手动 IP / 系统标识 / 快照原样保留。
+    失败只记日志 —— 克隆机已经建好了，这是展示层的附加信息。
+    """
+    if not template or not node or vmid is None:
+        return
+    # 模板文件（容器用系统模板新建）没有节点与 VMID，只有一个文件名
+    tpl_node = str(template.get("node") or "").strip()
+    tpl_name = str(template.get("name") or "").strip()
+    try:
+        tpl_vmid = int(template.get("vmid") or 0)
+    except (TypeError, ValueError):
+        tpl_vmid = 0
+    if not tpl_node and not tpl_vmid and not tpl_name:
+        return
+    if not tpl_node:
+        tpl_node = node if tpl_vmid else ""
+    try:
+        items = await _load()
+        key = _entry_key(node, vmid, connection_id)
+        entry: Dict[str, Any] = {}
+        for other, value in items.items():
+            if other == key or _same_identity(other, key):
+                entry = dict(value)
+                break
+        if not entry:
+            entry = {"ip": "", "os": ""}
+        entry["template"] = {
+            "node": tpl_node,
+            "vmid": tpl_vmid,
+            "name": tpl_name,
+        }
+        entry["ip"] = str(entry.get("ip") or "")
+        entry["os"] = str(entry.get("os") or "")
+        entry["by"] = str(entry.get("by") or by or "")
+        entry["at"] = int(entry.get("at") or time.time())
+        items[key] = entry
+        # 同一台机器只留一条（迁移前后各写过一次的话）
+        for other in [k for k in items if k != key and _same_identity(k, key)]:
+            items.pop(other, None)
+        await store.set_setting(META_KEY, json.dumps(items, ensure_ascii=False))
+    except Exception:  # noqa: BLE001 - 附加信息，失败不影响克隆结果
+        logger.warning("写入来源模板失败（%s/%s）", node, vmid, exc_info=True)
+
+
+async def template_of(
+    node: str,
+    vmid: int,
+    connection_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """该机器登记的「来源模板」；没有返回 ``None``。
+
+    克隆时用它把源机器已经关联的模板原样带给克隆体（人工关联的、或者它自己
+    克隆时继承来的都可以），这样源显示什么模板，克隆体就显示什么模板。
+    """
+    items = await _load()
+    key = _entry_key(node, vmid, connection_id)
+    item = items.get(key)
+    if not item:
+        for other, value in items.items():
+            if _same_identity(other, key):
+                item = value
+                break
+    tpl = (item or {}).get("template")
+    return tpl if isinstance(tpl, dict) else None
 
 
 async def manual_ip_index(user: Dict[str, Any]) -> Dict[Tuple[str, int], str]:

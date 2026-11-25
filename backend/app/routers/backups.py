@@ -946,6 +946,26 @@ async def create_backup(
     return {"task": task}
 
 
+async def _restore_target_exists(client: Any, node: str, vmid: int) -> Optional[bool]:
+    """目标 vmid 是否已存在于该节点。
+
+    ``None`` = 读不到集群清单（权限 / 网络），调用方退回宽松判定，别把功能做坏。
+    """
+    try:
+        resources = await client.cluster_resources("vm")
+    except Exception:  # noqa: BLE001 - 预检读不到就退回宽松判定，别把恢复做坏
+        return None
+    for item in resources or []:
+        try:
+            if int(item.get("vmid")) != int(vmid):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if str(item.get("node") or "") == str(node):
+            return True
+    return False
+
+
 @router.post("/backups/restore")
 async def restore_backup(
     payload: BackupRestore,
@@ -956,16 +976,29 @@ async def restore_backup(
     await assert_backup_access(user, payload.node, storage, payload.volid)
     # 归档归属校验只说明「这个备份是你能读的」，不代表「你可以往这个 vmid 里恢复」：
     # 指向别人的机器就是把人家的系统盘覆盖掉，所以 force 只由用户显式开启。
-    for _kind in ownership.GUEST_KINDS:
-        await guestguard.require_guest_object_if_owned(
-            user, payload.node, payload.vmid, _kind
-        )
+    #
+    # 目标机**已存在**时必须走严格归属判定：宽松版对「无归属」的存量机放行，
+    # 而存量机大量没有归属记录 —— 那等于允许覆盖任意历史遗留机器的系统盘。
+    # 目标 vmid 还不存在时没有对象级越权（撞号由 _assert_restore_target_free 兜）。
     # 恢复备份同样是「多出一台机器」。归档里的核数 / 内存 / 磁盘在开工前读不出来
     # （PVE 的备份索引不给客户机配置），所以这一维只能把住**台数**；核数 / 内存 /
     # 磁盘会在机器出现后的下一次统计里如实反映（读数会显示超额），但拦不住这一次。
     # 类型看 volid / storage content 的 format（目录型存储写 vzdump-<type>-<vmid>，
     # PBS 写 backup/<ct|vm>/<vmid>/…），认不出时按虚拟机处理。
     guest_type = archive_guest_type(payload.volid, payload.format) or "qemu"
+    kind = ownership.KIND_CT if guest_type == "lxc" else ownership.KIND_VM
+
+    exists = await _restore_target_exists(get_client(), payload.node, payload.vmid)
+    if exists:
+        await guestguard.require_guest_object(user, payload.node, payload.vmid, kind)
+    elif exists is None:
+        # 读不到集群清单：保持旧的宽松判定（宁可放行也不把功能做坏），
+        # 与 _assert_restore_target_free 的口径一致。
+        for _kind in ownership.GUEST_KINDS:
+            await guestguard.require_guest_object_if_owned(
+                user, payload.node, payload.vmid, _kind
+            )
+
     await quota.enforce_create(user, request, "ct" if guest_type == "lxc" else "vm")
     client = get_client()
     # 目标 VMID 撞号要在调用 PVE 之前判掉：撞上另一种类型的机器时 force 也救不了，

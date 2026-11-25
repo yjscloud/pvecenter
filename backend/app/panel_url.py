@@ -40,6 +40,23 @@ def normalize(url: Optional[str]) -> str:
     return text
 
 
+#: 进程内缓存：HTTPS 跳转（308）发生在中间件里，那里不能 await 查库。
+#: 启动时 :func:`refresh_cache` 载入，保存配置时同步更新；多 worker 时其它进程
+#: 最多滞后到下次重启 —— 滞后只会退化成「相对跳转」，不会指向攻击者的 Host。
+_cached_base = ""
+
+
+def cached_base_url() -> str:
+    """同步读取已配置的对外地址（未配置为空串）。"""
+    return _cached_base
+
+
+async def refresh_cache() -> str:
+    global _cached_base
+    _cached_base = await get_base_url()
+    return _cached_base
+
+
 async def get_base_url() -> str:
     """读取已配置的全局地址；未配置返回空串。"""
     return normalize(await store.get_setting(KEY))
@@ -52,6 +69,7 @@ async def set_base_url(url: Optional[str]) -> str:
         await store.set_setting(KEY, cleaned)
     else:
         await store.delete_setting(KEY)
+    await refresh_cache()
     return cleaned
 
 

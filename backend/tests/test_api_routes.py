@@ -22,6 +22,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests-only")
 
+from app import crypto  # noqa: E402
 from app import main  # noqa: E402
 from app import ownership  # noqa: E402
 from app import pve as pve_module  # noqa: E402
@@ -4129,7 +4130,9 @@ class TestConnectionConfig:
         raw = row[0]
         assert "plain-token-secret" not in raw
         assert "plain-console-password" not in raw
-        assert "enc:v1:" in raw
+        # 只断言「是本模块的密文」：新写入是 enc:v2（v1 仅保留读取），
+        # 具体版本号不该写进用例，否则每次升级格式都要改测试。
+        assert crypto.PREFIX in raw or crypto.PREFIX_V2 in raw
 
         # 读取侧解密，后端拿到的仍然是明文（签名、控制台登录照常工作）
         cfg = store.get_connection_config()

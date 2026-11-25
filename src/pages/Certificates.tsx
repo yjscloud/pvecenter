@@ -6,11 +6,12 @@
    续期流水线每一步的结果。腾讯云密钥收进折叠卡，首屏只留巡检信息。
    ========================================================================== */
 
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   certWorkflowRunsApi,
+  certWorkflowsApi,
   certsApi,
   connectionsApi,
   downloadCertificate,
@@ -56,7 +57,9 @@ import { CertUploadDialog, type CertUploadPayload } from "../components/CertUplo
 import type {
   CertDeployLog,
   CertDetail,
+  CertFlowRun,
   CertFlowRunDetail,
+  CertFlowStepLog,
   CertInventoryItem,
   CertInventoryStats,
   CertSite,
@@ -85,6 +88,38 @@ const STEP_LABEL: Record<string, MessageKey> = {
   deploy: 'cert.step.deploy',
   drop: 'cert.step.drop',
   notice: 'cert.step.notice',
+  /* 手动动作也进运行历史，文案与定时步骤共用同一张表 */
+  rotate: 'cert.step.rotate',
+  revoke: 'cert.step.revoke',
+  import: 'cert.step.import',
+  bind: 'cert.step.bind',
+};
+
+/** 站点阶段（后端派生）-> 文案 */
+const STAGE_LABEL: Record<string, MessageKey> = {
+  valid: 'cert.stage.valid',
+  expiring: 'cert.stage.expiring',
+  expired: 'cert.stage.expired',
+  failed: 'cert.stage.failed',
+  paused: 'cert.stage.paused',
+  revoked: 'cert.stage.revoked',
+  issuing: 'cert.stage.issuing',
+  empty: 'cert.stage.empty',
+  issued: 'cert.stage.issued',
+  waiting_confirm: 'cert.stage.waitingConfirm',
+  waiting_approval: 'cert.stage.waitingApproval',
+};
+
+/** 下一步动作（后端派生）-> 文案 */
+const NEXT_LABEL: Record<string, MessageKey> = {
+  none: 'cert.next.none',
+  confirm: 'cert.next.confirm',
+  approve: 'cert.next.approve',
+  wait_ca: 'cert.next.waitCa',
+  retry: 'cert.next.retry',
+  issue: 'cert.next.issue',
+  sync: 'cert.next.sync',
+  renew: 'cert.next.renew',
 };
 
 const STEP_STATUS: Record<string, MessageKey> = {
@@ -92,6 +127,7 @@ const STEP_STATUS: Record<string, MessageKey> = {
   skipped: 'cert.stepStatus.skipped',
   failed: 'cert.stepStatus.failed',
   running: 'cert.stepStatus.running',
+  waiting: 'cert.stepStatus.waiting',
 };
 
 /* ---- 运行日志：把 last_run 的逐步结果摊成一行一条日志 -------------------
@@ -166,19 +202,34 @@ interface StepView {
   detail: string;
   ms: string;
   at: string;
+  /** 父步骤 id：非空表示这是「签发 / 部署」内部的子步骤，渲染时缩进 */
+  parent: string;
+  /** 第几次尝试（自动重试时显示 2/3 这类标记） */
+  attempt: number;
+  /** waiting 状态的下次检查时间（epoch 秒，0 表示没有） */
+  nextAt: number;
+  level: string;
   logs: CertDeployLog[];
+  stepLogs: CertFlowStepLog[];
 }
 
 function stepViews(site: CertSite, detail: CertFlowRunDetail | null, t: TFunc): StepView[] {
   if (detail && detail.steps.length > 0) {
     return detail.steps.map((step) => ({
       key: step.node_id,
-      name: STEP_LABEL[step.node_id] ? t(STEP_LABEL[step.node_id]) : step.node_id,
+      name: STEP_LABEL[step.node_id]
+        ? t(STEP_LABEL[step.node_id])
+        : step.title || step.node_id,
       status: step.status,
       detail: step.detail || "",
       ms: step.ms ? `${step.ms} ms` : "",
       at: typeof step.at_ms === "number" ? `+${(step.at_ms / 1000).toFixed(2)}s` : "—",
+      parent: step.parent_id || "",
+      attempt: step.attempt || 0,
+      nextAt: step.next_at || 0,
+      level: step.level || "info",
       logs: step.logs ?? detail.groups?.[step.node_id] ?? [],
+      stepLogs: step.step_logs ?? [],
     }));
   }
   return (site.last_run ?? []).map((step) => ({
@@ -188,7 +239,12 @@ function stepViews(site: CertSite, detail: CertFlowRunDetail | null, t: TFunc): 
     detail: step.detail || "",
     ms: step.ms ? `${step.ms} ms` : "",
     at: typeof step.at === "number" ? `+${(step.at / 1000).toFixed(2)}s` : "—",
+    parent: "",
+    attempt: 0,
+    nextAt: 0,
+    level: "info",
     logs: detail?.groups?.[step.step] ?? [],
+    stepLogs: [],
   }));
 }
 
@@ -196,15 +252,24 @@ function stepViews(site: CertSite, detail: CertFlowRunDetail | null, t: TFunc): 
    站点上的 last_run 是**运行结束后**才投影的，正在跑的那一轮不在里面。所以
    先查最新运行记录，拿到 running 的那条就订阅 SSE，步骤与日志边跑边更新。
    引擎关闭（旧路径）时列表为空，调用方自动回退到 site.last_run。 */
-function useSiteRun(siteId: string | null): {
+function useSiteRun(
+  siteId: string | null,
+  /* 指定某次运行（历史列表点选）；为空则取该站点最新一次 */
+  runId = "",
+): {
   detail: CertFlowRunDetail | null;
   live: boolean;
 } {
   const [detail, setDetail] = useState<CertFlowRunDetail | null>(null);
   const [live, setLive] = useState(false);
+  /* 上一次请求的站点：切「站点」要清空，切「历史运行」不能清 ——
+     清空会让弹窗先白一帧、再退到站点最新一次渲染，用户看到的就是「闪一下」。 */
+  const prevSite = useRef<string | null>(null);
 
   useEffect(() => {
-    setDetail(null);
+    const siteChanged = prevSite.current !== siteId;
+    prevSite.current = siteId;
+    if (siteChanged) setDetail(null);
     setLive(false);
     if (!siteId) return;
 
@@ -213,12 +278,14 @@ function useSiteRun(siteId: string | null): {
     const controller = new AbortController();
 
     async function load() {
-      let target = "";
-      try {
-        const list = await certsApi.runs(id, 1);
-        if (list.items[0]) target = list.items[0].id;
-      } catch {
-        /* 引擎关闭 / 网络抖动：回退到站点投影 */
+      let target = runId;
+      if (!target) {
+        try {
+          const list = await certsApi.runs(id, 1);
+          if (list.items[0]) target = list.items[0].id;
+        } catch {
+          /* 引擎关闭 / 网络抖动：回退到站点投影 */
+        }
       }
       if (!alive || !target) return;
 
@@ -240,12 +307,32 @@ function useSiteRun(siteId: string | null): {
               setDetail((prev) =>
                 prev ? { ...prev, logs: [...prev.logs, ...event.items] } : prev,
               );
+            } else if (event.type === "steps") {
+              // 步骤状态变化：直接替换，失败步/等待步不必等运行结束才出现
+              setDetail((prev) =>
+                prev ? { ...prev, steps: event.steps } : prev,
+              );
             } else {
+              // done：以服务端最终步骤落一次，避免停留在最后一条中间态
+              if (event.steps?.length) {
+                setDetail((prev) =>
+                  prev ? { ...prev, steps: event.steps! } : prev,
+                );
+              }
               setLive(false);
             }
           },
           controller.signal,
         );
+        /* 流关闭后再拉一次完整详情：日志可能还有最后一两条，步骤也以库里的为准 */
+        if (alive) {
+          try {
+            const finalDetail = await certsApi.runDetail(target);
+            if (alive) setDetail(finalDetail);
+          } catch {
+            /* 拉取失败保留已有内容 */
+          }
+        }
       } catch {
         /* 流断开：保留已加载的部分，用户可重新展开 */
       } finally {
@@ -258,36 +345,143 @@ function useSiteRun(siteId: string | null): {
       alive = false;
       controller.abort();
     };
-  }, [siteId]);
+  }, [siteId, runId]);
 
   return { detail, live };
 }
 
-/** 一步一行：偏移 / 名称 / 状态 / 耗时 / 说明。弹窗与展开行共用。 */
-function StepLine({ step, t }: { step: StepView; t: TFunc }) {
+/** 等待步的倒计时需要每秒重渲染一次；没有等待步时不建立定时器 */
+function useNowTick(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [active]);
+  return now;
+}
+
+/** 运行日志的级别：只三档，够筛也够着色 */
+type RunLogLevel = "all" | "info" | "warn" | "error";
+
+const RUN_LOG_LEVELS: Array<{ key: RunLogLevel; label: MessageKey }> = [
+  { key: "all", label: "cert.runLogLevelAll" },
+  { key: "info", label: "cert.runLogLevelInfo" },
+  { key: "warn", label: "cert.runLogLevelWarn" },
+  { key: "error", label: "cert.runLogLevelError" },
+];
+
+/** 步骤自身的级别：失败=error，等待=warn，其余=info */
+function levelOfStep(step: StepView): Exclude<RunLogLevel, "all"> {
+  if (step.status === "failed") return "error";
+  if (step.status === "waiting") return "warn";
+  return "info";
+}
+
+/** 关键词高亮：不区分大小写切分，命中片段包进 <mark> */
+function highlight(text: string, query: string): ReactNode {
+  const q = query.trim();
+  if (!q || !text) return text;
+  const needle = q.toLowerCase();
+  const lower = text.toLowerCase();
+  const parts: ReactNode[] = [];
+  let from = 0;
+  let index = lower.indexOf(needle);
+  let key = 0;
+  while (index >= 0) {
+    if (index > from) parts.push(text.slice(from, index));
+    parts.push(<mark key={`hl-${key++}`}>{text.slice(index, index + q.length)}</mark>);
+    from = index + q.length;
+    index = lower.indexOf(needle, from);
+  }
+  if (from < text.length) parts.push(text.slice(from));
+  return parts;
+}
+
+/** 绝对时间只留时分秒：日志行里它用来对齐，不需要日期 */
+function clockText(ts?: number): string {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** 一步一行：级别点 / 偏移 / 步骤 / 状态 / 耗时 / 说明。弹窗与展开行共用。 */
+function StepLine({ step, t, query = "" }: { step: StepView; t: TFunc; query?: string }) {
+  /* waiting：后端给了下次检查时间时显示倒计时，比一句「等待中」有用得多 */
+  const waiting = step.status === "waiting" && step.nextAt > 0;
+  const now = useNowTick(waiting);
+  const waitingLeft = waiting
+    ? Math.max(0, Math.round(step.nextAt - now / 1000))
+    : null;
   return (
-    <div className={`cert-runlog-line is-${step.status}`}>
+    <div
+      className={`cert-runlog-line is-${step.status}${step.parent ? " is-substep" : ""}`}
+      style={step.parent ? { paddingLeft: 18 } : undefined}
+      data-level={levelOfStep(step)}
+    >
+      {/* 级别点：扫读时先看到红/橙，再读文字 */}
+      <span className={`cert-runlog-dot is-${step.status}`} aria-hidden="true" />
       <span className="cert-runlog-at">{step.at}</span>
-      <span className="cert-runlog-name">{step.name}</span>
+      <span className="cert-runlog-name">
+        {step.name}
+        {step.attempt > 1 ? (
+          <span className="fs-xs text-muted">{` · ${t('cert.runAttempt', { n: step.attempt })}`}</span>
+        ) : null}
+      </span>
       <span className="cert-runlog-status">
         {STEP_STATUS[step.status] ? t(STEP_STATUS[step.status]) : step.status}
       </span>
       <span className="cert-runlog-ms">{step.ms}</span>
-      <span className="cert-runlog-detail">{step.detail}</span>
+      <span className="cert-runlog-detail">
+        {highlight(step.detail, query)}
+        {waitingLeft !== null
+          ? `${step.detail ? " · " : ""}${t('cert.runWaitNext', { s: waitingLeft })}`
+          : ""}
+      </span>
     </div>
   );
 }
 
-function StepLogLines({ logs, t }: { logs: CertDeployLog[]; t: TFunc }) {
-  if (logs.length === 0) return null;
+function StepLogLines({
+  logs,
+  stepLogs,
+  t,
+  query = "",
+}: {
+  logs: CertDeployLog[];
+  stepLogs?: CertFlowStepLog[];
+  t: TFunc;
+  query?: string;
+}) {
+  const lines = stepLogs ?? [];
+  if (logs.length === 0 && lines.length === 0) return null;
   return (
     <ul className="cert-step-logs">
+      {/* 步骤内部的操作日志（下单 / 等待 / 目标写入…）：一行一条，先于业务日志 */}
+      {lines.map((log) => (
+        <li
+          key={`step-log-${log.id}`}
+          className={`cert-step-log is-${log.level || "info"}`}
+          data-level={log.level === "error" ? "error" : log.level === "warn" ? "warn" : "info"}
+        >
+          <span className="cert-step-log-time">{clockText(log.ts)}</span>
+          <span className="cert-step-log-action">{t('cert.stepLogLine')}</span>
+          <span className="cert-step-log-detail">{highlight(log.text, query)}</span>
+        </li>
+      ))}
       {logs.map((log) => (
-        <li key={log.id} className={`cert-step-log is-${log.result}`}>
+        <li
+          key={log.id}
+          className={`cert-step-log is-${log.result}`}
+          data-level={log.result === "failed" ? "error" : "info"}
+        >
+          <span className="cert-step-log-time">{clockText(log.ts)}</span>
           <span className="cert-step-log-action">
             {ACTION_LABEL[log.action] ? t(ACTION_LABEL[log.action]) : log.action}
           </span>
-          <span className="cert-step-log-detail">{log.detail}</span>
+          <span className="cert-step-log-detail">{highlight(log.detail, query)}</span>
         </li>
       ))}
     </ul>
@@ -512,6 +706,11 @@ export function Certificates() {
   /** 点过「保存」之后才显示字段错误：新开的空表单不该一上来就满屏红字 */
   const [submitTried, setSubmitTried] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<CertSite | null>(null);
+  /** 删除站点时是否连带删除它绑定的审批工作流（默认只解绑，不删工作流） */
+  const [deleteWorkflowToo, setDeleteWorkflowToo] = useState(false);
+  /** 证书清单里要删除的那张证书：会删掉它关联的全部站点配置 */
+  const [inventoryDeleteTarget, setInventoryDeleteTarget] =
+    useState<CertInventoryItem | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<CertSite | null>(null);
   /** 证书详情弹窗（链 / SAN / 指纹 / 线上体检） */
   const [detailSite, setDetailSite] = useState<CertSite | null>(null);
@@ -527,6 +726,13 @@ export function Certificates() {
   const [expanded, setExpanded] = useState("");
   /** 打开「运行日志」弹窗的站点（null = 关闭） */
   const [runLogSite, setRunLogSite] = useState<CertSite | null>(null);
+  /* 运行日志弹窗的检索状态：关键词、级别、是否跟随最新日志滚动 */
+  const [logQuery, setLogQuery] = useState("");
+  const [logLevel, setLogLevel] = useState<RunLogLevel>("all");
+  const [autoScroll, setAutoScroll] = useState(true);
+  const logScrollRef = useRef<HTMLDivElement | null>(null);
+  /** 弹窗里选中的历史运行 id；空串表示看最新一次 */
+  const [runPick, setRunPick] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [search, setSearch] = useState("");
   /** 证书清单的筛选：站点与清单是两套数据，各用各的搜索/渠道 */
@@ -555,11 +761,23 @@ export function Certificates() {
   const [wfToolbarSlot, setWfToolbarSlot] = useState<HTMLDivElement | null>(null);
 
   /* 展开行与弹窗各自订阅自己站点的运行：同一个 hook 两个实例，互不影响 */
-  const { detail: runDetail, live: runLive } = useSiteRun(runLogSite?.id ?? null);
+  const { detail: runDetail, live: runLive } = useSiteRun(
+    runLogSite?.id ?? null,
+    runPick,
+  );
   const { detail: expandedDetail, live: expandedLive } = useSiteRun(expanded || null);
 
   /* 轮询间隔跟「设置 → 面板设置 → 数据刷新间隔」走（见 useRefreshInterval） */
   const refresh = useRefreshInterval();
+
+  /* 运行历史：弹窗里可以回看最近 10 次（含手动动作），点一条就切到那次的详情 */
+  const runHistoryQuery = useQuery({
+    queryKey: ["cert-runs", runLogSite?.id],
+    queryFn: () => certsApi.runs(String(runLogSite?.id), 10),
+    enabled: !!runLogSite,
+    staleTime: 5_000,
+    retry: false,
+  });
   const query = useQuery({
     queryKey: ["certs"],
     queryFn: certsApi.get,
@@ -776,11 +994,76 @@ export function Certificates() {
     [runLogSite, runDetail, t],
   );
 
+  /* 弹窗里的日志检索：级别按「步骤 + 它的日志行」综合判断，
+     所以一个 ok 的部署步骤里挂了 failed 目标，筛「错误」也能命中。 */
+  const visibleSteps = useMemo(() => {
+    const q = logQuery.trim().toLowerCase();
+    return runSteps.filter((step) => {
+      if (logLevel !== "all") {
+        const levels = [
+          levelOfStep(step),
+          ...step.logs.map((log) => (log.result === "failed" ? "error" : "info")),
+          ...step.stepLogs.map((log) =>
+            log.level === "error" ? "error" : log.level === "warn" ? "warn" : "info",
+          ),
+        ];
+        if (!levels.includes(logLevel)) return false;
+      }
+      if (!q) return true;
+      const hay = [
+        step.name,
+        step.detail,
+        ...step.logs.map((log) => log.detail),
+        ...step.stepLogs.map((log) => log.text),
+      ]
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(q);
+    });
+  }, [runSteps, logQuery, logLevel]);
+
+  /* 自动滚动：只跟随「最新一条」，用户手动往上翻时由开关关掉 */
+  useEffect(() => {
+    if (!autoScroll || !runLogSite) return;
+    const el = logScrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [autoScroll, runLogSite, visibleSteps.length, runDetail?.logs.length]);
+
   /* 展开行的步骤视图：同一个合成函数，数据跟着 expanded 站点走 */
   const expandedSteps = useMemo(() => {
     const site = sites.find((item) => item.id === expanded);
     return site ? stepViews(site, expandedDetail, t) : [];
   }, [sites, expanded, expandedDetail, t]);
+
+  /* 证书事件推送档位（仅失败 / 失败+成功 / 全部） */
+  const notifyModeQuery = useQuery({
+    queryKey: ["cert-notify-mode"],
+    queryFn: certsApi.notifyMode,
+    staleTime: 300_000,
+    retry: false,
+  });
+
+  function saveNotifyMode(mode: string) {
+    void run(
+      "notify-mode",
+      async () => {
+        await certsApi.saveNotifyMode(mode);
+        await notifyModeQuery.refetch();
+        return t('cert.notifyModeSaved');
+      },
+      t('cert.notifyModeSaved'),
+    );
+  }
+
+  /* 可绑定的审批工作流（站点表单里的下拉；删除确认里也要用它显示工作流名）
+     只在打开表单或删除确认时拉，避免每次进页面都多一次请求。 */
+  const workflowDefsQuery = useQuery({
+    queryKey: ["cert-workflow-defs"],
+    queryFn: async () => (await certWorkflowsApi.list()).items,
+    enabled: !!form || deleteTarget !== null,
+    staleTime: 60_000,
+    retry: false,
+  });
 
   /* ---- 签发渠道凭据（腾讯云 / 阿里云 / 华为云，同一套接口） ---- */
   /** 记一次自检结果：卡片上要能一直看到「上次自检成功 / 失败 + 原因」 */
@@ -1163,6 +1446,22 @@ export function Certificates() {
     { id: "paused", label: 'cert.filterPaused', count: stats.paused },
   ];
 
+  /** 从失败的那一步重跑：成功后刷新运行历史并回到最新一次 */
+  function retryRun() {
+    const target = runDetail;
+    if (!target) return;
+    void run(
+      "run-retry",
+      async () => {
+        const result = await certsApi.retryRun(target.id);
+        setRunPick("");
+        await runHistoryQuery.refetch();
+        return result.detail || t('cert.runRetried');
+      },
+      t('cert.runRetried'),
+    );
+  }
+
   /* 把日志整段塞进剪贴板：排障时更多人是要贴到工单 / 群里，而不是逐行抄 */
   async function copyRunLog() {
     if (!runLogSite) return;
@@ -1172,6 +1471,22 @@ export function Certificates() {
     } catch {
       toast.error(t('common.opFailed'), t('cert.runLogCopy'));
     }
+  }
+
+  /** 导出成 .log：贴工单、留档都比截图靠谱 */
+  function exportRunLog() {
+    if (!runLogSite) return;
+    const blob = new Blob([runLogText(runLogSite, t, runSteps)], {
+      type: "text/plain;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `cert-run-${runLogSite.domain || "site"}.log`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   }
 
   return (
@@ -1429,6 +1744,25 @@ export function Certificates() {
             /* 工作流视图的工具栏由 CertWorkflowWorkspace 通过 portal 渲染到这里，
                与上面两个分支共用同一条工具栏、同一套控件 */
             <div className="cert-toolbar" ref={setWfToolbarSlot} />
+          ) : view === "providers" ? (
+            /* 通知档位放在 tab 行右端：它是整页的发送策略，不属于某条渠道，
+               搁在渠道列表底部会像「第三条待配置渠道」 */
+            <div className="cert-toolbar cert-notify-inline">
+              <span
+                className="cert-notify-inline-label"
+                title={t('cert.notifyModeHint')}
+              >
+                {t('cert.notifyModeTitle')}
+              </span>
+              <Select
+                className="cert-notify-inline-select"
+                value={notifyModeQuery.data?.mode || "failures_success"}
+                options={notifyModeQuery.data?.options ?? []}
+                disabled={!canManage}
+                aria-label={t('cert.notifyModeTitle')}
+                onChange={(e) => saveNotifyMode(e.target.value)}
+              />
+            </div>
           ) : null}
         </div>
 
@@ -1533,6 +1867,7 @@ export function Certificates() {
                   <th className="cert-col-expire">{t('cert.colExpire')}</th>
                   <th className="cert-col-target">{t('cert.colTarget')}</th>
                   <th className="cert-col-run">{t('cert.colRun')}</th>
+                  <th className="cert-col-next">{t('cert.colNext')}</th>
                   <th className="cert-col-actions">{t('cert.colAction')}</th>
                 </tr>
               </thead>
@@ -1693,6 +2028,25 @@ export function Certificates() {
                               {t('cert.attempts', { n: site.attempt_count ?? 0 })}
                             </div>
                           ) : null}
+                        </td>
+                        <td className="cert-col-next">
+                          <div className="cert-run">
+                            <span className={`cert-run-pill is-${site.stage || "none"}`}>
+                              {site.stage && STAGE_LABEL[site.stage]
+                                ? t(STAGE_LABEL[site.stage])
+                                : "—"}
+                            </span>
+                          </div>
+                          {site.next_action && site.next_action !== "none" ? (
+                            <div className="cert-run-note">
+                              {NEXT_LABEL[site.next_action]
+                                ? t(NEXT_LABEL[site.next_action])
+                                : site.next_action}
+                              {site.next_action_at
+                                ? ` · ${formatRelative(site.next_action_at)}`
+                                : ""}
+                            </div>
+                          ) : null}
                           {siteWorkflows > 0 ? (
                             <div className="cert-run-note is-workflow">
                               <IconFlow size={11} />
@@ -1786,7 +2140,7 @@ export function Certificates() {
                       </tr>
                       {open ? (
                         <tr className="cert-detail-row">
-                          <td colSpan={canManage ? 6 : 5}>
+                          <td colSpan={canManage ? 7 : 6}>
                             <div className="cert-detail">
                               <div className="cert-detail-main">
                                 <div className="cert-detail-head">
@@ -1811,7 +2165,10 @@ export function Certificates() {
                                     size="sm"
                                     className="cert-runlog-btn"
                                     icon={<IconTerminal size={14} />}
-                                    onClick={() => setRunLogSite(site)}
+                                    onClick={() => {
+                                      setRunPick("");
+                                      setRunLogSite(site);
+                                    }}
                                   >
                                     {t('cert.runLog')}
                                   </Button>
@@ -1822,7 +2179,7 @@ export function Certificates() {
                                       <li key={step.key} className={`cert-step is-${step.status}`}>
                                         <StepLine step={step} t={t} />
                                         {/* 这一步归因到的部署日志：谁能看到「哪一步打了什么」 */}
-                                        <StepLogLines logs={step.logs} t={t} />
+                                        <StepLogLines logs={step.logs} stepLogs={step.stepLogs} t={t} />
                                       </li>
                                     ))}
                                   </ol>
@@ -2208,6 +2565,18 @@ export function Certificates() {
                               {t('cert.inventoryBind')}
                             </Button>
                           ) : null}
+                          {/* 删除这张证书：删的是它在面板里的全部站点配置，
+                              云端证书与已部署文件不动（确认框里写清楚） */}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="cert-danger-text"
+                            icon={<IconTrash size={14} />}
+                            disabled={!canManage || item.pending || readonlyCert}
+                            onClick={() => setInventoryDeleteTarget(item)}
+                          >
+                            {t('common.delete')}
+                          </Button>
                           <Button
                             variant="ghost"
                             size="sm"
@@ -2272,16 +2641,19 @@ export function Certificates() {
           </>
         ) : (
           /* 签发渠道（字段由后端 schema 驱动）：同一张卡里的一块，不再单独成卡 */
-          <CertProvidersCard
-            bare
-            providers={providers}
-            canManage={canManage}
-            busy={busy}
-            tests={providerTests}
-            counts={providerCertCounts}
-            onSave={saveProvider}
-            onTest={testProvider}
-          />
+          <>
+            <CertProvidersCard
+              bare
+              providers={providers}
+              canManage={canManage}
+              busy={busy}
+              tests={providerTests}
+              counts={providerCertCounts}
+              onSave={saveProvider}
+              onTest={testProvider}
+            />
+
+          </>
         )}
       </Card>
 
@@ -2304,10 +2676,30 @@ export function Certificates() {
             : undefined
         }
         size="lg"
-        onClose={() => setRunLogSite(null)}
+        onClose={() => {
+          setRunLogSite(null);
+          setRunPick("");
+        }}
         footer={
           <>
-            <Button variant="secondary" onClick={() => setRunLogSite(null)}>
+            {runDetail?.status === "failed" ? (
+              /* 失败的那一步可以直接重跑：不必回到站点上再点一次「申请 / 部署」 */
+              <Button
+                variant="secondary"
+                icon={<IconRefresh size={14} />}
+                loading={busy === "run-retry"}
+                onClick={retryRun}
+              >
+                {t('cert.runRetry')}
+              </Button>
+            ) : null}
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setRunLogSite(null);
+                setRunPick("");
+              }}
+            >
               {t('common.close')}
             </Button>
             <Button
@@ -2321,34 +2713,126 @@ export function Certificates() {
           </>
         }
       >
-        {runSteps.length > 0 ? (
-          <>
-            {runLive ? (
-              <div className="cert-run-live">
-                <span className="cert-step-dot" aria-hidden="true" />
-                {t('cert.runLive')}
-              </div>
+        {/* 工具栏：搜索 / 级别 / 自动滚动 / 导出。日志一多，先筛再看 */}
+        <div className="cert-runlog-toolbar">
+          <div className="cert-runlog-search">
+            <IconSearch size={14} aria-hidden="true" />
+            <input
+              value={logQuery}
+              placeholder={t('cert.runLogSearch')}
+              aria-label={t('cert.runLogSearch')}
+              onChange={(e) => setLogQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && logQuery) {
+                  e.preventDefault();
+                  setLogQuery("");
+                }
+              }}
+            />
+            {logQuery ? (
+              <button
+                type="button"
+                className="cert-runlog-search-clear"
+                aria-label={t('cert.clearSearch')}
+                onClick={() => setLogQuery("")}
+              >
+                <IconClose size={12} />
+              </button>
             ) : null}
-            <ol className="cert-runlog-steps">
-              {runSteps.map((step) => (
-                <li key={step.key} className={`cert-step is-${step.status}`}>
-                  <StepLine step={step} t={t} />
-                  {/* 该步骤归因到的部署日志：签发 / 同步 / 每个部署目标各一行 */}
-                  <StepLogLines logs={step.logs} t={t} />
-                </li>
-              ))}
-            </ol>
-            {/* 失败步骤的说明里通常已经带着同一段错误，不再重复一遍 */}
-            {runLogSite?.last_error &&
-            !runSteps.some((step) =>
-              step.detail.includes(runLogSite.last_error as string),
-            ) ? (
-              <div className="cert-detail-error mt-8">{runLogSite.last_error}</div>
-            ) : null}
-          </>
-        ) : (
-          <div className="fs-sm text-secondary">{t('cert.runEmpty')}</div>
-        )}
+          </div>
+          <div className="cert-runlog-levels" role="tablist" aria-label={t('cert.runLogFilter')}>
+            {RUN_LOG_LEVELS.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                role="tab"
+                aria-selected={logLevel === item.key}
+                className={`cert-runlog-level${logLevel === item.key ? " is-active" : ""}`}
+                onClick={() => setLogLevel(item.key)}
+              >
+                {t(item.label)}
+              </button>
+            ))}
+          </div>
+          <label className="cert-runlog-auto">
+            <Switch checked={autoScroll} onChange={setAutoScroll} />
+            <span>{t('cert.runLogAutoScroll')}</span>
+          </label>
+          <Button
+            variant="ghost"
+            size="sm"
+            icon={<IconDownload size={14} />}
+            disabled={runSteps.length === 0}
+            onClick={exportRunLog}
+          >
+            {t('cert.runLogExport')}
+          </Button>
+        </div>
+
+        {runHistoryQuery.data?.items?.length ? (
+          /* 运行历史：定时 / 手动 / 重试都在这里，点一条切到那次的逐步日志 */
+          <div className="cert-runlog-runs">
+            <span className="cert-runlog-runs-label">{t('cert.runHistory')}</span>
+            {runHistoryQuery.data.items.map((item: CertFlowRun) => (
+              <button
+                key={item.id}
+                type="button"
+                className={`cert-runlog-run${
+                  (runPick || runDetail?.id) === item.id ? " is-active" : ""
+                }`}
+                title={[item.pipeline, item.trigger_by, item.error]
+                  .filter(Boolean)
+                  .join(" · ")}
+                onClick={() => setRunPick(item.id)}
+              >
+                <span className="cert-runlog-run-time">
+                  {formatDateTime(item.started_at || 0)}
+                </span>
+                <span className={`cert-runlog-run-state is-${item.status}`}>
+                  {item.status}
+                </span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="cert-runlog-scroll" ref={logScrollRef}>
+          {runLive ? (
+            <div className="cert-run-live">
+              <span className="cert-step-dot" aria-hidden="true" />
+              {t('cert.runLive')}
+            </div>
+          ) : null}
+          {visibleSteps.length > 0 ? (
+            <>
+              <ol className="cert-runlog-steps">
+                {visibleSteps.map((step) => (
+                  <li key={step.key} className={`cert-step is-${step.status}`}>
+                    <StepLine step={step} t={t} query={logQuery} />
+                    {/* 该步骤归因到的部署日志：签发 / 同步 / 每个部署目标各一行 */}
+                    <StepLogLines
+                      logs={step.logs}
+                      stepLogs={step.stepLogs}
+                      t={t}
+                      query={logQuery}
+                    />
+                  </li>
+                ))}
+              </ol>
+              {/* 失败步骤的说明里通常已经带着同一段错误，不再重复一遍 */}
+              {runLogSite?.last_error &&
+              !runSteps.some((step) =>
+                step.detail.includes(runLogSite.last_error as string),
+              ) ? (
+                <div className="cert-detail-error mt-8">{runLogSite.last_error}</div>
+              ) : null}
+            </>
+          ) : (
+            <div className="cert-runlog-empty">
+              {runSteps.length === 0 ? t('cert.runEmpty') : t('cert.runLogNoMatch')}
+            </div>
+          )}
+        </div>
       </Modal>
 
       {/* ---------------- 站点编辑 ---------------- */}
@@ -2441,6 +2925,19 @@ export function Certificates() {
                       : t('cert.caHintProvider')
               }
               onChange={(e) => setForm({ ...form, ca: e.target.value as CertSite["ca"] })}
+            />
+            <Select
+              label={t('cert.fieldWorkflow')}
+              value={form.workflow_id || ""}
+              options={[
+                { value: "", label: t('cert.workflowNone') },
+                ...(workflowDefsQuery.data ?? []).map((item) => ({
+                  value: item.id,
+                  label: item.name,
+                })),
+              ]}
+              hint={t('cert.workflowHint')}
+              onChange={(e) => setForm({ ...form, workflow_id: e.target.value })}
             />
             {form.ca === "acme" ? (
               <>
@@ -3270,18 +3767,97 @@ export function Certificates() {
           name: deleteTarget?.name ?? "",
           domain: deleteTarget?.domain ?? "",
         })}
-        onCancel={() => setDeleteTarget(null)}
+        onCancel={() => {
+          setDeleteTarget(null);
+          setDeleteWorkflowToo(false);
+        }}
         onConfirm={async () => {
           const ok = await run(
             "delete",
             async () => {
               if (!deleteTarget) return "";
+              /* 先删工作流（用户勾选时）：它若还有待审批 / 进行中的实例，后端
+                 会回 409 —— 这时**中止**，不能让「站点删了、工作流还在」这种
+                 半途状态出现。 */
+              if (deleteWorkflowToo && deleteTarget.workflow_id) {
+                await certWorkflowsApi.remove(deleteTarget.workflow_id);
+              }
               const r = await certsApi.removeSite(deleteTarget.id);
               return r.detail;
             },
             t('cert.siteDeleted'),
           );
-          if (ok) setDeleteTarget(null);
+          if (ok) {
+            setDeleteTarget(null);
+            setDeleteWorkflowToo(false);
+            /* 级联删除动了工作流与审批实例，这两份缓存一起作废 */
+            void qc.invalidateQueries({ queryKey: ["cert-workflows"] });
+            void qc.invalidateQueries({ queryKey: ["cert-workflow-runs"] });
+            void qc.invalidateQueries({ queryKey: ["cert-workflow-defs"] });
+          }
+        }}
+      >
+        {deleteTarget?.workflow_id ? (
+          <div className="mt-16">
+            <Notice tone="warning">
+              {t('cert.deleteBoundWorkflow', {
+                name:
+                  (workflowDefsQuery.data ?? []).find(
+                    (item) => item.id === deleteTarget.workflow_id,
+                  )?.name ?? deleteTarget.workflow_id,
+              })}
+            </Notice>
+            <Checkbox
+              label={t('cert.deleteWorkflowToo')}
+              checked={deleteWorkflowToo}
+              onChange={(e) => setDeleteWorkflowToo(e.target.checked)}
+            />
+          </div>
+        ) : null}
+      </ConfirmDialog>
+
+      {/* ---------------- 证书清单删除确认 ----------------
+          清单是按「厂商 + 证书 ID」聚合出来的视图，真正要删的是它关联的
+          站点配置（可能多个）。云端证书与已部署文件不在面板控制范围内。 */}
+      <ConfirmDialog
+        open={inventoryDeleteTarget !== null}
+        danger
+        title={t('cert.inventoryDeleteTitle')}
+        confirmText={t('common.delete')}
+        message={t('cert.inventoryDeleteMessage', {
+          domains: (inventoryDeleteTarget?.domains ?? []).join(", ") || "—",
+          count: inventoryDeleteTarget?.sites.length ?? 0,
+        })}
+        onCancel={() => setInventoryDeleteTarget(null)}
+        onConfirm={async () => {
+          const target = inventoryDeleteTarget;
+          if (!target) return;
+          const ok = await run(
+            "inventory-delete",
+            async () => {
+              /* 逐站点删：一台失败不该阻断其余站点（与批量操作同一口径），
+                 最后汇总失败数交给用户判断。 */
+              const results = await Promise.allSettled(
+                target.sites.map((site) => certsApi.removeSite(site.id)),
+              );
+              const failed = results.filter((r) => r.status === "rejected").length;
+              if (failed) {
+                throw new Error(
+                  t('cert.inventoryDeletePartial', {
+                    failed,
+                    total: target.sites.length,
+                  }),
+                );
+              }
+              return t('cert.inventoryDeleteDone', { n: target.sites.length });
+            },
+            t('cert.inventoryDeleted'),
+          );
+          if (ok) {
+            setInventoryDeleteTarget(null);
+            void qc.invalidateQueries({ queryKey: ["cert-workflow-runs"] });
+            void qc.invalidateQueries({ queryKey: ["cert-workflow-defs"] });
+          }
         }}
       />
 

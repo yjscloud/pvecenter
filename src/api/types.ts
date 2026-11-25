@@ -2595,7 +2595,8 @@ export interface LxcCreateResponse {
 }
 
 export interface LxcCloneRequest {
-  newid: number;
+  /** 省略 = 由后端分配下一个可用 VMID（克隆对话框已不再让用户填号） */
+  newid?: number;
   hostname?: string;
   target_storage?: string;
   target_node?: string;
@@ -3383,7 +3384,8 @@ export interface VmCreateResponse {
 }
 
 export interface VmCloneRequest {
-  newid: number;
+  /** 省略 = 由后端分配下一个可用 VMID */
+  newid?: number;
   name?: string;
   full?: boolean;
   target_storage?: string;
@@ -4288,6 +4290,30 @@ export interface CertSite {
   auto_renew: boolean;
   /** 签发后是否自动部署（关闭后只签发，等人工部署） */
   auto_deploy?: boolean;
+  /** 审批闸门：绑定的证书工作流 id（空 = 不审批） */
+  workflow_id?: string;
+  /** 是否有待处理的工作流审批 */
+  approval_pending?: boolean;
+  /** 自动部署被「生产目标待确认」拦下 */
+  deploy_blocked?: boolean;
+  /** 生产目标（PVE 节点 / CLB / CDN）是否允许自动部署 */
+  prod_auto_deploy?: boolean;
+  /** 下一次向 CA 同步状态的时间（分级同步） */
+  next_sync_at?: number;
+  /** 部署后线上校验结论 */
+  tls_verify?: {
+    ok: boolean;
+    at: number;
+    expected?: string;
+    actual?: string;
+    detail?: string;
+  };
+  /** 后端派生的阶段：valid / expiring / expired / issuing / failed / paused / empty … */
+  stage?: string;
+  /** 后端派生的下一步动作：issue / wait_ca / deploy / confirm / approve / retry / sync / renew */
+  next_action?: string;
+  /** 下一步动作的时间（epoch 秒，0 表示无排期） */
+  next_action_at?: number;
   /** 是否发送 30/14/7/3 天到期提醒 */
   notify_expiring?: boolean;
   /** 0 表示跟随全局设置 */
@@ -4477,16 +4503,39 @@ export interface CertDeployLog {
   node_id?: string;
 }
 
+/** 步骤内部的一行操作日志（cert_flow_step_log） */
+export interface CertFlowStepLog {
+  id: number;
+  run_id: string;
+  node_id: string;
+  seq: number;
+  ts: number;
+  level: 'info' | 'warn' | 'error' | string;
+  text: string;
+}
+
 /** 某次运行里的一步。字段与后端 cert_flow_step 对齐 */
 export interface CertFlowRunStep {
   node_id: string;
   node_type: string;
-  status: 'ok' | 'skipped' | 'failed' | 'running';
+  /** waiting = 异步等待（CA 签发 / DNS 生效），页面上显示倒计时 */
+  status: 'ok' | 'skipped' | 'failed' | 'running' | 'waiting';
   detail?: string;
   ms?: number;
   /** 相对运行开始的毫秒偏移 */
   at_ms?: number;
   error?: string;
+  /** 所属的顶层步骤；空串表示自己就是顶层步骤 */
+  parent_id?: string;
+  /** 后端给出的可读标题（子步骤用，顶层仍走文案表） */
+  title?: string;
+  /** 第几次尝试（同一目标重试时 node_id 不变） */
+  attempt?: number;
+  /** waiting 状态的下次检查时间（epoch 秒） */
+  next_at?: number;
+  level?: string;
+  /** 该步骤内部的日志行 */
+  step_logs?: CertFlowStepLog[];
   /** 本步产生的部署日志（按 id 升序，即产生顺序） */
   logs?: CertDeployLog[];
 }
@@ -4500,7 +4549,14 @@ export interface CertFlowRunStep {
 export type CertRunStreamEvent =
   | { type: 'snapshot'; run: CertFlowRunDetail }
   | { type: 'logs'; items: CertDeployLog[]; cursor: number }
-  | { type: 'done'; reason: 'finished' | 'idle' | 'timeout'; status?: string };
+  /** 步骤状态变化（开始跑 / 失败 / 等待）：直接替换步骤列表，不必等运行结束 */
+  | { type: 'steps'; steps: CertFlowRunStep[] }
+  | {
+      type: 'done';
+      reason: 'finished' | 'idle' | 'timeout';
+      status?: string;
+      steps?: CertFlowRunStep[];
+    };
 
 /** 运行头（列表用）。字段与后端 cert_flow_run 对齐 */
 export interface CertFlowRun {
@@ -4510,6 +4566,8 @@ export interface CertFlowRun {
   site_name?: string;
   domain?: string;
   pipeline?: string;
+  /** 关联的证书流水运行（工作流执行时写入，详情页互跳用） */
+  cert_run_id?: string;
   version?: number;
   /** 触发来源：tick / retry / manual / legacy */
   trigger_by?: string;
@@ -4524,6 +4582,8 @@ export interface CertFlowRunDetail extends CertFlowRun {
   steps: CertFlowRunStep[];
   /** 本次运行的全部日志（按产生顺序） */
   logs: CertDeployLog[];
+  /** 步骤内部的日志行（按产生顺序） */
+  step_logs?: CertFlowStepLog[];
   /** 按 node_id 分组；旧路径没有运行头时前端只用这份 */
   groups: Record<string, CertDeployLog[]>;
   artifacts?: Array<Record<string, unknown>>;
@@ -4600,8 +4660,16 @@ export interface CertProviderInfo {
   configured: boolean;
   /** 列表里用哪个字段当标识（AK ID / 邮箱） */
   identity_key?: string;
-  /** 没有可用于自检的接口（ACME 就是这种） */
+  /** 没有可用于自检的接口（ACME 现在可以「验证配置」，恒为 false） */
   test_disabled?: boolean;
+  /**
+   * 上一次自检的结论（服务端持久化）。
+   *
+   * 以前它只存在页面 state 里，刷新就退回「未自检」——用户刚验过、下次进来
+   * 又不知道能不能用。现在跟随渠道视图一起下发，卡片上能一直看到
+   * 「上次自检 X 前」或失败原因。
+   */
+  last_test?: { ok: boolean; detail: string; at: number } | null;
   /** 签发即拿证书（不需要轮询） */
   synchronous?: boolean;
   fields: CertProviderField[];
@@ -6674,6 +6742,8 @@ export interface CertWorkflowRun {
   workflow_name: string;
   site_id: string;
   site_domain: string;
+  /** 该流程执行时产生的证书流水运行 id（详情页可跳到运行日志） */
+  cert_run_id?: string;
   title: string;
   status: CertWorkflowRunStatus;
   /** 当前步骤下标；-1 表示待审批，steps.length 表示已完成 */

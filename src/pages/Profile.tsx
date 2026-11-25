@@ -132,6 +132,9 @@ export function Profile() {
   });
   const [tfaSetup, setTfaSetup] = useState<TwoFactorSetup | null>(null);
   const [tfaCode, setTfaCode] = useState('');
+  /* 绑定 2FA 要验当前口令：只凭一枚会话令牌不能换锁（否则被盗令牌可以把自己的
+     认证器绑上来，之后改密也解除不掉）。 */
+  const [tfaPwd, setTfaPwd] = useState('');
   const [tfaError, setTfaError] = useState<string | undefined>();
   const [tfaBusy, setTfaBusy] = useState(false);
   /* 恢复码只在开启成功那一刻返回一次，先用本地状态留住给用户抄 */
@@ -266,10 +269,14 @@ export function Profile() {
   /* ------------------------------------------------------- 两步验证操作 */
 
   const startTfaSetup = async () => {
+    if (!tfaPwd) {
+      setTfaError(t('profile.tfaNeedPassword'));
+      return;
+    }
     setTfaBusy(true);
     setTfaError(undefined);
     try {
-      const res = await authApi.setupTwoFactor();
+      const res = await authApi.setupTwoFactor(tfaPwd);
       setTfaSetup(res);
       setTfaCode('');
       setRecoveryCodes([]);
@@ -285,13 +292,18 @@ export function Profile() {
       setTfaError(t('profile.tfaInvalidCode'));
       return;
     }
+    if (!tfaPwd) {
+      setTfaError(t('profile.tfaNeedPassword'));
+      return;
+    }
     setTfaBusy(true);
     setTfaError(undefined);
     try {
-      const res = await authApi.enableTwoFactor(tfaCode.trim());
+      const res = await authApi.enableTwoFactor(tfaCode.trim(), tfaPwd);
       setRecoveryCodes(res.recovery_codes);
       setTfaSetup(null);
       setTfaCode('');
+      setTfaPwd('');
       await refresh().catch(() => undefined);
       await tfaQuery.refetch();
       toast.success(t('profile.tfaEnabled'), t('profile.tfaEnabledDetail'));
@@ -791,16 +803,29 @@ export function Profile() {
                   </div>
                 </>
               ) : (
-                <div className="form-row dyn-foot">
-                  <Button
-                    variant="primary"
-                    icon={<IconShield size={15} />}
-                    onClick={() => void startTfaSetup()}
-                    loading={tfaBusy}
-                  >
-                    {t('profile.startTfa')}
-                  </Button>
-                </div>
+                <>
+                  {/* 绑定 2FA = 换锁：先要一次当前口令，防止被盗令牌把自己的
+                      认证器绑上来（之后改密也解除不掉）。 */}
+                  <Field label={t('profile.fieldCurrentPwd')} required>
+                    <Input
+                      type="password"
+                      value={tfaPwd}
+                      onChange={(e) => setTfaPwd(e.target.value)}
+                      autoComplete="current-password"
+                      placeholder={t('profile.tfaPasswordHint')}
+                    />
+                  </Field>
+                  <div className="form-row dyn-foot">
+                    <Button
+                      variant="primary"
+                      icon={<IconShield size={15} />}
+                      onClick={() => void startTfaSetup()}
+                      loading={tfaBusy}
+                    >
+                      {t('profile.startTfa')}
+                    </Button>
+                  </div>
+                </>
               )
             ) : tfa?.required ? (
               /* 这一态只有一句话，同样贴底：贴着状态徽章留一大片空白更像没写完 */

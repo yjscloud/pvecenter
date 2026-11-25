@@ -26,6 +26,7 @@ from fastapi import HTTPException, Request
 
 from . import (
     frp,
+    guestostype,
     i18n,
     ippool,
     migrateguard,
@@ -368,6 +369,9 @@ async def _run_one(
             from .routers.vm_meta import drop_entry as drop_vm_meta
 
             await drop_vm_meta(conn_id, node, vmid)
+            # 系统类型缓存同理：同号重建的机器若换了发行版，图标会一直错
+            # （单台 6 小时，节点汇总还要再叠 2 分钟）
+            guestostype.forget(conn_id, node, gtype, vmid)
 
         elif action == "tag":
             config_getter = client.qemu_config if gtype == "qemu" else client.lxc_config

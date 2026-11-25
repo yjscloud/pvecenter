@@ -17,7 +17,7 @@
 | `LOGIN_MAX_FAILURES` / `LOGIN_LOCKOUT_MINUTES` | `5` / `15` | 登录失败几次就锁定，账号和来源 IP 双计数 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS` | `720` / `14` | 令牌有效期，后者等于一次登录最多能用多久 |
 | `SESSION_MAX_PER_USER` | `10` | 同一账号最多保留几台已登录设备，新登录挤掉最旧的一台；`0` = 不限 |
-| `COOKIE_SECURE` | 跟随 `FORCE_HTTPS` | refresh Cookie 是否只走 HTTPS |
+| `COOKIE_SECURE` | 跟随请求是否 HTTPS（含 `FORCE_HTTPS`） | 会话 Cookie 是否带 Secure；本地明文调试才需要显式设 `0` |
 | `TOTP_REQUIRED_ROLES` | 空（`.env.example` 示例为 `admin`） | 强制开两步验证的角色 |
 | `TOTP_ISSUER` | `pvecenter` | 认证器 App 里显示的签发方名称，建议写成面板的公网域名 |
 | `TOTP_TRUST_ENABLED` | `true` | 是否允许勾选「信任设备」（同一台浏览器 7 天内免输动态码）。`false` 则每次登录都要过第二因子 |
@@ -33,7 +33,7 @@
 | `PVE_VERIFY_SSL` | `false` | 出站是否校验 PVE 证书。默认关闭：PVE 出厂自签，开着会握手失败。要安全就用连接里的「证书 PEM」（`ca_cert`）钉扎，或证书由正规 CA 签发时改成 `true` |
 | `PVE_TRUST_ENV` | `false` | 是否让请求走环境变量里的 `HTTP_PROXY` / `HTTPS_PROXY` |
 | `PVE_CONSOLE_USER` / `PVE_CONSOLE_PASSWORD` | 空 | 控制台用的 PVE 账号密码，留空则控制台不可用 |
-| `CORS_ORIGINS` | `http://localhost:5173` | 允许的前端来源，逗号分隔 |
+| `CORS_ORIGINS` | 空（不启用 CORS） | 允许的前端来源，逗号分隔；只有前端独立部署 / Vite 开发时才填 |
 | `HTTP_TIMEOUT` / `TASK_POLL_INTERVAL` | `30` / `2` | PVE 请求超时（秒）与任务状态轮询间隔（秒）。轮询是自适应的：从 0.2 秒起逐步翻倍，最长到这个值 |
 | `BATCH_CONCURRENCY` | `3` | 批量下发的并发台数（仅 `stop_on_error=0` 时生效，设 `1` 回到串行）。每台都要等 PVE 任务结束，并发能把总耗时压到接近「最慢一台 × 轮数」 |
 | `DEBUG` | `false` | 响应里带 `X-PVE-Calls` / `X-DB-Queries` 计数头，便于排性能问题；生产别开 |

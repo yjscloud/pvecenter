@@ -62,6 +62,44 @@ def test_multi_targets_are_kept_and_summarised_on_site() -> None:
     assert site["deploy_dir"] == "/etc/nginx/ssl"
 
 
+def test_first_target_id_never_becomes_site_id() -> None:
+    """回归：第一个目标的 id 不能被当成站点 id。
+
+    前端把第一个目标固定命名为 ``primary``（附加目标叫 ``t-<时间戳>``）。
+    此前 ``normalise_site`` 会把目标 id 搬成站点 id，于是所有新建站点都拿到
+    ``id="primary"``，落库时按 id 覆盖上一个站点 —— 域名、证书绑定与部署目标
+    一起消失（线上表现为「新加一个站点后，原来那个域名不见了」）。
+    """
+    first = certs.normalise_site(
+        _payload(
+            domain="a.example.com",
+            targets=[{"id": "primary", "method": "local", "deploy_dir": "/etc/nginx/ssl"}],
+        )
+    )
+    second = certs.normalise_site(
+        _payload(
+            domain="b.example.com",
+            targets=[{"id": "primary", "method": "local", "deploy_dir": "/etc/nginx/ssl"}],
+        )
+    )
+    assert first["id"] != "primary" and second["id"] != "primary"
+    assert first["id"] != second["id"]
+    # 目标自己的 id 仍然保留：部署日志按它归因
+    assert first["targets"][0]["id"] == "primary"
+
+
+def test_new_site_ignores_client_supplied_id() -> None:
+    """新建站点的 id 由服务端生成：请求体给 id 不能覆盖已有站点。"""
+    site = certs.normalise_site(_payload(id="an-existing-site"))
+    assert site["id"] != "an-existing-site"
+
+
+def test_edit_keeps_site_id() -> None:
+    existing = certs.normalise_site(_payload())
+    updated = certs.normalise_site(_payload(domain="other.example.com"), existing)
+    assert updated["id"] == existing["id"]
+
+
 def test_target_view_merges_site_and_target() -> None:
     site = certs.normalise_site(
         _payload(

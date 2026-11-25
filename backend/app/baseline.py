@@ -38,6 +38,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import time
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
@@ -54,6 +55,17 @@ SSHD_MAIN = "/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR = "/etc/ssh/sshd_config.d"
 # 面板托管的两处加固文件：只碰它们，不动发行版自带配置
 SSHD_DROPIN = os.path.join(SSHD_DROPIN_DIR, "99-panel-baseline.conf")
+
+#: 允许面板以 sudo 执行的 sshd 绝对路径白名单。远端 ``command -v sshd`` 的结果
+#: 会被拼进命令，而 PATH 里可能有可写目录 —— 只认这几个固定值。
+_SSHD_BINARIES = (
+    "/usr/sbin/sshd",
+    "/usr/bin/sshd",
+    "/sbin/sshd",
+    "/bin/sshd",
+    "/usr/local/sbin/sshd",
+    "/usr/local/bin/sshd",
+)
 SYSCTL_FILE = "/etc/sysctl.d/99-panel-baseline.conf"
 LOGIN_DEFS = "/etc/login.defs"
 
@@ -2231,9 +2243,11 @@ async def _remote_read_file(
 ) -> Optional[str]:
     """读远程文件；不存在返回 ``None``（用标记区分「不存在」与「空文件」）。"""
     marker = "##panel:exists##"
+    # 路径一律 quote：这些字符串会被拼进远端 shell，被管主机上的文件名同样不可信
+    safe = shlex.quote(str(path))
     _ok, output = await _remote_run(
         row,
-        f"if [ -e {path} ]; then printf '{marker}'; {sudo}cat {path} 2>/dev/null; fi",
+        f"if [ -e {safe} ]; then printf '{marker}'; {sudo}cat {safe} 2>/dev/null; fi",
     )
     if marker not in output:
         return None
@@ -2246,7 +2260,9 @@ async def _remote_write_file(
     """写远程文件：先建目录（SFTP 不会自动建父目录），再交给 sshremote。"""
     directory = os.path.dirname(path)
     if directory:
-        await _remote_run(row, f"{sudo}mkdir -p {directory} 2>/dev/null")
+        await _remote_run(
+            row, f"{sudo}mkdir -p {shlex.quote(directory)} 2>/dev/null"
+        )
     ok, error = await _sshremote().write_file(row, path, content)
     if not ok:
         raise FixError(
@@ -2262,7 +2278,7 @@ async def _remote_restore(
 ) -> None:
     try:
         if before is None:
-            await _remote_run(row, f"{sudo}rm -f {path}")
+            await _remote_run(row, f"{sudo}rm -f {shlex.quote(str(path))}")
         else:
             await _remote_write_file(row, path, before, sudo)
     except Exception:  # noqa: BLE001 - 回滚失败只能记日志
@@ -2308,6 +2324,11 @@ async def _remote_apply_sshd(
         row, "command -v sshd 2>/dev/null || ls /usr/sbin/sshd 2>/dev/null"
     )
     binary = (binary_out.strip().splitlines() or [""])[0].strip()
+    # ``command -v`` 的输出由**被管主机**决定：PATH 里有可写目录时，文件名可以是
+    # ``sshd;cp /bin/sh /tmp/x;``。只接受固定的绝对路径，其余回退默认值 ——
+    # 绝不把远端输出拼进 sudo 命令行（PVE-EXEC-003）。
+    if binary and binary not in _SSHD_BINARIES:
+        binary = "/usr/sbin/sshd"
     if not binary:
         await _remote_restore(row, SSHD_DROPIN, before, sudo)
         raise FixError("远程主机上找不到 sshd 可执行文件，无法校验配置")
@@ -2383,7 +2404,9 @@ async def _remote_apply_sysctl(
     content = render_sysctl_file(merged)
     await _remote_write_file(row, SYSCTL_FILE, content, sudo)
 
-    ok, output = await _remote_run(row, f"{sudo}sysctl -p {SYSCTL_FILE} 2>/dev/null", timeout=30)
+    ok, output = await _remote_run(
+        row, f"{sudo}sysctl -p {shlex.quote(SYSCTL_FILE)} 2>/dev/null", timeout=30
+    )
     if not ok:
         ok, output = await _remote_run(row, f"{sudo}sysctl --system 2>/dev/null", timeout=30)
         if not ok:
@@ -2393,7 +2416,7 @@ async def _remote_apply_sysctl(
     failed: List[str] = []
     for name, value in updates.items():
         path = os.path.join("/proc/sys", name.replace(".", "/"))
-        _ok, out = await _remote_run(row, f"cat {path} 2>/dev/null")
+        _ok, out = await _remote_run(row, f"cat {shlex.quote(path)} 2>/dev/null")
         actual = out.strip().splitlines()[-1].strip() if out.strip() else ""
         if actual and actual != str(value).strip():
             failed.append(

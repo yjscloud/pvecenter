@@ -1419,6 +1419,8 @@ export const zhCompute = {
   /* 容器详情「更多操作」菜单。措辞与 vmMore.* 对齐，但把「虚拟机」换成「容器」——
      两页并排看时说的是同一件事，只是对象不同。 */
   'lxcMore.clone': '克隆为新的容器',
+  'lxcMore.cloneRunningHint':
+    '容器正在运行，无法克隆。请先关闭容器，再执行克隆。',
   'lxcMore.cloneTitle': '克隆为新的容器',
   'lxcMore.cloneHostname': '主机名',
   'lxcMore.cloneTask': '克隆「{name}」',
@@ -2318,7 +2320,6 @@ export const zhCompute = {
   /* 「操作系统」列图标的判定依据（悬停可查） */
   'guestList.osFromMeta': '手动标注',
   'guestList.osFromTemplate': '来源模板 {name}',
-  'guestList.osFromLinkedTemplate': '手工关联的模板 {name}',
   'guestList.osFromSnapshot': '系统信息快照（{time}）',
   'guestList.osSnapshot': '系统信息快照：{detail}（采集于 {time}）。隔离 / 解除隔离 / 开机时自动更新，读取失败不会清空已有信息。',
   'guestList.osSnapshotEmpty': '已记录采集时间',

@@ -1353,7 +1353,6 @@ function CloneTemplateDialog({
   /* 这个对话框做的是「把机器转成模板」—— 属于模板管理 */
   const canManage = hasPermission('template.manage');
 
-  const [newId, setNewId] = useState('');
   const [name, setName] = useState('');
   /** 默认链接克隆：以模板磁盘为 backing file，秒级完成且几乎不占空间 */
   const [full, setFull] = useState(false);
@@ -1366,14 +1365,6 @@ function CloneTemplateDialog({
 
   /* 容器模板与虚拟机模板的克隆参数不同：容器没有链接克隆，且占用 rootdir 存储 */
   const isLxc = template?.guest_type === 'lxc';
-
-  const nextIdQuery = useQuery({
-    queryKey: ['cluster', 'nextid', template?.connection_id ?? ''],
-    queryFn: () => clusterApi.nextId(template?.connection_id),
-    enabled: Boolean(template),
-    retry: false,
-    staleTime: 0,
-  });
 
   const nodesQuery = useQuery({
     queryKey: ['nodes', template?.connection_id ?? ''],
@@ -1425,18 +1416,7 @@ function CloneTemplateDialog({
     setFull(Boolean(defaults.full_clone));
   }, [template, vmDefaultsQuery.data]);
 
-  useEffect(() => {
-    if (template && !newId && nextIdQuery.data?.vmid) {
-      setNewId(String(nextIdQuery.data.vmid));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nextIdQuery.data, template]);
 
-  const idNum = Number(newId);
-  const idError =
-    newId && (!Number.isInteger(idNum) || idNum < 100 || idNum > 999999999)
-      ? t('templates.vmidRule')
-      : undefined;
 
   /* 虚拟机占 images 存储、容器占 rootdir 存储 —— 别把放不下的选项列给用户挑 */
   const storageContent = isLxc ? 'rootdir' : 'images';
@@ -1458,7 +1438,7 @@ function CloneTemplateDialog({
   ];
 
   const submit = async () => {
-    if (!template || !newId || idError || !canManage) return;
+    if (!template || !canManage) return;
     setBusy(true);
     try {
       if (isLxc) {
@@ -1469,7 +1449,6 @@ function CloneTemplateDialog({
             template.node,
             template.vmid,
             {
-              newid: idNum,
               hostname: name || `ct-${template.vmid}-clone`,
               target_storage: targetStorage || undefined,
               target_node: targetNode || undefined,
@@ -1478,7 +1457,7 @@ function CloneTemplateDialog({
             template.connection_id,
           ),
           {
-            title: t('templates.cloneTaskCt', { vmid: idNum }),
+            title: t('guestList.cloneTask', { name: name || template.name || template.vmid }),
             node: template.node,
             invalidate: [['vms'], ['lxc'], ['templates'], ['cluster'], ['storages']],
           },
@@ -1491,7 +1470,6 @@ function CloneTemplateDialog({
             {
               source_node: template.node,
               source_vmid: template.vmid,
-              newid: idNum,
               /* 后端该字段必填，缺省时给一个与表单一致的兜底名 */
               name: name || `vm-${template.vmid}-clone`,
               full,
@@ -1506,7 +1484,7 @@ function CloneTemplateDialog({
             template.connection_id,
           ),
           {
-            title: t('templates.cloneTaskVm', { vmid: idNum }),
+            title: t('guestList.cloneTask', { name: name || template.name || template.vmid }),
             node: template.node,
             invalidate: [['vms'], ['templates'], ['cluster'], ['storages']],
           },
@@ -1540,7 +1518,6 @@ function CloneTemplateDialog({
             variant="primary"
             onClick={submit}
             loading={busy}
-            disabled={!newId || Boolean(idError)}
           >
             {t('templates.cloneStart')}
           </Button>
@@ -1548,18 +1525,6 @@ function CloneTemplateDialog({
       }
     >
       <div className="form-grid-2">
-        <Input
-          label={t('templates.cloneNewId')}
-          required
-          value={newId}
-          onChange={(e) => setNewId(e.target.value.replace(/\D/g, ''))}
-          error={idError}
-          hint={
-            nextIdQuery.data
-              ? t('templates.cloneSuggested', { vmid: nextIdQuery.data.vmid })
-              : t('templates.cloneUnique')
-          }
-        />
         <Input
           label={
             isLxc ? t('templates.cloneNewHostname') : t('templates.cloneNewName')

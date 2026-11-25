@@ -48,7 +48,7 @@ from ..formatters import (
     pve_flag,
 )
 from ..vm_scope import bind_vm_connection
-from .vm_meta import drop_entry as drop_vm_meta, manual_ip_index
+from .vm_meta import drop_entry as drop_vm_meta, manual_ip_index, set_template
 from ..pve import (
     ProxmoxError,
     client_for_connection,
@@ -1529,6 +1529,10 @@ async def _create_vm_core(
         # 正是克隆。克隆可以落到 target_node，缓存键带节点，必须按实际落点清。
         clone_node = payload.clone_from.target_node or payload.clone_from.node
         await guestip.forget(_op_connection(), clone_node, vmid, "qemu")
+        # 系统类型缓存同理：VMID 回收后同号新机器可能是另一种系统（实测 108
+        # 从 ubuntu 换成 centos，图标最长 6 小时仍停在 ubuntu —— 节点汇总缓存
+        # 只看「vmid 还在不在」，同号重建不会让它失效）。
+        guestostype.forget(_op_connection(), clone_node, "qemu", vmid)
         # 置顶 / 收藏与 IP 缓存同理：都是按 vmid 记账。上一台同号机器若是面板外
         # 删掉的就走不到删除接口，这里兜底清一次，新克隆体从默认状态开始。
         await prefs.forget_guest_refs(_op_connection(), clone_node, vmid)
@@ -1627,6 +1631,8 @@ async def _create_vm_core(
     # 之类会留下），会贴到这台新机器上。清一次，让列表从这台机器自己的配置 /
     # Agent 重新解析 —— 否则「刚建出来的机器显示着别人的地址」。
     await guestip.forget(_op_connection(), payload.node, vmid, "qemu")
+    # 系统类型缓存（6 小时）：同号上一台可能是另一种系统，不清就会画错图标
+    guestostype.forget(_op_connection(), payload.node, "qemu", vmid)
     # 置顶 / 收藏同样是按 vmid 记账的：上一台同号机器可能是在面板外回收的，
     # 走不到删除接口，这里兜底清掉，保证新机器默认未收藏、未置顶。
     await prefs.forget_guest_refs(_op_connection(), payload.node, vmid)
@@ -2026,6 +2032,8 @@ async def _create_from_clone(
             str(user.get("username") or ""),
         ),
     )
+    # 回收号上的旧 ostype 缓存要清：同号新机器的系统可能完全不同
+    guestostype.forget(_op_connection(), target_node, "qemu", vmid)
 
     # 下发通知：快速部署走的正是这条路（链接克隆），通知里必须带上连接信息。
     # 与全新创建那条路径一致，丢到后台（同步 SMTP 不该挡住创建响应）。
@@ -2232,6 +2240,9 @@ async def delete_vm(
     )
     # IP 缓存同样要清：VMID 回收后，旧地址会贴着同号的新机器显示一分钟
     await _best_effort("IP 缓存", guestip.forget(conn_id, node, vmid, "qemu"))
+    # 系统类型缓存（单台 6 小时 + 节点汇总 2 分钟）：不清的话，同号重建的机器
+    # 会继续按上一台的系统画图标（实测：centos 容器顶着 ubuntu 徽标）
+    guestostype.forget(conn_id, node, "qemu", vmid)
     # 隔离登记也要清：VMID 会被回收，同号的新机器不该一出生就带「隔离」标签
     # （正常情况下隔离中的机器走不到这里，见上面的 409 —— 这行是给「先解除隔离
     # 再删除」以及历史残留兜底的）
@@ -2756,6 +2767,18 @@ async def clone_vm(
 ) -> Dict[str, Any]:
     client = get_client()
 
+    # VMID 由系统分配：克隆不需要用户填号。PVE 的 nextid 会跳过已被占用的号，
+    # 客户端仍可显式指定（脚本 / 迁移工具），传了就用传的。
+    newid = int(payload.newid or await client.nextid())
+
+    # 节点可见范围：源节点在路径里、落点节点在请求体里，两个都要校验。
+    # 少了落点这一条，受限账号可以把机器「克隆到」自己看不见的节点上 ——
+    # 资源已落地、界面里却没有，运维很难发现（PVE-AUTHZ-006）。
+    connection_id = guestguard.call_connection()
+    await security.ensure_node_allowed(user, connection_id, node)
+    if payload.target_node:
+        await security.ensure_node_allowed(user, connection_id, payload.target_node)
+
     # 克隆同样会实实在在多出一台虚拟机，配额必须跟着算 ——
     # 只在 POST /vms 拦的话，拿一台已有机器反复克隆就能绕过上限。
     await quota.enforce_for_create(user, request, "vm")
@@ -2775,16 +2798,39 @@ async def clone_vm(
         )
     except ProxmoxError as exc:
         await security.audit(
-            request, user, "vm.clone", target=f"{node}/{vmid} -> {payload.newid}",
+            request, user, "vm.clone", target=f"{node}/{vmid} -> {newid}",
             result="failed", detail=exc.message,
         )
         _raise(exc)
+
+    # 链接克隆只支持「源磁盘是完整盘」。源机器自己若是链接克隆（磁盘形如
+    # `base-100-disk-0.qcow2/109/vm-109-disk-0.qcow2`），PVE 会回一句
+    # `Linked clone feature is not supported ...` —— 提前拦下，并直接告诉用户
+    # 改「完整克隆」，不必等 PVE 报错、也不必看到那条存储路径。
+    if not payload.full:
+        try:
+            source_config = await client.qemu_config(node, vmid) or {}
+        except ProxmoxError:
+            source_config = {}
+        linked_from = int(
+            guest_created.config_source(source_config, node).get("vmid") or 0
+        )
+        if linked_from:
+            detail = (
+                f"源虚拟机 {vmid} 本身是链接克隆（基于模板 {linked_from}），"
+                "不能再做链接克隆。请勾选「完整克隆」后重试"
+            )
+            await security.audit(
+                request, user, "vm.clone", target=f"{node}/{vmid}",
+                result="failed", detail=detail,
+            )
+            raise HTTPException(status_code=400, detail=detail)
 
     try:
         result = await client.qemu_clone(
             node,
             vmid,
-            newid=payload.newid,
+            newid=newid,
             name=payload.name,
             full=payload.full,
             target_storage=payload.target_storage,
@@ -2794,7 +2840,7 @@ async def clone_vm(
     except ProxmoxError as exc:
         exc.message = explain_clone_error(exc.message, payload.full)
         await security.audit(
-            request, user, "vm.clone", target=f"{node}/{vmid} -> {payload.newid}",
+            request, user, "vm.clone", target=f"{node}/{vmid} -> {newid}",
             result="failed", detail=exc.message,
         )
         _raise(exc)
@@ -2804,7 +2850,12 @@ async def clone_vm(
     # 新号可能是回收来的：置顶 / 收藏都按 vmid 记账，先清掉上一个占用者留下的
     # 状态，克隆体才不会带着别人的星标出现（放在这里，下面两条返回路径都覆盖到）。
     await prefs.forget_guest_refs(
-        _op_connection(), payload.target_node or node, payload.newid
+        _op_connection(), payload.target_node or node, newid
+    )
+    # 回收号上可能还留着上一台机器的 ostype 缓存：不清的话克隆体会顶着别人的
+    # 系统图标（单台缓存 6 小时，节点汇总缓存还要再叠 2 分钟）
+    guestostype.forget(
+        _op_connection(), payload.target_node or node, "qemu", newid
     )
 
     # 克隆体继承母机的机型，而母机上可能是「默认机型的旧写法」（面板早期写成 pc）
@@ -2823,38 +2874,51 @@ async def clone_vm(
     # 整机克隆走。容器克隆一直有这一步（lxc.py 的 clone_container），虚拟机侧漏了。
     await ownership.claim(
         ownership.KIND_VM,
-        ownership.vm_ref(_op_connection(), target_node, payload.newid),
+        ownership.vm_ref(_op_connection(), target_node, newid),
         str(user.get("username") or ""),
     )
 
+    # 关联「源克隆机所用的模板」：PVE 把 Linux 一律记成 l26，具体发行版只能靠
+    # 模板名（TencentOS4 / ubuntu-2204）认。克隆 109 这台普通机器时，沿审计再取
+    # 一层拿到它当初的模板，列表的操作系统列据此显示同一个系统。
+    await set_template(
+        _op_connection(),
+        target_node,
+        newid,
+        await guest_created.source_template_of(
+            client, _op_connection(), node, vmid, "qemu"
+        ),
+        by=str(user.get("username") or ""),
+    )
+
     try:
-        source_config = await client.qemu_config(target_node, payload.newid) or {}
+        source_config = await client.qemu_config(target_node, newid) or {}
     except ProxmoxError:
         source_config = {}
     machine_overrides = vmconfig.clone_machine_overrides(source_config)
     if machine_overrides:
         try:
             await client.qemu_set_config(
-                target_node, payload.newid, machine_overrides
+                target_node, newid, machine_overrides
             )
         except ProxmoxError as exc:
             # 机器已经建好了，机型没纠成不该让整个请求失败 —— 如实带出来即可
             await security.audit(
                 request, user, "vm.clone",
                 # 同上：配置没纠成不代表来源不成立
-                target=f"{node}/{vmid} -> {target_node}/{payload.newid}",
+                target=f"{node}/{vmid} -> {target_node}/{newid}",
                 result="partial", detail=f"克隆成功但机型纠正失败: {exc.message}",
             )
-            return {"task": task, "vmid": payload.newid, "warning": exc.message}
+            return {"task": task, "vmid": newid, "warning": exc.message}
 
     await security.audit(
         request, user, "vm.clone",
         # 目标段必须带节点：来源解析按 `节点/VMID` 精确匹配 target_guest，
         # 只写 `-> 104` 时归一化出来是 `104`，这台机器就永远查不到来源，列表徽标是「—」。
-        target=f"{node}/{vmid} -> {target_node}/{payload.newid}",
+        target=f"{node}/{vmid} -> {target_node}/{newid}",
         detail={"name": payload.name, "full": payload.full},
     )
-    return {"task": task, "vmid": payload.newid}
+    return {"task": task, "vmid": newid}
 
 
 @router.post("/vms/{node}/{vmid}/template")

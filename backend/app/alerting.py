@@ -25,6 +25,7 @@ from . import (
     ownership,
     prefs,
     site,
+    ssrfguard,
     store,
 )
 from .pve import (
@@ -1310,6 +1311,14 @@ async def save_webhook(raw: Dict[str, Any], owner: str = "") -> Dict[str, Any]:
 
     if not valid_webhook(webhook):
         raise WebhookConfigError(i18n.tr("Webhook 地址需要是完整的 http(s) 链接"))
+    if webhook:
+        # 保存前就拦：内网 / 回环地址存进去之后，后台告警会反复替租户探测它
+        try:
+            await ssrfguard.assert_url_allowed(webhook)
+        except ssrfguard.TargetBlocked as exc:
+            raise WebhookConfigError(
+                i18n.tr("Webhook 地址不被允许：") + str(exc)
+            ) from exc
 
     template = str(raw.get("template") or "").strip()
     if template:
@@ -1443,6 +1452,13 @@ async def send_webhook(
         return False, i18n.tr("未配置通用 Webhook 地址")
     if not valid_webhook(url):
         return False, i18n.tr("Webhook 地址不是合法的 http(s) 链接")
+    # Webhook 是用户自由填写的出站地址：不拦内网 / 回环，面板就成了租户的内网
+    # 探测器（且「测试」会把对端响应当成错误文案回显）。公网地址照常可用，
+    # 内网目标需要管理员写进 CONNECTION_TEST_ALLOW_TARGETS 白名单。
+    try:
+        await ssrfguard.assert_url_allowed(url)
+    except ssrfguard.TargetBlocked as exc:
+        return False, i18n.tr("Webhook 地址不被允许：") + str(exc)
 
     sign_secret = str(config.get("sign_secret") or "")
     if sign_secret:
@@ -1475,10 +1491,9 @@ async def send_webhook(
         return False, i18n.tr("发送失败：") + str(exc)
 
     if resp.status_code >= 300:
-        return (
-            False,
-            "HTTP " + str(resp.status_code) + i18n.tr("：") + resp.text[:160],
-        )
+        # 只回状态码：把对端响应体拼进错误文案，等于给「测试」按钮装了一个
+        # 可读内网接口内容的回显通道（PVE-SSRF-002）。
+        return False, "HTTP " + str(resp.status_code)
     return True, i18n.tr("已发送")
 
 

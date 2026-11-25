@@ -7,6 +7,7 @@ import re
 import secrets
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
@@ -1246,6 +1247,28 @@ def decode_token(token: str, expected_typ: str = "access") -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------- cookies
+#: 本次请求是否走在 TLS 上（由 main 的中间件按 ASGI ``scheme`` 写入）。
+#: uvicorn 的 ProxyHeaders 已按 FORWARDED_ALLOW_IPS 验过信任链，所以反代终结
+#: TLS 的部署这里也会是 True —— 会话 cookie 因此不会漏到明文回程上
+#: （PVE-CONF-003(c)）。
+_request_is_https: ContextVar[bool] = ContextVar("pvecenter_https", default=False)
+
+
+def note_request_scheme(scheme: str) -> None:
+    _request_is_https.set(str(scheme or "").lower() in ("https", "wss"))
+
+
+def cookie_secure() -> bool:
+    """Cookie 是否带 Secure。
+
+    * ``COOKIE_SECURE=1/0`` 显式指定时按它（本地明文调试需要显式关掉）；
+    * 否则「本次请求是 HTTPS」或「强制 HTTPS」就带 Secure。
+    """
+    if settings.cookie_secure is not None:
+        return bool(settings.cookie_secure)
+    return bool(settings.force_https) or _request_is_https.get()
+
+
 def set_refresh_cookie(response: Response, token: str) -> None:
     """下发 refresh cookie：HttpOnly + SameSite=Lax（同源部署足够）。"""
     response.set_cookie(
@@ -1254,7 +1277,7 @@ def set_refresh_cookie(response: Response, token: str) -> None:
         max_age=session_refresh_days() * 86400,
         path=REFRESH_COOKIE_PATH,
         httponly=True,
-        secure=settings.secure_cookie,
+        secure=cookie_secure(),
         samesite="lax",
     )
 
@@ -1264,7 +1287,7 @@ def clear_refresh_cookie(response: Response) -> None:
         key=REFRESH_COOKIE,
         path=REFRESH_COOKIE_PATH,
         httponly=True,
-        secure=settings.secure_cookie,
+        secure=cookie_secure(),
         samesite="lax",
     )
 
@@ -1277,7 +1300,7 @@ def set_access_cookie(response: Response, token: str) -> None:
         max_age=session_access_minutes() * 60,
         path=ACCESS_COOKIE_PATH,
         httponly=True,
-        secure=settings.secure_cookie,
+        secure=cookie_secure(),
         samesite="lax",
     )
 
@@ -1287,7 +1310,7 @@ def clear_access_cookie(response: Response) -> None:
         key=ACCESS_COOKIE,
         path=ACCESS_COOKIE_PATH,
         httponly=True,
-        secure=settings.secure_cookie,
+        secure=cookie_secure(),
         samesite="lax",
     )
 
@@ -1302,7 +1325,7 @@ def set_csrf_cookie(response: Response, value: str = "") -> str:
         path=CSRF_COOKIE_PATH,
         # 故意不加 HttpOnly：前端需要读出来放进请求头（攻击者站点读不到）
         httponly=False,
-        secure=settings.secure_cookie,
+        secure=cookie_secure(),
         samesite="lax",
     )
     return token
@@ -1325,7 +1348,7 @@ def set_trusted_cookie(response: Response, token: str, max_age: int) -> None:
         max_age=max(0, int(max_age)),
         path=TRUSTED_COOKIE_PATH,
         httponly=True,
-        secure=settings.secure_cookie,
+        secure=cookie_secure(),
         samesite="lax",
     )
 
@@ -1335,7 +1358,7 @@ def clear_trusted_cookie(response: Response) -> None:
         key=TRUSTED_COOKIE,
         path=TRUSTED_COOKIE_PATH,
         httponly=True,
-        secure=settings.secure_cookie,
+        secure=cookie_secure(),
         samesite="lax",
     )
 
@@ -1345,7 +1368,7 @@ def clear_csrf_cookie(response: Response) -> None:
         key=CSRF_COOKIE,
         path=CSRF_COOKIE_PATH,
         httponly=False,
-        secure=settings.secure_cookie,
+        secure=cookie_secure(),
         samesite="lax",
     )
 
@@ -1906,13 +1929,19 @@ def client_ip_from_scope(scope: Dict[str, Any]) -> str:
     client = scope.get("client")
     if client:
         peer = client[0] or ""
-    if peer in trusted_proxies():
+    trusted = trusted_proxies()
+    if peer in trusted:
         for name, value in scope.get("headers") or []:
-            if name == b"x-forwarded-for":
-                first = value.decode("latin-1").split(",")[0].strip()
-                if first:
-                    return first
-                break
+            if name != b"x-forwarded-for":
+                continue
+            # 从右往左跳过可信代理段，取最右侧的「非可信」地址。
+            # 追加式 XFF（nginx 的 $proxy_add_x_forwarded_for）最左段正是客户端
+            # 自己填的值：信它等于把限流桶、登录锁定与审计来源交给攻击者。
+            for hop in reversed(value.decode("latin-1").split(",")):
+                hop = hop.strip()
+                if hop and hop not in trusted:
+                    return hop
+            break
     return peer
 
 

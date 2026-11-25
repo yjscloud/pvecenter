@@ -10,9 +10,10 @@ Webhook 地址（拿到即可向群里推送任意消息）和签名密钥。本
 * 采用 encrypt-then-MAC，用认证密钥对 ``nonce || 密文`` 计算 16 字节标签，
   解密时用 :func:`hmac.compare_digest` 校验，防止篡改。
 
-密文格式为 ``enc:v1:<urlsafe-base64(nonce || tag || body)>``。带版本前缀是
-为了将来平滑升级算法；:func:`decrypt` 对不带前缀的内容原样返回，因此历史
-明文配置依然可用（调用方可在读取时顺手迁移为密文）。
+密文格式为 ``enc:v2:<urlsafe-base64(nonce || tag || body)>``（tag 32 字节，
+密钥用 scrypt + 安装级 salt 派生）。旧版本写下的 ``enc:v1:`` 仍然可以解密
+（tag 16 字节、无 salt 的 HMAC 派生），:func:`needs_rewrap` 会提示把它们重写成
+v2；:func:`decrypt` 对不带前缀的内容原样返回，历史明文配置依然可用。
 
 不引入 ``cryptography``/``Fernet`` 的原因：后端依赖保持精简，而这套实现对
 "加密一段 Webhook 字符串"的场景已经足够。注意根密钥来自 ``secret_key``，
@@ -30,9 +31,14 @@ import hashlib
 import hmac
 import os
 
-from .config import settings
+from .config import DATA_DIR, settings
 
 PREFIX = "enc:v1:"
+#: v2：密钥派生改为带迭代的 scrypt + 安装级随机 salt，标签放宽到 32 字节。
+#: v1 的 ``HMAC(secret_key, info)`` 没有 salt、没有迭代，**拿到任意一段密文**
+#: 就能对候选 SECRET_KEY 做一次 HMAC 验证（PVE-CONF-002）。v1 只保留读取，
+#: 新写入一律 v2；读取到 v1 时由 :func:`needs_rewrap` 提示重写。
+PREFIX_V2 = "enc:v2:"
 
 #: KDF 的上下文标识，参与密钥派生：它一变，库里已存的 PVE Token / SMTP 口令 /
 #: TOTP 种子、SSH 私钥都会解不开。2026-11 随项目改名换成了现在的名字，
@@ -48,6 +54,65 @@ _LEGACY_KDF_INFOS = (
 )
 _NONCE_LEN = 16
 _TAG_LEN = 16
+_TAG_LEN_V2 = 32
+_SALT_LEN = 16
+#: scrypt 参数：n=2^14 约 16MB 内存、单次 ~50ms。只在本进程首次加解密时付一次
+#: （结果缓存在 :data:`_KEY_CACHE`），之后都是字典命中。
+_SCRYPT_N = 2**14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_KEY_CACHE: dict = {}
+_SALT_CACHE: list = []
+#: 安装级 salt 落在数据目录（不进数据库：数据库备份泄露时它不该跟着走）
+_SALT_FILE = DATA_DIR / ".enc-salt"
+
+
+def _salt() -> bytes:
+    """读取（或首次生成）安装级 salt。
+
+    文件权限 0600；用 ``O_CREAT|O_EXCL`` 创建，多 worker 同时首启也只会有一份。
+    """
+    if _SALT_CACHE:
+        return _SALT_CACHE[0]
+    try:
+        salt = _SALT_FILE.read_bytes()
+    except OSError:
+        salt = b""
+    if not salt:
+        candidate = os.urandom(_SALT_LEN)
+        try:
+            _SALT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(_SALT_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # 另一个进程刚建好：用它写下的那一份
+            try:
+                salt = _SALT_FILE.read_bytes()
+            except OSError:
+                salt = candidate
+        except OSError:
+            salt = candidate
+        else:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(candidate)
+            salt = candidate
+    _SALT_CACHE.clear()
+    _SALT_CACHE.append(salt)
+    return salt
+
+
+def _derive_keys_v2(master: bytes, salt: bytes) -> tuple:
+    """v2 的密钥派生：scrypt(master, 安装级 salt) 出 64 字节，前 32 加密、后 32 认MAC。"""
+    cached = _KEY_CACHE.get((master, salt))
+    if cached is not None:
+        return cached
+    material = hashlib.scrypt(
+        master, salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=64
+    )
+    keys = (material[:32], material[32:])
+    if len(_KEY_CACHE) > 8:  # 轮换密钥时也就几条，防止被测试无限撑大
+        _KEY_CACHE.clear()
+    _KEY_CACHE[(master, salt)] = keys
+    return keys
 
 
 def _derive_keys(info: bytes = _KDF_INFO, master_key: bytes = b"") -> tuple:
@@ -94,22 +159,22 @@ def _xor(data: bytes, key: bytes, nonce: bytes) -> bytes:
 
 
 def is_encrypted(value: str) -> bool:
-    """判断字符串是否为本模块产出的密文。"""
-    return isinstance(value, str) and value.startswith(PREFIX)
+    """判断字符串是否为本模块产出的密文（v1 与 v2 都算）。"""
+    return isinstance(value, str) and value.startswith((PREFIX, PREFIX_V2))
 
 
 def encrypt(plain: str) -> str:
-    """加密字符串；空串原样返回（避免给"未配置"也套一层密文）。"""
+    """加密字符串（始终写 v2）；空串原样返回（避免给"未配置"也套一层密文）。"""
     if not plain:
         return ""
     if is_encrypted(plain):
         return plain
-    enc_key, mac_key = _derive_keys()
+    enc_key, mac_key = _derive_keys_v2(_current_master(), _salt())
     nonce = os.urandom(_NONCE_LEN)
     body = _xor(plain.encode("utf-8"), enc_key, nonce)
-    tag = hmac.new(mac_key, nonce + body, hashlib.sha256).digest()[:_TAG_LEN]
+    tag = hmac.new(mac_key, nonce + body, hashlib.sha256).digest()[:_TAG_LEN_V2]
     token = base64.urlsafe_b64encode(nonce + tag + body).decode("ascii")
-    return PREFIX + token
+    return PREFIX_V2 + token
 
 
 def decrypt(value: str) -> str:
@@ -126,6 +191,8 @@ def decrypt(value: str) -> str:
         return ""
     if not is_encrypted(value):
         return value
+    if value.startswith(PREFIX_V2):
+        return _decrypt_v2(value)
     try:
         raw = base64.urlsafe_b64decode(value[len(PREFIX):].encode("ascii"))
     except (ValueError, TypeError):
@@ -144,6 +211,26 @@ def decrypt(value: str) -> str:
     return ""
 
 
+def _decrypt_v2(value: str) -> str:
+    """解 v2 密文：scrypt 派生的密钥 + 32 字节标签。"""
+    try:
+        raw = base64.urlsafe_b64decode(value[len(PREFIX_V2):].encode("ascii"))
+    except (ValueError, TypeError):
+        return ""
+    if len(raw) <= _NONCE_LEN + _TAG_LEN_V2:
+        return ""
+    nonce = raw[:_NONCE_LEN]
+    tag = raw[_NONCE_LEN:_NONCE_LEN + _TAG_LEN_V2]
+    body = raw[_NONCE_LEN + _TAG_LEN_V2:]
+    salt = _salt()
+    for master in _masters():
+        enc_key, mac_key = _derive_keys_v2(master, salt)
+        expected = hmac.new(mac_key, nonce + body, hashlib.sha256).digest()
+        if hmac.compare_digest(tag, expected):
+            return _xor(body, enc_key, nonce).decode("utf-8", "replace")
+    return ""
+
+
 def needs_rewrap(value: str) -> bool:
     """密文是否需要用当前根密钥重写。
 
@@ -152,6 +239,9 @@ def needs_rewrap(value: str) -> bool:
     """
     if not is_encrypted(value):
         return False
+    if value.startswith(PREFIX):
+        # v1 一律重写成 v2：v1 的派生无 salt / 无迭代，留着就等于留着离线验证面
+        return bool(decrypt(value))
     plain = decrypt(value)
     if not plain:
         # 解不开的密文无从判断，交给运维排查；这里不谎报「需要重写」
@@ -161,6 +251,18 @@ def needs_rewrap(value: str) -> bool:
 
 def _decrypt_with_current(value: str) -> str:
     """只用当前根密钥解密（用于判断是否需要重写）。"""
+    if value.startswith(PREFIX_V2):
+        raw = base64.urlsafe_b64decode(value[len(PREFIX_V2):].encode("ascii")) if value else b""
+        if len(raw) <= _NONCE_LEN + _TAG_LEN_V2:
+            return ""
+        nonce = raw[:_NONCE_LEN]
+        tag = raw[_NONCE_LEN:_NONCE_LEN + _TAG_LEN_V2]
+        body = raw[_NONCE_LEN + _TAG_LEN_V2:]
+        enc_key, mac_key = _derive_keys_v2(_current_master(), _salt())
+        expected = hmac.new(mac_key, nonce + body, hashlib.sha256).digest()
+        if hmac.compare_digest(tag, expected):
+            return _xor(body, enc_key, nonce).decode("utf-8", "replace")
+        return ""
     try:
         raw = base64.urlsafe_b64decode(value[len(PREFIX):].encode("ascii"))
     except (ValueError, TypeError):

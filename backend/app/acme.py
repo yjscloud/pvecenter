@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol
@@ -31,6 +32,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.x509.oid import NameOID
+
+from . import certflow, i18n
 
 # 常见目录，界面直接给下拉，也允许自己填。
 # Google Trust Services / SSL.com / Actalis / Buypass 都要求 EAB（见 AcmeClient 的
@@ -498,13 +501,46 @@ class AcmeClient:
         if solver.kind == "http-01" and any(d.startswith("*.") for d in domains):
             raise AcmeError("泛域名只能用 DNS-01 验证")
 
+        await certflow.emit_log(
+            i18n.pick("向 ACME 下单：", "Creating an ACME order for ")
+            + ", ".join(domains)
+        )
         order = await self.new_order(domains)
+        await certflow.emit_step(
+            "issue.order",
+            title=i18n.pick("创建订单", "Create order"),
+            detail=i18n.pick("已创建订单，域名 ", "Order created for ")
+            + str(len(domains))
+            + i18n.pick(" 个", " domain(s)"),
+        )
         try:
-            await self._authorize(order, solver, poll_timeout)
+            try:
+                await self._authorize(order, solver, poll_timeout)
+            except Exception as exc:
+                await certflow.emit_step(
+                    "issue.validate",
+                    status=certflow.NODE_FAILED,
+                    title=i18n.pick("域名验证", "Domain validation"),
+                    error=str(exc),
+                    level="error",
+                )
+                raise
             cert_key = new_private_key(key_type)
             order = await self.finalize(order, build_csr(domains, cert_key))
             order = await self._wait_order(order, poll_timeout)
+            await certflow.emit_step(
+                "issue.finalize",
+                title=i18n.pick("CA 签发", "CA issued"),
+                detail=i18n.pick("订单状态：valid", "Order status: valid"),
+            )
             fullchain = await self.download(str(order.get("certificate") or ""))
+            await certflow.emit_step(
+                "issue.download",
+                title=i18n.pick("下载证书", "Download certificate"),
+                detail=i18n.pick("已下载证书链 ", "Downloaded chain, ")
+                + str(len(fullchain))
+                + i18n.pick(" 字节", " bytes"),
+            )
         finally:
             # 成功要清理（删 DNS TXT / webroot 文件），失败更要清理
             cleanup = getattr(solver, "cleanup_all", None)
@@ -540,10 +576,21 @@ class AcmeClient:
                 value = key_auth
             await solver.present(domain, str(challenge.get("token") or ""), value)
             await self.respond_challenge(str(challenge.get("url") or ""))
+            await certflow.emit_log(
+                i18n.pick(
+                    "已提交验证：" + domain + "（" + solver.kind + "）",
+                    "Validation submitted: " + domain + " (" + solver.kind + ")",
+                )
+            )
             pending.append({"url": str(authz_url), "domain": domain})
 
         for item in pending:
             await self._wait_authorization(item["url"], item["domain"], deadline)
+        await certflow.emit_step(
+            "issue.validate",
+            title=i18n.pick("域名验证", "Domain validation"),
+            detail=i18n.pick("全部域名验证通过", "All domains validated"),
+        )
 
     async def _wait_authorization(self, url: str, domain: str, deadline: float) -> None:
         while True:
@@ -557,6 +604,14 @@ class AcmeClient:
                 )
             if time.monotonic() > deadline:
                 raise AcmeError(domain + " 的验证超时（CA 一直没有确认）")
+            # 等待也进流水线：页面上能看到「等的是哪个域名、下次什么时候再看」。
+            await certflow.emit_step(
+                "issue.wait:" + domain[:48],
+                status=certflow.NODE_WAITING,
+                title=i18n.pick("等待 CA 验证", "Waiting for CA validation"),
+                detail=domain + i18n.pick("（验证中）", " (validating)"),
+                next_at=int(time.time()) + int(POLL_INTERVAL),
+            )
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _wait_order(self, order: Dict[str, Any], poll_timeout: float) -> Dict[str, Any]:
@@ -572,6 +627,13 @@ class AcmeClient:
                 return order
             if time.monotonic() > deadline:
                 raise AcmeError("证书签发超时（CA 一直没有完成 finalize）")
+            await certflow.emit_step(
+                "issue.wait-order",
+                status=certflow.NODE_WAITING,
+                title=i18n.pick("等待 CA 签发", "Waiting for CA issuance"),
+                detail=i18n.pick("订单状态：", "Order status: ") + status,
+                next_at=int(time.time()) + int(POLL_INTERVAL),
+            )
             await asyncio.sleep(POLL_INTERVAL)
             order = await self.get_json(url)
             order["_url"] = url
@@ -606,6 +668,10 @@ def _problem(resp: httpx.Response) -> Dict[str, Any]:
     return body if isinstance(body, dict) else {"detail": str(body)[:300]}
 
 
+#: HTTP-01 的 token 会直接当文件名：只允许 URL 安全字符（RFC 8555 §8.3）。
+_HTTP01_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
 class Http01Solver:
     """把 token 写成 ``<webroot>/.well-known/acme-challenge/<token>``。
 
@@ -627,10 +693,21 @@ class Http01Solver:
     def _write(self, token: str, value: str) -> None:
         from pathlib import Path
 
-        directory = Path(self.webroot) / ".well-known" / "acme-challenge"
+        # token 来自 CA（或中间人）的挑战响应，却直接当文件名用：`../../etc/cron.d/x`
+        # 会写穿 webroot。按 RFC 8555 §8.3 只允许 URL 安全字符，并再断言落点。
+        if not _HTTP01_TOKEN_RE.fullmatch(token or ""):
+            raise AcmeError("ACME 返回的 token 不合法")
+        directory = (Path(self.webroot) / ".well-known" / "acme-challenge").resolve()
         directory.mkdir(parents=True, exist_ok=True)
-        target = directory / token
-        target.write_text(value, encoding="utf-8")
+        target = (directory / token).resolve()
+        if target.parent != directory:
+            raise AcmeError("ACME token 试图写出 webroot")
+        # "x" = 不覆盖已存在的文件：覆盖别人的同名文件同样是一种越权写入
+        try:
+            with target.open("x", encoding="utf-8") as handle:
+                handle.write(value)
+        except FileExistsError as exc:
+            raise AcmeError("ACME 挑战文件已存在，拒绝覆盖") from exc
         try:
             target.chmod(0o644)
         except OSError:
@@ -643,9 +720,13 @@ class Http01Solver:
     async def cleanup_all(self) -> None:
         from pathlib import Path
 
+        directory = (Path(self.webroot) / ".well-known" / "acme-challenge").resolve()
         for path in self._written:
             try:
-                Path(path).unlink()
+                candidate = Path(path).resolve()
+                # 只删自己挑战目录里的文件：记录本身也可能是旧版本写下的越界路径
+                if candidate.parent == directory:
+                    candidate.unlink()
             except OSError:
                 pass
         self._written.clear()

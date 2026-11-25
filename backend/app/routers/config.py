@@ -2272,6 +2272,18 @@ async def get_site_logo() -> FileResponse:
     meta = await site.get_logo_meta()
     if not meta:
         raise HTTPException(status_code=404, detail="未设置自定义 Logo")
+    # 存量记录可能是修复前写下的（客户端声明 SVG、内容其实是 HTML）：读之前按
+    # 内容复核一次，认不出来就把这条记录当作「没有 Logo」，不要直出。
+    try:
+        with open(meta["path"], "rb") as handle:
+            data = handle.read()
+    except OSError:
+        raise HTTPException(status_code=404, detail="自定义 Logo 已失效，请重新上传")
+    if (
+        site.detect_mime(data) != meta.get("mime")
+        or not site.logo_payload_is_safe(data, str(meta.get("mime") or ""))
+    ):
+        raise HTTPException(status_code=404, detail="自定义 Logo 已失效，请重新上传")
     return FileResponse(
         meta["path"],
         media_type=meta["mime"],

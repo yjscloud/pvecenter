@@ -39,6 +39,21 @@ def _run(coro):
     return asyncio.run(_shutdown_pool(coro))
 
 
+@pytest.fixture(autouse=True)
+def _allow_loopback_receiver(monkeypatch):
+    """本文件用 127.0.0.1 上的真实 HTTP 服务收 Webhook。
+
+    生产里 Webhook 不许指内网 / 回环（SSRF-002），测试要投递到本地接收器，
+    所以只在本文件内放行回环地址 —— 不要把它当成「默认允许」。
+    """
+
+    async def _allow(url: str, **kwargs: Any) -> Any:
+        return ("127.0.0.1", 0)
+
+    monkeypatch.setattr(alerting.ssrfguard, "assert_url_allowed", _allow)
+    monkeypatch.setattr(alerting.ssrfguard, "assert_public_target", _allow)
+
+
 async def _create_settings_table() -> None:
     """只建 ``settings`` 表 —— 通用 Webhook 的配置就存在这一个键值表里。
 

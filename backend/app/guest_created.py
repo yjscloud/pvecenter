@@ -726,6 +726,109 @@ async def source_of(
     return {}
 
 
+async def source_template_of(
+    client: Any,
+    conn_id: Any,
+    node: Any,
+    vmid: Any,
+    guest_type: Any = "qemu",
+) -> Optional[Dict[str, Any]]:
+    """克隆体应当关联的「来源模板」：源克隆机当初用的那张模板。
+
+    克隆 109（一台普通机器）出来的 111，若只把来源记成 109，列表认不出系统 ——
+    PVE 把 Linux 一律记成 ``l26``，而 109 自己也只是「从 TencentOS4 克隆来的」。
+    这里沿审计再取一层，拿到真正的模板（VMID + 名字），交给克隆体做「来源模板」
+    关联；列表的操作系统列据此显示那张模板的系统。
+
+    取不到（源是 ISO 装的、来源是模板文件、审计被删）返回空 —— 调用方跳过。
+    """
+    if not node or vmid is None:
+        return None
+
+    async def _config(target_node: str, target_vmid: int) -> Dict[str, Any]:
+        try:
+            if str(guest_type) == "lxc":
+                return await client.lxc_config(target_node, target_vmid) or {}
+            return await client.qemu_config(target_node, target_vmid) or {}
+        except Exception:  # noqa: BLE001 - 名字取不到时留空，不影响关联
+            return {}
+
+    def _name_of(config: Dict[str, Any]) -> str:
+        return str(config.get("name") or config.get("hostname") or "")
+
+    # 1) 源机器自己已经登记过模板（人工关联的，或它克隆时继承来的）。
+    #    直接沿用 —— 源显示什么模板，克隆体就显示什么模板。
+    try:
+        from .routers.vm_meta import template_of
+
+        existing = await template_of(str(node), int(vmid), conn_id)
+    except Exception:  # noqa: BLE001 - 读不到就继续往下找
+        existing = None
+    if existing:
+        return existing
+
+    # 2) 容器：来源可能是**模板文件**（用系统模板新建），也可能是一台容器。
+    #    审计里的 ct.create 带着 ostemplate，这一条不能漏 —— 漏了克隆体就少了
+    #    「ubuntu-24.04-...tar.zst」这个模板名，列表只剩一个发行版图标。
+    if str(guest_type) == "lxc":
+        async def _lxc_origin(origin_node: Any, origin_vmid: Any) -> Dict[str, Any]:
+            try:
+                rows = await lxc_sources_for(
+                    [
+                        {
+                            "connection_id": conn_id,
+                            "node": origin_node,
+                            "vmid": origin_vmid,
+                            "type": "lxc",
+                        }
+                    ]
+                )
+                return rows.get(
+                    (str(conn_id or ""), str(origin_node), int(origin_vmid))
+                ) or {}
+            except Exception:  # noqa: BLE001 - 查不到就当没有来源
+                return {}
+
+        origin = await _lxc_origin(node, vmid)
+        if origin.get("file"):
+            return {"node": "", "vmid": 0, "name": str(origin["file"])}
+        if origin.get("vmid"):
+            parent_node = str(origin.get("node") or node)
+            parent_vmid = int(origin["vmid"])
+            # 来源是另一台容器：再取它自己的模板文件（一层足够 —— 容器的
+            # 「来源模板」最终一定落在一个 vztmpl 文件上）
+            deeper = await _lxc_origin(parent_node, parent_vmid)
+            if deeper.get("file"):
+                return {"node": "", "vmid": 0, "name": str(deeper["file"])}
+            parent_config = await _config(parent_node, parent_vmid)
+            return {
+                "node": parent_node,
+                "vmid": parent_vmid,
+                "name": _name_of(parent_config),
+            }
+    else:
+        origin = await source_of(conn_id, node, vmid, guest_type)
+        if origin.get("vmid"):
+            tpl_node = str(origin.get("node") or node)
+            tpl_vmid = int(origin["vmid"])
+            config = await _config(tpl_node, tpl_vmid)
+            return {
+                "node": tpl_node,
+                "vmid": tpl_vmid,
+                "name": _name_of(config),
+            }
+
+    # 3) 源自己就是模板：直接关联它自己（模板克隆 / 快速部署走这条路）
+    config = await _config(str(node), int(vmid))
+    if pve_flag(config.get("template", 0)) == 1:
+        return {
+            "node": str(node),
+            "vmid": int(vmid),
+            "name": _name_of(config),
+        }
+    return None
+
+
 async def sources_for(
     items: Iterable[Dict[str, Any]],
 ) -> Dict[Tuple[str, str, int], Dict[str, Any]]:

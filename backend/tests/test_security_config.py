@@ -211,20 +211,31 @@ class TestHttpsEnforcement:
         assert sent[0]["status"] == 200
 
     def test_plain_http_redirects_to_https(self, https_on) -> None:
+        # 未配置对外地址时只给相对 Location：Host 头是攻击者可控的，
+        # 拼进跳转就等于开放重定向（PVE-CONF-003(b)）。
         sent = _call_middleware(
             _http_scope(path="/vms", query=b"id=100", host="panel.example.com")
         )
         assert sent[0]["status"] == 308
-        headers = dict(sent[0]["headers"])
-        assert headers[b"location"] == b"https://panel.example.com/vms?id=100"
+        assert dict(sent[0]["headers"])[b"location"] == b"/vms?id=100"
 
-    def test_redirect_strips_panel_and_default_ports(self, https_on) -> None:
-        # 后端自己不提供 TLS，跳转必须落到反代的 443
-        for host in (f"panel.example.com:{settings.port}", "panel.example.com:80"):
-            sent = _call_middleware(_http_scope(host=host))
-            assert dict(sent[0]["headers"])[b"location"] == (
-                b"https://panel.example.com/api/health"
-            ), host
+    def test_redirect_ignores_forged_host(self, https_on) -> None:
+        sent = _call_middleware(
+            _http_scope(path="/vms", host="evil.example", peer="203.0.113.5")
+        )
+        location = dict(sent[0]["headers"])[b"location"]
+        assert b"evil.example" not in location, location
+        assert location == b"/vms"
+
+    def test_redirect_uses_configured_panel_url(self, https_on, monkeypatch) -> None:
+        from app import panel_url
+
+        monkeypatch.setattr(panel_url, "_cached_base", "https://panel.example.com")
+        sent = _call_middleware(_http_scope(path="/vms", host="evil.example"))
+
+        assert dict(sent[0]["headers"])[b"location"] == (
+            b"https://panel.example.com/vms"
+        )
 
     def test_forged_forwarded_proto_does_not_bypass(self, https_on) -> None:
         """公网请求自称「我是 https」无效：只看 uvicorn 改写后的 scheme。"""

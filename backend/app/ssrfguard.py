@@ -238,6 +238,48 @@ async def _resolve(host: str, port: int) -> List[Any]:
     return found
 
 
+def _normalize_target(raw_text: str, port: int) -> Target:
+    """目标地址的格式与端口校验；返回 ``(主机, 端口)``。
+
+    带 scheme 时只接受 ``scheme://host[:port]``。路径 / 查询 / userinfo 都会
+    让「归一化后的主机」与客户端实际连接的地址不是同一个（例如
+    ``172.16.149.3/x:8006`` 会绕到 443），必须挡在准入层。
+    """
+    target_host, target_port = split_host_port(raw_text, port)
+    if int(target_port) <= 0:
+        # 带 scheme 的 URL 常常只写主机：按协议补默认端口，否则后面会被当成非法端口
+        target_port = 443 if raw_text.lower().startswith("https://") else 80
+    if not target_host:
+        raise TargetBlocked("目标地址不能为空", TARGET_INVALID)
+    if not 1 <= int(target_port) <= 65535:
+        raise TargetBlocked("目标端口必须在 1 到 65535 之间", TARGET_INVALID)
+    if any(ch.isspace() for ch in target_host) or any(
+        ch in target_host for ch in ("/", "\\", "?", "#", "@")
+    ):
+        raise TargetBlocked("目标地址格式不正确", TARGET_INVALID)
+    if raw_text.startswith(("http://", "https://")):
+        parsed = urlsplit(raw_text)
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+        ):
+            raise TargetBlocked("目标地址不能带路径 / 查询串 / 用户信息", TARGET_INVALID)
+    elif any(ch in raw_text for ch in ("/", "\\", "?", "#", "@")):
+        raise TargetBlocked("目标地址格式不正确", TARGET_INVALID)
+    return target_host, int(target_port)
+
+
+async def _target_addresses(target_host: str, target_port: int) -> List[Any]:
+    """目标的全部 IP（字面量直接返回，主机名走一次解析）。"""
+    literal = parse_ip(target_host)
+    if literal is not None:
+        return [literal]
+    return await _resolve(target_host, target_port)
+
+
 async def assert_target_allowed(
     host: str,
     port: int,
@@ -251,31 +293,7 @@ async def assert_target_allowed(
     ``allow_targets`` 留空时读 ``CONNECTION_TEST_ALLOW_TARGETS``。
     """
     raw_text = str(host or "").strip()
-    target_host, target_port = split_host_port(raw_text, port)
-    if not target_host:
-        raise TargetBlocked("目标地址不能为空", TARGET_INVALID)
-    if not 1 <= int(target_port) <= 65535:
-        raise TargetBlocked("目标端口必须在 1 到 65535 之间", TARGET_INVALID)
-    if any(ch.isspace() for ch in target_host) or any(
-        ch in target_host for ch in ("/", "\\", "?", "#", "@")
-    ):
-        raise TargetBlocked("目标地址格式不正确", TARGET_INVALID)
-
-    # 带 scheme 时只接受 ``scheme://host[:port]``。路径 / 查询 / userinfo 都会
-    # 让「归一化后的主机」与客户端实际连接的地址不是同一个（例如
-    # ``172.16.149.3/x:8006`` 会绕到 443），必须挡在准入层。
-    if raw_text.startswith(("http://", "https://")):
-        parsed = urlsplit(raw_text)
-        if (
-            parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in ("", "/")
-        ):
-            raise TargetBlocked("目标地址不能带路径 / 查询串 / 用户信息", TARGET_INVALID)
-    elif any(ch in raw_text for ch in ("/", "\\", "?", "#", "@")):
-        raise TargetBlocked("目标地址格式不正确", TARGET_INVALID)
+    target_host, target_port = _normalize_target(raw_text, port)
 
     raw_allow = (
         settings.connection_test_allow_targets
@@ -288,11 +306,7 @@ async def assert_target_allowed(
     key = host_key(target_host)
     by_registry = (key, int(target_port)) in registry
 
-    literal = parse_ip(target_host)
-    if literal is not None:
-        addresses = [literal]
-    else:
-        addresses = await _resolve(target_host, int(target_port))
+    addresses = await _target_addresses(target_host, int(target_port))
 
     by_allow_host = key in allow_hosts
     by_allow_net = any(
@@ -315,6 +329,81 @@ async def assert_target_allowed(
             )
 
     return target_host, int(target_port)
+
+
+async def assert_public_target(
+    host: str,
+    port: int,
+    *,
+    allow_targets: Optional[str] = None,
+    registered: Iterable[Target] = (),
+) -> Target:
+    """用户**可自由填写**地址的出站请求的准入（webhook / 证书监控 / AI base_url）。
+
+    与 :func:`assert_target_allowed` 的差别：公网地址默认放行，只挡内网、回环与
+    链路本地（云元数据 169.254.169.254 属链路本地）。内网 webhook / 自建模型是
+    真实需求，用管理员维护的白名单（``CONNECTION_TEST_ALLOW_TARGETS`` 或
+    ``registered``）开口子，而不是让每个租户随便填。
+
+    解析不到地址时只做格式校验后放行：请求本身会失败，这里也无法对未知 IP 分类。
+    """
+    raw_text = str(host or "").strip()
+    target_host, target_port = _normalize_target(raw_text, port)
+
+    raw_allow = (
+        settings.connection_test_allow_targets
+        if allow_targets is None
+        else allow_targets
+    )
+    allow_hosts, allow_nets = parse_allow_targets(raw_allow)
+    key = host_key(target_host)
+    addresses = await _target_addresses(target_host, target_port)
+
+    by_allow = key in allow_hosts or (key, target_port) in set(registered or ())
+    if not by_allow:
+        by_allow = any(
+            ip.version == net.version and ip in net
+            for ip in addresses
+            for net in allow_nets
+        )
+
+    for addr in addresses:
+        kind = _classify(addr)
+        # 链路本地 / 组播 / 保留地址即使登记过也不放行：元数据端点就在这一类里
+        if kind in ("link_local", "multicast", "unspecified", "reserved"):
+            raise TargetBlocked(
+                f"目标地址属于禁止访问的保留网段（address_blocked）：{addr}",
+                ADDRESS_BLOCKED,
+            )
+        if kind in ("loopback", "private") and not by_allow:
+            raise TargetBlocked(
+                "不允许访问内网 / 回环地址（address_blocked）："
+                "确有需要请让管理员把它加进出站白名单",
+                ADDRESS_BLOCKED,
+            )
+    return target_host, target_port
+
+
+async def assert_url_allowed(
+    url: str,
+    *,
+    allow_targets: Optional[str] = None,
+    registered: Iterable[Target] = (),
+) -> Target:
+    """按完整 URL 校验出站目标（webhook / 监控 / 模型接口都带路径与查询串）。
+
+    只取 ``scheme://host:port`` 做准入；路径与查询串本来就不影响实际连接的主机。
+    """
+    parts = urlsplit(str(url or "").strip())
+    if parts.scheme not in ("http", "https"):
+        raise TargetBlocked("只允许 http(s) 目标", TARGET_INVALID)
+    host = parts.hostname or ""
+    if not host:
+        raise TargetBlocked("目标地址不能为空", TARGET_INVALID)
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    return await assert_public_target(
+        host, int(port), allow_targets=allow_targets, registered=registered
+    )
 
 
 # ------------------------------------------------------------------ 失败归一化

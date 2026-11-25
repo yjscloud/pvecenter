@@ -336,6 +336,11 @@ async def init_db() -> None:
 
     # 建表之后再补：把升级前明文落库的 PVE 密钥改成密文（见函数说明）
     await _encrypt_stored_connection_secrets()
+    # 再把旧格式（enc:v1，无 salt 的派生）的密文升级成 v2 —— 幂等
+    try:
+        await _rewrap_legacy_ciphertexts()
+    except Exception:  # noqa: BLE001 - 迁移失败不影响启动，下次启动再试
+        logger.warning("旧格式密文升级失败", exc_info=True)
     # 已有账号仍在用弱默认口令的话大声提醒（只告警：把线上后台直接下线并不更安全）
     await _warn_weak_admin_password()
 
@@ -1109,7 +1114,7 @@ async def rewrap_all_settings() -> Dict[str, int]:
     for row in rows:
         key = str(row[0])
         raw = row[1]
-        if not isinstance(raw, str) or crypto.PREFIX not in raw:
+        if not isinstance(raw, str) or not crypto.is_encrypted(raw):
             continue
         try:
             data = json.loads(raw)
@@ -1537,6 +1542,50 @@ async def _encrypt_stored_connection_secrets() -> None:
                 logger.info("已把 %s 里的明文 PVE 密钥改为密文存储", key)
         except Exception:  # noqa: BLE001 - 迁移尽力而为，失败不影响主流程
             logger.warning("迁移 %s 的 PVE 密钥失败", key, exc_info=True)
+
+
+def _rewrap_node(node: Any) -> Any:
+    """递归把 JSON 里的 v1 密文换成 v2（其它类型原样返回）。"""
+    if isinstance(node, str):
+        return crypto.rewrap(node) if crypto.needs_rewrap(node) else node
+    if isinstance(node, list):
+        return [_rewrap_node(item) for item in node]
+    if isinstance(node, dict):
+        return {key: _rewrap_node(value) for key, value in node.items()}
+    return node
+
+
+async def _rewrap_legacy_ciphertexts() -> None:
+    """把 settings 里所有 ``enc:v1:`` 密文重写成 v2（幂等，失败不影响启动）。
+
+    v1 的密钥派生没有 salt、没有迭代：拿到任意一段密文就能离线验证
+    ``SECRET_KEY``。新写入已经是 v2，这里负责把存量（PVE Token / SMTP 口令 /
+    webhook 密钥 / TOTP 种子…）平滑迁过去 —— 行的其它字段一律原样保留。
+    """
+    async with database.connect() as db:
+        cursor = await db.execute("SELECT `key`, `value` FROM settings")
+        rows = await cursor.fetchall()
+    for row in rows:
+        key = str(row[0])
+        raw = row[1]
+        if not isinstance(raw, str) or crypto.PREFIX not in raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            if crypto.is_encrypted(raw):
+                upgraded = crypto.rewrap(raw)
+                if upgraded and upgraded != raw:
+                    await set_setting(key, upgraded)
+            continue
+        try:
+            upgraded_value = _rewrap_node(data)
+        except Exception:  # noqa: BLE001 - 单行迁移失败不该拖住启动
+            logger.warning("重写 %s 的旧密文失败", key, exc_info=True)
+            continue
+        if upgraded_value != data:
+            await set_setting(key, json.dumps(upgraded_value, ensure_ascii=False))
+            logger.info("已把 %s 里的旧格式密文升级为 enc:v2", key)
 
 
 #: settings 读结果的进程内缓存：``key -> (写入时刻, 原始值)``。

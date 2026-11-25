@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from . import certnotify, certs, i18n
+from . import certnotify, certs, i18n, ssrfguard
 
 #: 单次探测超时。站点慢不该拖住 5 分钟一轮的作业。
 TIMEOUT = 10.0
@@ -207,12 +207,25 @@ async def probe(url: str) -> Dict[str, Any]:
         return {"status": "", "code": 0, "latency_ms": 0, "error": "", "cert_days": None}
     if "://" not in target:
         target = "https://" + target
+    # 站点监控地址由用户填写：内网 / 回环一律拒绝（后台会反复探测，比一次性
+    # 请求更适合做内网测绘）。内网站点确有需要时由管理员加进出站白名单。
+    try:
+        await ssrfguard.assert_url_allowed(target)
+    except ssrfguard.TargetBlocked as exc:
+        return {
+            "status": "down",
+            "code": 0,
+            "latency_ms": 0,
+            "error": str(exc)[:200],
+            "cert_days": None,
+        }
     started = time.perf_counter()
     status, code, error = "down", 0, ""
     try:
-        # 关掉校验：自签 / 过期证书也要能探到「站点本身是活的」
+        # 恢复证书校验：关掉它等于让这条出站通道可被中间人利用。自签站点会报
+        # 证书错误，需要把 CA 装进面板的信任链，而不是把校验关掉。
         async with httpx.AsyncClient(
-            timeout=TIMEOUT, verify=False, follow_redirects=True
+            timeout=TIMEOUT, verify=True, follow_redirects=True
         ) as client:
             response = await client.get(target)
         code = int(response.status_code)

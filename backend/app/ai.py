@@ -49,6 +49,7 @@ from . import (
     i18n,
     sshguard,
     sshremote,
+    ssrfguard,
     store,
 )
 
@@ -154,10 +155,16 @@ USER_SETTING_KEYS = ("hours", "token_budget", "reply_chars_terse", "reply_chars_
 #: 分析窗口（小时）的取值范围
 HOURS_RANGE = (1, 168)
 
-#: 单次排查 token 上限的取值范围。上限放到 1 亿：真正的刹车是**步数**与**整轮超时**
-#: （MAX_STEPS / AGENT_TOTAL_TIMEOUT），token 上限只是最后一道兜底 —— 卡太死反而会
-#: 让长排查半路收口，然后得出一个「数据不足」的结论。
+#: 单次排查 token 上限的取值范围（平台配置，管理员可设）。
 TOKEN_BUDGET_RANGE = (4_000, 100_000_000)
+
+#: **用户个人设置**的 token 预算硬顶。个人预算的初衷是「自己少花点」，而
+#: ``granted`` 允许用别人的模型 —— 花的是授权人的额度。放到 1 亿等于把别人的
+#: 钱包交给被授权人（PVE-AI-004）。20 万够一次深度排查，又不足以打爆额度。
+USER_TOKEN_BUDGET_MAX = 200_000
+
+#: 用户个人设置的分析窗口硬顶（小时）。窗口越大，抓的数据越多、花的 token 越多。
+USER_HOURS_MAX = 72
 
 #: 回复字数档位的取值范围。放得比较宽：有人要一句话结论、有人要详尽交代，这是个人
 #: 偏好，平台不该替他定死，只挡住明显不合理的输入（0 或几十万字）。
@@ -526,7 +533,21 @@ async def load_config(username: str = "") -> Dict[str, Any]:
 
     settings = (cfg.get("user_settings") or {}).get(str(username or ""))
     if isinstance(settings, dict):
-        for key, value in clamp_user_settings(settings).items():
+        user_cfg = clamp_user_settings(settings)
+        # 个人设置只能**调低**，不能高于平台值 / 服务端硬顶：被授权用别人模型的
+        # 人把预算调到 1 亿，烧的是授权人的额度（PVE-AI-004）。
+        if "token_budget" in user_cfg:
+            ceiling = min(
+                _clamp_int(cfg.get("token_budget"), *TOKEN_BUDGET_RANGE, DEFAULT_TOKEN_BUDGET),
+                USER_TOKEN_BUDGET_MAX,
+            )
+            user_cfg["token_budget"] = min(user_cfg["token_budget"], ceiling)
+        if "hours" in user_cfg:
+            hours_ceiling = min(
+                _clamp_int(cfg.get("hours"), *HOURS_RANGE, 24), USER_HOURS_MAX
+            )
+            user_cfg["hours"] = min(user_cfg["hours"], hours_ceiling)
+        for key, value in user_cfg.items():
             cfg[key] = value
     return cfg
 
@@ -540,10 +561,16 @@ def clamp_user_settings(raw: Dict[str, Any]) -> Dict[str, int]:
     source = raw if isinstance(raw, dict) else {}
     out: Dict[str, int] = {}
     if "hours" in source:
-        out["hours"] = _clamp_int(source.get("hours"), *HOURS_RANGE, 24)
+        # 个人设置的上限比平台更紧（见 USER_HOURS_MAX / USER_TOKEN_BUDGET_MAX）
+        out["hours"] = _clamp_int(
+            source.get("hours"), HOURS_RANGE[0], min(HOURS_RANGE[1], USER_HOURS_MAX), 24
+        )
     if "token_budget" in source:
         out["token_budget"] = _clamp_int(
-            source.get("token_budget"), *TOKEN_BUDGET_RANGE, DEFAULT_TOKEN_BUDGET
+            source.get("token_budget"),
+            TOKEN_BUDGET_RANGE[0],
+            min(TOKEN_BUDGET_RANGE[1], USER_TOKEN_BUDGET_MAX),
+            DEFAULT_TOKEN_BUDGET,
         )
     if "reply_chars_terse" in source:
         out["reply_chars_terse"] = _clamp_int(
@@ -942,6 +969,13 @@ async def chat(
     if prov.get("api_key"):
         headers["Authorization"] = "Bearer " + str(prov["api_key"])
 
+    # Base URL 由配置决定，但配置权在 settings.manage：不校验就等于把面板当成
+    # 访问内网 / 云元数据的跳板。公网厂商域放行，内网自建模型需管理员加白名单。
+    try:
+        await ssrfguard.assert_url_allowed(str(prov.get("base_url") or ""))
+    except ssrfguard.TargetBlocked as exc:
+        raise AIError(i18n.tr("模型接口地址不被允许：") + str(exc)) from exc
+
     endpoint = _endpoint(prov["base_url"])
     timeout = cfg.get("timeout") or 90
 
@@ -1021,12 +1055,11 @@ async def chat(
         resp = await _post_retry(payload)
 
     if resp.status_code != 200:
-        detail = (resp.text or "")[:300]
+        # 只回状态码，不回显响应体：base_url 可填任意地址，「配置测试」的报错
+        # 文案就成了读取内网接口内容的回显通道（PVE-SSRF-004）。
         raise AIError(
             i18n.pick("模型返回 HTTP ", "The model returned HTTP ")
             + str(resp.status_code)
-            + i18n.tr("：")
-            + detail
             + _endpoint_hint(endpoint, resp.status_code)
         )
 
@@ -1230,8 +1263,8 @@ async def _chat_stream(
                         attempt += 1
                         continue
                     if status != 200:
-                        raw = await resp.aread()
-                        detail = raw.decode("utf-8", "ignore")[:300]
+                        await resp.aread()
+                        # 不回显上游响应体（见非流式分支的说明）
                         # 上游不认这些「锦上添花」的字段时，去掉重试一次
                         if status == 400 and "stream_options" in body and not dropped_options:
                             body.pop("stream_options", None)
@@ -1244,8 +1277,6 @@ async def _chat_stream(
                         raise AIError(
                             i18n.pick("模型返回 HTTP ", "The model returned HTTP ")
                             + str(status)
-                            + i18n.tr("：")
-                            + detail
                             + _endpoint_hint(endpoint, status)
                         )
                     started = True

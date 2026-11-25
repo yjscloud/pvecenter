@@ -42,6 +42,7 @@ from ..schemas import (
     ResetTokenIn,
     StepUpRequest,
     TotpCodeIn,
+    TotpSetupIn,
     TotpDisableIn,
     UserOut,
 )
@@ -1619,6 +1620,7 @@ async def totp_status(
 @router.post("/2fa/setup")
 async def totp_setup(
     request: Request,
+    payload: Optional[TotpSetupIn] = None,
     user: Dict[str, Any] = Depends(security.get_current_user),
 ) -> Dict[str, Any]:
     """生成一枚新种子（此时**还没启用**，要再用动态码确认一次）。
@@ -1628,6 +1630,17 @@ async def totp_setup(
     record = await store.get_user(user["username"])
     if not record:
         raise HTTPException(status_code=404, detail="用户不存在")
+    # 绑定 2FA 是「换锁」：只凭一枚被盗的 access token 就能把自己的认证器绑到
+    # 受害者账号上，而 disable 要口令 + 动态码 —— 攻击者绑完，原主改密也解不掉。
+    # 所以这里先要当前口令，与 2fa/disable 对称。
+    password = str(getattr(payload, "password", "") or "")
+    if not password:
+        raise HTTPException(status_code=400, detail="请输入当前密码")
+    if not security.verify_password(password, str(record.get("password_hash") or "")):
+        await security.audit(
+            request, user, "auth.totp_setup", result="failed", detail="口令不正确"
+        )
+        raise HTTPException(status_code=400, detail="当前密码不正确")
     if record.get("totp_enabled"):
         raise HTTPException(
             status_code=400, detail="两步验证已开启；如需更换认证器请先关闭再重新绑定"
@@ -1657,6 +1670,16 @@ async def totp_enable(
     record = await store.get_user(user["username"]) or {}
     if not record.get("totp_secret"):
         raise HTTPException(status_code=400, detail="请先生成两步验证密钥")
+    # 与 setup 同一道门：确认生效这一步同样要口令，否则绕过 setup 的校验没意义。
+    if not str(payload.password or ""):
+        raise HTTPException(status_code=400, detail="请输入当前密码")
+    if not security.verify_password(
+        payload.password, str(record.get("password_hash") or "")
+    ):
+        await security.audit(
+            request, user, "auth.totp_enable", result="failed", detail="口令不正确"
+        )
+        raise HTTPException(status_code=400, detail="当前密码不正确")
     if not totp.verify_code(str(record.get("totp_secret") or ""), payload.code):
         await security.audit(
             request, user, "auth.totp_enable", result="failed", detail="动态码不正确"

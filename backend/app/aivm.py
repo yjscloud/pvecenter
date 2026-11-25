@@ -1273,6 +1273,15 @@ def _truncate(text: str, limit: int = MAX_OUTPUT) -> str:
 
 # --------------------------------------------------------------------- 策略层
 
+#: Windows 路径会被拼进 ``cmd.exe /c`` 字符串：引号能闭合参数，``&`` / ``|`` 能追加
+#: 命令。路径校验必须禁止这些字符（PVE-AI-002）。
+_WINDOWS_CMD_UNSAFE = frozenset('"&|<>^%!')
+
+
+def _windows_cmd_unsafe(path: str) -> bool:
+    return any(ch in _WINDOWS_CMD_UNSAFE for ch in str(path or ""))
+
+
 def _check_ops_path(lease: Dict[str, Any], path: str, *, write: bool) -> str:
     """运维授权下的路径检查：**不再要求在预设目录内**，但仍拒绝认证材料与设备节点。
 
@@ -1292,6 +1301,14 @@ def _check_ops_path(lease: Dict[str, Any], path: str, *, write: bool) -> str:
             )
         if ".." in text.split("\\"):
             raise ToolDenied(i18n.pick("路径不合法", "Invalid path"))
+        if _windows_cmd_unsafe(text):
+            raise ToolDenied(
+                i18n.pick(
+                    "路径里不能包含引号或 cmd 元字符（\" & | < > ^ % !）",
+                    "The path must not contain quotes or cmd metacharacters "
+                    '(\" & | < > ^ % !)',
+                )
+            )
         if any(hint in text.lower() for hint in WINDOWS_FORBIDDEN):
             raise ToolDenied(
                 i18n.pick("该路径不在允许范围内", "This path is not allowed")
@@ -1343,6 +1360,14 @@ def _check_path(lease: Dict[str, Any], path: str, *, write: bool) -> str:
             )
         if ".." in text.split("\\"):
             raise ToolDenied(i18n.pick("路径不合法", "Invalid path"))
+        if _windows_cmd_unsafe(text):
+            raise ToolDenied(
+                i18n.pick(
+                    "路径里不能包含引号或 cmd 元字符（\" & | < > ^ % !）",
+                    "The path must not contain quotes or cmd metacharacters "
+                    '(\" & | < > ^ % !)',
+                )
+            )
         lowered = text.lower()
         if any(hint in lowered for hint in WINDOWS_FORBIDDEN):
             raise ToolDenied(
@@ -1447,6 +1472,17 @@ def _check_ops_command(lease: Dict[str, Any], command: str) -> str:
             )
         )
     windows = str(lease.get("os_type")) == "windows"
+    if not windows and aitools.is_destructive_command(text):
+        # 正则锚在字面形态上，引号 / 绝对路径就能绕过去；argv 级判定兜住这条
+        raise ToolDenied(
+            i18n.pick(
+                "这条命令包含不可回滚的操作（删根 / 重分区 / 整机关机重启 / "
+                "修改认证信息等），即使运维授权也不会执行。请让用户手动处理。",
+                "This command contains an irreversible operation (removing the root "
+                "filesystem, repartitioning, rebooting the VM, altering credentials, …). "
+                "It will not run even under an ops grant; ask the user to do it manually.",
+            )
+        )
     patterns = WINDOWS_OPS_FORBIDDEN if windows else OPS_FORBIDDEN
     lowered = text.lower()
     for pattern in patterns:

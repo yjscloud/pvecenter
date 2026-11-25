@@ -14,7 +14,7 @@ import tarfile
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -904,6 +904,35 @@ def status(
     return data
 
 
+#: 发行包里 frpc 的大小上限（正常 ~15MB）。超了多半不是官方包。
+_FRPC_MAX_BYTES = 128 * 1024 * 1024
+
+
+def _frpc_member(tar: tarfile.TarFile) -> Optional[tarfile.TarInfo]:
+    """挑出 frpc 成员，并拒绝一切「会写到临时目录之外」的形态。
+
+    ``tar.extract`` 默认会照成员名建目录：``../../root/.ssh/frpc`` 既满足
+    ``endswith('/frpc')`` 又是普通文件，解包就落到 tmp 之外，随后被复制成
+    可执行文件并拉起（PVE-FILE-004）。这里显式按**路径分段**判断，不靠字符串。
+    """
+    for member in tar.getmembers():
+        name = str(member.name or '')
+        if not name.endswith('/frpc') or not member.isfile():
+            continue
+        if member.size > _FRPC_MAX_BYTES:
+            raise FrpError('发行包里的 frpc 体积异常，已拒绝安装。')
+        if name.startswith('/') or '\\' in name:
+            raise FrpError('发行包中的 frpc 路径不合法（绝对路径）。')
+        parts = PurePosixPath(name).parts
+        # 任何一段是 .. 都等于可以跳出 tmp；盘符 / 空段同样拒绝
+        if any(part in ('..', '', '.') for part in parts) or ':' in parts[0]:
+            raise FrpError('发行包中的 frpc 路径不合法（包含上级目录）。')
+        if member.issym() or member.islnk():
+            raise FrpError('发行包中的 frpc 不是普通文件，已拒绝安装。')
+        return member
+    return None
+
+
 async def install() -> str:
     """从 GitHub 下载 frp 发行包，仅取出 frpc 二进制。"""
     BIN_DIR.mkdir(parents=True, exist_ok=True)
@@ -916,15 +945,26 @@ async def install() -> str:
             raise FrpError('下载失败，请检查服务器外网连通性：' + str(exc)) from exc
         if resp.status_code != 200:
             raise FrpError('下载失败（HTTP ' + str(resp.status_code) + '）。')
-        archive.write_bytes(resp.content)
+        content = resp.content
+        # 供应链校验：管理员可以用 PC_FRPC_SHA256 钉住期望的发行包哈希。
+        # 没配就跳过（默认不阻断安装），但至少链路被替换时有一个确定的开关。
+        expected = str(os.environ.get('PC_FRPC_SHA256') or '').strip().lower()
+        if expected:
+            actual = hashlib.sha256(content).hexdigest()
+            if actual != expected:
+                raise FrpError(
+                    '发行包 sha256 校验失败：期望 ' + expected + '，实际 ' + actual
+                )
+        archive.write_bytes(content)
         with tarfile.open(archive, 'r:gz') as tar:
-            member = next(
-                (m for m in tar.getmembers() if m.name.endswith('/frpc') and m.isfile()),
-                None,
-            )
+            member = _frpc_member(tar)
             if member is None:
                 raise FrpError('发行包中未找到 frpc 二进制。')
-            tar.extract(member, path=tmp)
+            try:
+                # data filter 会再拦一次绝对路径 / 链接 / 设备文件（3.11.4+）
+                tar.extract(member, path=tmp, filter='data')
+            except TypeError:  # pragma: no cover - 更老的 3.11 没有 filter 参数
+                tar.extract(member, path=tmp)
             target = BIN_DIR / 'frpc'
             shutil.copyfile(Path(tmp) / member.name, target)
             target.chmod(0o755)

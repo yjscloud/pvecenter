@@ -1136,33 +1136,132 @@
   }
 }
 
+/* 渠道页：中等宽度下卡片单列、步骤条两列 —— 四列会把每步文字压成两行 */
+@media (max-width: 767px) {
+  .cert-provider-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .cert-provider-actions {
+    justify-self: start;
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .cert-provider-flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 10px;
+  }
+}
+
 @media (max-width: 559px) {
   .cert-stat {
     flex: 1 1 50%;
   }
 
-  /* 渠道行在手机上竖排：状态在上、操作换到下一行，避免名字被挤成省略号 */
+  /* 渠道卡在手机上竖排：状态在上、操作换到下一行，避免名字被挤成省略号 */
   .cert-provider-row {
     grid-template-columns: minmax(0, 1fr);
-    gap: 8px;
+    gap: 10px;
+    padding: 12px 12px 12px 16px;
   }
 
   .cert-provider-actions {
     justify-self: start;
     flex-wrap: wrap;
+    padding-left: 0;
+    border-left: 0;
   }
 
+  /* 名称优先收缩：徽章与证书数留在第一行，不被长名字顶下去 */
+  .cert-provider-head {
+    gap: 6px;
+  }
+
+  .cert-provider-head .cert-provider-name {
+    /* 可收缩、不撑满：徽章与证书数要紧跟在名字后面 */
+    flex: 0 1 auto;
+  }
+
+  /* 待配置行：名称与说明占满一行，动作落到下一行左侧 */
   .cert-provider-pending-row {
     flex-wrap: wrap;
+    gap: 10px;
   }
 
-  .cert-provider-tagline {
-    flex-basis: 100%;
+  .cert-provider-pending-main {
+    flex: 1 1 100%;
+  }
+
+  .cert-provider-pending-row .cert-provider-tagline {
     white-space: normal;
   }
 
+  /* 步骤条改为纵向：横向四列在手机上会把文字压成两三个字一行 */
   .cert-provider-flow {
-    gap: 6px 12px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .cert-provider-flow-step:not(:last-child)::after {
+    display: none;
+  }
+
+  .cert-provider-note {
+    align-items: flex-start;
+  }
+
+  .cert-provider-progress {
+    flex-basis: 88px;
+  }
+
+  /* 运行日志：窄屏折叠状态与耗时，说明独占一行 */
+  .cert-runlog-search {
+    flex-basis: 100%;
+  }
+
+  .cert-runlog-line {
+    grid-template-columns: 6px 52px minmax(0, 1fr);
+    row-gap: 1px;
+  }
+
+  .cert-runlog-name,
+  .cert-runlog-detail {
+    grid-column: 3 / -1;
+  }
+
+  .cert-runlog-status,
+  .cert-runlog-ms {
+    display: none;
+  }
+
+  .cert-step-log {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .cert-step-log-time,
+  .cert-step-log-action {
+    display: none;
+  }
+
+  /* 历史运行：时间字号收一档，两条并排而不是一行一条 */
+  .cert-runlog-run {
+    padding: 2px 7px;
+  }
+
+  .cert-runlog-run-time {
+    font-size: 11px;
+  }
+
+  /* 通知档位：窄屏占满一行，别和 tab 挤在一起 */
+  .cert-notify-inline {
+    width: 100%;
+  }
+
+  .cert-notify-inline-select {
+    flex: 1 1 auto;
+    width: auto;
   }
 
   .cert-stat-label {

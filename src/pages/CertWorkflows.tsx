@@ -23,7 +23,7 @@ import type {
   CertWorkflowSummary,
   CertWorkflowTemplate,
 } from '../api/types';
-import { Button, IconButton } from '../components/ui/Button';
+import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
 import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import { Spinner } from '../components/ui/Spinner';
@@ -557,6 +557,10 @@ export function CertWorkflowWorkspace({
       toast.success(t('workflow.deleted'), deleteTarget.name);
       setDeleteTarget(null);
       await refresh();
+      /* 后端同时解绑了引用它的证书站点、清掉了它的审批实例：
+         这两处缓存不跟着作废，切过去还会显示「已绑定 / 有实例」。 */
+      await queryClient.invalidateQueries({ queryKey: ['cert-workflow-runs'] });
+      await queryClient.invalidateQueries({ queryKey: ['certs'] });
     } catch (err) {
       toast.error(t('workflow.deleteFailed'), errText(err));
     } finally {
@@ -792,13 +796,18 @@ export function CertWorkflowWorkspace({
                         <option value="yaml">{t('workflow.exportYaml')}</option>
                       </select>
                     </span>
-                    <IconButton
-                      label={t('workflow.delete')}
-                      variant="danger"
+                    {/* 删除用带文字的按钮，不再只是角落里的图标：
+                        之前是纯图标 + 藏在「定义」子视图里，用户根本找不到 */}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="cert-danger-text"
+                      icon={<IconTrash size={14} />}
+                      disabled={!canManage}
                       onClick={() => setDeleteTarget(workflow)}
                     >
-                      <IconTrash size={15} />
-                    </IconButton>
+                      {t('workflow.delete')}
+                    </Button>
                   </div>
                 </article>
               ))}

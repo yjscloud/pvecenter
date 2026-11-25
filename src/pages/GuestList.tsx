@@ -1871,11 +1871,11 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
            关联的名字反而更完整，所以名字为空也让它接管。 */
         const auditSource = vm.source_template;
         const linked = metaTemplateOf(vm);
-        const source =
-          auditSource && auditSource.name?.trim()
-            ? auditSource
-            : linked ?? auditSource;
-        const fromLinked = Boolean(linked) && source === linked;
+        /* 克隆时后端会把「源克隆机所用的那张模板」写进 `vm_meta.template`
+           （见 guest_created.source_template_of）：109 是普通机器，名字里没有
+           系统线索，而它当初的模板 100 叫 TencentOS4 —— 操作系统列就是靠这个
+           模板名判出来的。所以关联的模板优先于审计里的中间机器。 */
+        const source = linked ?? auditSource;
         const name = source?.name?.trim() ?? '';
         /* 两级来源：
            1. 面板侧记录的系统家族（`vm_meta` 的 `os`）—— 人工确认过，最可信；
@@ -1937,9 +1937,9 @@ export function GuestListPage({ kind }: { kind: GuestKind }) {
             ? `${t('guestList.osFromMeta')} · ${name}`
             : t('guestList.osFromMeta')
           : name
-            ? fromLinked
-              ? t('guestList.osFromLinkedTemplate', { name })
-              : t('guestList.osFromTemplate', { name })
+            /* 来源模板就是来源模板：克隆时自动写入的那条与运维手工关联的那条
+               在界面上没有区别，用户不需要知道它是怎么记下来的 */
+            ? t('guestList.osFromTemplate', { name })
             : snapshotFamily && family === snapshotFamily
               ? t('guestList.osFromSnapshot', {
                   time: formatDateTime(snapshot?.taken_at ?? 0),
@@ -2994,7 +2994,6 @@ function CloneDialog({
   const meta = KIND_META[kind];
   const L = useKindLabels(kind);
   const runner = useTaskRunner();
-  const [newId, setNewId] = useState('');
   const [name, setName] = useState('');
   const [full, setFull] = useState(true);
   const [targetStorage, setTargetStorage] = useState('');
@@ -3004,7 +3003,6 @@ function CloneDialog({
 
   useEffect(() => {
     if (vm) {
-      setNewId('');
       setName(`${vm.name || (container ? `ct-${vm.vmid}` : `vm-${vm.vmid}`)}-clone`);
       /* 克隆模板默认链接克隆（秒级、省空间）；克隆普通虚拟机仍用完整克隆，
          因为链接克隆要求源磁盘处于可链接状态，普通虚机常不满足 */
@@ -3012,12 +3010,6 @@ function CloneDialog({
       setTargetStorage('');
     }
   }, [vm, container]);
-
-  const idNum = Number(newId);
-  const idError =
-    newId && (!Number.isInteger(idNum) || idNum < 100 || idNum > 999999999)
-      ? t('guestList.cloneIdRange')
-      : undefined;
 
   /* 目标存储：只列**源机器所在节点**上、且能放这类磁盘的存储池（虚拟机 images、
      容器 rootdir）。原先是个自由文本框，名字写错（或写了别的主机上的池子）必然
@@ -3047,19 +3039,20 @@ function CloneDialog({
     ];
   }, [storagesQuery.data, container, t]);
 
+  /* 运行中的容器不能整机克隆（PVE 只允许从快照克隆）：直接拦在提交前 */
+  const running = container && String(vm?.status ?? '') === 'running';
+
   const submit = async () => {
-    if (!vm || idError || !newId) return;
+    if (!vm || running) return;
     setBusy(true);
     try {
       await runner.run(
         container
           ? lxcApi.clone(vm.node, vm.vmid, {
-              newid: idNum,
               hostname: name || undefined,
               target_storage: targetStorage || undefined,
             })
           : vmsApi.clone(vm.node, vm.vmid, {
-              newid: idNum,
               name: name || undefined,
               full,
               target_storage: targetStorage || undefined,
@@ -3100,7 +3093,7 @@ function CloneDialog({
             variant="primary"
             onClick={submit}
             loading={busy}
-            disabled={!newId || Boolean(idError)}
+            disabled={running}
           >
             {t('guestList.cloneStart')}
           </Button>
@@ -3108,15 +3101,6 @@ function CloneDialog({
       }
     >
       <div className="form-grid">
-        <Input
-          label={t('guestList.cloneNewId')}
-          required
-          value={newId}
-          onChange={(e) => setNewId(e.target.value.replace(/\D/g, ''))}
-          placeholder={t('guestList.cloneNewIdPlaceholder')}
-          error={idError}
-          hint={t('guestList.cloneIdHint', { create: L.create })}
-        />
         <Input
           label={t('guestList.cloneNewName')}
           value={name}
@@ -3131,6 +3115,11 @@ function CloneDialog({
           hint={t('guestList.cloneTargetHint')}
         />
       </div>
+      {running ? (
+        <div className="mt-16">
+          <Notice tone="warning">{t('lxcMore.cloneRunningHint')}</Notice>
+        </div>
+      ) : null}
       {container ? (
         <div className="mt-16">
           <Notice tone="info" title={t('guestList.cloneCtOnlyTitle')}>

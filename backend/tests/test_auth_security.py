@@ -240,7 +240,12 @@ class TestSessionsAndLogout:
 # ------------------------------------------------------------ 两步验证（TOTP）
 class TestTwoFactor:
     def _enable(self, client, token: str):
-        setup = client.post("/api/auth/2fa/setup", headers=_bearer(token))
+        # 绑定 / 启用 2FA 都要验当前口令（PVE-AUTH-002）：只凭令牌不能换锁
+        setup = client.post(
+            "/api/auth/2fa/setup",
+            headers=_bearer(token),
+            json={"password": ADMIN["password"]},
+        )
         assert setup.status_code == 200, setup.text
         body = setup.json()
         assert body["qr_png"].startswith("data:image/png;base64,")
@@ -248,7 +253,9 @@ class TestTwoFactor:
 
         code = pyotp.TOTP(body["secret"]).now()
         enabled = client.post(
-            "/api/auth/2fa/enable", headers=_bearer(token), json={"code": code}
+            "/api/auth/2fa/enable",
+            headers=_bearer(token),
+            json={"code": code, "password": ADMIN["password"]},
         )
         assert enabled.status_code == 200, enabled.text
         return body["secret"], enabled.json()["recovery_codes"]

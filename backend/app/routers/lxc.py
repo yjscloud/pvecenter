@@ -34,6 +34,7 @@ from .. import (
     guestnotify,
     guest_osinfo,
     guestpasswd,
+    guestguard,
     i18n,
     ippool,
     migrateguard,
@@ -71,7 +72,7 @@ from ..schemas import (
     SnapshotCreate,
 )
 from ..vm_scope import bind_vm_connection
-from .vm_meta import drop_entry as drop_vm_meta, manual_ip_index
+from .vm_meta import drop_entry as drop_vm_meta, manual_ip_index, set_template
 from .vms import (
     _filter_snapshots,
     _op_connection,
@@ -685,6 +686,9 @@ async def _create_lxc_core(
     # 之类会留下），会贴到这台新容器上。清一次，让列表从它自己的 netN 重新解析
     # —— 否则「刚建出来的容器显示着别人的地址」。
     await guestip.forget(_op_connection(), payload.node, vmid, "lxc")
+    # 系统类型缓存（单台 6 小时）：回收号上的上一台可能是另一种发行版（实测
+    # 108 从 ubuntu 换成 centos 后图标仍停在 ubuntu），不清就会画错图标
+    guestostype.forget(_op_connection(), payload.node, "lxc", vmid)
     # 同一个号的上一个占用者若是面板外删的，删除接口不会跑；这里兜底清一次置顶
     # 与收藏，保证新容器默认未收藏、未置顶。
     await prefs.forget_guest_refs(_op_connection(), payload.node, vmid)
@@ -845,6 +849,8 @@ async def delete_container(
     await guest_created.drop_record(_op_connection(), node, vmid, "lxc")
     # 同虚拟机：IP 缓存一并清掉，免得贴在重建的同号容器上
     await guestip.forget(_op_connection(), node, vmid, "lxc")
+    # 系统类型缓存（6 小时）同理：同号重建的容器若换了发行版，图标会一直错
+    guestostype.forget(_op_connection(), node, "lxc", vmid)
     # 地址池的分配登记同样释放（见 app.ippool 的「分配登记」一节）
     await ippool.release_guest(_op_connection(), node, vmid)
     # 归属记录不删的话额度不会还给用户（见 ownership.forget_guest 的说明）；
@@ -1464,6 +1470,15 @@ async def migrate_container(
     return {"task": task, "mode": mode}
 
 
+def _running_clone_detail() -> str:
+    """运行中的容器不能克隆时的提示（前置校验与错误兜底共用一句）。"""
+    return i18n.pick(
+        "容器正在运行，无法克隆。请先在详情页关闭容器，再执行克隆",
+        "The container is running and cannot be cloned. "
+        "Shut it down first, then clone.",
+    )
+
+
 @router.post("/lxc/{node}/{vmid}/clone")
 async def clone_container(
     node: str,
@@ -1474,6 +1489,30 @@ async def clone_container(
 ) -> Dict[str, Any]:
     client = get_client()
 
+    # 与虚拟机克隆同样的节点范围校验：源节点 + 落点节点都要在可见范围内
+    connection_id = guestguard.call_connection()
+    await security.ensure_node_allowed(user, connection_id, node)
+    if payload.target_node:
+        await security.ensure_node_allowed(user, connection_id, payload.target_node)
+
+    # 运行中的容器不能整机克隆：PVE 只允许「从快照克隆」，直接调用会得到一句
+    # `Full clone of a running container is only possible from a snapshot` ——
+    # 用户看不出该怎么办。这里提前拦住，并明确告诉他先关机。
+    try:
+        status = await client.lxc_status(node, vmid) or {}
+    except Exception:  # noqa: BLE001 - 读不到状态就跳过预检，交给 PVE 兜底
+        status = {}
+    if str(status.get("status") or "") == "running":
+        detail = _running_clone_detail()
+        await security.audit(
+            request, user, "ct.clone", target=f"{node}/{vmid}",
+            result="failed", detail=detail,
+        )
+        raise HTTPException(status_code=409, detail=detail)
+
+    # VMID 由系统分配：克隆不需要用户填号（显式传了仍以传入的为准）
+    newid = int(payload.newid or await client.nextid())
+
     # 克隆会实实在在多出一台机器，配额必须跟着算（算在容器额度上）
     await quota.enforce_for_create(user, request, "lxc")
     # 资源额度：克隆体照抄来源容器，规格从读数里取
@@ -1483,15 +1522,21 @@ async def clone_container(
         result = await client.lxc_clone(
             node,
             vmid,
-            newid=payload.newid,
+            newid=newid,
             hostname=payload.hostname,
             target_storage=payload.target_storage,
             target_node=payload.target_node,
             description=payload.description,
         )
     except ProxmoxError as exc:
+        # 状态可能在上面的预检之后刚变成 running（有人刚点了开机）：按同一句话
+        # 翻译，别把 PVE 的英文原文丢给用户。
+        if "running container" in exc.message.lower():
+            exc.message = _running_clone_detail()
+            exc.status_code = 409
         await security.audit(
-            request, user, "ct.clone", target=f"{node}/{vmid} -> {payload.newid}",
+            request, user, "ct.clone",
+            target=f"{node}/{vmid} -> {payload.target_node or node}/{newid}",
             result="failed", detail=exc.message,
         )
         _raise(exc)
@@ -1508,27 +1553,44 @@ async def clone_container(
     target_node = payload.target_node or node
     await ownership.claim(
         ownership.KIND_CT,
-        ownership.vm_ref(_op_connection(), target_node, payload.newid),
+        ownership.vm_ref(_op_connection(), target_node, newid),
         str(user.get("username") or ""),
     )
+    # 关联「源克隆机所用的模板」：列表的操作系统列据此显示同一个系统
+    # （容器的 ostype 本身已够用，这里主要为了「来源模板」列一致）
+    await set_template(
+        _op_connection(),
+        target_node,
+        newid,
+        await guest_created.source_template_of(
+            client, _op_connection(), node, vmid, "lxc"
+        ),
+        by=str(user.get("username") or ""),
+    )
     await security.audit(
-        request, user, "ct.clone", target=f"{node}/{vmid} -> {payload.newid}",
+        request, user, "ct.clone",
+        # 目标段必须带节点：来源解析按 `节点/VMID` 精确匹配 target_guest，
+        # 只写 `-> 113` 时归一化出来是 `113`，这台容器就永远查不到来源，
+        # 列表的「来源模板」与操作系统列都会空着（与 vms.py 同一处坑）。
+        target=f"{node}/{vmid} -> {target_node}/{newid}",
         detail={"hostname": payload.hostname},
     )
     # 创建时间：克隆会继承来源容器的 meta，必须记面板这一份
     await guest_created.record(
         _op_connection(),
         target_node,
-        payload.newid,
+        newid,
         "lxc",
         source="clone",
         username=str(user.get("username") or ""),
     )
     # IP 记录同理：clone 可能落到回收的 VMID，也不能沿用旧机器的地址
-    await guestip.forget(_op_connection(), target_node, payload.newid, "lxc")
+    await guestip.forget(_op_connection(), target_node, newid, "lxc")
+    # ostype 缓存同理：回收号上的上一台可能是另一种发行版
+    guestostype.forget(_op_connection(), target_node, "lxc", newid)
     # 克隆体可能落在回收的 VMID 上：置顶 / 收藏同样不能沿用旧占用者的状态
-    await prefs.forget_guest_refs(_op_connection(), target_node, payload.newid)
-    return {"task": task, "vmid": payload.newid, "node": target_node}
+    await prefs.forget_guest_refs(_op_connection(), target_node, newid)
+    return {"task": task, "vmid": newid, "node": target_node}
 
 
 @router.post("/lxc/{node}/{vmid}/template")

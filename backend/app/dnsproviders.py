@@ -30,7 +30,13 @@ import httpx
 HTTP_TIMEOUT = 20.0
 
 #: 记录 TTL。验证期间要尽快生效，所以取各家允许的最小值附近。
+#:
+#: 但**各家允许的最小值不一样**，统一写 60 会被「低于最小值」直接拒绝
+#: （DNSPod 免费版 600 起、华为云 300 起、GoDaddy 600 起）。按服务商分开：
+#: ACME 的验证查询走权威 DNS，TTL 小并不带来额外收益，取各家最小值即可。
 TXT_TTL = 60
+DNSPOD_TTL = 600
+HUAWEI_TTL = 300
 
 #: 各服务商的字段 schema（配置驱动扩展）。
 #:
@@ -154,7 +160,49 @@ def form_fields(kind: str) -> Tuple[Dict[str, Any], ...]:
 
 
 class DnsError(Exception):
-    """DNS 服务商接口返回的错误。"""
+    """DNS 服务商接口返回的错误。
+
+    ``code`` 保留服务商原始错误码：:meth:`DnspodProvider._find_zone` 靠它区分
+    「这个 zone 不在账号里」和「密钥 / 权限不对」—— 两者都抛 DnsError，混在
+    一起会把鉴权失败说成「找不到域名」，让人去查解析而不是查密钥。
+    """
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = str(code or "")
+
+
+def _zone_not_found(exc: DnsError) -> bool:
+    """这个错误是不是「该域名不在账号里」（可以继续截断父域重试）。
+
+    只有这一类值得往下试；鉴权（``AuthFailure.*``）、限流、签名错误换多少个
+    候选都一样失败，继续循环只会把真实原因盖掉。
+    """
+    code = str(getattr(exc, "code", "") or "").lower()
+    if code:
+        # 鉴权 / 签名类错误里也常带 ``NotFound``（如
+        # ``AuthFailure.SecretIdNotFound``），必须先排除，否则又会退回「把密钥
+        # 错误说成域名不存在」的老路。
+        if code.startswith("authfailure") or "signature" in code or "secretid" in code:
+            return False
+        # 各家对「域名不在账号里」的写法不同：DNSPod 是
+        # ``ResourceNotFound.DomainNotExist``、阿里云是 ``InvalidDomainName.NoExist``、
+        # GoDaddy 是 ``NOT_FOUND`` / ``UNKNOWN_DOMAIN`` ……
+        return any(
+            token in code
+            for token in (
+                "notexist",
+                "noexist",
+                "not_found",
+                "notfound",
+                "unknown_domain",
+                "domainnot",
+                "domaininvalid",
+                "invalid_domain",
+            )
+        )
+    text = str(exc).lower()
+    return "not exist" in text or "not found" in text or "不存在" in text
 
 
 def _client() -> httpx.AsyncClient:
@@ -182,6 +230,26 @@ class DnsProvider:
 
     async def delete_txt(self, name: str, record_id: str) -> None:
         raise NotImplementedError
+
+    async def check_domain(self, name: str) -> str:
+        """只读探测 ``name`` 的托管域是否在本账号下，返回托管域名。
+
+        ``_find_zone`` 在各家内部就是一次查询（列记录 / 列域），不会创建任何
+        记录 —— 这是「验证配置」与「真跑一次签发」的边界：前者只读，不消耗
+        CA 配额，也不在 DNS 里留下痕迹。
+
+        鉴权失败、域名不在账号下都会抛 :class:`DnsError`（带真实原因），
+        调用方原样展示即可。
+        """
+        finder = getattr(self, "_find_zone", None)
+        if finder is None:
+            raise DnsError(str(self.name or "该服务商") + " 不支持域名探测")
+        zone = await finder(name)
+        if isinstance(zone, str):
+            return zone
+        if isinstance(zone, dict):
+            return str(zone.get("name") or zone.get("zone") or "")
+        return ""
 
 
 # ------------------------------------------------------------------ DNSPod
@@ -271,7 +339,10 @@ class DnspodProvider(DnsProvider):
             raise DnsError("DNSPod 返回的不是 JSON") from exc
         error = data.get("Error")
         if error:
-            raise DnsError(f"DNSPod {action} 失败：{error.get('Message') or error.get('Code')}")
+            raise DnsError(
+                f"DNSPod {action} 失败：{error.get('Message') or error.get('Code')}",
+                code=str(error.get("Code") or ""),
+            )
         return data
 
     async def _find_zone(self, name: str) -> str:
@@ -283,9 +354,14 @@ class DnspodProvider(DnsProvider):
                     return str(data["Domain"])
                 return candidate
             except DnsError as exc:
+                # 密钥无效 / 无 DNSPod 权限 / 被限流时，换哪个候选都一样失败。
+                # 继续循环会把 ``The SecretId is not found`` 盖成「找不到域名」，
+                # 用户按提示去查解析，真正要改的是密钥。
+                if not _zone_not_found(exc):
+                    raise
                 last = exc
                 continue
-        raise DnsError(f"找不到 {name} 对应的 DNSPod 域名") from last
+        raise DnsError(f"找不到 {name} 对应的 DNSPod 域名：{last}") from last
 
     async def create_txt(self, name: str, value: str) -> str:
         zone = await self._find_zone(name)
@@ -298,7 +374,8 @@ class DnspodProvider(DnsProvider):
                 "RecordType": "TXT",
                 "RecordLine": "默认",
                 "Value": value,
-                "TTL": TXT_TTL,
+                # DNSPod 免费版的最小 TTL 是 600，传 60 会回「TTL 值超出了限制」
+                "TTL": DNSPOD_TTL,
             },
         )
         return str((data.get("RecordInfo") or {}).get("Id") or "")
@@ -368,9 +445,11 @@ class AliyunProvider(DnsProvider):
                 await self._call("DescribeDomainRecords", {"DomainName": candidate, "PageSize": 1})
                 return candidate
             except DnsError as exc:
+                if not _zone_not_found(exc):
+                    raise
                 last = exc
                 continue
-        raise DnsError(f"找不到 {name} 对应的阿里云域名") from last
+        raise DnsError(f"找不到 {name} 对应的阿里云域名：{last}") from last
 
     async def create_txt(self, name: str, value: str) -> str:
         zone = await self._find_zone(name)
@@ -475,9 +554,11 @@ class HuaweiProvider(DnsProvider):
                     zone = zones[0]
                     return {"id": str(zone.get("id") or ""), "name": str(zone.get("name") or "")}
             except DnsError as exc:
+                if not _zone_not_found(exc):
+                    raise
                 last = exc
                 continue
-        raise DnsError(f"找不到 {name} 对应的华为云域名") from last
+        raise DnsError(f"找不到 {name} 对应的华为云域名：{last}") from last
 
     async def create_txt(self, name: str, value: str) -> str:
         zone = await self._find_zone(name)
@@ -489,7 +570,8 @@ class HuaweiProvider(DnsProvider):
             payload={
                 "name": sub + "." + zone_name + ".",
                 "type": "TXT",
-                "ttl": TXT_TTL,
+                # 华为云 DNS 的 TTL 下限是 300
+                "ttl": HUAWEI_TTL,
                 "records": [f'"{value}"'],
             },
         )
@@ -531,7 +613,9 @@ class CloudflareProvider(DnsProvider):
             errors = data.get("errors") or []
             raise DnsError(
                 "Cloudflare 请求失败："
-                + "; ".join(str(e.get("message") or e) for e in errors)[:300]
+                + "; ".join(str(e.get("message") or e) for e in errors)[:300],
+                # 带上错误码：鉴权（9109）与「域名不存在」要能区分开
+                code=str((errors[0] or {}).get("code") or "") if errors else "",
             )
         return data
 
@@ -544,9 +628,11 @@ class CloudflareProvider(DnsProvider):
                 if zones:
                     return {"id": str(zones[0].get("id") or ""), "name": str(zones[0].get("name") or "")}
             except DnsError as exc:
+                if not _zone_not_found(exc):
+                    raise
                 last = exc
                 continue
-        raise DnsError(f"找不到 {name} 对应的 Cloudflare 域名") from last
+        raise DnsError(f"找不到 {name} 对应的 Cloudflare 域名：{last}") from last
 
     async def create_txt(self, name: str, value: str) -> str:
         zone = await self._find_zone(name)
@@ -597,10 +683,18 @@ class GodaddyProvider(DnsProvider):
             )
         if resp.status_code >= 400:
             try:
-                detail = resp.json().get("message") or resp.text[:300]
+                payload_obj: Dict[str, Any] = resp.json() or {}
             except ValueError:
-                detail = resp.text[:300]
-            raise DnsError(f"GoDaddy 请求失败（HTTP {resp.status_code}）：{detail}")
+                payload_obj = {}
+            detail = str(
+                payload_obj.get("message") or payload_obj.get("code") or resp.text[:300]
+            )
+            raise DnsError(
+                f"GoDaddy 请求失败（HTTP {resp.status_code}）：{detail}",
+                # NOT_FOUND / UNKNOWN_DOMAIN 才是「域名不在账号里」，
+                # 鉴权失败（401 / INVALID_API_KEY）要直接抛出去
+                code=str(payload_obj.get("code") or ""),
+            )
         if not resp.text:
             return None
         try:
@@ -616,8 +710,10 @@ class GodaddyProvider(DnsProvider):
                 if data and data.get("domain"):
                     return str(data["domain"])
             except DnsError as exc:
+                if not _zone_not_found(exc):
+                    raise
                 last = exc
-        raise DnsError(f"找不到 {name} 对应的 GoDaddy 域名") from last
+        raise DnsError(f"找不到 {name} 对应的 GoDaddy 域名：{last}") from last
 
     async def _read_txt(self, zone: str, record_name: str) -> List[Dict[str, Any]]:
         path = f"/domains/{zone}/records/TXT/{quote(record_name, safe='')}"
@@ -925,8 +1021,10 @@ class NamecheapProvider(DnsProvider):
                 )
                 return {"sld": sld, "tld": tld, "zone": candidate}
             except DnsError as exc:
+                if not _zone_not_found(exc):
+                    raise
                 last = exc
-        raise DnsError(f"找不到 {name} 对应的 Namecheap 域名") from last
+        raise DnsError(f"找不到 {name} 对应的 Namecheap 域名：{last}") from last
 
     async def _hosts(self, sld: str, tld: str) -> List[Dict[str, str]]:
         root = await self._call("namecheap.domains.dns.getHosts", {"SLD": sld, "TLD": tld})

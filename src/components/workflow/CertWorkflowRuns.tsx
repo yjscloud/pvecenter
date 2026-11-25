@@ -21,9 +21,10 @@ import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { Select, Textarea } from '../ui/Input';
 import { Modal } from '../ui/Modal';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { EmptyState, ErrorState, Notice } from '../ui/EmptyState';
 import { Spinner } from '../ui/Spinner';
-import { IconCheck, IconClock, IconFlow, IconRefresh } from '../Icons';
+import { IconCheck, IconClock, IconFlow, IconRefresh, IconTrash } from '../Icons';
 import { nodeVisual } from './nodeMeta';
 import { useRefreshInterval } from '../../hooks/useRefreshInterval';
 import { useToast } from '../../hooks/useToast';
@@ -300,6 +301,9 @@ export function CertWorkflowRuns({
   const [runId, setRunId] = useState('');
   const [note, setNote] = useState('');
   const [busyAction, setBusyAction] = useState<CertWorkflowRunAction | ''>('');
+  /** 要删除的审批实例：只允许终态（进行中的实例后端会 409） */
+  const [deleteTarget, setDeleteTarget] = useState<CertWorkflowRun | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const toast = useToast();
 
   const listQuery = useQuery({
@@ -489,9 +493,30 @@ export function CertWorkflowRuns({
                       <span>{t('workflow.run.noApproval')}</span>
                     )}
                   </div>
-                  <Button size="sm" onClick={() => openDetail(run.id)}>
-                    {t('workflow.run.viewDetail')}
-                  </Button>
+                  <div className="wf-run-actions">
+                    <Button size="sm" onClick={() => openDetail(run.id)}>
+                      {t('workflow.run.viewDetail')}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="wf-danger-text"
+                      icon={<IconTrash size={14} />}
+                      disabled={
+                        !canManage ||
+                        run.status === 'pending' ||
+                        run.status === 'running'
+                      }
+                      title={
+                        run.status === 'pending' || run.status === 'running'
+                          ? t('workflow.run.deleteActive')
+                          : undefined
+                      }
+                      onClick={() => setDeleteTarget(run)}
+                    >
+                      {t('workflow.run.delete')}
+                    </Button>
+                  </div>
                 </div>
               </article>
             );
@@ -582,6 +607,17 @@ export function CertWorkflowRuns({
                   <span>{selectedRun.workflow_name}</span>
                   {selectedRun.site_domain ? (
                     <span className="mono">{selectedRun.site_domain}</span>
+                  ) : null}
+                  {selectedRun.cert_run_id ? (
+                    /* 这一步执行时产生的证书流水（签发/部署的逐步日志在那一边） */
+                    <a
+                      className="mono"
+                      href={`/certs?site=${encodeURIComponent(selectedRun.site_id)}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {t('workflow.run.certRunLink')}
+                    </a>
                   ) : null}
                   <span>
                     {t('workflow.run.requestedBy', { name: selectedRun.requester })}
@@ -684,6 +720,34 @@ export function CertWorkflowRuns({
           </div>
         )}
       </Modal>
+
+      {/* 删除审批实例：只删这条记录，证书运行日志不受影响 */}
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        danger
+        title={t('workflow.run.deleteTitle')}
+        confirmText={t('common.delete')}
+        message={t('workflow.run.deleteMessage', {
+          name: deleteTarget?.title || deleteTarget?.workflow_name || '',
+        })}
+        loading={deleting}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={async () => {
+          const target = deleteTarget;
+          if (!target) return;
+          setDeleting(true);
+          try {
+            await certWorkflowRunsApi.remove(target.id);
+            toast.success(t('workflow.run.deleted'), target.title || target.workflow_name);
+            setDeleteTarget(null);
+            await qc.invalidateQueries({ queryKey: ['cert-workflow-runs'] });
+          } catch (err) {
+            toast.error(t('workflow.run.deleteFailed'), errText(err));
+          } finally {
+            setDeleting(false);
+          }
+        }}
+      />
     </div>
   );
 }

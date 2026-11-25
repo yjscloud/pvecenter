@@ -183,6 +183,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 会话有效期可能被管理员改过（存 settings KV），启动时读进进程缓存：
     # 签发令牌是同步路径，不能在那儿查库（见 security.refresh_session_policy）
     await security.refresh_session_policy()
+    # 对外地址读进进程缓存：HTTPS 308 跳转发生在中间件里，那里不能 await 查库
+    try:
+        await panel_url.refresh_cache()
+    except Exception:  # noqa: BLE001 - 读不到就退化成相对跳转，不影响启动
+        logger.debug("读取面板对外地址失败，308 跳转将使用相对地址", exc_info=True)
     # AI 排查助手：谁在什么时候让 AI 在哪台机器上跑了什么命令，必须可追溯
     await aiaudit.init_table()
     # AI 候选目标的跨 worker 探测缓存（多 worker 时避免把每台机器重复探 N 遍）
@@ -607,6 +612,26 @@ if settings.cors_origin_list:
     )
 
 
+class RequestSchemeMiddleware:
+    """把本次请求的 scheme 记进 contextvar，供下发 cookie 时决定是否带 Secure。
+
+    uvicorn 的 ProxyHeaders 已经按 ``FORWARDED_ALLOW_IPS`` 验过信任链、把结论写进
+    ``scope["scheme"]``，这里只做搬运，不重复判断。没有它的话，「反代终结 TLS、
+    FORCE_HTTPS 未开」这种常见部署下 cookie 永远不带 Secure（PVE-CONF-003(c)）。
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") in ("http", "websocket"):
+            security.note_request_scheme(scope.get("scheme") or "")
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(RequestSchemeMiddleware)
+
+
 class PveConnectionScopeMiddleware:
     """把 ``X-PVE-Connection`` / ``X-PVE-Scope`` 请求头绑定到本次请求。
 
@@ -746,19 +771,22 @@ class HttpsEnforcementMiddleware:
 
     @staticmethod
     def _redirect_target(scope: Any, headers: Dict[bytes, bytes]) -> str:
-        host = (headers.get(b"host") or b"").decode("latin-1")
-        for port in (f":{settings.port}", ":80"):
-            if port and host.endswith(port):
-                host = host[: -len(port)]
-                break
-        if not host:
-            server = scope.get("server") or ("localhost", settings.port)
-            host = str(server[0])
-        location = f"https://{host}{scope.get('path') or '/'}"
+        """升级到 HTTPS 的目标地址。
+
+        **绝不采信请求里的 Host**：攻击者发一句 ``Host: evil.example`` 就能把
+        升级跳转变成开放重定向（凭据收割 / 缓存投毒）。两档选择：
+
+        * 管理员配了对外地址（``panel_base_url``）→ 用它拼绝对地址；
+        * 没配 → 只给**相对路径**，由浏览器按当前源解析，同样不可能被带偏。
+        """
+        del headers  # 保留参数只为兼容调用点；Host 头不再参与计算
+        path = scope.get("path") or "/"
         query = scope.get("query_string") or b""
-        if query:
-            location += "?" + query.decode("latin-1")
-        return location
+        suffix = "?" + query.decode("latin-1") if query else ""
+        base = panel_url.cached_base_url()
+        if base:
+            return base.rstrip("/") + path + suffix
+        return path + suffix
 
     @staticmethod
     def _with_hsts(send: Any) -> Any:
@@ -1737,6 +1765,9 @@ CERT_FIRST_DELAY = 120
 # 短退避，所以单独起一个 5 分钟的轻量作业，只挑「退避到点」的站点补跑。
 # 首次延迟 3 分钟，错开主作业与启动时的连接初始化。
 CERT_RETRY_INTERVAL = 300
+#: 待办队列消费间隔。入队是即时的，消费慢一两分钟不影响体验；
+#: 站点多时比「每 5 分钟扫全表」便宜得多。
+CERT_JOB_INTERVAL = 60
 CERT_RETRY_FIRST_DELAY = 180
 # 监控历史采样周期。它同时决定采样点的时间戳对齐粒度（见 metrics.align_ts），
 # 所以那个函数会回头问调度器要当前生效值，两边一起变才不会出现重复点。
@@ -2260,6 +2291,18 @@ scheduler.register(
         CERT_RETRY_INTERVAL,
         summarize=_cert_summary,
         first_delay=CERT_RETRY_FIRST_DELAY,
+    )
+)
+scheduler.register(
+    _job(
+        "cert_jobs",
+        "证书待办队列",
+        "监控与证书",
+        "消费建站签发 / 部署重试等排队动作（持久化，重启不丢）",
+        cert_manager.job_tick,
+        CERT_JOB_INTERVAL,
+        summarize=_cert_summary,
+        first_delay=90,
     )
 )
 scheduler.register(

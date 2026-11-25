@@ -27,6 +27,8 @@ from .. import (
     cloneguard,
     defaults,
     diskspec,
+    guest_created,
+    guestostype,
     guestguard,
     ownership,
     pvecache,
@@ -37,6 +39,7 @@ from .. import (
 )
 from ..formatters import pve_flag
 from ..vm_scope import bind_node_connection
+from .vm_meta import set_template
 from ..pve import (
     ProxmoxError,
     connection_label,
@@ -776,13 +779,15 @@ async def convert_vm_to_template(
     payload: TemplateFromVm,
     request: Request,
     user: Dict[str, Any] = Depends(security.require_permission("template.manage")),
+    # 这条路径会强制关机（payload.shutdown）：除了「能管模板」，还要「能关机」。
+    _power: Dict[str, Any] = Depends(security.require_permission("vm.power")),
 ) -> Dict[str, Any]:
     """Convert an existing VM into a template, optionally shutting it down."""
     await _bind_source_connection(user, payload.node, payload.vmid)
-    # 对象级鉴权：源必须是自己的机器。这条路径还会**强制关机**（payload.shutdown），
-    # 以前只校验 template.manage，把别人的 vmid 填进来就能把别人的机器关掉并
-    # 变成模板。模板本身没有归属概念，所以只要求「源 VM 有归属就得是自己」。
-    await guestguard.require_guest_object_if_owned(
+    # 对象级鉴权：源必须是自己的机器，且**必须是严格判定**。宽松版
+    # （require_guest_object_if_owned）对「无归属」的存量机放行，等于把面板外创建 /
+    # 历史遗留的机器全部变成可关机、可转模板的公共资源。
+    await guestguard.require_guest_object(
         user, payload.node, payload.vmid, ownership.KIND_VM
     )
     client = get_client()
@@ -987,6 +992,20 @@ async def clone_template(
         ownership.KIND_VM,
         ownership.vm_ref(_op_connection(), target_node, newid),
         str(user.get("username") or ""),
+    )
+
+    # 回收号上的旧 ostype 缓存要清：同号新机器的系统可能完全不同
+    guestostype.forget(_op_connection(), target_node, "qemu", newid)
+
+    # 关联来源模板：模板克隆的来源就是这张模板本身，列表据此显示它的系统
+    await set_template(
+        _op_connection(),
+        target_node,
+        newid,
+        await guest_created.source_template_of(
+            client, _op_connection(), payload.source_node, payload.source_vmid, "qemu"
+        ),
+        by=str(user.get("username") or ""),
     )
 
     return {

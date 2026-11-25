@@ -460,7 +460,6 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   /* What the OS badge is based on (shown on hover) */
   'guestList.osFromMeta': 'Manual tag',
   'guestList.osFromTemplate': 'From template {name}',
-  'guestList.osFromLinkedTemplate': 'Linked template {name}',
   'guestList.osFromSnapshot': 'OS snapshot ({time})',
   'guestList.osSnapshot':
     'OS snapshot: {detail} (taken {time}). Refreshed on isolate / release / power-on; a failed read never clears what is already stored.',
@@ -1752,6 +1751,8 @@ export const enCompute: Partial<Record<MessageKey, string>> = {
   'lxcDetail.monRangeAria': 'Monitoring time range',
   /* Container detail "More actions". Mirrors vmMore.* with the noun swapped. */
   'lxcMore.clone': 'Clone as new container',
+  'lxcMore.cloneRunningHint':
+    'The container is running and cannot be cloned. Shut it down first, then clone.',
   'lxcMore.cloneTitle': 'Clone as new container',
   'lxcMore.cloneHostname': 'Hostname',
   'lxcMore.cloneTask': 'Clone “{name}”',

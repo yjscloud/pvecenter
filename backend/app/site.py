@@ -83,9 +83,44 @@ def _sniff_mime(data: bytes) -> Optional[str]:
     if len(data) > 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
     # SVG 是文本，没法用魔数，退而检查正文里有没有 <svg>
-    if b"<svg" in data[:4096]:
+    if b"<svg" in data[:4096].lower():
         return "image/svg+xml"
     return None
+
+
+#: SVG 一旦出现这些片段，就不是「一张图」而是可执行文档：脚本、事件属性、外部实体、
+#: 外链引用。Logo 是**匿名可读**的同源资源，这类标记必须直接拒收（在服务端安全剥离
+#: SVG 需要完整 XML 解析与白名单，收益不如明确拒收）。
+_SVG_DANGEROUS = (
+    b"<script",
+    b"javascript:",
+    b"<!entity",
+    b"<foreignobject",
+    b"onload=",
+    b"onerror=",
+    b"onclick=",
+    b"onmouseover=",
+    b"onfocus=",
+    b"onbegin=",
+    b"xlink:href=\"http",
+    b"xlink:href='http",
+)
+
+
+def _svg_is_safe(data: bytes) -> bool:
+    """SVG 正文里没有脚本 / 事件属性 / 外部实体时才允许落盘。"""
+    lowered = data.lower()
+    return not any(mark in lowered for mark in _SVG_DANGEROUS)
+
+
+def detect_mime(data: bytes) -> Optional[str]:
+    """对外暴露的内容类型判定（读取端复核对存量文件时用）。"""
+    return _sniff_mime(data)
+
+
+def logo_payload_is_safe(data: bytes, mime: str) -> bool:
+    """落盘内容与声明的类型是否仍然可信（存量记录可能是修复前写下的）。"""
+    return mime != "image/svg+xml" or _svg_is_safe(data)
 
 
 def _normalize(value: Any, default: str, limit: int) -> str:
@@ -200,10 +235,15 @@ async def save_logo(data: bytes, declared_mime: str = "") -> Dict[str, Any]:
     if len(data) > MAX_LOGO_BYTES:
         raise ValueError(f"图片不能超过 {MAX_LOGO_BYTES // 1024} KB")
 
-    mime = _sniff_mime(data) or str(declared_mime or "").split(";")[0].strip().lower()
-    ext = IMAGE_TYPES.get(mime)
+    # 只认魔数，**不采信客户端声明**：声明 image/svg+xml 就能把一段 HTML 存成
+    # logo.svg 同源直出（匿名可读），这条回落分支本身就是存储型 XSS 的入口。
+    # declared_mime 保留在签名里只为兼容现有调用方，不再参与判定。
+    mime = _sniff_mime(data)
+    ext = IMAGE_TYPES.get(mime or "")
     if not ext:
         raise ValueError("仅支持 PNG / JPG / WebP / GIF / SVG / ICO 格式的图片")
+    if mime == "image/svg+xml" and not _svg_is_safe(data):
+        raise ValueError("SVG 里含有脚本或外部引用，已拒绝；请改用 PNG 等位图格式")
 
     LOGO_DIR.mkdir(parents=True, exist_ok=True)
     await _purge_logo_files()

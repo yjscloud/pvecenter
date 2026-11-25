@@ -2,12 +2,12 @@
 
 设计边界
 --------
-这里不执行真正的证书签发 / 部署命令。工作流定义描述「应该做哪些步骤」，
-运行实例由具备 ``cert.manage`` 的操作者发起与审批，再逐步确认完成；
-真正的执行入口仍然是证书站点上的「申请 / 部署 / 同步」动作。
+本模块只做**状态机**：定义描述「应该做哪些步骤」，运行实例停在 ``pending``
+等审批，通过后一步步推进。每一步真正做什么由 :mod:`app.certworkflow_exec`
+在执行 ``advance`` 时调用 —— 签发 / 部署 / 同步 / 通知都会走 ``certs.run_manual``，
+因此工作流触发的动作与手动按钮共用同一套运行日志与通知。
 
-这样做有两个好处：审批与流转可以独立于具体执行器测试；后续接入自动执行器时，
-只需要把 ``advance`` 从人工确认换成执行结果回调，状态机不用重写。
+状态机保持纯函数（不碰网络与证书模块），执行器单独一层，两边都能独立测试。
 
 状态机
 ------
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS cert_workflow_run (
     workflow_name VARCHAR(128) NOT NULL DEFAULT '',
     site_id       VARCHAR(64)  NOT NULL DEFAULT '',
     site_domain   VARCHAR(255) NOT NULL DEFAULT '',
+    cert_run_id   VARCHAR(48)  NOT NULL DEFAULT '',
     title         VARCHAR(255) NOT NULL DEFAULT '',
     status        VARCHAR(24)  NOT NULL DEFAULT 'pending',
     current_index INT          NOT NULL DEFAULT -1,
@@ -280,9 +281,30 @@ def apply_action(
     return current
 
 
+async def attach_cert_run(owner: str, run_id: str, cert_run_id: str) -> bool:
+    """把执行产生的证书流水运行 id 记到工作流实例上（详情页互跳）。"""
+    if not run_id or not cert_run_id:
+        return False
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "UPDATE cert_workflow_run SET cert_run_id = ?, updated_at = ?"
+            " WHERE username = ? AND id = ?",
+            (str(cert_run_id)[:48], _now(), str(owner or ""), str(run_id)),
+        )
+        await db.commit()
+    return bool(cursor.rowcount)
+
+
 async def init_table() -> None:
     async with database.connect() as db:
         await db.executescript(SCHEMA)
+        # 旧库补列：工作流步骤与证书流水运行关联（详情页互跳用）
+        columns = await database.table_columns(db, "cert_workflow_run")
+        if "cert_run_id" not in columns:
+            await db.execute(
+                "ALTER TABLE cert_workflow_run"
+                " ADD COLUMN cert_run_id VARCHAR(48) NOT NULL DEFAULT ''"
+            )
         await db.commit()
 
 
@@ -307,6 +329,70 @@ async def list_runs(
         cursor = await db.execute(sql, tuple(params))
         rows = await cursor.fetchall()
     return [_view(row) for row in rows]
+
+
+async def delete_run(owner: str, run_id: str) -> bool:
+    """删除一条审批实例（按用户名隔离）。
+
+    只删 ``cert_workflow_run`` 这一行：它引用的证书流水运行（``cert_run_id``）
+    有独立的保留策略，删审批记录不该把证书运行的日志一起带走。
+    """
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "DELETE FROM cert_workflow_run WHERE username = ? AND id = ?",
+            (str(owner or ""), str(run_id or "")),
+        )
+        await db.commit()
+    return bool(cursor.rowcount)
+
+
+async def delete_for_site(site_id: str) -> int:
+    """删掉某个站点名下的全部审批实例（站点被删除时调用）。
+
+    这些实例引用的是一个已经不存在的 ``site_id``：留着它们，运行列表里会一直
+    挂着「一台不存在的机器的审批」，点进去还会去查证书详情（404）。
+    """
+    sid = str(site_id or "")
+    if not sid:
+        return 0
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "DELETE FROM cert_workflow_run WHERE site_id = ?", (sid,)
+        )
+        await db.commit()
+    return cursor.rowcount or 0
+
+
+async def delete_for_workflow(owner: str, workflow_id: str) -> int:
+    """删掉某个工作流名下的全部审批实例（工作流定义被删除时调用）。"""
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "DELETE FROM cert_workflow_run WHERE username = ? AND workflow_id = ?",
+            (str(owner or ""), str(workflow_id or "")),
+        )
+        await db.commit()
+    return cursor.rowcount or 0
+
+
+async def count_active(owner: str, workflow_id: str) -> int:
+    """该工作流下还有多少「待审批 / 进行中」的实例。
+
+    删除定义前用它拦一道：直接删会让这些实例永远停在半路（既推进不了，也
+    没人能批准），用户看到的是「卡住的审批」而不是「工作流没了」。
+    """
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) AS n FROM cert_workflow_run"
+            " WHERE username = ? AND workflow_id = ? AND status IN (?, ?)",
+            (
+                str(owner or ""),
+                str(workflow_id or ""),
+                STATUS_PENDING,
+                STATUS_RUNNING,
+            ),
+        )
+        row = await cursor.fetchone()
+    return int((row or {}).get("n") or 0)
 
 
 async def stats_for(owner: str) -> Dict[str, int]:

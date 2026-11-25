@@ -42,6 +42,8 @@ from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Seq
 NODE_OK = "ok"
 NODE_SKIPPED = "skipped"
 NODE_FAILED = "failed"
+#: 异步等待（CA 审核中、DNS 生效中）：不是失败，也不是完成，页面上要显示倒计时。
+NODE_WAITING = "waiting"
 RUNNING = "running"
 
 # 单条 detail 落库前的截断长度。与 certpipeline.DETAIL_LIMIT 保持一致：
@@ -117,6 +119,73 @@ def enter_step(node_id: str, index: int = 0) -> None:
     ``index`` 虽然暂时不用，签名必须兼容 ``(name, index)``。
     """
     _NODE_ID.set(str(node_id or ""))
+
+
+# ------------------------------------------------------------------ 子步骤与日志
+# 「签发里到底做了哪几步」不能只靠顶层节点回答：ACME 是下单 / 挑战 / 校验 /
+# finalize / 下载，云厂商是下单 / 等待 / 下载 / 解析，部署是「每个目标一组动作」。
+# 这些动作分散在 acme.py、certs.py 的深处，逐层传 ctx 会把签名污染一大片。
+# 这里用 contextvar 暴露两个**无参**入口（emit_step / emit_log）：不在流水线里
+# 调用就是空操作，因此深层的业务代码可以无条件写日志。
+Emitter = Callable[[Dict[str, Any]], Awaitable[None]]
+_EMITTER: contextvars.ContextVar[Optional[Emitter]] = contextvars.ContextVar(
+    "cert_flow_emitter", default=None
+)
+
+
+async def _emit(event: Dict[str, Any]) -> None:
+    fn = _EMITTER.get()
+    if fn is None:
+        return
+    try:
+        await fn(event)
+    except Exception:  # noqa: BLE001 - 记录失败不能反过来打断签发
+        pass
+
+
+async def emit_step(
+    node_id: str,
+    *,
+    status: str = NODE_OK,
+    title: str = "",
+    detail: str = "",
+    error: str = "",
+    parent: str = "",
+    attempt: int = 0,
+    next_at: int = 0,
+    level: str = "info",
+    node_type: str = "sub",
+    ms: int = 0,
+) -> None:
+    """申报一个子步骤（或更新它）。``parent`` 为空时挂到当前顶层步骤下。"""
+    await _emit(
+        {
+            "kind": "step",
+            "node_id": str(node_id or ""),
+            "node_type": str(node_type or "sub"),
+            "status": str(status or NODE_OK),
+            "title": str(title or ""),
+            "detail": _short(detail),
+            "error": str(error or "")[:DETAIL_LIMIT],
+            "parent": str(parent or ""),
+            "attempt": int(attempt or 0),
+            "next_at": int(next_at or 0),
+            "level": str(level or "info"),
+            "ms": int(ms or 0),
+        }
+    )
+
+
+async def emit_log(text: str, *, level: str = "info", node_id: str = "") -> None:
+    """在**当前步骤**里追加一行操作日志（不落 cert_deploy_log，走步骤日志表）。"""
+    await _emit(
+        {
+            "kind": "log",
+            "node_id": str(node_id or ""),
+            "text": str(text or "")[:DETAIL_LIMIT],
+            "level": str(level or "info"),
+        }
+    )
 
 
 class FlowError(ValueError):
@@ -303,6 +372,16 @@ class RunStep:
     ms: int = 0
     at: int = 0
     error: str = ""
+    # --- 子步骤（issue / deploy 内部的细粒度动作）--------------------------
+    #: 所属的顶层步骤 id；空串表示自己就是顶层步骤。``last_run`` 投影只取顶层，
+    #: 所以这些字段对旧前端完全透明。
+    parent_id: str = ""
+    title: str = ""
+    #: 第几次尝试（自动重试用同一个 node_id，靠它区分）
+    attempt: int = 0
+    #: ``waiting`` 状态的下次检查时间（epoch 秒），页面据此显示倒计时
+    next_at: int = 0
+    level: str = "info"
 
     def as_dict(self) -> Dict[str, Any]:
         # 只暴露旧字段：这是 ``site["last_run"]`` 的对外契约
@@ -315,10 +394,15 @@ class RunStep:
         }
 
     def as_row(self) -> Dict[str, Any]:
-        """落库用：比 :meth:`as_dict` 多出类型与错误原文，便于排障。"""
+        """落库用：比 :meth:`as_dict` 多出类型、层级与错误原文，便于排障。"""
         row = self.as_dict()
         row["node_type"] = self.node_type
         row["error"] = self.error
+        row["parent_id"] = self.parent_id
+        row["title"] = self.title
+        row["attempt"] = int(self.attempt)
+        row["next_at"] = int(self.next_at)
+        row["level"] = self.level
         return row
 
 
@@ -374,9 +458,17 @@ class Run:
     def artifact_kinds(self) -> List[str]:
         return [a.kind for a in self.artifacts]
 
-    def as_list(self) -> List[Dict[str, Any]]:
-        """与 ``certpipeline.RunResult.as_list`` 逐字段一致。"""
-        return [s.as_dict() for s in self.steps]
+    def as_list(self, top_level_only: bool = True) -> List[Dict[str, Any]]:
+        """与 ``certpipeline.RunResult.as_list`` 逐字段一致。
+
+        默认只投影**顶层步骤**：子步骤（issue / deploy 内部的细粒度动作）是给
+        运行详情页看的，塞进 ``site["last_run"]`` 会改变旧契约的粒度。
+        """
+        return [
+            s.as_dict()
+            for s in self.steps
+            if not (top_level_only and s.parent_id)
+        ]
 
     @property
     def keys(self) -> Tuple[str, ...]:
@@ -557,6 +649,19 @@ class Definition:
 
 
 # ------------------------------------------------------------------------- 执行器
+async def _sink_call(sink: Any, method: str, *args: Any) -> None:
+    """调用记录器的方法；没有该方法 / 抛异常都不算运行失败。"""
+    if sink is None:
+        return
+    fn = getattr(sink, method, None)
+    if fn is None:
+        return
+    try:
+        await fn(*args)
+    except Exception:  # noqa: BLE001 - 记录失败不能反过来打断签发
+        pass
+
+
 class Runner:
     """按定义执行一轮流水。
 
@@ -568,15 +673,50 @@ class Runner:
         self.registry = registry or REGISTRY
 
     async def _call(self, sink: Any, method: str, *args: Any) -> None:
-        if sink is None:
-            return
-        fn = getattr(sink, method, None)
-        if fn is None:
-            return
-        try:
-            await fn(*args)
-        except Exception:  # noqa: BLE001 - 记录失败不能反过来打断签发
-            pass
+        await _sink_call(sink, method, *args)
+
+    @staticmethod
+    def _emitter(
+        run: Run,
+        sink: Any,
+        elapsed: Callable[[], int],
+        top_node_id: str,
+    ) -> Emitter:
+        """把 ``emit_step`` / ``emit_log`` 的申报落到本次运行。
+
+        子步骤统一挂到当前顶层节点下（``parent_id``），因此 ``last_run`` 投影
+        不会变长；运行详情页按 ``parent_id`` 缩进展示。
+        """
+
+        async def handle(event: Dict[str, Any]) -> None:
+            if event.get("kind") == "log":
+                await _sink_call(
+                    sink,
+                    "log",
+                    run,
+                    str(event.get("node_id") or top_node_id),
+                    str(event.get("text") or ""),
+                    str(event.get("level") or "info"),
+                )
+                return
+            step = RunStep(
+                node_id=str(event.get("node_id") or ""),
+                node_type=str(event.get("node_type") or "sub"),
+                status=str(event.get("status") or NODE_OK),
+                detail=str(event.get("detail") or ""),
+                ms=int(event.get("ms") or 0),
+                at=elapsed(),
+                error=str(event.get("error") or ""),
+                parent_id=str(event.get("parent") or top_node_id),
+                title=str(event.get("title") or ""),
+                attempt=int(event.get("attempt") or 0),
+                next_at=int(event.get("next_at") or 0),
+                level=str(event.get("level") or "info"),
+            )
+            run.steps.append(step)
+            await _sink_call(sink, "step", run, step)
+
+        return handle
 
     async def run(
         self,
@@ -660,6 +800,11 @@ class Runner:
 
             ctx.current = item
             started = time.perf_counter()
+            # 子步骤 / 步骤日志的出口：节点内部（含 acme.py、deploy_site 这类深层
+            # 代码）调 certflow.emit_step / emit_log 即可，不必逐层传参。
+            emitter_token = _EMITTER.set(
+                self._emitter(run, sink, elapsed, item.id)
+            )
             try:
                 value = await spec.handler(ctx)
             except Exception as exc:  # noqa: BLE001 - 统一收口，原样交还调用方
@@ -677,6 +822,8 @@ class Runner:
                 run.finished_at = _now()
                 await self._call(sink, "finish", run)
                 return run
+            finally:
+                _EMITTER.reset(emitter_token)
 
             cost = int((time.perf_counter() - started) * 1000)
             ctx.outputs[item.id] = value
@@ -689,6 +836,87 @@ class Runner:
         run.value = ctx.get("result")
         run.finished_at = _now()
         await self._call(sink, "finish", run)
+        return run
+
+
+def _unit_detail(value: Any) -> str:
+    """单步运行的一句话说明：与旧 ``run_manual`` 的取值规则保持一致。"""
+    if isinstance(value, dict):
+        return _short(value.get("detail") or "")
+    if isinstance(value, str):
+        return _short(value)
+    return ""
+
+
+async def execute_unit(
+    site: Dict[str, Any],
+    node_id: str,
+    job: Callable[[], Awaitable[Any]],
+    *,
+    trigger: str = "manual",
+    node_type: str = "manual",
+    pipeline: str = "cert-manual",
+    version: int = 1,
+    sink: Any = None,
+) -> Run:
+    """把一次「单动作」（申请 / 部署 / 同步 / 轮换 / 吊销 / 导入 / 绑定）跑成运行。
+
+    与 :class:`Runner` 的区别只在于没有定义与依赖：这一类动作本身就是一步，
+    但**一步里面**仍可以申报子步骤（``emit_step``），所以手动操作与定时任务在
+    运行详情页里是同一套渲染。
+
+    异常不在这里抛：失败也必须有完整的运行记录，调用方拿到 ``run.exc`` 后再决定
+    是否原样抛出（接口层的 400 / 500 语义不变）。
+    """
+    rid = new_run_id()
+    run = Run(
+        id=rid,
+        pipeline=str(pipeline or "cert-manual"),
+        version=int(version),
+        status=RUNNING,
+        trigger=trigger,
+        site_id=str(site.get("id") or ""),
+        owner=str(site.get("username") or ""),
+        started_at=_now(),
+    )
+    base = time.perf_counter()
+
+    def elapsed() -> int:
+        return int((time.perf_counter() - base) * 1000)
+
+    with step_scope(rid):
+        enter_step(node_id)
+        await _sink_call(sink, "start", run)
+        emitter_token = _EMITTER.set(Runner._emitter(run, sink, elapsed, node_id))
+        started = time.perf_counter()
+        try:
+            value = await job()
+        except BaseException as exc:  # noqa: BLE001 - 失败也要留下这一步
+            cost = int((time.perf_counter() - started) * 1000)
+            step = RunStep(
+                node_id, node_type, NODE_FAILED, _short(exc), cost, elapsed(), str(exc)
+            )
+            run.steps.append(step)
+            run.status = NODE_FAILED
+            run.error = f"{node_id}: {exc}"
+            run.exc = exc
+            run.finished_at = _now()
+            await _sink_call(sink, "step", run, step)
+            await _sink_call(sink, "finish", run)
+            return run
+        finally:
+            _EMITTER.reset(emitter_token)
+
+        cost = int((time.perf_counter() - started) * 1000)
+        run.value = value
+        step = RunStep(
+            node_id, node_type, NODE_OK, _unit_detail(value), cost, elapsed()
+        )
+        run.steps.append(step)
+        run.status = NODE_OK
+        run.finished_at = _now()
+        await _sink_call(sink, "step", run, step)
+        await _sink_call(sink, "finish", run)
         return run
 
 

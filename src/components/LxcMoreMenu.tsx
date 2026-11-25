@@ -262,7 +262,6 @@ function CloneMiniDialog({
 }) {
   const t = useT();
   const runner = useTaskRunner();
-  const [newId, setNewId] = useState('');
   const [hostname, setHostname] = useState('');
   const [storage, setStorage] = useState('');
   const [targetNode, setTargetNode] = useState('');
@@ -314,21 +313,18 @@ function CloneMiniDialog({
 
   useEffect(() => {
     if (!ct) return;
-    setNewId('');
     setHostname(`${ct.hostname || ct.name || `ct-${ct.vmid}`}-clone`);
     setStorage('');
     setTargetNode('');
     setBusy(false);
   }, [ct?.node, ct?.vmid]);
 
-  const idNum = Number(newId);
-  const idError =
-    newId && (!Number.isInteger(idNum) || idNum < 100 || idNum > 999999999)
-      ? t('guestList.cloneIdRange')
-      : undefined;
+  /* 运行中的容器不能整机克隆（PVE 只允许从快照克隆）：直接拦在提交前，
+     不让用户点下去再看到一句英文报错 */
+  const running = String(ct?.status ?? '') === 'running';
 
   const submit = async () => {
-    if (!ct || !newId || idError) return;
+    if (!ct || running) return;
     setBusy(true);
     try {
       await runner.run(
@@ -336,7 +332,6 @@ function CloneMiniDialog({
           ct.node,
           ct.vmid,
           {
-            newid: idNum,
             hostname: hostname || undefined,
             target_storage: storage || undefined,
             target_node: targetNode || undefined,
@@ -377,7 +372,7 @@ function CloneMiniDialog({
             variant="primary"
             onClick={() => void submit()}
             loading={busy}
-            disabled={!newId || Boolean(idError)}
+            disabled={running}
           >
             {t('guestList.cloneStart')}
           </Button>
@@ -385,19 +380,12 @@ function CloneMiniDialog({
       }
     >
       <div className="dyn-list">
-        <div className="field-row">
-          <Field label={t('guestList.cloneNewId')} required error={idError}>
-            <Input
-              value={newId}
-              onChange={(e) => setNewId(e.target.value.replace(/\D/g, ''))}
-              placeholder={t('guestList.cloneNewIdPlaceholder')}
-              mono
-            />
-          </Field>
-          <Field label={t('lxcMore.cloneHostname')}>
-            <Input value={hostname} onChange={(e) => setHostname(e.target.value)} />
-          </Field>
-        </div>
+        {running ? (
+          <Notice tone="warning">{t('lxcMore.cloneRunningHint')}</Notice>
+        ) : null}
+        <Field label={t('lxcMore.cloneHostname')}>
+          <Input value={hostname} onChange={(e) => setHostname(e.target.value)} />
+        </Field>
         <Field label={t('guestList.cloneTarget')} hint={t('lxcMore.cloneStorageHint')}>
           <Select
             value={storage}

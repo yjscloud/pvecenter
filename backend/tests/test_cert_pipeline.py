@@ -172,14 +172,30 @@ def _renew(site: Dict[str, Any]):
     return _run(certs.renew_site(site))
 
 
-def test_renew_without_cert_touches_nothing(monkeypatch) -> None:
+def test_renew_without_cert_issues_first_certificate(monkeypatch) -> None:
+    """建站即签发：没有证书的启用站点不再被流水线忽略，而是走首次签发。"""
     calls: List[str] = []
     _patch_io(monkeypatch, calls)
-    site = _site()  # 既没有 cert_id 也没有 pending
+    site = _site()  # 既没有 cert_id 也没有 pending，但 auto_renew 默认开
 
     run = _renew(site)
 
-    assert calls == []  # 不查腾讯云，也不写库（保持旧行为）
+    assert "apply:renew=False" in calls  # 首次签发，不按续期处理
+    assert "update" in calls
+    assert run.value and run.value.get("action") == "issue"
+    steps = {s["step"]: s["status"] for s in site["last_run"]}
+    assert steps["issue"] == STEP_OK
+    assert steps["deploy"] == STEP_SKIPPED
+
+
+def test_renew_without_cert_and_auto_off_touches_nothing(monkeypatch) -> None:
+    calls: List[str] = []
+    _patch_io(monkeypatch, calls)
+    site = _site(auto_renew=False)
+
+    run = _renew(site)
+
+    assert calls == []  # 关掉自动签发的空站点仍然不动
     assert run.ran is False
     assert all(step["status"] == STEP_SKIPPED for step in site["last_run"])
 
@@ -390,7 +406,8 @@ def test_retry_tick_only_picks_due_sites(monkeypatch) -> None:
     now = int(time.time())
     sites = [
         _site(id="due-1", next_attempt_at=now - 60),
-        _site(id="never", next_attempt_at=0),  # 从没失败过：不补跑
+        # 有证书、没排期：属于「一切正常」，不补跑
+        _site(id="never", next_attempt_at=0, cert_id="c-never"),
         _site(id="later", next_attempt_at=now + 600),  # 窗口内：等主作业
         _site(id="disabled", next_attempt_at=now - 60, enabled=False),
         _site(id="due-2", next_attempt_at=now - 60),
@@ -419,6 +436,31 @@ def test_retry_tick_only_picks_due_sites(monkeypatch) -> None:
     assert len(result) == 3
     # 补跑与主作业必须能在运行记录里区分开：同一张证书两条路径都可能触发
     assert triggers == ["retry"]
+
+
+def test_retry_tick_picks_never_issued_sites(monkeypatch) -> None:
+    """没有证书、也没有排期的启用站点：建站那次后台签发丢了也要补上。"""
+    sites = [
+        _site(id="fresh"),
+        _site(id="upload-fresh", ca="upload"),
+        _site(id="auto-off", auto_renew=False),
+    ]
+    picked: List[str] = []
+
+    async def fake_load() -> List[Dict[str, Any]]:
+        return sites
+
+    async def fake_run(batch, trigger: str = "tick") -> List[Dict[str, Any]]:
+        picked.extend(str(s["id"]) for s in batch)
+        return []
+
+    monkeypatch.setattr(certs, "load_sites", fake_load)
+    monkeypatch.setattr(certs, "_run_sites", fake_run)
+
+    _run(certs.retry_tick())
+
+    # 托管证书没有可签发的、关掉自动签发的不该被拉起
+    assert picked == ["fresh"]
 
 
 def test_retry_tick_yields_to_running_pipeline(monkeypatch) -> None:

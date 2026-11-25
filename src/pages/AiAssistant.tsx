@@ -4330,7 +4330,9 @@ function SettingsModal({
                   <Input
                     type="number"
                     min={1}
-                    max={168}
+                    // 个人设置的服务端硬顶（见 ai.USER_HOURS_MAX）：界面上限与服务端
+                    // 保持一致，别让人填 168 再被后端悄悄夹回去
+                    max={72}
                     value={hours}
                     onChange={(e) => setHours(Number(e.target.value) || 24)}
                   />
@@ -4341,7 +4343,9 @@ function SettingsModal({
                   <Input
                     type="number"
                     min={4000}
-                    max={100000000}
+                    // 个人预算硬顶 20 万（见 ai.USER_TOKEN_BUDGET_MAX）：
+                    // 用别人的授权模型时烧的是对方的额度
+                    max={200000}
                     value={tokenBudget}
                     onChange={(e) => setTokenBudget(Number(e.target.value) || 60000)}
                   />

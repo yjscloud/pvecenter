@@ -278,7 +278,6 @@ function CloneMiniDialog({
 }) {
   const t = useT();
   const runner = useTaskRunner();
-  const [newId, setNewId] = useState('');
   const [name, setName] = useState('');
   const [full, setFull] = useState(true);
   const [storage, setStorage] = useState('');
@@ -317,26 +316,18 @@ function CloneMiniDialog({
 
   useEffect(() => {
     if (!vm) return;
-    setNewId('');
     setName(`${vm.name || `vm-${vm.vmid}`}-clone`);
     setStorage('');
     setFull(true);
     setBusy(false);
   }, [vm?.node, vm?.vmid]);
 
-  const idNum = Number(newId);
-  const idError =
-    newId && (!Number.isInteger(idNum) || idNum < 100 || idNum > 999999999)
-      ? t('guestList.cloneIdRange')
-      : undefined;
-
   const submit = async () => {
-    if (!vm || !newId || idError) return;
+    if (!vm) return;
     setBusy(true);
     try {
       await runner.run(
         vmsApi.clone(vm.node, vm.vmid, {
-          newid: idNum,
           name: name || undefined,
           full,
           target_storage: storage || undefined,
@@ -375,7 +366,6 @@ function CloneMiniDialog({
             variant="primary"
             onClick={() => void submit()}
             loading={busy}
-            disabled={!newId || Boolean(idError)}
           >
             {t('guestList.cloneStart')}
           </Button>
@@ -383,19 +373,9 @@ function CloneMiniDialog({
       }
     >
       <div className="dyn-list">
-        <div className="field-row">
-          <Field label={t('guestList.cloneNewId')} required error={idError}>
-            <Input
-              value={newId}
-              onChange={(e) => setNewId(e.target.value.replace(/\D/g, ''))}
-              placeholder={t('guestList.cloneNewIdPlaceholder')}
-              mono
-            />
-          </Field>
-          <Field label={t('guestList.cloneNewName')}>
-            <Input value={name} onChange={(e) => setName(e.target.value)} />
-          </Field>
-        </div>
+        <Field label={t('guestList.cloneNewName')}>
+          <Input value={name} onChange={(e) => setName(e.target.value)} />
+        </Field>
         <Field label={t('guestList.cloneTarget')} hint={t('guestList.cloneTargetHint')}>
           <Select
             value={storage}

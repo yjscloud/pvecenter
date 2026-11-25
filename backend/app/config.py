@@ -325,7 +325,11 @@ class Settings(BaseSettings):
     pve_console_password: str = ""
 
     # --- Behaviour ---------------------------------------------------------
-    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    # 默认**空** = 不启用 CORS。以前默认塞了两个 Vite 开发源，于是每台面板都带着
+    # ``Access-Control-Allow-Origin`` + ``Allow-Credentials`` 启动：本机占住 5173
+    # 的任意程序与 localhost 面板同站，就能跨源读 /api 响应（PVE-CONF-003）。
+    # 需要独立前端 / 本地调试时显式写 CORS_ORIGINS，别改这里的默认值。
+    cors_origins: str = ""
     task_poll_interval: float = 2.0
     # 批量下发的并发度：每台都要阻塞等 PVE 任务（克隆 / 导入），串行执行时总耗时
     # 是各台的**和**。2–4 路并发能把链接克隆的批量耗时压到原来的 1/3 左右；设 1
@@ -338,14 +342,20 @@ class Settings(BaseSettings):
     pve_snapshot_concurrency: int = 16
 
     # --- 证书流水引擎 ------------------------------------------------------
-    # 打开后证书续期改由 app/certflow.py 的节点引擎调度，并把每次运行写进
-    # cert_flow_run / cert_flow_step / cert_flow_artifact（旁路，只写不读）。
-    # 默认关闭：关掉即完全回到 certpipeline 的固定线性步骤，行为与升级前一致，
-    # 也是出现问题时的一键回滚开关。切换前后 site["last_run"] 的投影格式不变。
-    certflow_enabled: bool = False
+    # 打开后证书续期改由 app/certflow.py 的节点引擎调度，并把每次运行（含手动
+    # 申请 / 部署 / 同步 / 轮换 / 吊销 / 导入 / 绑定）写进
+    # cert_flow_run / cert_flow_step / cert_flow_step_log，供「运行详情」逐步展示。
+    # 默认打开：这是证书可观测性的主路径；关掉即回到 certpipeline 的固定线性
+    # 步骤（行为与升级前一致），也是出问题时的回滚开关。
+    # 切换前后 site["last_run"] 的投影格式不变。
+    certflow_enabled: bool = True
     # 产物正文（证书链 / 私钥）是否一起落库。默认不落：产物表只留 kind、
     # 指纹与大小，正文仍由站点配置与部署目标持有，避免私钥多存一份。
     certflow_store_payload: bool = False
+    # 证书事件推送档位：failures（只发失败）/ failures_success（失败 + 成功，
+    # 默认）/ all（再加上到期分档等 warning）。通道沿用「监控告警」里各用户
+    # 自己的邮件 / 飞书 / Webhook 配置，不需要为证书再配一遍。
+    cert_notify_mode: str = "failures_success"
 
     # --- 监控历史落库 ------------------------------------------------------
     # 节点与虚拟机的资源指标按固定周期采样进 metrics_history：PVE 的 rrddata
@@ -485,7 +495,11 @@ class Settings(BaseSettings):
 
     @property
     def secure_cookie(self) -> bool:
-        """refresh cookie 是否只走 HTTPS：COOKIE_SECURE 留空则跟随 FORCE_HTTPS。"""
+        """仅作兼容保留；实际下发 Cookie 用的是 :func:`app.security.cookie_secure`。
+
+        后者还会看本次请求的 scheme（反代终结 TLS 时 FORCE_HTTPS 通常是关的），
+        见 PVE-CONF-003(c)。
+        """
         if self.cookie_secure is None:
             return bool(self.force_https)
         return bool(self.cookie_secure)

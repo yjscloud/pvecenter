@@ -10,7 +10,14 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from .. import certworkflow_run, certworkflow_store, certs, i18n, security
+from .. import (
+    certworkflow_exec,
+    certworkflow_run,
+    certworkflow_store,
+    certs,
+    i18n,
+    security,
+)
 
 router = APIRouter(prefix="/api/cert-workflow-runs", tags=["cert-workflow-runs"])
 
@@ -86,6 +93,50 @@ async def get_run(
     return {"run": run}
 
 
+@router.delete("/{run_id}")
+async def delete_run(
+    run_id: str,
+    request: Request,
+    user: Dict[str, Any] = Depends(CERT_MANAGE),
+) -> Dict[str, Any]:
+    """删除一条审批实例（只允许终态）。
+
+    待审批 / 进行中的实例还在往前走：删掉它会让正在运行的步骤失去归属，
+    用户也会看到「流程凭空消失」。先把它们审批 / 取消掉再删。
+    """
+    owner = _owner(user)
+    run = await certworkflow_run.get_run(owner, run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=404, detail=i18n.t("workflow.run.not_found")
+        )
+    if run.get("status") in (
+        certworkflow_run.STATUS_PENDING,
+        certworkflow_run.STATUS_RUNNING,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=i18n.pick(
+                "这条流程还在待审批 / 进行中，请先完成或取消后再删除",
+                "This run is still pending or in progress. Finish or cancel it before deleting.",
+            ),
+        )
+    removed = await certworkflow_run.delete_run(owner, run_id)
+    if not removed:
+        raise HTTPException(
+            status_code=404, detail=i18n.t("workflow.run.not_found")
+        )
+    await security.audit(
+        request,
+        user,
+        "cert.workflow_run.delete",
+        run_id,
+        "success",
+        "删除审批实例 " + str(run.get("workflow_name") or ""),
+    )
+    return {"removed": True}
+
+
 @router.post("")
 async def create_run(
     payload: CreateRunPayload,
@@ -155,12 +206,39 @@ async def transition_run(
 ) -> Dict[str, Any]:
     owner = _owner(user)
     action = str(payload.action or "").strip()
+    note = str(payload.note or "")
+
+    # 推进前**真的执行**这一步：审批通过不代表证书自己会签出来。
+    # 执行失败就不推进（步骤保持 running），修好环境后再点一次即可。
+    if action == certworkflow_run.ACTION_ADVANCE:
+        current = await certworkflow_run.get_run(owner, run_id)
+        if current is None:
+            raise HTTPException(
+                status_code=404, detail=i18n.t("workflow.run.not_found")
+            )
+        try:
+            executed = await certworkflow_exec.execute_current(
+                owner, current, note=note
+            )
+        except certs.CertError as exc:
+            await security.audit(
+                request,
+                user,
+                "cert.workflow.run.execute",
+                str(current.get("site_domain") or current.get("workflow_name") or run_id),
+                "failed",
+                str(exc),
+            )
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if executed:
+            note = (note + "\n" if note else "") + executed
+
     try:
         run = await certworkflow_run.transition_run(
             owner,
             run_id,
             action,
-            note=str(payload.note or ""),
+            note=note,
             operator=owner,
         )
     except certworkflow_run.RunError as exc:

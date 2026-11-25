@@ -108,8 +108,17 @@ class LoginMfaRequest(BaseModel):
     trust_device: bool = False
 
 
+class TotpSetupIn(BaseModel):
+    """生成 TOTP 种子前要验当前口令：绑定 2FA 等于「换锁」，只凭一枚
+    access token 不能换（否则被盗令牌可绑定攻击者自己的认证器）。"""
+
+    password: str = ""
+
+
 class TotpCodeIn(BaseModel):
     code: str
+    # 与 2fa/disable 对称：确认绑定同样要口令，不能只有动态码。
+    password: str = ""
 
 
 class TotpDisableIn(BaseModel):
@@ -797,7 +806,8 @@ class PowerRequest(BaseModel):
 
 
 class CloneRequest(BaseModel):
-    newid: int
+    #: 不传（或 0）= 由后端分配下一个可用 VMID。克隆对话框已不再让用户填号。
+    newid: Optional[int] = None
     name: Optional[str] = None
     full: bool = True
     target_storage: Optional[str] = None
@@ -999,7 +1009,8 @@ class LxcMigrateRequest(BaseModel):
 
 
 class LxcCloneRequest(BaseModel):
-    newid: int
+    #: 不传（或 0）= 由后端分配下一个可用 VMID
+    newid: Optional[int] = None
     hostname: Optional[str] = None
     target_storage: Optional[str] = None
     target_node: Optional[str] = None

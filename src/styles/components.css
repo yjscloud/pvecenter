@@ -8537,9 +8537,8 @@ button.cert-stat.is-failed.has-value:hover {
 }
 
 .cert-provider-panel .cert-provider-empty,
-.cert-provider-panel .cert-provider-list,
 .cert-provider-panel .cert-provider-hint {
-  margin: 12px 16px;
+  margin: 12px 0;
 }
 
 /* --- 区块层级：主体一张卡，辅助三张卡各自成组 ---------------------------- */
@@ -9238,17 +9237,47 @@ button.cert-stat.is-failed.has-value:hover {
    说明列不截断 —— 这一栏存在的意义就是「看清到底报了什么」。 */
 .cert-runlog-line {
   display: grid;
-  grid-template-columns: 62px 88px 40px 62px minmax(0, 1fr);
+  /* 级别点 / 偏移 / 步骤 / 状态 / 耗时 / 说明 */
+  grid-template-columns: 6px 62px 88px 44px 62px minmax(0, 1fr);
   gap: 8px;
   align-items: baseline;
-  padding: 2px 0;
+  padding: 3px 0;
   font-size: var(--font-size-xs);
   line-height: 1.6;
+  /* 长列表的兜底：屏外行不参与布局与绘制 */
+  content-visibility: auto;
+  contain-intrinsic-size: 0 26px;
+}
+
+/* 级别点：扫读时先看到红 / 橙，再读文字 */
+.cert-runlog-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  align-self: center;
+}
+
+.cert-runlog-dot.is-ok {
+  background: var(--success);
+}
+
+.cert-runlog-dot.is-failed {
+  background: var(--danger);
+}
+
+.cert-runlog-dot.is-waiting {
+  background: var(--warning);
+}
+
+.cert-runlog-dot.is-skipped {
+  background: var(--border);
 }
 
 .cert-runlog-at {
   color: var(--text-muted);
   text-align: right;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
 
@@ -9282,6 +9311,207 @@ button.cert-stat.is-failed.has-value:hover {
   color: var(--text-muted);
 }
 
+/* --- 运行日志弹窗：工具栏 / 历史 / 可滚动列表 ----------------------------- */
+
+.cert-runlog-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+/* 搜索框：与系统其它输入框同一套边框 / 焦点环 */
+.cert-runlog-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 200px;
+  min-width: 160px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.cert-runlog-search:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.cert-runlog-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--font-size-xs);
+}
+
+.cert-runlog-search-clear {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.cert-runlog-search-clear:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.cert-runlog-search-clear:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 级别筛选：分段控件，选中项变成白底 + 品牌蓝 */
+.cert-runlog-levels {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
+.cert-runlog-level {
+  padding: 3px 9px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.cert-runlog-level:hover {
+  color: var(--text-primary);
+}
+
+.cert-runlog-level.is-active {
+  background: var(--bg-surface);
+  color: var(--accent);
+  font-weight: var(--font-weight-semibold);
+  box-shadow: var(--shadow-sm);
+}
+
+.cert-runlog-level:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.cert-runlog-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+/* 历史运行：一排胶囊，时间用等宽、状态着色 */
+.cert-runlog-runs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.cert-runlog-runs-label {
+  margin-right: 2px;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.cert-runlog-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-pill);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.cert-runlog-run:hover {
+  border-color: var(--accent-border);
+}
+
+.cert-runlog-run.is-active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--text-primary);
+}
+
+.cert-runlog-run-time {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.cert-runlog-run-state {
+  color: var(--text-muted);
+}
+
+.cert-runlog-run-state.is-ok {
+  color: var(--success);
+}
+
+.cert-runlog-run-state.is-failed {
+  color: var(--danger);
+}
+
+.cert-runlog-run-state.is-running {
+  color: var(--warning);
+}
+
+/* 日志区：固定高度内滚动，几百行也不会把弹窗撑到屏幕外。
+   min-height 保证「切到一条只有一步的运行」时弹窗不会塌一下再弹回来。 */
+.cert-runlog-scroll {
+  min-height: 180px;
+  max-height: min(56vh, 520px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+.cert-runlog-empty {
+  padding: 24px 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  text-align: center;
+}
+
+/* 搜索命中：警告色底，深浅主题下都读得清 */
+.cert-runlog-line mark,
+.cert-step-log mark {
+  padding: 0 1px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--warning) 28%, transparent);
+  color: inherit;
+}
+
 /* --- 弹窗里的步骤 + 该步日志 ---------------------------------------------
    行内那版是 grid（阶段/状态/耗时/说明四列），这里每步下面要再挂一段日志，
    所以把 li 改回块级，日志用左侧竖线表示「属于上一步」。 */
@@ -9306,12 +9536,29 @@ button.cert-stat.is-failed.has-value:hover {
 
 .cert-step-log {
   display: grid;
-  /* 动作 / 说明：动作定宽对齐，说明吃掉剩余宽度且整段换行不截断 */
-  grid-template-columns: 64px minmax(0, 1fr);
+  /* 时间 / 动作 / 说明：前两列定宽对齐，说明整段换行不截断 */
+  grid-template-columns: 62px 64px minmax(0, 1fr);
   gap: 8px;
   font-size: var(--font-size-xs);
   line-height: 1.6;
   color: var(--text-secondary);
+  content-visibility: auto;
+  contain-intrinsic-size: 0 24px;
+}
+
+.cert-step-log-time {
+  /* 12px 数字用 secondary 才够 4.5:1；muted 在浅底上只有 3.2:1 */
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.cert-step-log[data-level="error"] .cert-step-log-detail {
+  color: var(--danger);
+}
+
+.cert-step-log[data-level="warn"] .cert-step-log-detail {
+  color: var(--warning);
 }
 
 .cert-step-log-action {
@@ -9742,31 +9989,51 @@ button.cert-stat.is-failed.has-value:hover {
 
 /* 签发渠道：列表 + 添加弹窗。列表只放结果，表单在弹窗里一次填完 */
 .cert-provider-list {
-  display: flex;
-  flex-direction: column;
-  margin: 0 -8px;
+  display: grid;
+  gap: 10px;
+  margin: 0;
 }
 
-/* 一行 = 左边身份与状态（可换行的失败原因），右边操作，不让它们挤在同一条基线上 */
+/* 一行 = 一张「渠道卡」：左边身份与状态，右边操作。
+   之前是纯分隔线列表，四行挤在一起看不出边界；卡片化之后每个渠道是独立实体，
+   鼠标划过、聚焦、失败三种状态也都能落在卡片本身上。 */
 .cert-provider-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  /* 顶部对齐：失败原因多占一行时，右侧操作不能跟着沉到卡片中间 */
   align-items: start;
-  gap: 12px;
-  padding: 11px 8px;
-  border-radius: var(--radius-sm);
-  border-bottom: 1px solid var(--border-muted);
+  gap: 12px 16px;
+  padding: 14px 16px;
+  /* 轮廓用 --border 而不是 --border-muted：卡片本身是白底，
+     在浅灰页面上 muted 边框几乎看不见，整行会显得「飘」 */
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  transition:
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    background var(--transition-fast);
 }
 
-/* 最后一行不再画分隔线：下面「还可以接入」自己有一条上边线 */
-.cert-provider-row:last-child {
-  border-bottom: 0;
+/* 自检失败时整卡边框微微染红：状态已经由徽章与失败原因表达，
+   这里只补一层「这张卡需要看一眼」的提示，不做左侧粗色条。 */
+.cert-provider-row[data-state="failed"] {
+  border-color: color-mix(in srgb, var(--danger) 26%, var(--border-muted));
 }
+
+/* 悬停只提亮边框与底色：卡片是列表项，不是浮层。
+   加阴影会在浅底上留一圈发灰的晕（截图上就是角上那道斜线）。 */
+.cert-provider-row:hover {
+  border-color: var(--accent-border);
+}
+
+/* 焦点交给行内按钮自己的 focus-visible 环：整卡再套一圈蓝框，
+   会让「刚点过的卡片」看起来像被选中，和 tab 的选中态混淆。 */
 
 .cert-provider-main {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
   min-width: 0;
 }
 
@@ -9774,21 +10041,21 @@ button.cert-stat.is-failed.has-value:hover {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
   min-width: 0;
 }
 
-.cert-provider-row:last-child {
-  border-bottom: 0;
-}
-
-.cert-provider-row:hover {
-  background: var(--bg-hover);
+/* 名称可收缩但不撑满：徽章与证书数要紧跟在名字后面，
+   而不是被一个 flex:1 的名称顶到行的最右边 */
+.cert-provider-head .cert-provider-name {
+  flex: 0 1 auto;
 }
 
 .cert-provider-name {
-  flex: 1 1 auto;
-  font-size: var(--font-size-base);
-  font-weight: 600;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -.01em;
+  color: var(--text-primary);
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -9800,10 +10067,11 @@ button.cert-stat.is-failed.has-value:hover {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  padding: 1px 7px 1px 6px;
+  padding: 2px 8px 2px 7px;
   border-radius: var(--radius-pill);
-  font-size: var(--font-size-xs);
+  font-size: 11px;
   font-weight: var(--font-weight-medium);
+  line-height: 1.5;
   white-space: nowrap;
 }
 
@@ -9821,13 +10089,30 @@ button.cert-stat.is-failed.has-value:hover {
   white-space: nowrap;
 }
 
-/* AK、续期天数、自检时间：一行里按需换行，窄屏也不会把名字挤没 */
+/* AK、续期天数、自检时间：一行里按需换行，窄屏也不会把名字挤没。
+   分隔用伪元素画点：真文本会在换行时留下孤零零的「·」。 */
 .cert-provider-meta {
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   flex-wrap: wrap;
-  gap: 4px 10px;
+  gap: 2px 0;
   min-width: 0;
+  /* 12px 小字用 --text-secondary 才够 4.5:1 对比度；--text-muted 只有 3.2:1 */
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+}
+
+/* 元信息每项按内容宽度排，不参与拉伸：否则窄屏会被撑成两端对齐 */
+.cert-provider-meta > span {
+  flex: 0 0 auto;
+}
+
+.cert-provider-meta > span:not(:empty) + span:not(:empty)::before {
+  content: "·";
+  margin: 0 8px;
+  color: var(--border);
 }
 
 /* 失败原因是排障起点，必须常驻并允许换行；toast 一消失就没法照着查了 */
@@ -9835,13 +10120,14 @@ button.cert-stat.is-failed.has-value:hover {
   display: flex;
   align-items: flex-start;
   gap: 6px;
-  margin-top: 4px;
-  padding: 5px 8px;
+  margin-top: 6px;
+  padding: 6px 9px;
+  border: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
   border-radius: var(--radius-sm);
   background: var(--danger-dim);
   color: var(--danger);
   font-size: var(--font-size-xs);
-  line-height: 1.5;
+  line-height: 1.55;
   overflow-wrap: anywhere;
 }
 
@@ -9864,6 +10150,7 @@ button.cert-stat.is-failed.has-value:hover {
   font-size: var(--font-size-xs);
   white-space: nowrap;
   text-decoration: none;
+  border-radius: var(--radius-sm);
   transition: color var(--transition-fast);
 }
 
@@ -9889,8 +10176,16 @@ button.cert-stat.is-failed.has-value:hover {
 
 .cert-provider-actions {
   display: inline-flex;
-  gap: 2px;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
   justify-self: end;
+  /* 与名称行（14px/1.5）对齐：按钮本身 24px 高，视觉上抬 2px 更平 */
+  margin-top: -2px;
+  /* 一条 1px 竖线把「状态」与「动作」分开：不加的话
+     徽章、证书数、三个操作会连成一长串 */
+  padding-left: 14px;
+  border-left: 1px solid var(--border-muted);
 }
 
 /* 一家都没有时的引导：一条虚线框，动作就在旁边 */
@@ -9933,13 +10228,46 @@ button.cert-stat.is-failed.has-value:hover {
 
 /* 摘要行：标题由切换器承担，这里只补状态与凭据说明。
    不放按钮——未配置渠道各自有「配置」，同一个弹窗不需要第二个入口 */
+/* 摘要行：左边「已配置 2 / 4 条渠道 + 细进度」，右边凭据说明。
+   两端对齐只在同一行成立；换行后说明单独一行会飘到右边，所以窄屏改成左对齐。 */
 .cert-provider-note {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 6px 12px;
-  padding: 10px 16px;
+  margin-bottom: 12px;
+  padding: 12px 0;
   border-bottom: 1px solid var(--border-muted);
+}
+
+/* 摘要左侧：一句状态 + 一条配置进度（2 / 4）。进度只是把这句话可视化，
+   文字仍是主信息，读屏器只念 summary 一次。 */
+.cert-provider-note-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.cert-provider-note-summary {
+  white-space: nowrap;
+}
+
+.cert-provider-progress {
+  flex: 0 0 64px;
+  height: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.cert-provider-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--transition);
 }
 
 /* 两段文字靠字色区分层级，不插分隔符：
@@ -9952,8 +10280,16 @@ button.cert-stat.is-failed.has-value:hover {
 .cert-provider-crednote {
   flex: 0 1 auto;
   min-width: 0;
-  color: var(--text-muted);
+  margin-left: auto;
+  color: var(--text-secondary);
   font-size: var(--font-size-xs);
+}
+
+/* 窄屏：说明换行后不要靠右飘着，跟左边的状态一起左对齐 */
+@media (max-width: 900px) {
+  .cert-provider-crednote {
+    margin-left: 0;
+  }
 }
 
 /* 无 cert.manage：说清楚「能看不能改」，而不是只把按钮置灰 */
@@ -9978,94 +10314,168 @@ button.cert-stat.is-failed.has-value:hover {
   font-size: var(--font-size-xs);
 }
 
-/* 还没配置的渠道：列出来才知道还能接什么 */
+/* 还没配置的渠道：列出来才知道还能接什么。
+   与上面的「已配置」用分组标题 + 更强的分隔线隔开，避免两组混读。 */
 .cert-provider-pending {
-  margin: 12px 16px;
-  padding-top: 12px;
+  margin: 18px 0 0;
+  padding-top: 16px;
   border-top: 1px solid var(--border-muted);
 }
 
 .cert-provider-section-title {
-  margin-bottom: 4px;
-  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  color: var(--text-secondary);
   font-size: var(--font-size-xs);
-  letter-spacing: 0.04em;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.02em;
+}
+
+/* 标题右侧一条渐隐横线：把「分组标题」和「列表」连成一块 */
+.cert-provider-section-title::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: linear-gradient(90deg, var(--border-muted), transparent);
 }
 
 .cert-provider-pending-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  transition:
+    border-color var(--transition-fast),
+    background var(--transition-fast);
+}
+
+/* 与已配置卡片同构：名称与说明上下成一组，动作靠右 */
+.cert-provider-pending-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cert-provider-pending-row:last-child {
+  margin-bottom: 0;
 }
 
 .cert-provider-pending-row:hover {
+  border-color: var(--accent-border);
   background: var(--bg-hover);
 }
 
 .cert-provider-pending-row .cert-provider-name {
-  flex: 0 0 auto;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+}
+
+/* 窄屏换行后按钮会落到 1fr 那一列：靠右收住，别拉成一整条 */
+.cert-provider-pending-row > .btn {
+  justify-self: end;
 }
 
 .cert-provider-tagline {
-  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--text-secondary);
 }
 
-/* 签发流程：四步是真实顺序，编号在这里承载信息 */
+/* 签发流程：四步是真实顺序，编号在这里承载信息。
+   横向步骤条 + 连接线，比原来四个互不相干的小圆点更容易读成一条流程。 */
 .cert-provider-flow-box {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-  margin: 14px 16px 16px;
-  padding: 10px 12px;
+  margin: 18px 0 0;
+  padding: 14px 16px 16px;
   border: 1px solid var(--border-muted);
   border-radius: var(--radius);
   background: var(--bg-elevated);
 }
 
 .cert-provider-flow-title {
+  display: block;
+  margin-bottom: 12px;
   color: var(--text-secondary);
   font-size: var(--font-size-xs);
-  font-weight: var(--font-weight-medium);
-  white-space: nowrap;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.02em;
 }
 
 .cert-provider-flow {
-  display: flex;
-  flex: 1 1 auto;
-  flex-wrap: wrap;
-  gap: 8px 20px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
 .cert-provider-flow-step {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  min-width: 0;
   color: var(--text-secondary);
   font-size: var(--font-size-xs);
+  line-height: 1.5;
+}
+
+/* 步骤之间的连接线：画在本步右侧的剩余空间里，末步不画 */
+.cert-provider-flow-step:not(:last-child)::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  margin: 0 10px 0 2px;
+  /* 连接线只是秩序，不是内容：压到 border-muted，别和卡片边框抢重量 */
+  background: var(--border-muted);
+}
+
+.cert-provider-flow-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .cert-provider-flow-index {
   display: inline-grid;
   place-items: center;
   flex: none;
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
   border: 1px solid var(--border);
   border-radius: 50%;
   background: var(--bg-surface);
-  color: var(--text-muted);
-  font-size: 10px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
   font-variant-numeric: tabular-nums;
+}
+
+/* 通知档位：跟在 tab 行右端的一条紧凑控件，不占列表底部的位置 */
+.cert-notify-inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cert-notify-inline-label {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+  cursor: default;
+}
+
+.cert-notify-inline-select {
+  width: 200px;
+  max-width: 100%;
 }
 
 /* --- 添加 / 编辑厂商弹窗：左选类型，右填凭据 --- */
@@ -10200,21 +10610,10 @@ button.cert-stat.is-failed.has-value:hover {
 }
 
 @media (max-width: 760px) {
-  .cert-provider-row {
-    flex-wrap: wrap;
-    row-gap: 4px;
-    padding: 8px;
-  }
-
-  .cert-provider-name {
-    flex: 1 1 calc(100% - 90px);
-    line-height: 1.4;
-  }
-
-  .cert-provider-meta {
-    flex: 1 1 100%;
-    justify-content: space-between;
-  }
+  /* 渠道卡片的响应式统一在 responsive.css 里处理（卡片 → 单列）。
+     这里不要再写 .cert-provider-row / -name / -meta：旧规则用的是 flex
+     布局，会把现在 grid 的卡片撑乱，还会让元信息被 justify-content:
+     space-between 拉成两端对齐。 */
 
   .cert-picker {
     grid-template-columns: minmax(0, 1fr);

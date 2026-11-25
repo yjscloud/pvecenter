@@ -407,13 +407,14 @@ export const authApi = {
 
   /* ---- 两步验证（TOTP）---- */
   twoFactorStatus: () => get<TwoFactorStatus>('/auth/2fa'),
-  /** 生成新种子（还没启用）：返回二维码与种子，扫完要用动态码确认 */
-  setupTwoFactor: () => post<TwoFactorSetup>('/auth/2fa/setup'),
-  /** 用一次动态码确认绑定，返回一次性恢复码（只显示这一次） */
-  enableTwoFactor: (code: string) =>
+  /** 生成新种子（还没启用）：返回二维码与种子，扫完要用动态码确认。要当前口令 */
+  setupTwoFactor: (password: string) =>
+    post<TwoFactorSetup>('/auth/2fa/setup', { password }),
+  /** 用一次动态码确认绑定，返回一次性恢复码（只显示这一次）。同样要当前口令 */
+  enableTwoFactor: (code: string, password: string) =>
     post<{ ok: boolean; recovery_codes: string[]; message: string }>(
       '/auth/2fa/enable',
-      { code },
+      { code, password },
     ),
   /** 关闭两步验证（口令 + 动态码双确认） */
   disableTwoFactor: (password: string, code: string) =>
@@ -2351,7 +2352,12 @@ export const certsApi = {
   updateSite: (id: string, site: Partial<CertSite>) =>
     put<{ site: CertSite }>(`/certs/sites/${id}`, site),
   removeSite: (id: string) =>
-    del<{ removed: boolean; detail: string }>(`/certs/sites/${id}`),
+    del<{
+      removed: boolean;
+      detail: string;
+      /** 级联清理的行数：runs / logs / jobs / leases / workflow_runs */
+      purged?: Record<string, number>;
+    }>(`/certs/sites/${id}`),
   apply: (id: string, domain?: string) =>
     post<{ cert_id: string; detail: string; site: CertSite }>(
       `/certs/sites/${id}/apply`,
@@ -2409,6 +2415,15 @@ export const certsApi = {
       params: { site_id: siteId, limit },
     }),
   runDetail: (runId: string) => get<CertFlowRunDetail>(`/certs/runs/${runId}`),
+  /** 从失败的那一步重跑一次（签发 / 部署 / 同步 / 轮换 / 吊销） */
+  retryRun: (runId: string) =>
+    post<{
+      run_id: string;
+      site_id: string;
+      step: string;
+      detail: string;
+      site: CertSite | null;
+    }>(`/certs/runs/${runId}/retry`, {}),
   /** 游标增量拉日志（SSE 不可用时的兜底）：把上次的 cursor 当 after 传回 */
   runLogs: (runId: string, after = 0, nodeId = "") =>
     get<{ items: CertDeployLog[]; cursor: number; node_id: string }>(
@@ -2429,6 +2444,13 @@ export const certsApi = {
       "GET",
     ),
   /* ---- 证书清单与多站点绑定 ---- */
+  /** 证书事件推送档位：failures / failures_success / all */
+  notifyMode: () =>
+    get<{ mode: string; options: { value: string; label: string }[] }>(
+      "/certs/notify-mode",
+    ),
+  saveNotifyMode: (mode: string) =>
+    put<{ mode: string }>("/certs/notify-mode", { mode }),
   stats: () => get<CertInventoryStats>("/certs/stats"),
   inventory: () =>
     get<{ items: CertInventoryItem[]; count: number }>("/certs/inventory"),
@@ -2469,7 +2491,9 @@ export const certWorkflowsApi = {
   update: (id: string, body: CertWorkflowInput) =>
     put<{ workflow: CertWorkflow }>(`/cert-workflows/${id}`, body),
   remove: (id: string) =>
-    del<{ removed: boolean }>(`/cert-workflows/${id}`),
+    del<{ removed: boolean; detached_sites?: number; removed_runs?: number }>(
+      `/cert-workflows/${id}`,
+    ),
   validate: (body: CertWorkflowInput) =>
     post<CertWorkflowValidation>("/cert-workflows/validate", body),
   importFile: (filename: string, content: string) =>
@@ -2506,6 +2530,8 @@ export const certWorkflowRunsApi = {
     get<{ run: CertWorkflowRun }>(`/cert-workflow-runs/${id}`),
   create: (body: CertWorkflowRunInput) =>
     post<{ run: CertWorkflowRun }>("/cert-workflow-runs", body),
+  /** 删除一条终态的审批实例（进行中的后端会 409） */
+  remove: (id: string) => del<{ removed: boolean }>(`/cert-workflow-runs/${id}`),
   transition: (id: string, action: CertWorkflowRunAction, note = "") =>
     post<{ run: CertWorkflowRun }>(`/cert-workflow-runs/${id}/transition`, {
       action,

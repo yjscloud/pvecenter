@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import shlex
 import signal
 import time
@@ -44,6 +45,7 @@ from . import (
     certflow,
     certflow_store,
     certnotify,
+    certworkflow_run,
     crypto,
     database,
     dnsproviders,
@@ -155,6 +157,31 @@ RELOAD_BAD_CHARS = (";", "|", "&", "$", "`", ">", "<", "\n", "\r")
 #: 90 天的免费证书大约只有 6 次机会，靠"失败就等 6 小时"很容易把次数耗光。
 BACKOFF_STEPS = (600, 1800, 7200, 21600)
 
+#: 云厂商异步签发时的轮询间隔（秒）。腾讯云免费证书通常 1–5 分钟签出；
+#: 这个值同时写进 ``next_attempt_at``，补跑作业（5 分钟一轮）据此提前接手，
+#: 不必等 6 小时的主轮 —— 页面上的「等待 CA 签发 · 下次 10:23」就是它。
+CA_POLL_SECONDS = 120
+#: 等待签发的上限（秒）：超过就停下高频轮询并告警，避免无效 API 调用。
+CA_WAIT_TIMEOUT = 6 * 3600
+
+#: 同一签发账号的并发上限。云厂商的证书接口普遍有 QPS 限制，站点一多，一轮
+#: 并发 sync/apply 很容易打成 429。按 (kind, owner) 各一个信号量。
+PROVIDER_CONCURRENCY = 2
+_PROVIDER_SLOTS: Dict[Tuple[str, str], asyncio.Semaphore] = {}
+#: describe 结果短缓存：同一张证书会被主轮、补跑与手动同步反复查询，
+#: 60 秒内复用同一个结论，既不改变判定，又省掉大部分调用。
+DESCRIBE_TTL = 60
+_DESCRIBE_CACHE: Dict[Tuple[str, str, str], Tuple[float, Any]] = {}
+
+
+def _provider_slot(kind: str, owner: str) -> asyncio.Semaphore:
+    key = (str(kind or ""), str(owner or ""))
+    sem = _PROVIDER_SLOTS.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(PROVIDER_CONCURRENCY)
+        _PROVIDER_SLOTS[key] = sem
+    return sem
+
 
 def backoff_after(attempts: int) -> int:
     """第 N 次失败后等多久再试；超过表长就按最后一档封顶。"""
@@ -174,6 +201,16 @@ DEPLOY_METHODS = (
     "tencent_cdn",
     "aliyun_cdn",
 )
+#: 部署到这些目标等于「改动生产入口」。自动部署默认允许，但站点把
+#: ``prod_auto_deploy`` 关掉后，自动轮次会停下等人工确认（手动部署不受限）。
+PROD_DEPLOY_METHODS = (
+    "pve",
+    "tencent_clb",
+    "aliyun_slb",
+    "tencent_cdn",
+    "aliyun_cdn",
+)
+
 DEPLOY_METHOD_LABELS = {
     "local": "本机目录（面板所在服务器）",
     "ssh": "SSH 远程服务器",
@@ -225,6 +262,16 @@ DEFAULT_TARGET: Dict[str, Any] = {
     # 每个目标自己的部署结果
     "last_error": "",
     "last_deploy_at": 0,
+    # --- 部署侧观测（幂等与排障用）-----------------------------------------
+    #: 最近一次**成功写入**的证书指纹（fullchain 的 sha256 前 16 位）。
+    #: 同一张证书重复部署时可以据此跳过；也为「部署到底生效没有」提供比对基线。
+    "deployed_fingerprint": "",
+    #: 该指纹首次落地的时间
+    "deployed_at": 0,
+    #: 连续部署失败次数
+    "deploy_attempts": 0,
+    #: 该目标自己的下次重试时间：多目标时失败的那一个退避，成功的那个不受影响
+    "next_retry_at": 0,
 }
 SSH_AUTH_METHODS = ("password", "key")
 
@@ -267,6 +314,19 @@ DEFAULT_SITE: Dict[str, Any] = {
     "auto_renew": True,
     # 工作流开关：关闭后流水线只申请不自动部署 / 不发到期提醒，交给人工决定
     "auto_deploy": True,
+    # 审批闸门：绑定的证书工作流（空 = 不审批，签发/续期全自动）。
+    # 只拦签发、不拦部署 —— 部署可逆且幂等，签发才占用 CA 配额。
+    "workflow_id": "",
+    # 闸门已经建过一条审批实例，等人工处理（列表徽标用）
+    "approval_pending": False,
+    # 同步分级：下一次允许向 CA 拉状态的时间（按剩余天数决定间隔）
+    "next_sync_at": 0,
+    # 生产目标（PVE 节点 / CLB / CDN）是否允许自动部署；关掉后自动部署会停下等确认
+    "prod_auto_deploy": True,
+    # 上次自动部署因「生产目标待确认」被拦下
+    "deploy_blocked": False,
+    # 部署后的线上校验结论：{ok, at, expected, actual, detail}
+    "tls_verify": {},
     "notify_expiring": True,
     "renew_before_days": 0,  # 0 = 跟随全局设置
     # 签发渠道：tencent（腾讯云免费证书）/ acme（自建 ACME，支持泛域名与多域名）
@@ -321,6 +381,9 @@ DEFAULT_SITE: Dict[str, Any] = {
     "notes": "",
     # 运行时状态
     "cert_status": -1,
+    #: 进入「等待 CA 签发」的起点（epoch 秒）。短轮询靠它计算是否已超时，
+    #: 避免 CA 长期不返回时补跑作业无限期地每 5 分钟打一次接口。
+    "wait_started_at": 0,
     "cert_status_text": "",
     "cert_domain": "",
     "expire_at": 0,
@@ -687,6 +750,12 @@ def normalise_site(raw: Dict[str, Any], existing: Optional[Dict[str, Any]] = Non
         first = raw_targets[0]
         item = dict(item)
         for key in DEFAULT_TARGET:
+            # id / name 是**目标自己**的身份，不能当成站点字段搬上来：
+            # 前端把第一个目标固定叫 primary（或 t-<时间戳>），一旦被当成站点
+            # id，每个「新增站点」都会拿到同一个 id，落库时按 id 覆盖上一个
+            # 站点 —— 域名、证书绑定、部署目标会一起消失。
+            if key in ("id", "name"):
+                continue
             if key in first and key not in item:
                 item[key] = first[key]
         item.setdefault("deploy_method", first.get("method"))
@@ -695,7 +764,9 @@ def normalise_site(raw: Dict[str, Any], existing: Optional[Dict[str, Any]] = Non
         site.update(existing)
     site.update({k: v for k, v in item.items() if k in DEFAULT_SITE})
 
-    site["id"] = str(existing.get("id") if existing and existing.get("id") else item.get("id") or _new_id())
+    # 站点 id 是服务端身份：编辑沿用原 id，新建一律随机生成，**不接受**请求体
+    # 里的值（否则客户端给一个已存在的 id 就能借「新增」覆盖掉那条站点）。
+    site["id"] = str(existing.get("id")) if existing and existing.get("id") else _new_id()
     site["name"] = str(item.get("name") or site.get("name") or "").strip()[:60]
     # 归属只由服务端决定：编辑沿用原归属，新站点由接口层补上创建者
     site["username"] = site_owner(existing) if existing else ""
@@ -924,7 +995,10 @@ def normalise_site(raw: Dict[str, Any], existing: Optional[Dict[str, Any]] = Non
     first = targets[0]
     site["deploy_method"] = str(first["method"])
     for key in DEFAULT_TARGET:
-        if key in ("id", "method", "last_error", "last_deploy_at"):
+        # ``id`` / ``name`` 是**目标自己**的身份，不是站点字段：目标名默认是
+        # ``primary``（或空串），搬上来会把用户在「站点名称」里填的值直接覆盖掉
+        # —— 保存看似成功，读回来却是空的（或者变成 primary）。
+        if key in ("id", "name", "method", "last_error", "last_deploy_at"):
             continue
         site[key] = first.get(key)
     return site
@@ -1296,8 +1370,9 @@ def acme_channel_view(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "tagline_key": "cert.providerAcmeTagline",
         "configured": bool(str(cfg.get("email") or "").strip()),
         "identity_key": "email",
-        # ACME 没有「列一次证书」的接口，测连接就没有意义
-        "test_disabled": True,
+        # ACME 没有「列一次证书」的接口，但可以验证配置：CA 目录可达 / 账号
+        # 可注册（含 EAB）+ DNS 凭据能定位托管域。两者都是只读，不签发。
+        "test_disabled": False,
         "synchronous": True,
         "fields": acme_fields(),
         "values": values,
@@ -1773,6 +1848,119 @@ async def delete_site(site_id: str) -> bool:
     )
 
 
+async def purge_site_data(site_id: str) -> Dict[str, int]:
+    """站点删除后的级联清理：运行记录 / 部署日志 / 队列 / 租约 / 审批实例。
+
+    站点配置是唯一事实来源（清单表每次都从它重建），但下面这些是按 ``site_id``
+    记账的独立表，删站点时不会跟着走：
+
+    * ``cert_flow_run``（连同步骤 / 日志 / 产物）—— 否则运行记录页签里还挂着
+      一台已经不存在的机器，点进去查不到站点；
+    * ``cert_deploy_log`` —— 部署日志仍能查到，但归属的站点已经没了；
+    * ``cert_job`` —— 队列里残留的 tick 会被反复取出、反复失败；
+    * ``cert_lease`` —— 占着租约（虽然会过期，但同号新站点可能立刻被挡住）；
+    * ``cert_workflow_run`` —— 审批实例引用的是已删除的站点。
+
+    任何一步失败都只记日志：站点已经删掉了，善后失败不能把「删除成功」变成
+    500（否则用户会重试，而第二次是 404，更难查）。返回各表实际删除的行数，
+    供审计与前端提示使用。
+    """
+    counts = {"runs": 0, "logs": 0, "jobs": 0, "leases": 0, "workflow_runs": 0}
+    sid = str(site_id or "")
+    if not sid:
+        return counts
+    try:
+        async with database.connect() as db:
+            cursor = await db.execute(
+                "SELECT id FROM cert_flow_run WHERE site_id = ?", (sid,)
+            )
+            run_ids = [str(row["id"]) for row in (await cursor.fetchall()) or []]
+            if run_ids:
+                marks = ",".join("?" for _ in run_ids)
+                await db.execute(
+                    f"DELETE FROM cert_flow_step WHERE run_id IN ({marks})",
+                    tuple(run_ids),
+                )
+                await db.execute(
+                    f"DELETE FROM cert_flow_step_log WHERE run_id IN ({marks})",
+                    tuple(run_ids),
+                )
+                await db.execute(
+                    f"DELETE FROM cert_flow_artifact WHERE run_id IN ({marks})",
+                    tuple(run_ids),
+                )
+                cursor = await db.execute(
+                    f"DELETE FROM cert_flow_run WHERE id IN ({marks})",
+                    tuple(run_ids),
+                )
+                counts["runs"] = cursor.rowcount or 0
+            cursor = await db.execute(
+                "DELETE FROM cert_deploy_log WHERE site_id = ?", (sid,)
+            )
+            counts["logs"] = cursor.rowcount or 0
+            cursor = await db.execute(
+                "DELETE FROM cert_job WHERE site_id = ?", (sid,)
+            )
+            counts["jobs"] = cursor.rowcount or 0
+            cursor = await db.execute(
+                "DELETE FROM cert_lease WHERE site_id = ?", (sid,)
+            )
+            counts["leases"] = cursor.rowcount or 0
+            await db.commit()
+    except Exception:  # noqa: BLE001 - 善后失败不影响「站点已删除」
+        logger.warning("清理站点残留数据失败（%s）", sid, exc_info=True)
+    try:
+        counts["workflow_runs"] = await certworkflow_run.delete_for_site(sid)
+    except Exception:  # noqa: BLE001
+        logger.warning("清理站点审批实例失败（%s）", sid, exc_info=True)
+    return counts
+
+
+async def detach_workflow(owner: str, workflow_id: str) -> int:
+    """把某用户名下绑定了该工作流的站点解绑，返回受影响的站点数。
+
+    工作流定义被删掉之后，站点的 ``workflow_id`` 会变成悬空引用：闸门逻辑
+    （``certworkflow_gate``）会检测到并放弃签发，但证书页仍显示「已绑定」。
+    删除定义时顺手解绑，界面与数据才一致。
+    """
+    wid = str(workflow_id or "")
+    if not wid:
+        return 0
+    async with _SITES_LOCK:
+        for _ in range(SITE_WRITE_RETRIES):
+            raw = await store.get_setting(SETTING_KEY) or ""
+            items = _load_site_items(raw)
+            changed = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("workflow_id") or "") != wid:
+                    continue
+                if str(item.get("username") or "") != str(owner or ""):
+                    continue
+                item["workflow_id"] = ""
+                # 审批挂起标记也一起清：否则站点永远停在「等审批」，
+                # 而审批已经不可能再来了。
+                if item.get("approval_pending"):
+                    item["approval_pending"] = False
+                changed += 1
+            if not changed:
+                return 0
+            payload = json.dumps(items, ensure_ascii=False)
+            if not raw:
+                if await store.insert_setting_if_absent(SETTING_KEY, payload):
+                    return changed
+                continue
+            if await store.compare_and_set_setting(SETTING_KEY, payload, raw):
+                return changed
+    raise CertError(
+        i18n.pick(
+            "站点解绑冲突（可能有其它实例在同时更新），请重试",
+            "Concurrent site update conflict (another instance may be writing), please retry",
+        )
+    )
+
+
 # ------------------------------------------------------------------ 部署日志
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cert_deploy_log (
@@ -1811,6 +1999,34 @@ CREATE TABLE IF NOT EXISTS cert_inventory (
     updated_at BIGINT       NOT NULL DEFAULT 0,
     PRIMARY KEY (username, cert_id, provider),
     KEY idx_cert_inventory_expire (expire_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 站点执行租约：同一站点同一时刻只允许一个 worker 跑流水线。
+-- 多副本部署时进程内锁跨不过去，这条记录是唯一的仲裁点；过期即可被抢占，
+-- 所以进程崩溃不会留下永久死锁。
+CREATE TABLE IF NOT EXISTS cert_lease (
+    site_id    VARCHAR(64) NOT NULL,
+    holder     VARCHAR(96) NOT NULL DEFAULT '',
+    expires_at BIGINT      NOT NULL DEFAULT 0,
+    PRIMARY KEY (site_id),
+    KEY idx_cert_lease_expire (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 待办队列：建站即签发、部署失败重试这类「稍后要做」的动作先入队，
+-- 由独立的轻量作业消费。相比扫全表，入队是 O(1)、重启不丢、重试次数可查。
+CREATE TABLE IF NOT EXISTS cert_job (
+    id         BIGINT      NOT NULL AUTO_INCREMENT,
+    site_id    VARCHAR(64) NOT NULL,
+    action     VARCHAR(24) NOT NULL DEFAULT 'tick',
+    not_before BIGINT      NOT NULL DEFAULT 0,
+    state      VARCHAR(16) NOT NULL DEFAULT 'queued',
+    attempts   INT         NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at BIGINT      NOT NULL DEFAULT 0,
+    updated_at BIGINT      NOT NULL DEFAULT 0,
+    PRIMARY KEY (id),
+    KEY idx_cert_job_due (state, not_before),
+    KEY idx_cert_job_site (site_id, state)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
@@ -2045,92 +2261,106 @@ async def run_detail(run_id: str, owner: Optional[str] = None) -> Dict[str, Any]
     return detail
 
 
-async def _finish_manual(
-    site: Dict[str, Any],
-    run_id: str,
-    node_id: str,
-    status: str,
-    detail: str,
-    error: str,
-    started: float,
-    trigger: str,
-) -> None:
-    """把手动动作的结果投影成「一步运行」并落库。
-
-    只写站点上的 ``last_run``，不写 ``cert_flow_run``：手动动作是一次同步请求，
-    前端拿到响应后刷新即可；运行表留给后台那一轮，混进手动动作反而让时间线
-    变得不好读。
-    """
-    cost = int((time.perf_counter() - started) * 1000)
-    flow = certflow.Run(
-        id=run_id,
-        pipeline="cert-manual",
-        version=RENEW_FLOW_VERSION,
-        status=status,
-        steps=[
-            certflow.RunStep(
-                node_id,
-                node_id,
-                status,
-                str(detail)[:certflow.DETAIL_LIMIT],
-                cost,
-                0,
-                str(error)[:certflow.DETAIL_LIMIT],
-            )
-        ],
-        trigger=trigger,
-        site_id=str(site.get("id") or ""),
-        owner=site_owner(site),
-        started_at=now_ts(),
-        finished_at=now_ts(),
-    )
-    certflow.project_last_run(site, flow)
-    try:
-        await update_site(site)
-    except Exception:  # noqa: BLE001 - 运行记录落库失败不该让动作本身失败
-        logger.debug("写入手动运行记录失败", exc_info=True)
-
-
 async def run_manual(
     site: Dict[str, Any],
     node_id: str,
     job: Any,
     *,
     trigger: str = "manual",
+    version: int = 0,
 ) -> Any:
-    """把一次手动动作（申请 / 部署 / 同步）记成「只有一步的运行」。
+    """把一次手动动作（申请 / 部署 / 同步 / 轮换 / 吊销 / 导入 / 绑定）跑成一条运行。
 
-    手动接口以前直接调底层函数，站点上不留任何运行记录 —— 用户点完「立即部署」
-    再展开「续期流水线」什么也看不到，看到的永远是上一轮定时任务的旧结果。
-    这里复用同一套归因与投影，于是**手动动作和定时续期在页面上长得一样**：
+    以前手动接口直接调底层函数，站点上只留一句 ``last_run``，运行详情里什么都
+    看不到。现在走 :func:`certflow.execute_unit`：
 
-    * 步骤名与 ``RENEW_FLOW`` 里的一致（issue / deploy / sync），文案表直接复用；
-    * 动作内部调用的 ``record_log`` 因为处在 ``step_scope`` 里，会自动挂到这一步；
-    * 失败时异常原样抛出，接口层原有的 ``except`` 分支不需要改。
+    * 动作内部调用的 ``record_log`` 与 ``emit_step`` 都会归因到这一步（含子步骤）；
+    * 运行头与步骤写进 ``cert_flow_run`` / ``cert_flow_step``（引擎开关打开时），
+      于是手动动作、定时续期、工作流审批在运行历史里是同一套记录；
+    * 失败时异常原样抛出（``run.exc``），接口层原有的 400 / 500 分支不用改。
 
     用法::
 
         result = await run_manual(site, "deploy", lambda: deploy_site(site, action="renew"))
     """
-    run_id = certflow.new_run_id()
-    started = time.perf_counter()
-    with certflow.step_scope(run_id):
-        certflow.enter_step(node_id)
-        try:
-            value = await job()
-        except BaseException as exc:  # noqa: BLE001 - 失败也要留下这一步再抛
-            await _finish_manual(
-                site, run_id, node_id, certflow.NODE_FAILED, str(exc), str(exc), started, trigger
+    sink = (
+        certflow_store.SqlSink(site, settings.certflow_store_payload)
+        if settings.certflow_enabled
+        else None
+    )
+    run = await certflow.execute_unit(
+        site,
+        node_id,
+        job,
+        trigger=trigger,
+        node_type=node_id or "manual",
+        pipeline="cert-manual",
+        version=int(version or RENEW_FLOW_VERSION),
+        sink=sink,
+    )
+    certflow.project_last_run(site, run)
+    try:
+        await update_site(site)
+    except Exception:  # noqa: BLE001 - 运行记录落库失败不该让动作本身失败
+        logger.debug("写入手动运行记录失败", exc_info=True)
+    if run.failed:
+        if run.exc is not None:
+            raise run.exc
+        raise CertError(str(run.error or i18n.tr("执行失败")))
+    return run.value
+
+
+#: 「重跑这一步」支持的动作：只放行**不需要额外输入**的步骤。
+#: 导入 / 绑定依赖用户当时粘贴的 PEM 或选择的证书 ID，重跑只能回站点上做。
+RETRYABLE_STEPS = ("issue", "deploy", "sync", "rotate", "revoke")
+
+
+async def retry_run(run_id: str, owner: Optional[str] = None) -> Dict[str, Any]:
+    """从运行里失败的那一步重跑一次动作。
+
+    语义是「再执行一次同样的动作」，不是续跑整条流程：失败多半来自外部状态
+    （CA 抖动、目标主机不可达），重新执行才有意义。新运行会重新投影到站点，
+    页面刷新即可看到新的时间线。
+    """
+    head = await certflow_store.get_run(run_id)
+    if not head:
+        raise CertError(i18n.tr("运行记录不存在"))
+    site = await get_site(str(head.get("site_id") or ""), owner)
+    if not site:
+        raise CertError(i18n.tr("站点不存在"))
+    steps = [
+        item for item in head.get("steps") or [] if not str(item.get("parent_id") or "")
+    ]
+    target = next(
+        (item for item in steps if str(item.get("status")) == "failed"), None
+    ) or (steps[0] if steps else None)
+    node_id = str((target or {}).get("node_id") or "")
+    if node_id not in RETRYABLE_STEPS:
+        raise CertError(
+            i18n.pick(
+                "该步骤需要原始输入（PEM / 证书 ID），请在站点上重新执行",
+                "This step needs its original input (PEM / certificate ID); retry it from the site",
             )
-            raise
-        if isinstance(value, dict):
-            detail = str(value.get("detail") or "")
-        else:
-            detail = value if isinstance(value, str) else ""
-        await _finish_manual(
-            site, run_id, node_id, certflow.NODE_OK, detail, "", started, trigger
         )
-        return value
+    if node_id == "issue":
+        job = lambda: apply_certificate(site, None, renew=bool(site.get("cert_id")))
+    elif node_id == "deploy":
+        action = "renew" if site.get("pending_cert_id") else "deploy"
+        job = lambda: deploy_site(site, None, action=action, force=True)
+    elif node_id == "sync":
+        job = lambda: sync_site_cert(site)
+    elif node_id == "rotate":
+        job = lambda: rotate_site(site, None, deploy=True)
+    else:
+        job = lambda: revoke_certificate(site, int(site.get("revoke_reason") or 0))
+    result = await run_manual(site, node_id, job, trigger="retry")
+    detail = str(result.get("detail") or "") if isinstance(result, dict) else ""
+    return {
+        "run_id": str(site.get("last_run_id") or ""),
+        "site_id": str(site.get("id") or ""),
+        "step": node_id,
+        "detail": detail,
+    }
 
 
 async def clear_logs(owner: Optional[str] = None) -> int:
@@ -3186,7 +3416,14 @@ async def _push_pve_node(
         " (written by PVE; pveproxy restarted)",
     )
     upid = str(result or "").strip()
-    if upid:
+    if upid.startswith("UPID:"):
+        # 上传是**异步任务**：``restart=1`` 让 PVE 在任务里落盘并重启 pveproxy。
+        # 不等它完成，紧接着的线上校验必然抓到旧证书（5–10 秒的空窗）。
+        # 超时不算部署失败 —— 证书多半已经写好，只是任务状态没及时回来。
+        try:
+            await client.wait_for_task(upid, timeout=30)
+        except Exception:  # noqa: BLE001 - 等待失败不影响部署结论
+            logger.debug("等待 PVE 证书上传任务超时（%s）", upid, exc_info=True)
         detail += i18n.pick("，任务 ", ", task ") + upid
     return detail, ""
 
@@ -3217,10 +3454,19 @@ async def sync_site_cert(site: Dict[str, Any], provider: Any = None) -> Dict[str
         return site
     if provider is None:
         provider = await provider_for(site)
-    try:
-        info = await provider.describe(cert_id)
-    except ProviderError as exc:
-        raise CertError(str(exc)) from exc
+    owner = site_owner(site)
+    cache_key = (kind, owner, cert_id)
+    cached = _DESCRIBE_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < DESCRIBE_TTL:
+        info = cached[1]
+    else:
+        try:
+            # 同账号串行一部分请求：避免多站点并发把厂商接口打成 429
+            async with _provider_slot(kind, owner):
+                info = await provider.describe(cert_id)
+        except ProviderError as exc:
+            raise CertError(str(exc)) from exc
+        _DESCRIBE_CACHE[cache_key] = (time.time(), info)
     if not info:
         site["last_error"] = (
             i18n.pick("证书 ", "Certificate ")
@@ -3275,16 +3521,160 @@ async def _push_target(view: Dict[str, Any], bundle: Dict[str, Any]) -> Tuple[st
     return await _push_local(view, bundle)
 
 
+def _leaf_fingerprint(bundle: Dict[str, Any]) -> str:
+    """证书链里**叶证书**的 SHA256（DER）指纹，用于与线上探测结果比对。
+
+    不能用「PEM 文本的 sha256」：``certmonitor.inspect_tls`` 返回的是证书 DER 的
+    SHA256，两者格式不同，拿来比会永远不相等。
+    """
+    from cryptography.hazmat.primitives import hashes
+
+    pem = str(bundle.get("fullchain") or "")
+    match = re.search(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem, re.S
+    )
+    if not match:
+        return ""
+    try:
+        cert = x509.load_pem_x509_certificate(match.group(0).encode("utf-8"))
+    except Exception:  # noqa: BLE001 - 解析失败只表示「没法校验」
+        return ""
+    return cert.fingerprint(hashes.SHA256()).hex()
+
+
+#: 线上校验的重试次数与间隔。
+#:
+#: 部署动作返回时，**新证书往往还没开始对外服务**：
+#:
+#: * 本机 / SSH 目标：``nginx -s reload`` 只是发信号，旧 worker 还在优雅退出；
+#: * PVE 节点目标：证书上传后 ``pveproxy`` 要重启，反向代理（nginx → 8006）
+#:   的连接池也要重建，动辄 5–10 秒。
+#:
+#: 第一次握手拿到旧证书是常态，不是失败。这里轮询到期望指纹出现为止，间隔
+#: 2.5 秒、最多 6 次（约 12.5 秒）—— 覆盖上面两种延迟，又不会让一次失败的
+#: 部署等太久。
+TLS_VERIFY_RETRIES = 6
+TLS_VERIFY_DELAY = 2.5
+
+
+async def _verify_deployed(
+    site: Dict[str, Any], bundle: Dict[str, Any], cert_fp: str
+) -> bool:
+    """部署后做一次线上生效校验（依赖站点监控地址），返回是否通过。
+
+    证书文件写成功 ≠ 浏览器看到的已经是新证书：反代没 reload、目标写到了另一台
+    机器、CDN 还在用旧证书，都会出现「部署成功但线上没换」。这里用监控地址做一次
+    TLS 握手，比对叶证书指纹，不一致就记一步并通知。
+    """
+    from . import certmonitor
+
+    url = str(site.get("monitor_url") or "").strip()
+    if not url:
+        await certflow.emit_step(
+            "verify",
+            status=certflow.NODE_SKIPPED,
+            title=i18n.pick("线上校验", "Online verification"),
+            detail=i18n.pick(
+                "未配置站点监控地址，跳过线上校验",
+                "No monitor URL configured; skipped online verification",
+            ),
+        )
+        return True
+
+    expected = _leaf_fingerprint(bundle)
+    host, port = certmonitor._url_host(url)
+    health: Dict[str, Any] = {}
+    actual = ""
+    ok = False
+
+    # ``nginx -s reload`` 是**异步**的：命令返回只代表信号已送达 master，旧 worker
+    # 还在优雅退出（``worker process is shutting down``），新的握手仍可能落到旧
+    # worker 上 —— 立刻校验会拿到**上一张**证书，把一次成功的部署报成「未通过」。
+    # 重试几次即可覆盖这段时间；顺带也盖住 CDN / 反代回源的秒级延迟。
+    for attempt in range(TLS_VERIFY_RETRIES):
+        health = {}
+        if host:
+            try:
+                health = await asyncio.to_thread(certmonitor.inspect_tls, host, port)
+            except Exception:  # noqa: BLE001 - 探测失败只是没有结论
+                health = {}
+        actual = str(health.get("fingerprint") or "")
+        ok = bool(expected) and actual.lower() == expected.lower()
+        if ok or not expected:
+            break
+        if attempt < TLS_VERIFY_RETRIES - 1:
+            await asyncio.sleep(TLS_VERIFY_DELAY)
+
+    site["tls_verify"] = {
+        "ok": ok,
+        "at": now_ts(),
+        "expected": expected[:64],
+        "actual": actual[:64],
+        "detail": str(health.get("detail") or ""),
+    }
+    await certflow.emit_step(
+        "verify",
+        status=certflow.NODE_OK if ok else certflow.NODE_FAILED,
+        title=i18n.pick("线上校验", "Online verification"),
+        detail=(
+            i18n.pick("线上叶证书已更新（", "Live leaf certificate updated (")
+            + expected[:16]
+            + ")"
+        )
+        if ok
+        else i18n.pick(
+            "线上证书与本次部署不一致：期望 " + expected[:16] + "，实际 " + (actual[:16] or "读不到"),
+            "Live certificate mismatch: expected "
+            + expected[:16]
+            + ", got "
+            + (actual[:16] or "unreadable"),
+        ),
+        level="info" if ok else "error",
+    )
+    if not ok:
+        await certflow.emit_log(
+            i18n.pick(
+                "线上证书指纹对不上：先确认反代是否 reload、监控地址是否指向这台机器。",
+                "Live fingerprint mismatch: check whether the reverse proxy reloaded "
+                "and whether the monitor URL points at this host.",
+            ),
+            level="error",
+        )
+        await certnotify.notify(
+            site_owner(site),
+            site,
+            certnotify.EVENT_VERIFY_MISMATCH,
+            i18n.pick(
+                "部署后线上证书不一致：" + str(site.get("domain") or ""),
+                "Live certificate still stale after deploy: " + str(site.get("domain") or ""),
+            ),
+            i18n.pick(
+                "本次部署的证书指纹 " + expected[:16] + "，线上读到 " + (actual[:16] or "读不到") + "。",
+                "Deployed fingerprint " + expected[:16] + ", live reads " + (actual[:16] or "unreadable") + ".",
+            ),
+            key="verify:" + cert_fp,
+            once=True,
+            level="error",
+        )
+    return ok
+
+
 async def deploy_site(
     site: Dict[str, Any],
     cfg: Optional[Dict[str, Any]] = None,
     action: str = "deploy",
+    *,
+    force: bool = False,
 ) -> Dict[str, Any]:
     """把证书写到站点的**每一个**部署目标；任一目标失败即整体算失败。
 
     证书只取一次（腾讯云下载 / ACME 与托管直接用站点缓存的 PEM），然后逐个
     目标落地。失败的目标单独记 ``last_error``，站点保留 ``pending_cert_id``，
-    下一轮流水线会重试部署；已经成功的目���重复写同一张证书是幂等的。
+    下一轮流水线会重试部署。
+
+    ``force=False``（自动部署）时，目标上已经是同一张证书（指纹一致且上次没有
+    报错）就跳过写入与 reload；用户显式点「部署」/工作流推进时传 ``force=True``，
+    保证他们看到的动作真的发生了。
     """
     cert_id = str(site.get("pending_cert_id") or site.get("cert_id") or "")
     if not cert_id:
@@ -3310,18 +3700,119 @@ async def deploy_site(
     if not targets:
         raise CertError(i18n.tr("请先添加部署目标（至少一个写入位置）"))
 
+    # 部署的是哪一张证书：指纹同时用于「同一张证书重复部署」的观测与通知去重。
+    cert_fp = hashlib.sha256(
+        str(bundle.get("fullchain") or "").encode("utf-8")
+    ).hexdigest()[:16]
+    await certflow.emit_log(
+        i18n.pick("证书指纹 ", "Certificate fingerprint ")
+        + cert_fp
+        + i18n.pick("，共 ", ", targets: ")
+        + str(len(targets))
+        + i18n.pick(" 个目标", "")
+    )
+
     results: List[Dict[str, Any]] = []
     failures: List[str] = []
+    #: 因「生产目标待确认」被拦下的目标：既不算成功也不算失败
+    blocked: List[str] = []
+    #: 仍在各自退避窗口里的目标：本轮跳过，等 not_before 到点
+    deferred: List[int] = []
     # 每个目标一条日志：部署是最需要「逐个目标看结果」的一步 —— 三个目标里挂了
     # 一个，只看汇总那句「部署失败」根本不知道是哪个。
     target_logs: List[Tuple[bool, str, str]] = []
     for target in targets:
         view = _target_view(site, target)
         label = str(target.get("name") or "").strip() or deploy_target_text(view)
+        # 子步骤 id 用目标自己的 id：同一目标重试复用同一行（sink 按 node_id 更新），
+        # 失败计数靠 attempt 区分。
+        node_key = "deploy:" + (str(target.get("id") or label))[:48]
+        started = time.perf_counter()
+        previous_fp = str(target.get("deployed_fingerprint") or "")
+        retry_at = int(target.get("next_retry_at") or 0)
+        if not force and retry_at > now_ts():
+            detail = i18n.pick(
+                "目标仍在退避中，"
+                + str(max(1, (retry_at - now_ts()) // 60))
+                + " 分钟后重试",
+                "Target is backing off; retry in "
+                + str(max(1, (retry_at - now_ts()) // 60))
+                + " min",
+            )
+            deferred.append(retry_at)
+            target_logs.append((False, label, detail))
+            results.append(
+                {
+                    "id": target.get("id"),
+                    "name": label,
+                    "ok": False,
+                    "written": False,
+                    "deferred": True,
+                    "detail": detail,
+                }
+            )
+            await certflow.emit_step(
+                node_key,
+                status=certflow.NODE_WAITING,
+                title=label,
+                detail=detail,
+                next_at=retry_at,
+            )
+            continue
+        if (
+            not force
+            and str(target.get("method") or "local") in PROD_DEPLOY_METHODS
+            and not site.get("prod_auto_deploy", True)
+        ):
+            # 生产目标要人工确认：不写、不 reload、不算失败（避免无限重试）
+            detail = i18n.pick(
+                "等待人工确认后部署到生产目标",
+                "Waiting for confirmation before deploying to a production target",
+            )
+            blocked.append(label)
+            target["last_error"] = ""
+            results.append(
+                {
+                    "id": target.get("id"),
+                    "name": label,
+                    "ok": False,
+                    "written": False,
+                    "blocked": True,
+                    "detail": detail,
+                }
+            )
+            await certflow.emit_step(
+                node_key,
+                status=certflow.NODE_WAITING,
+                title=label,
+                detail=detail,
+            )
+            continue
+        if not force and previous_fp and previous_fp == cert_fp and not target.get("last_error"):
+            # 自动部署且目标上已经是这张证书：不重复写文件、不 reload。
+            # 用户显式点「部署」时 force=True，跳过这段，保证动作真的发生。
+            detail = i18n.pick("已是最新证书，跳过写入", "Already up to date; skipped")
+            target_logs.append((True, label, detail))
+            results.append(
+                {"id": target.get("id"), "name": label, "ok": True, "written": False, "detail": detail}
+            )
+            await certflow.emit_step(
+                node_key,
+                status=certflow.NODE_OK,
+                title=label,
+                detail=detail,
+                ms=0,
+            )
+            continue
         try:
             detail, fingerprint = await _push_target(view, bundle)
         except ReloadError as exc:
+            cost = int((time.perf_counter() - started) * 1000)
             target["last_error"] = str(exc)
+            target["deploy_attempts"] = int(target.get("deploy_attempts") or 0) + 1
+            target["next_retry_at"] = now_ts() + backoff_after(
+                min(int(target["deploy_attempts"]), len(BACKOFF_STEPS))
+            )
             failures.append(
                 label
                 + i18n.pick("：证书已写入，但重载失败：", ": written, but reload failed: ")
@@ -3333,21 +3824,60 @@ async def deploy_site(
             results.append(
                 {"id": target.get("id"), "name": label, "ok": False, "written": True, "detail": str(exc)}
             )
+            await certflow.emit_step(
+                node_key,
+                status=certflow.NODE_FAILED,
+                title=label,
+                error=str(exc),
+                level="error",
+                attempt=int(target.get("deploy_attempts") or 0),
+                ms=cost,
+            )
         except CertError as exc:
+            cost = int((time.perf_counter() - started) * 1000)
             target["last_error"] = str(exc)
+            target["deploy_attempts"] = int(target.get("deploy_attempts") or 0) + 1
+            target["next_retry_at"] = now_ts() + backoff_after(
+                min(int(target["deploy_attempts"]), len(BACKOFF_STEPS))
+            )
             failures.append(label + i18n.pick("：", ": ") + str(exc))
             target_logs.append((False, label, str(exc)))
             results.append(
                 {"id": target.get("id"), "name": label, "ok": False, "written": False, "detail": str(exc)}
             )
+            await certflow.emit_step(
+                node_key,
+                status=certflow.NODE_FAILED,
+                title=label,
+                error=str(exc),
+                level="error",
+                attempt=int(target.get("deploy_attempts") or 0),
+                ms=cost,
+            )
         else:
+            cost = int((time.perf_counter() - started) * 1000)
             target["last_error"] = ""
             target["last_deploy_at"] = now_ts()
+            target["deployed_fingerprint"] = cert_fp
+            target["deployed_at"] = (
+                int(target.get("deployed_at") or 0)
+                if previous_fp == cert_fp
+                else now_ts()
+            )
+            target["deploy_attempts"] = 0
+            target["next_retry_at"] = 0
             if fingerprint:
                 target["ssh_host_key"] = fingerprint
             target_logs.append((True, label, detail))
             results.append(
                 {"id": target.get("id"), "name": label, "ok": True, "written": True, "detail": detail}
+            )
+            await certflow.emit_step(
+                node_key,
+                status=certflow.NODE_OK,
+                title=label,
+                detail=detail,
+                ms=cost,
             )
 
     site["targets"] = targets
@@ -3359,10 +3889,24 @@ async def deploy_site(
             continue
         site[key] = first.get(key)
 
-    ok_all = not failures
+    ok_all = not failures and not blocked and not deferred
+    site["deploy_blocked"] = bool(blocked)
+    if failures:
+        # 部署失败进待办队列（持久化、重启不丢）：取失败目标里最早的重试时间。
+        # 补跑作业据此让路，不会同一站点做两遍。
+        retry_at = min(
+            [int(t.get("next_retry_at") or 0) for t in targets if t.get("last_error")]
+            or [now_ts() + backoff_after(1)]
+        )
+        site["next_attempt_at"] = 0
+        await enqueue_job(str(site.get("id") or ""), "deploy", retry_at)
     if ok_all:
         site["cert_id"] = cert_id
         site["pending_cert_id"] = ""
+        site["wait_started_at"] = 0
+        site["approval_pending"] = False
+        site["deploy_blocked"] = False
+        site["next_attempt_at"] = 0
         site["last_deploy_at"] = now_ts()
         site["last_error"] = ""
         detail = i18n.pick(
@@ -3371,9 +3915,32 @@ async def deploy_site(
             + ", ".join(str(r["name"]) for r in results),
         )
         detail += i18n.tr("，证书 ID ") + cert_id
+    elif deferred and not failures and not blocked:
+        site["next_attempt_at"] = 0
+        site["last_error"] = i18n.pick(
+            "有 " + str(len(deferred)) + " 个目标在退避中，稍后自动重试",
+            str(len(deferred)) + " target(s) backing off; retrying automatically",
+        )
+        detail = site["last_error"]
+        await enqueue_job(str(site.get("id") or ""), "deploy", min(deferred))
+    elif blocked and not failures:
+        # 证书已经签发，只是生产目标在等确认：不安排自动重试，等人点一次部署
+        site["next_attempt_at"] = 0
+        site["last_error"] = i18n.pick(
+            "等待确认部署到生产目标：" + "、".join(blocked),
+            "Waiting for confirmation to deploy to: " + ", ".join(blocked),
+        )
+        detail = site["last_error"]
     else:
         site["last_error"] = "；".join(failures)[:500]
         detail = site["last_error"]
+
+    if ok_all:
+        # 线上生效校验：只有配了监控地址才做，结果作为独立子步骤可见
+        verified = await _verify_deployed(site, bundle, cert_fp)
+        if not verified:
+            detail += i18n.pick("；线上校验未通过", "; online verification failed")
+            site["last_error"] = detail
 
     # 先逐目标落明细、再落汇总：步骤日志按 id 升序展示时，读到的顺序正好是
     # 「目标 A → 目标 B → 整体结论」，符合排障时的阅读习惯。
@@ -3385,18 +3952,74 @@ async def deploy_site(
             i18n.pick("目标「", "Target \"") + label + i18n.pick("」：", "\": ") + text,
         )
     await record_log(site, action, "success" if ok_all else "failed", detail)
-    if not ok_all:
-        # 部署失败统一在这里发一次：手动部署与续期部署走同一条路径，避免
-        # 「页面上点了部署失败，但没人收到通知」。第二次及以上失败升级提醒。
-        attempts = int(site.get("attempt_count") or 0)
+    # 逐目标结果再进一遍「步骤日志」：结构化的一行一条，展开 deploy 步骤就能看，
+    # 不必在汇总那段话里找是哪一个目标挂了。
+    for ok, label, text in target_logs:
+        await certflow.emit_log(
+            (i18n.pick("[成功] ", "[OK] ") if ok else i18n.pick("[失败] ", "[FAIL] "))
+            + label
+            + i18n.pick("：", ": ")
+            + text,
+            level="info" if ok else "error",
+        )
+
+    owner = site_owner(site)
+    domain = str(site.get("domain") or "")
+    if ok_all:
+        # 成功也发（用户明确要求）：同一张证书只发一次，自动重试成功不会重复刷屏。
         await certnotify.notify(
-            site_owner(site),
+            owner,
             site,
-            certnotify.EVENT_DEPLOY_FAILED,
+            certnotify.EVENT_DEPLOY_OK,
+            i18n.pick("证书部署成功：" + domain, "Certificate deployed: " + domain),
+            detail,
+            key="deploy_ok:" + cert_id + ":" + cert_fp,
+            once=True,
+            level="info",
+        )
+    elif deferred and not failures and not blocked:
+        # 目标都在退避中：上一次失败已经发过通知，这里不重复喊
+        pass
+    elif blocked and not failures:
+        # 生产目标待确认：不是故障，但必须让人知道「还差最后一次确认」
+        await certnotify.notify(
+            owner,
+            site,
+            certnotify.EVENT_DEPLOY_HELD,
             i18n.pick(
-                "证书部署失败：" + str(site.get("domain") or ""),
-                "Certificate deploy failed: " + str(site.get("domain") or ""),
+                "证书部署待确认：" + domain,
+                "Certificate deployment awaiting confirmation: " + domain,
             ),
+            i18n.pick(
+                "证书已签发，但这些生产目标需要人工确认后才会写入：" + "、".join(blocked)
+                + "。在站点上点一次「部署」即可完成。",
+                "The certificate is issued, but these production targets need manual "
+                "confirmation: " + ", ".join(blocked) + ". Click Deploy on the site to finish.",
+            ),
+            key="held:" + cert_fp,
+            once=True,
+            level="error",
+        )
+    else:
+        ok_count = sum(1 for item in results if item.get("ok"))
+        attempts = int(site.get("attempt_count") or 0)
+        # 部分成功也用独立事件：只在群里说一句「部署失败」会让人以为全站都挂了。
+        event = (
+            certnotify.EVENT_DEPLOY_PARTIAL if ok_count else certnotify.EVENT_DEPLOY_FAILED
+        )
+        title = (
+            i18n.pick(
+                "证书部署部分失败：" + domain + "（" + str(ok_count) + "/" + str(len(results)) + " 成功）",
+                f"Certificate partially deployed: {domain} ({ok_count}/{len(results)} OK)",
+            )
+            if ok_count
+            else i18n.pick("证书部署失败：" + domain, "Certificate deploy failed: " + domain)
+        )
+        await certnotify.notify(
+            owner,
+            site,
+            event,
+            title,
             detail,
             escalate=attempts >= 1,
         )
@@ -3571,6 +4194,8 @@ async def _apply_acme(site: Dict[str, Any], *, renew: bool = False) -> Dict[str,
         (issued.fullchain[:256] + str(issued.expire_at)).encode("utf-8")
     ).hexdigest()[:16]
     site["pending_cert_id"] = cert_id
+    site["approval_pending"] = False
+    site["wait_started_at"] = now_ts()
     set_status(site, STATUS_ISSUED, changed_at=now_ts())
     site["cert_domain"] = domains[0]
     site["expire_at"] = issued.expire_at
@@ -3586,7 +4211,28 @@ async def _apply_acme(site: Dict[str, Any], *, renew: bool = False) -> Dict[str,
             "ACME issued the certificate (" + " / ".join(domains) + "); waiting for deployment",
         ),
     )
+    await certflow.emit_step(
+        "issue.persist",
+        title=i18n.pick("写入站点", "Save site"),
+        detail=i18n.pick("ACME 证书已落库：", "ACME certificate stored: ") + cert_id,
+    )
     await update_site(site)
+    await certnotify.notify(
+        site_owner(site),
+        site,
+        certnotify.EVENT_ISSUE_SUBMITTED,
+        i18n.pick(
+            "证书已签发：" + str(site.get("domain") or ""),
+            "Certificate issued: " + str(site.get("domain") or ""),
+        ),
+        i18n.pick(
+            "ACME 已签发证书（" + " / ".join(domains) + "），签发后会自动部署。",
+            "ACME issued the certificate (" + " / ".join(domains) + "); it will be deployed automatically.",
+        ),
+        key="issue_submitted:" + cert_id,
+        once=True,
+        level="info",
+    )
     return {
         "cert_id": cert_id,
         "domain": domains[0],
@@ -3665,6 +4311,7 @@ async def import_certificate(
     site["ca"] = "upload"
     site["cert_id"] = "upload-" + hashlib.sha256(str(pem).encode("utf-8")).hexdigest()[:16]
     site["pending_cert_id"] = ""
+    site["wait_started_at"] = 0
     set_status(site, STATUS_ISSUED, changed_at=now_ts())
     site["cert_domain"] = cert_domains[0] if cert_domains else (wanted[0] if wanted else "")
     site["expire_at"] = meta["expire_at"]
@@ -3715,16 +4362,52 @@ async def apply_certificate(
         )
     domains = site_domains(site)
     old_id = str(site.get("cert_id") or "") if renew else ""
+    await certflow.emit_log(
+        i18n.pick("向 ", "Submitting to ")
+        + provider_label(kind)
+        + i18n.pick(" 提交申请：", " for ")
+        + ", ".join(domains)
+    )
     try:
         result = await provider.apply(
             domains, renew_from=old_id, alias=str(site.get("name") or domains[0])
         )
     except ProviderError as exc:
+        await certflow.emit_step(
+            "issue.order",
+            status=certflow.NODE_FAILED,
+            title=i18n.pick("提交申请", "Submit request"),
+            error=str(exc),
+            level="error",
+        )
         raise CertError(str(exc)) from exc
     except TencentCloudError as exc:  # 兼容直接抛腾讯云异常的老客户端
+        await certflow.emit_step(
+            "issue.order",
+            status=certflow.NODE_FAILED,
+            title=i18n.pick("提交申请", "Submit request"),
+            error=str(exc),
+            level="error",
+        )
         raise CertError(str(exc)) from exc
 
+    await certflow.emit_step(
+        "issue.order",
+        title=i18n.pick("提交申请", "Submit request"),
+        detail=provider_label(kind)
+        + i18n.pick(" 已受理，证书 ID ", " accepted, certificate ID ")
+        + result.cert_id
+        + i18n.pick("，状态：", ", status: ")
+        + i18n.tr(status_text(result.status)),
+    )
+
     site["pending_cert_id"] = result.cert_id
+    site["approval_pending"] = False
+    # 新的申请从此刻开始计等待时间：短轮询的超时判定依赖它
+    site["wait_started_at"] = now_ts()
+    # 排一次短轮询：5 分钟一轮的补跑作业到点会再查一次 CA，签出后立刻部署。
+    # （以前这里什么都不写，异步签发只能等 6 小时主作业。）
+    site["next_attempt_at"] = now_ts() + CA_POLL_SECONDS
     set_status(site, result.status, changed_at=now_ts())
     if result.expire_at:
         site["expire_at"] = int(result.expire_at)
@@ -3733,6 +4416,11 @@ async def apply_certificate(
         site["acme_pem"] = result.pem
         site["acme_key"] = result.key
     site["last_error"] = ""
+    await certflow.emit_step(
+        "issue.persist",
+        title=i18n.pick("写入站点", "Save site"),
+        detail=i18n.pick("已记录待签发证书 ", "Pending certificate recorded: ") + result.cert_id,
+    )
     action = "renew" if renew else "apply"
     await record_log(
         site,
@@ -3744,6 +4432,22 @@ async def apply_certificate(
         + i18n.pick("），等待 CA 签发后自动部署", "); it will be deployed once the CA issues it"),
     )
     await update_site(site)
+    await certnotify.notify(
+        site_owner(site),
+        site,
+        certnotify.EVENT_ISSUE_SUBMITTED,
+        i18n.pick(
+            "证书申请已提交：" + str(site.get("domain") or ""),
+            "Certificate request submitted: " + str(site.get("domain") or ""),
+        ),
+        provider_label(kind)
+        + i18n.pick(" 已受理（ID ", " accepted (ID ")
+        + result.cert_id
+        + i18n.pick("），签发后会自动部署。", "); it will be deployed once issued."),
+        key="issue_submitted:" + result.cert_id,
+        once=True,
+        level="info",
+    )
     return {
         "cert_id": result.cert_id,
         "domain": domains[0] if domains else "",
@@ -3789,6 +4493,7 @@ async def bind_certificate(
     site["ca"] = target_kind
     site["cert_id"] = cert_id
     site["pending_cert_id"] = ""
+    site["wait_started_at"] = 0
     _apply_cert_meta(site, info)
     site["last_error"] = ""
     await record_log(
@@ -4162,39 +4867,69 @@ async def bulk_action(
             i18n.pick("不支持的批量操作：" + action, "Unsupported bulk action: " + action)
         )
     results: List[Dict[str, Any]] = []
-    for site in sites:
-        item: Dict[str, Any] = {
-            "site_id": str(site.get("id") or ""),
-            "name": str(site.get("name") or ""),
-            "domain": str(site.get("domain") or ""),
-            "ok": False,
-            "detail": "",
-        }
-        try:
-            if action == "apply":
-                await apply_certificate(site, None, renew=bool(site.get("cert_id")))
-                item["ok"] = True
-                item["detail"] = i18n.pick("已提交申请", "Request submitted")
-            elif action == "sync":
-                await sync_site_cert(site, None)
-                item["ok"] = True
-                item["detail"] = i18n.pick("已同步", "Synced")
-            elif action == "deploy":
-                outcome = await deploy_site(site, None, action="deploy")
-                item["ok"] = bool(outcome.get("ok"))
-                item["detail"] = str(outcome.get("detail") or "")
-            elif action == "rotate":
-                outcome = await rotate_site(site, None, deploy=True)
-                item["ok"] = True
-                item["detail"] = str(outcome.get("detail") or "")
-            else:  # revoke
-                outcome = await revoke_certificate(site, reason)
-                item["ok"] = True
-                item["detail"] = str(outcome.get("detail") or "")
-        except (CertError, ProviderError, TencentCloudError) as exc:
-            item["detail"] = str(exc)
-        results.append(item)
+    # 批量里逐站点发通知会变成「20 条消息」：先全部压制，结束后按归属各发一条汇总。
+    with certnotify.suppress():
+        for site in sites:
+            item: Dict[str, Any] = {
+                "site_id": str(site.get("id") or ""),
+                "name": str(site.get("name") or ""),
+                "domain": str(site.get("domain") or ""),
+                "ok": False,
+                "detail": "",
+            }
+            try:
+                # 每个站点也跑成一条运行：运行详情里能逐个站点看「批量部署」
+                if action == "apply":
+                    result = await run_manual(
+                        site,
+                        "issue",
+                        lambda: apply_certificate(site, None, renew=bool(site.get("cert_id"))),
+                        trigger="bulk",
+                    )
+                    item["ok"] = True
+                    item["detail"] = str(
+                        (result or {}).get("detail")
+                        or i18n.pick("已提交申请", "Request submitted")
+                    )
+                elif action == "sync":
+                    await run_manual(
+                        site, "sync", lambda: sync_site_cert(site, None), trigger="bulk"
+                    )
+                    item["ok"] = True
+                    item["detail"] = i18n.pick("已同步", "Synced")
+                elif action == "deploy":
+                    outcome = await run_manual(
+                        site,
+                        "deploy",
+                        lambda: deploy_site(site, None, action="deploy", force=True),
+                        trigger="bulk",
+                    )
+                    item["ok"] = bool((outcome or {}).get("ok"))
+                    item["detail"] = str((outcome or {}).get("detail") or "")
+                elif action == "rotate":
+                    outcome = await run_manual(
+                        site,
+                        "rotate",
+                        lambda: rotate_site(site, None, deploy=True),
+                        trigger="bulk",
+                    )
+                    item["ok"] = True
+                    item["detail"] = str((outcome or {}).get("detail") or "")
+                else:  # revoke
+                    outcome = await run_manual(
+                        site,
+                        "revoke",
+                        lambda: revoke_certificate(site, reason),
+                        trigger="bulk",
+                    )
+                    item["ok"] = True
+                    item["detail"] = str((outcome or {}).get("detail") or "")
+            except (CertError, ProviderError, TencentCloudError) as exc:
+                item["detail"] = str(exc)
+            results.append(item)
+
     ok_count = sum(1 for row in results if row["ok"])
+    await _notify_bulk_summary(action, sites, results)
     return {
         "action": action,
         "total": len(results),
@@ -4202,6 +4937,51 @@ async def bulk_action(
         "failed": len(results) - ok_count,
         "results": results,
     }
+
+
+async def _notify_bulk_summary(
+    action: str, sites: List[Dict[str, Any]], results: List[Dict[str, Any]]
+) -> None:
+    """批量操作结束后按归属者各发一条汇总（成功/部分失败同一个事件）。"""
+    by_owner: Dict[str, List[Dict[str, Any]]] = {}
+    for site, row in zip(sites, results):
+        by_owner.setdefault(site_owner(site), []).append(row)
+    for owner, rows in by_owner.items():
+        if not owner:
+            continue
+        ok = sum(1 for row in rows if row["ok"])
+        level = "info" if ok == len(rows) else ("warning" if ok else "error")
+        label = {
+            "apply": i18n.pick("申请", "issue"),
+            "deploy": i18n.pick("部署", "deploy"),
+            "sync": i18n.pick("同步", "sync"),
+            "rotate": i18n.pick("轮换", "rotate"),
+            "revoke": i18n.pick("吊销", "revoke"),
+        }.get(action, action)
+        lines = [
+            ("✓ " if row["ok"] else "✗ ")
+            + str(row.get("domain") or row.get("name") or "")
+            + ("" if row["ok"] else i18n.pick("：", ": ") + str(row.get("detail") or ""))
+            for row in rows
+        ]
+        marker = next(
+            (site for site in sites if site_owner(site) == owner),
+            {"id": "", "username": owner, "domain": ""},
+        )
+        await certnotify.notify(
+            owner,
+            marker,
+            certnotify.EVENT_BULK,
+            i18n.pick(
+                "批量" + label + "：" + str(ok) + "/" + str(len(rows)) + " 成功",
+                "Bulk " + action + ": " + str(ok) + "/" + str(len(rows)) + " succeeded",
+            ),
+            "\n".join(lines),
+            level=level,
+            key="bulk:" + action,
+            # 每次批量都要发（这是用户主动触发的动作），不能被 12 小时冷却吃掉
+            ttl=0,
+        )
 
 
 # ------------------------------------------------------------ Prometheus 指标
@@ -4311,6 +5091,31 @@ def renew_threshold(site: Dict[str, Any], cfg: Dict[str, Any]) -> int:
 #:       └─ wait    仍在签发中 → 只落库
 #:
 #: 要加动作（到期提醒、多目标分发、部署后回滚），往列表里 append 一个 Step 即可。
+def _sync_interval(days: Optional[int]) -> int:
+    """按剩余天数决定「多久向 CA 拉一次状态」。
+
+    离到期远的时候没必要每次 tick 都打接口：>30 天 12 小时、7–30 天 1 小时、
+    7 天内 15 分钟。等待签发（pending）时由调用方强制每次同步。
+    """
+    if days is None or days > 30:
+        return 12 * 3600
+    if days > 7:
+        return 3600
+    return 900
+
+
+def _schedule_sync(ctx: Context) -> None:
+    """计算本轮要不要 sync，并把下一次时间写回站点。"""
+    site = ctx.site
+    now = now_ts()
+    pending = bool(site.get("pending_cert_id"))
+    at = int(site.get("next_sync_at") or 0)
+    due = pending or not at or at <= now
+    ctx.set("sync_due", due)
+    if due:
+        site["next_sync_at"] = now + _sync_interval(days_left(site))
+
+
 async def _step_prepare(ctx: Context) -> str:
     """取「这个站点归属者」在该签发渠道上的配置。
 
@@ -4320,6 +5125,7 @@ async def _step_prepare(ctx: Context) -> str:
     选厂商 —— 同一轮里可以混着腾讯云、阿里云、华为云与 ACME 的站点。
     """
     kind = ca_kind(ctx.site)
+    _schedule_sync(ctx)
     if kind == "upload":
         # 托管证书不签发也不续期，只需要部署与到期提醒
         ctx.set("cfg", {})
@@ -4342,10 +5148,14 @@ async def _step_prepare(ctx: Context) -> str:
         ctx.set("prepared", True)
         if configured:
             return i18n.pick("已配置", "Configured")
-        return i18n.pick(
+        # 配置不全时别让补跑作业每 5 分钟打一次：退到 1 小时后再说，
+        # 并把原因写进 last_error，页面上能直接看到「为什么没签出来」。
+        ctx.site["next_attempt_at"] = now_ts() + 3600
+        ctx.site["last_error"] = i18n.pick(
             "ACME 配置不完整（邮箱 / 验证方式 / DNS 服务商）",
             "Incomplete ACME configuration (email / validation / DNS provider)",
         )
+        return str(ctx.site["last_error"])
     # 云厂商：按站点归属者取配置，造一个统一客户端（不认厂商名）
     kind = ca_kind(ctx.site)
     cfg = await provider_cfg_for(ctx.site)
@@ -4356,13 +5166,66 @@ async def _step_prepare(ctx: Context) -> str:
     ctx.set("prepared", True)
     if provider.configured:
         return provider_label(kind) + i18n.pick(" 已配置", " configured")
-    return provider_label(kind) + i18n.pick(" 未配置 API 密钥", " API credentials missing")
+    ctx.site["next_attempt_at"] = now_ts() + 3600
+    ctx.site["last_error"] = provider_label(kind) + i18n.pick(
+        " 未配置 API 密钥", " API credentials missing"
+    )
+    return str(ctx.site["last_error"])
 
 
 async def _step_sync(ctx: Context) -> None:
-    """拉取证书在 CA 侧的最新状态（签发结果、到期时间）。"""
-    await sync_site_cert(ctx.site, ctx.get("provider"))
+    """拉取证书在 CA 侧的最新状态（签发结果、到期时间）。
+
+    还没签出来的（``pending_cert_id`` 存在、状态既不是已签发也不是失败）顺带
+    排一次短轮询：写 ``next_attempt_at`` 并申报一个 ``waiting`` 子步骤，
+    页面显示倒计时，补跑作业到点就会再来查一次。
+    """
+    site = ctx.site
+    await sync_site_cert(site, ctx.get("provider"))
     ctx.set("synced", True)
+
+    pending = str(site.get("pending_cert_id") or "")
+    status = int(site.get("cert_status") or 0)
+    if pending and status not in STATUS_FAILED and status != STATUS_ISSUED:
+        started = int(site.get("wait_started_at") or 0) or now_ts()
+        site["wait_started_at"] = started
+        waited = now_ts() - started
+        if waited > CA_WAIT_TIMEOUT:
+            # 超时不等于失败：证书可能已经在 CA 侧签出，只是同步一直拿不到。
+            # 这里停掉高频轮询并喊一次，交给人看一眼。
+            site["next_attempt_at"] = 0
+            site["last_error"] = i18n.pick(
+                "证书签发超时（超过 " + str(CA_WAIT_TIMEOUT // 3600) + " 小时仍未签出）",
+                f"Certificate issuance timed out (not issued within {CA_WAIT_TIMEOUT // 3600}h)",
+            )
+            await certnotify.notify(
+                site_owner(site),
+                site,
+                certnotify.EVENT_ISSUE_FAILED,
+                i18n.pick(
+                    "证书签发超时：" + str(site.get("domain") or ""),
+                    "Certificate issuance timed out: " + str(site.get("domain") or ""),
+                ),
+                site["last_error"]
+                + i18n.pick(
+                    "，请到签发渠道确认，或在站点上重新申请。",
+                    "; check the CA console or re-apply from the site.",
+                ),
+                escalate=True,
+            )
+        else:
+            site["next_attempt_at"] = now_ts() + CA_POLL_SECONDS
+            await certflow.emit_step(
+                "wait-ca",
+                status=certflow.NODE_WAITING,
+                title=i18n.pick("等待 CA 签发", "Waiting for the CA"),
+                detail=i18n.pick("证书 ", "Certificate ")
+                + pending
+                + i18n.pick("，状态：", ", status: ")
+                + i18n.tr(status_text(status)),
+                next_at=site["next_attempt_at"],
+                attempt=max(1, waited // max(1, CA_POLL_SECONDS)),
+            )
 
 
 def _decide(ctx: Context) -> str:
@@ -4376,6 +5239,15 @@ def _decide(ctx: Context) -> str:
         if status in STATUS_FAILED:
             return "drop"
         return "wait"
+    if not site.get("cert_id"):
+        # 从来没有证书：这是「首次签发」，不是「续期」。托管证书没有可签发的
+        # 东西，回到原来的提醒语义（让人上传）。
+        if ca_kind(site) == "upload":
+            return "notice"
+        if not site.get("auto_renew"):
+            return "notice"
+        ctx.set("left", None)
+        return _issue_decision(site)
     left = days_left(site)
     ctx.set("left", left)
     threshold = renew_threshold(site, ctx.get("cfg"))
@@ -4391,7 +5263,79 @@ def _decide(ctx: Context) -> str:
         return "notice"
     if not site.get("auto_renew"):
         return "notice"
-    return "due"
+    return _issue_decision(site)
+
+
+def _issue_decision(site: Dict[str, Any]) -> str:
+    """需要签发时走哪条路：绑定工作流就走审批闸门，否则直接签发。"""
+    return "gate" if str(site.get("workflow_id") or "").strip() else "due"
+
+
+async def _step_gate(ctx: Context) -> str:
+    """审批闸门：创建（或复用）一条待审批的工作流实例，本轮不签发。
+
+    只拦签发、不拦部署：部署可逆且幂等，没必要让人再点一次。
+    """
+    from . import certworkflow_gate
+
+    site = ctx.site
+    run = await certworkflow_gate.ensure_gate(site)
+    if run:
+        site["approval_pending"] = True
+        site["gate_at"] = now_ts()
+        detail = i18n.pick(
+            "已创建工作流审批：" + str(run.get("title") or run.get("workflow_name") or ""),
+            "Workflow approval created: "
+            + str(run.get("title") or run.get("workflow_name") or ""),
+        )
+        await certflow.emit_log(
+            i18n.pick(
+                "证书需要签发，已提交工作流审批，批准后推进「申请证书」即会真实签发。",
+                "Issuance requires approval; approve and advance the apply node to issue.",
+            )
+        )
+        await certnotify.notify(
+            site_owner(site),
+            site,
+            certnotify.EVENT_APPROVAL,
+            i18n.pick(
+                "证书签发待审批：" + str(site.get("domain") or ""),
+                "Certificate issuance awaiting approval: " + str(site.get("domain") or ""),
+            ),
+            i18n.pick(
+                "站点「" + str(site.get("name") or site.get("domain") or "")
+                + "」需要签发证书，已按绑定的工作流发起审批。",
+                "Site \""
+                + str(site.get("name") or site.get("domain") or "")
+                + "\" needs a certificate; an approval was created from the bound workflow.",
+            ),
+            key="approval:" + str(site.get("domain") or ""),
+            ttl=0,
+        )
+    else:
+        open_run = await certworkflow_gate.has_open(site)
+        site["approval_pending"] = open_run
+        if not open_run:
+            # 上一条被驳回 / 取消 / 工作流被删：压一小时再重新发起，
+            # 否则补跑作业每 5 分钟就会建一条新审批。
+            site["next_attempt_at"] = now_ts() + 3600
+            detail = i18n.pick(
+                "审批未通过或工作流不可用，1 小时后再试（也可到站点上手动处理）",
+                "Approval was rejected or the workflow is unavailable; retrying in 1h "
+                "(or handle it manually on the site)",
+            )
+        else:
+            # 已有审批：半小时后再看一次，别让补跑作业每 5 分钟记一轮「仍在等待」
+            site["next_attempt_at"] = now_ts() + 1800
+            detail = i18n.pick(
+                "已有待处理的审批，等待处理",
+                "An approval is already open; waiting",
+            )
+    ctx.set(
+        "result",
+        {"site": site.get("name"), "action": "gate", "detail": detail},
+    )
+    return detail
 
 
 async def _step_decide(ctx: Context) -> str:
@@ -4416,10 +5360,16 @@ async def _step_guard(ctx: Context) -> str:
 
 async def _step_issue(ctx: Context) -> None:
     site = ctx.site
-    await apply_certificate(site, ctx.get("cfg"), renew=True)
+    first_time = not site.get("cert_id")
+    await apply_certificate(site, ctx.get("cfg"), renew=not first_time)
     left = ctx.get("left")
     kind = ca_kind(site)
-    if kind == "acme":
+    if first_time:
+        detail = i18n.pick(
+            "首次签发：" + provider_label(kind) + " 已受理，等待签出后自动部署",
+            "First issuance: " + provider_label(kind) + " accepted; will deploy after issuance",
+        )
+    elif kind == "acme":
         detail = i18n.pick(
             "证书剩余 " + str(left) + " 天，已通过 ACME 重新签发",
             f"Certificate expires in {left} days; reissued through ACME",
@@ -4433,7 +5383,11 @@ async def _step_issue(ctx: Context) -> None:
         )
     ctx.set(
         "result",
-        {"site": site.get("name"), "action": "renew", "detail": detail},
+        {
+            "site": site.get("name"),
+            "action": "issue" if first_time else "renew",
+            "detail": detail,
+        },
     )
 
 
@@ -4514,6 +5468,7 @@ async def _step_drop(ctx: Context) -> None:
     site = ctx.site
     status = int(site.get("cert_status") or 0)
     site["pending_cert_id"] = ""
+    site["wait_started_at"] = 0
     site["last_error"] = i18n.pick(
         "续期证书申请失败：" + status_text(status),
         f"Renewal request failed: {i18n.tr(status_text(status))}",
@@ -4607,8 +5562,18 @@ def _only(decision: str) -> Any:
 
 
 def _has_cert(ctx: Context) -> bool:
-    """没有证书也没有待签发证书时，整条流水线无事可做（连库都不写）。"""
-    return bool(ctx.site.get("pending_cert_id") or ctx.site.get("cert_id"))
+    """这个站点要不要进自动化流水线。
+
+    有证书 / 待签发证书的站点当然要（续期、同步、部署）；**新建但还没有证书**
+    的站点同样要 —— 否则「新建站点」永远进不来，「建站即签发」就无从谈起。
+    托管证书（upload）没有可签发的东西，没证书时仍然不进来。
+    """
+    site = ctx.site
+    if not site.get("enabled", True):
+        return False
+    if site.get("pending_cert_id") or site.get("cert_id"):
+        return True
+    return ca_kind(site) != "upload" and bool(site.get("auto_renew", True))
 
 
 _RENEW_PIPELINE = Pipeline(
@@ -4621,11 +5586,17 @@ _RENEW_PIPELINE = Pipeline(
             when=lambda ctx: _has_cert(ctx) and not ctx.get("hold"),
             detail=lambda ctx, value: value,
         ),
-        Step("sync", _step_sync, when=lambda ctx: ctx.get("configured", False)),
+        # 分级同步：没到期的站点本轮可以跳过 CA 查询，decide 用上次的到期时间判定
+        Step(
+            "sync",
+            _step_sync,
+            when=lambda ctx: ctx.get("configured", False)
+            and ctx.get("sync_due", True),
+        ),
         Step(
             "decide",
             _step_decide,
-            when=lambda ctx: ctx.get("synced", False),
+            when=lambda ctx: ctx.get("prepared", False),
             detail=lambda ctx, value: i18n.pick("决策：", "Decision: ") + str(value),
         ),
         Step(
@@ -4634,6 +5605,8 @@ _RENEW_PIPELINE = Pipeline(
             when=lambda ctx: ctx.get("decision") in ("due", "notice")
             and ctx.site.get("notify_expiring", True),
         ),
+        # 审批闸门：绑定了工作流的站点先把签发挂起，等人工批准
+        Step("gate", _step_gate, when=_only("gate")),
         Step("issue", _step_issue, when=_only("due")),
         Step(
             "deploy",
@@ -4651,7 +5624,7 @@ _RENEW_PIPELINE = Pipeline(
 # ------------------------------------------------------------- 流水定义（新引擎）
 #: 定义版本。节点组合或顺序一变就必须 +1：回滚是「切回上一版定义」，
 #: 靠覆盖同一个版本号会让历史运行动态地换了含义。
-RENEW_FLOW_VERSION = 1
+RENEW_FLOW_VERSION = 2
 
 
 def _same_detail(ctx: Any, value: Any) -> str:
@@ -4688,6 +5661,8 @@ def _register_renew_nodes() -> None:
         ("sync", _step_sync, ()),
         ("decide", _step_decide, ()),
         ("warn", _step_warn, ()),
+        # 审批闸门：只创建工作流审批实例，不产出证书
+        ("gate", _step_gate, ()),
         # 签发节点是唯一真正产出证书正文的地方，显式声明产物类别，
         # 后续「多目标分发」节点就能按 kind 找上游，而不是靠节点顺序猜。
         ("issue", _step_issue, ("cert", "key")),
@@ -4737,15 +5712,16 @@ RENEW_FLOW = certflow.Definition(
             "sync",
             title="同步 CA 侧状态",
             needs=("prepare",),
-            when=lambda ctx: ctx.get("configured", False),
+            when=lambda ctx: ctx.get("configured", False)
+            and ctx.get("sync_due", True),
             detail=_silent_detail,
         ),
         certflow.Node(
             "decide",
             "decide",
             title="判定本次动作",
-            needs=("sync",),
-            when=lambda ctx: ctx.get("synced", False),
+            needs=("prepare",),
+            when=lambda ctx: ctx.get("prepared", False),
             detail=_decision_detail,
         ),
         certflow.Node(
@@ -4755,6 +5731,14 @@ RENEW_FLOW = certflow.Definition(
             needs=("decide",),
             when=lambda ctx: ctx.get("decision") in ("due", "notice")
             and ctx.site.get("notify_expiring", True),
+            detail=_silent_detail,
+        ),
+        certflow.Node(
+            "gate",
+            "gate",
+            title="创建工作流审批",
+            needs=("decide",),
+            when=_only("gate"),
             detail=_silent_detail,
         ),
         certflow.Node(
@@ -4805,7 +5789,10 @@ def _as_legacy_result(flow: certflow.Run) -> RunResult:
     return RunResult(
         status=flow.status,
         steps=[
-            StepResult(s.node_id, s.status, s.detail, s.ms, s.at) for s in flow.steps
+            StepResult(s.node_id, s.status, s.detail, s.ms, s.at)
+            for s in flow.steps
+            # 子步骤只给运行详情页看；旧返回值（last_run 的粒度）保持只有顶层步骤
+            if not s.parent_id
         ],
         value=flow.value,
         error=flow.error,
@@ -4851,6 +5838,14 @@ async def renew_site(site: Dict[str, Any], trigger: str = "tick") -> RunResult:
         )
 
     certflow.project_last_run(site, flow)
+    # 「什么都没做」的一次检查（decision=none）不占运行历史：主作业 6 小时一轮，
+    # 一天 4 条纯检查记录会把真正有动作的运行刷到翻页。站点上的 last_run 投影
+    # 仍然更新，「最近一次巡检时间」不受影响。
+    if (
+        str(flow.state.get("decision") or "") == "none"
+        and str(flow.status or "") == "ok"
+    ):
+        await certflow_store.drop_run(flow.id)
     # 取过配置或同步过的站点才落库；没证书的站点保持「不碰库」的旧行为
     if flow.state.get("prepared", False) or flow.state.get("synced", False):
         await update_site(site)
@@ -4869,7 +5864,9 @@ async def _run_sites(
     for site in sites:
         if not site.get("enabled"):
             continue
-        run = await renew_site(site, trigger=trigger)
+        run = await _renew_with_lease(site, trigger=trigger)
+        if run.error == "busy":
+            continue
         if run.exc is not None:
             # 接口抖动：记一笔就继续下一个站点，别让一个坏站点拖垮整轮；
             # 其它异常（代码 bug / 数据库）照旧往上抛，交给调度器记失败。
@@ -4889,20 +5886,250 @@ async def _run_sites(
             continue
         if run.value:
             results.append(run.value)
-            # 定时/补跑触发的动作也要进 audit_log：只写 cert_deploy_log 的话，
-            # 安全复盘时「凌晨那张证书是谁签的」在审计里查不到。
-            await store.add_audit(
-                username=site_owner(site) or "system",
-                action="cert.auto_" + str(run.value.get("action") or "renew"),
-                target=str(site.get("domain") or ""),
-                result="success" if run.status == "ok" else "failed",
-                detail={
-                    "site_id": str(site.get("id") or ""),
-                    "site": str(site.get("name") or ""),
-                    "trigger": trigger,
-                    "detail": str(run.value.get("detail") or "")[:800],
-                },
-                ip="scheduler",
+        # 定时/补跑触发的每一轮都进 audit_log（含「本轮无动作」）：
+        # 只写 cert_deploy_log 的话，安全复盘时「凌晨那张证书是谁签的 / 为什么没签」
+        # 在审计里查不到。
+        value = run.value or {}
+        await store.add_audit(
+            username=site_owner(site) or "system",
+            action="cert.auto_" + str(value.get("action") or "check"),
+            target=str(site.get("domain") or ""),
+            result="success" if run.status == "ok" else "failed",
+            detail={
+                "site_id": str(site.get("id") or ""),
+                "site": str(site.get("name") or ""),
+                "trigger": trigger,
+                "detail": str(value.get("detail") or site.get("last_error") or "")[:800],
+            },
+            ip="scheduler",
+        )
+    return results
+
+
+async def auto_issue(site_id: str, owner: Optional[str] = None) -> None:
+    """建站即签发：在后台跑一轮流水线，把「新建站点」推进到已签发/已部署。
+
+    不阻塞保存请求：失败了由 5 分钟补跑作业接手（``next_attempt_at`` 与
+    「没有证书」的判定都会把它捞回来）。这里吞掉所有异常——建站已经成功，
+    签发的事交给流水线自己的重试与通知。
+    """
+    try:
+        site = await get_site(site_id, owner)
+        if not site or not site.get("enabled", True):
+            return
+        if site.get("cert_id") or site.get("pending_cert_id"):
+            return
+        await renew_site(site, trigger="create")
+    except Exception:  # noqa: BLE001 - 后台任务失败不该影响建站结果
+        logger.warning("建站自动签发失败：%s", site_id, exc_info=True)
+
+
+# ---------------------------------------------------- 单飞租约 / 待办队列
+#: 租约时长。流水线单站点最长也就几分钟，10 分钟足够；进程崩溃后过期即被抢占。
+LEASE_TTL = 600
+#: 队列里同一站点连续失败的上限：到顶转 failed，等人看（并已发过通知）
+JOB_MAX_ATTEMPTS = 4
+
+
+def _lease_holder() -> str:
+    """租约持有者标识：进程 + 随机串，日志里能看出是哪台/哪个 worker。"""
+    return f"{socket.gethostname()[:32]}:{os.getpid()}:{secrets.token_hex(4)}"
+
+
+async def acquire_lease(site_id: str, holder: str, ttl: int = LEASE_TTL) -> bool:
+    """抢占站点执行租约；返回是否抢到（过期租约可直接抢占）。"""
+    site_id = str(site_id or "")
+    if not site_id:
+        return True
+    now = now_ts()
+    try:
+        async with database.connect() as db:
+            await db.execute(
+                "INSERT INTO cert_lease (site_id, holder, expires_at)"
+                " VALUES (?, '', 0) ON DUPLICATE KEY UPDATE holder = holder",
+                (site_id,),
+            )
+            cursor = await db.execute(
+                "UPDATE cert_lease SET holder = ?, expires_at = ?"
+                " WHERE site_id = ? AND (expires_at <= ? OR holder = ?)",
+                (str(holder), now + max(30, int(ttl)), site_id, now, str(holder)),
+            )
+            await db.commit()
+            return bool(cursor.rowcount)
+    except Exception:  # noqa: BLE001 - 租约表不可用时退回「不串行」，不让整轮停摆
+        logger.warning("抢占证书执行租约失败，本轮不做单飞约束：%s", site_id, exc_info=True)
+        return True
+
+
+async def release_lease(site_id: str, holder: str) -> None:
+    """释放租约（只释放自己持有的那条）。"""
+    if not site_id:
+        return
+    try:
+        async with database.connect() as db:
+            await db.execute(
+                "UPDATE cert_lease SET holder = '', expires_at = 0"
+                " WHERE site_id = ? AND holder = ?",
+                (str(site_id), str(holder)),
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001 - 释放失败最多让下一个 worker 等 TTL
+        logger.debug("释放证书执行租约失败：%s", site_id, exc_info=True)
+
+
+async def enqueue_job(site_id: str, action: str = "tick", not_before: int = 0) -> bool:
+    """把站点排进待办队列；同一站点已有排队任务时不重复建，只前移时间。"""
+    site_id = str(site_id or "")
+    if not site_id:
+        return False
+    now = now_ts()
+    when = int(not_before or now)
+    try:
+        async with database.connect() as db:
+            cursor = await db.execute(
+                "SELECT id FROM cert_job WHERE site_id = ? AND state = 'queued' LIMIT 1",
+                (site_id,),
+            )
+            row = await cursor.fetchone()
+            if row:
+                await db.execute(
+                    "UPDATE cert_job SET not_before = ?, updated_at = ? WHERE id = ?",
+                    (min(when, now), now, int(row["id"])),
+                )
+                await db.commit()
+                return False
+            await db.execute(
+                "INSERT INTO cert_job (site_id, action, not_before, state, attempts,"
+                " created_at, updated_at) VALUES (?, ?, ?, 'queued', 0, ?, ?)",
+                (site_id, str(action or "tick"), when, now, now),
+            )
+            await db.commit()
+        return True
+    except Exception:  # noqa: BLE001 - 入队失败不影响当前动作，退避/扫描仍会兜底
+        logger.warning("写入证书待办任务失败：%s/%s", site_id, action, exc_info=True)
+        return False
+
+
+async def queued_site_ids() -> set:
+    """队列里还没跑完的站点 id（补跑作业据此让路，避免同一站点做两遍）。"""
+    try:
+        async with database.connect() as db:
+            cursor = await db.execute(
+                "SELECT DISTINCT site_id FROM cert_job WHERE state IN ('queued','running')"
+            )
+            rows = await cursor.fetchall()
+        return {str(row["site_id"]) for row in rows}
+    except Exception:  # noqa: BLE001 - 队列不可用时退回原来的扫表逻辑
+        return set()
+
+
+async def claim_job() -> Optional[Dict[str, Any]]:
+    """认领一条到点任务（条件更新，多 worker 下只有一人抢到）。"""
+    now = now_ts()
+    async with database.connect() as db:
+        cursor = await db.execute(
+            "SELECT id, site_id, action, attempts FROM cert_job"
+            " WHERE state = 'queued' AND not_before <= ? ORDER BY not_before, id LIMIT 1",
+            (now,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cursor = await db.execute(
+            "UPDATE cert_job SET state = 'running', updated_at = ?"
+            " WHERE id = ? AND state = 'queued'",
+            (now, int(row["id"])),
+        )
+        await db.commit()
+        if not cursor.rowcount:
+            return None
+    return dict(row)
+
+
+async def finish_job(
+    job: Dict[str, Any], ok: bool, error: str = "", retry_in: int = 0
+) -> None:
+    """收尾：成功置 done；失败按退避回队，连续失败到顶转 failed。"""
+    job_id = int(job.get("id") or 0)
+    attempts = int(job.get("attempts") or 0)
+    now = now_ts()
+    async with database.connect() as db:
+        if ok:
+            await db.execute(
+                "UPDATE cert_job SET state = 'done', attempts = ?, last_error = '',"
+                " updated_at = ? WHERE id = ?",
+                (attempts, now, job_id),
+            )
+        else:
+            attempts += 1
+            if attempts >= JOB_MAX_ATTEMPTS:
+                await db.execute(
+                    "UPDATE cert_job SET state = 'failed', attempts = ?, last_error = ?,"
+                    " updated_at = ? WHERE id = ?",
+                    (attempts, str(error or "")[:1000], now, job_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE cert_job SET state = 'queued', attempts = ?, last_error = ?,"
+                    " not_before = ?, updated_at = ? WHERE id = ?",
+                    (
+                        attempts,
+                        str(error or "")[:1000],
+                        now + max(60, int(retry_in or 60)),
+                        now,
+                        job_id,
+                    ),
+                )
+        await db.commit()
+
+
+async def _renew_with_lease(site: Dict[str, Any], trigger: str) -> RunResult:
+    """带租约跑一轮流水线：抢不到就跳过（另一个 worker 正在处理同一站点）。"""
+    site_id = str(site.get("id") or "")
+    if not site_id:
+        return await renew_site(site, trigger=trigger)
+    holder = _lease_holder()
+    if not await acquire_lease(site_id, holder):
+        logger.info("站点 %s 正由其它 worker 处理，本轮跳过", site.get("domain"))
+        return RunResult(status="ok", steps=[], value=None, error="busy", exc=None)
+    try:
+        return await renew_site(site, trigger=trigger)
+    finally:
+        await release_lease(site_id, holder)
+
+
+async def job_tick(limit: int = 5) -> List[Dict[str, Any]]:
+    """待办队列消费者：每次最多处理 N 条，失败按退避回队。"""
+    results: List[Dict[str, Any]] = []
+    for _ in range(max(1, int(limit))):
+        job = await claim_job()
+        if job is None:
+            break
+        site = await get_site(str(job.get("site_id") or ""))
+        if site is None:
+            await finish_job(job, True)
+            continue
+        try:
+            run = await _renew_with_lease(site, "job")
+            if run.error == "busy":
+                await finish_job(job, False, "busy", retry_in=60)
+                continue
+            ok = run.status == "ok" and not str(site.get("last_error") or "")
+            await finish_job(
+                job,
+                ok,
+                str(site.get("last_error") or "")[:400],
+                retry_in=backoff_after(int(job.get("attempts") or 0) + 1),
+            )
+            results.append(
+                {"site": site.get("domain"), "action": job.get("action"), "ok": ok}
+            )
+        except Exception as exc:  # noqa: BLE001 - 单条任务失败不影响其它任务
+            await finish_job(
+                job,
+                False,
+                str(exc)[:400],
+                retry_in=backoff_after(int(job.get("attempts") or 0) + 1),
             )
     return results
 
@@ -4932,12 +6159,26 @@ async def retry_tick() -> List[Dict[str, Any]]:
     async with _TICK_LOCK:
         now = now_ts()
         sites = await load_sites()
+        queued = await queued_site_ids()
         due = []
         for site in sites:
             if not site.get("enabled"):
                 continue
             at = int(site.get("next_attempt_at") or 0)
-            if at and at <= now:
+            if at:
+                # 有排期就完全按排期走：窗口内的一律等主作业，不因为「没证书」插队
+                if at <= now:
+                    due.append(site)
+                continue
+            # 新建站点（没有证书、也没有待签发）没有排期：交给队列消费；
+            # 队列不可用（未建表等）时才退回扫表，避免同一站点做两遍。
+            if (
+                not site.get("cert_id")
+                and not site.get("pending_cert_id")
+                and site.get("auto_renew", True)
+                and ca_kind(site) != "upload"
+                and str(site.get("id") or "") not in queued
+            ):
                 due.append(site)
         if not due:
             return []
@@ -5000,9 +6241,166 @@ async def list_remote_certificates(
     return result
 
 
+async def _test_acme(owner: str) -> Dict[str, Any]:
+    """验证 ACME 配置：CA 目录 / 账号注册（含 EAB）+ DNS 凭据能否定位托管域。
+
+    全程**只读**：不签发、不下单、不写 TXT 记录。目的是把「配置类错误」提前
+    到设置页 —— 目录拼错、邮箱格式、EAB kid/hmac、DNS 密钥失效、域名不在
+    该账号下，这些问题以前都要等点了「申请」、等 DNS 传播完才暴露。
+
+    返回的 ``detail`` 是一段人话（CA / DNS 两段），前端直接展示。
+    """
+    cfg = await load_acme(owner)
+    email = str(cfg.get("email") or "").strip()
+    if not email:
+        raise CertError(
+            i18n.pick("请先填写 ACME 账号邮箱", "Enter the ACME account email first")
+        )
+    directory = str(cfg.get("directory") or acme_mod.DIRECTORY_LETSENCRYPT)
+    notes: List[str] = []
+
+    # 1) CA 侧：读目录 + 注册/复用账号。account_key 复用已保存的那把，
+    #    不会每次点「验证」都在 CA 上新建账号（Let's Encrypt 对 newAccount
+    #    也有限流）。
+    client = acme_mod.AcmeClient(
+        directory,
+        email=email,
+        account_key_pem=str(cfg.get("account_key") or ""),
+        eab_kid=str(cfg.get("eab_kid") or ""),
+        eab_hmac_key=str(cfg.get("eab_hmac_key") or ""),
+    )
+    try:
+        async with client:
+            await client.ensure_account()
+        if not cfg.get("account_key"):
+            # 首次验证就把账号密钥落库：否则每次点「验证」都会在 CA 上新建一个
+            # 账号（Let's Encrypt 对 newAccount 也限流）。与签发流程同一套做法。
+            await save_acme({**cfg, "account_key": client.account_key.pem}, owner)
+    except acme_mod.AcmeError as exc:
+        raise CertError(
+            i18n.pick("ACME 账号验证失败：", "ACME account check failed: ") + str(exc)
+        ) from exc
+    notes.append(i18n.pick("CA 连接正常（账号可用）", "CA reachable (account ready)"))
+
+    # 2) DNS 侧：用该用户的 ACME 站点域名做一次托管域探测
+    kind = str(cfg.get("dns_provider") or "").lower()
+    if not kind:
+        notes.append(
+            i18n.pick(
+                "未选择 DNS 服务商（仅 HTTP-01 可用）",
+                "No DNS provider selected (HTTP-01 only)",
+            )
+        )
+        return {"total": 0, "detail": "；".join(notes)}
+
+    block = cfg.get(kind) if isinstance(cfg.get(kind), dict) else {}
+    provider = dnsproviders.build_provider(kind, block)
+    domains = [
+        str(site.get("domain") or "")
+        for site in await load_sites()
+        if site_owner(site) == str(owner or "")
+        and ca_kind(site) == "acme"
+        and site.get("domain")
+    ]
+    if not domains:
+        notes.append(
+            i18n.pick(
+                "DNS 凭据已填写（还没有 ACME 站点可校验域名）",
+                "DNS credentials set (no ACME site yet to check a domain)",
+            )
+        )
+        return {"total": 0, "detail": "；".join(notes)}
+
+    challenge = "_acme-challenge." + domains[0]
+    try:
+        zone = await provider.check_domain(challenge)
+    except dnsproviders.DnsError as exc:
+        text = str(exc)
+        low = text.lower()
+        # 把「服务商原话」翻译成「该去改哪里」：这两类失败的处置完全不同，
+        # 只回一句 "The SecretId is not found" / "域名不正确" 用户还得再猜。
+        if "secretid" in low or "authfailure" in low or "signature" in low:
+            hint = i18n.pick(
+                "请检查 SecretId / SecretKey 是否有效、是否具备该 DNS 的权限",
+                "Check that the SecretId/SecretKey are valid and allowed to manage this DNS",
+            )
+        elif "域名" in text or "domain" in low:
+            hint = i18n.pick(
+                "请确认 " + domains[0] + " 已托管在该 DNS 账号下",
+                "Confirm that " + domains[0] + " is hosted in this DNS account",
+            )
+        else:
+            hint = ""
+        raise CertError(
+            i18n.pick("DNS 凭据验证失败：", "DNS credential check failed: ")
+            + text
+            + (i18n.pick("（", " (") + hint + i18n.pick("）", ")") if hint else "")
+        ) from exc
+    notes.append(
+        i18n.pick(
+            "DNS 凭据可用（"
+            + domains[0]
+            + " 托管在 "
+            + (zone or "未知域")
+            + "）",
+            "DNS credentials work ("
+            + domains[0]
+            + " is hosted on "
+            + (zone or "unknown zone")
+            + ")",
+        )
+    )
+    return {"total": 0, "detail": "；".join(notes)}
+
+
+#: 渠道自检结果的存储前缀：每用户一份，按 kind 存
+#: ``{"ok": bool, "detail": str, "at": ts}``。
+#:
+#: 以前自检结果只存在页面 state 里，刷新就退回「未自检」——用户明明刚验过，
+#: 下次进来又不知道能不能用。落库之后「上次自检 5 分钟前 / 自检失败：原因」
+#: 才会一直留在卡片上。
+PROVIDER_TEST_KEY = "cert_provider_test:"
+
+
+def provider_test_key(owner: str) -> str:
+    return PROVIDER_TEST_KEY + str(owner or "")
+
+
+async def load_provider_tests(owner: str) -> Dict[str, Dict[str, Any]]:
+    raw = await store.get_setting(provider_test_key(owner))
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+async def record_provider_test(owner: str, kind: str, result: Dict[str, Any]) -> None:
+    """记住一次自检结论（成功或失败）。失败只记日志，不影响本次返回。"""
+    kind = str(kind or "").strip().lower()
+    if not kind:
+        return
+    try:
+        data = await load_provider_tests(owner)
+        data[kind] = {
+            "ok": bool(result.get("ok")),
+            "detail": str(result.get("detail") or "")[:500],
+            "at": int(result.get("at") or now_ts()),
+        }
+        await store.set_setting(
+            provider_test_key(owner), json.dumps(data, ensure_ascii=False)
+        )
+    except Exception:  # noqa: BLE001 - 自检已完成，记不住不影响结果
+        logger.warning("记录渠道自检结果失败（%s）", kind, exc_info=True)
+
+
 async def test_connection(kind: str = "tencent", owner: str = "") -> Dict[str, Any]:
     """验证该用户在指定厂商上的密钥是否可用（顺带返回账号下的证书数量）。"""
     kind = str(kind or "tencent").strip().lower()
+    if kind == "acme":
+        return await _test_acme(owner)
     provider = build_provider(kind, await load_provider(kind, owner))
     if not provider.configured:
         raise CertError(
